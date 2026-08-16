@@ -91,8 +91,8 @@ Model access must be behind provider/gateway abstractions.
 Evaluation logic must not be embedded in UI code.
 Cost calculation must use configuration, never scattered hard-coded prices.
 
-Optional optimization modules must be controlled through typed configuration as defined in `docs/MODULE_CONFIGURATION.md`.
-Do not hard-code module enable/disable behavior throughout the codebase.
+Optional optimizer capabilities such as semantic cache, context reduction, and historical policy must be controlled through typed configuration as defined in `docs/MODULE_CONFIGURATION.md`.
+Do not treat quality evaluation as a normal enable/disable optimization flag.
 
 ## Azure rules
 
@@ -168,7 +168,17 @@ Planner output must include:
 
 Every decision must be inspectable in the UI.
 
+Planner V1 is authoritative in `docs/PLANNER_V1.md`.
+
+Quality Profile defines the minimum acceptable quality threshold.
+Optimization Mode (`COST`, `BALANCED`, `QUALITY`) controls how aggressively the planner pursues lower-cost execution plans. It must materially affect Planner V1 behavior and must never lower the Quality Contract threshold.
+
+The planner builds a composable execution plan across cache, context, model, and verification/escalation policies. Friendly UI plan names are derived labels, not separate routing implementations.
+
 ## Quality rules
+
+Quality evaluation is mandatory for any normal OPTIMA execution that claims Quality Contract compliance.
+Tests and local development may inject fake evaluators, but the production/hackathon path must not silently disable evaluation.
 
 Never treat an LLM judge score as objective truth.
 
@@ -188,6 +198,8 @@ Use deterministic evaluators when possible:
 Use LLM-as-judge only for natural-language qualities that cannot be measured deterministically.
 
 A strategy "succeeds" only when its final result meets the Quality Contract.
+
+
 
 ## Cost and token rules
 

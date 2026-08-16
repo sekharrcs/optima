@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Planner V1 selects an explainable execution plan expected to satisfy the Quality Contract at the lowest reasonable cost.
+Planner V1 selects an explainable execution plan expected to satisfy the Quality Contract at the lowest reasonable cost under the selected Optimization Mode.
 
 V1 is deterministic plus bounded historical evidence. It is not reinforcement learning and does not generate arbitrary agent graphs.
 
@@ -28,7 +28,7 @@ Verification / Escalation Policy
 Execution Plan
 ```
 
-A friendly strategy name may still be derived for the UI, such as:
+A friendly plan name may still be derived for the UI, such as:
 
 `Context Reduce -> Small -> Verify -> Escalate if needed`
 
@@ -49,7 +49,7 @@ The planner contains no Azure model deployment names.
 
 Planner input includes:
 - Request Profile
-- Quality Contract
+- Quality Contract, including Optimization Mode
 - Module Configuration
 - Cache candidate metadata, if cache is enabled
 - Historical Policy Statistics, if enabled
@@ -100,7 +100,8 @@ HIGH examples:
 - ambiguous multi-step reasoning
 - high-risk or highly complex analysis
 
-The profiler may use deterministic signals plus a lightweight structured classifier. A classifier produces profile attributes; it does not select a model.
+The profiler may use deterministic signals plus a lightweight structured classifier.
+A classifier produces profile attributes; it does not select a model.
 
 ### Other profile fields
 
@@ -127,12 +128,25 @@ history_small_avoid_pass_rate = 0.70
 
 All thresholds must live in typed configuration.
 
+## Quality Profile vs Optimization Mode
+
+These are separate inputs:
+
+- Quality Profile sets the minimum acceptable quality score.
+- Optimization Mode changes how aggressively OPTIMA pursues lower-cost plans.
+
+Optimization Mode must never lower the Quality Contract threshold.
+
+Reason codes must always include exactly one of:
+- `OPTIMIZATION_MODE_COST`
+- `OPTIMIZATION_MODE_BALANCED`
+- `OPTIMIZATION_MODE_QUALITY`
+
 ## Step 0: Module capability gates
 
 Before selecting optimizations, honor `docs/MODULE_CONFIGURATION.md`.
 
 If a module is disabled, the planner must not include it in the plan.
-
 Module state must be represented in reason/debug metadata so a run is explainable.
 
 ## Step 1: Semantic cache gate
@@ -167,37 +181,61 @@ if (
 Primary reason code:
 - `CACHE_HIGH_CONFIDENCE_MATCH`
 
+Optimization Mode does not override cache safety or contract compatibility.
+
 ## Step 2: Context policy
 
-Context reduction is an optional plan component, not a mandatory monolithic strategy.
+Context reduction is an optional plan component, not a monolithic strategy.
 
-If context reduction module is disabled:
+If `context_reduction_enabled == false`:
 - do not reduce context
 - reason: `CONTEXT_REDUCTION_DISABLED`
 
-If enabled, initial policy is:
+V1 must make a deterministic decision. There is no unresolved `CONSIDER` state in the final Execution Plan.
+
+### COST mode
+
+If a safe reducer is available and the request is not blocked by risk safeguards:
 
 ```text
-input tokens < 4,000
-    -> no reduction
-
-4,000 <= input tokens < 8,000
-    -> consider reduction
-
-input tokens >= 8,000
-    -> reduction preferred
+input tokens < 4,000       -> KEEP_ORIGINAL
+input tokens >= 4,000      -> REDUCE
 ```
 
-Risk/quality safeguard:
-- for Critical quality with high-risk content, V1 should conservatively skip aggressive context reduction unless a task-specific safe reducer is available
+This is deliberately aggressive because verification/escalation protects the Quality Contract.
+
+### BALANCED mode
+
+If a safe reducer is available and the request is not blocked by risk safeguards:
+
+```text
+input tokens < 8,000       -> KEEP_ORIGINAL
+input tokens >= 8,000      -> REDUCE
+```
+
+### QUALITY mode
+
+```text
+input tokens < 8,000       -> KEEP_ORIGINAL
+input tokens >= 8,000      -> REDUCE only when:
+                               - a task-safe reducer is available
+                               - risk tier is LOW or MEDIUM
+                               - contract is not Critical + HIGH risk
+                             otherwise KEEP_ORIGINAL
+```
+
+### Hard safeguard
+
+For `CRITICAL` quality with `HIGH` risk, V1 must keep original context unless an explicitly task-safe reducer is configured and approved for that task class.
 
 Potential reason codes:
 - `CONTEXT_WITHIN_NORMAL_RANGE`
-- `CONTEXT_REDUCTION_CONSIDERED`
 - `CONTEXT_ABOVE_REDUCTION_THRESHOLD`
 - `CONTEXT_REDUCTION_SELECTED`
 - `CONTEXT_REDUCTION_SKIPPED_HIGH_RISK`
+- `CONTEXT_REDUCTION_SKIPPED_QUALITY_MODE`
 - `CONTEXT_REDUCTION_DISABLED`
+- `SAFE_REDUCER_UNAVAILABLE`
 
 The context reducer must emit before/after token counts and preserve evidence needed by evaluation.
 
@@ -206,35 +244,34 @@ The context reducer must emit before/after token counts and preserve evidence ne
 Models are represented conceptually as `SMALL` and `STRONG`.
 Provider/deployment configuration maps these roles to actual Azure models.
 
-### Standard quality contract
+Quality Profile determines the minimum acceptable score.
+Optimization Mode determines how aggressively OPTIMA attempts a lower-cost model before using the strong model.
 
-Initial threshold: 0.80
+### COST mode
 
-| Complexity | Base policy |
-|---|---|
-| LOW | Small direct |
-| MEDIUM | Small -> Verify -> Escalate |
-| HIGH | Strong direct |
+| Quality Profile | LOW | MEDIUM | HIGH |
+|---|---|---|---|
+| Standard | Small direct | Small -> Verify -> Escalate | Small -> Verify -> Escalate |
+| High | Small -> Verify -> Escalate | Small -> Verify -> Escalate | Strong direct |
+| Critical | Small -> Verify -> Escalate | Strong direct | Strong direct |
 
-### High quality contract
+### BALANCED mode
 
-Initial threshold: 0.90
+| Quality Profile | LOW | MEDIUM | HIGH |
+|---|---|---|---|
+| Standard | Small direct | Small -> Verify -> Escalate | Strong direct |
+| High | Small -> Verify -> Escalate | Small -> Verify -> Escalate | Strong direct |
+| Critical | Small -> Verify -> Escalate | Strong direct | Strong direct |
 
-| Complexity | Base policy |
-|---|---|
-| LOW | Small -> Verify -> Escalate |
-| MEDIUM | Small -> Verify -> Escalate |
-| HIGH | Strong direct |
+### QUALITY mode
 
-### Critical quality contract
+| Quality Profile | LOW | MEDIUM | HIGH |
+|---|---|---|---|
+| Standard | Small -> Verify -> Escalate | Strong direct | Strong direct |
+| High | Small -> Verify -> Escalate | Strong direct | Strong direct |
+| Critical | Strong direct | Strong direct | Strong direct |
 
-Initial threshold: 0.95
-
-| Complexity | Base policy |
-|---|---|
-| LOW | Small -> Verify -> Escalate |
-| MEDIUM | Strong direct |
-| HIGH | Strong direct |
+These are initial hackathon policy defaults and may later be calibrated from benchmark evidence.
 
 Reason codes include:
 - `LOW_COMPLEXITY`
@@ -243,32 +280,49 @@ Reason codes include:
 - `STANDARD_QUALITY_CONTRACT`
 - `HIGH_QUALITY_CONTRACT`
 - `CRITICAL_QUALITY_CONTRACT`
+- `OPTIMIZATION_MODE_COST`
+- `OPTIMIZATION_MODE_BALANCED`
+- `OPTIMIZATION_MODE_QUALITY`
 - `SMALL_MODEL_ELIGIBLE`
 - `STRONG_MODEL_REQUIRED`
+- `QUALITY_MODE_PREFERS_STRONG`
+- `COST_MODE_ALLOWS_SMALL_FIRST`
 
 ## Step 4: Historical policy adjustment
 
-Historical learning is disabled unless:
-- historical policy module is enabled
-- sufficient comparable samples exist
+Historical policy is applied only when:
+- `historical_policy_enabled == true`
+- at least `history_minimum_samples` comparable runs exist
 
-Minimum initial evidence:
-- at least 20 comparable runs for the relevant task/profile bucket
+Comparable history should initially be bucketed by:
+- task type
+- Quality Profile
+- Optimization Mode
+- relevant risk tier where practical
 
-Historical policy may make the base plan more efficient but must not bypass explicit safety/risk rules.
+### Positive small-first evidence
 
-Initial guidance:
+If all are true:
+- sample count >= 20
+- small-first pass-without-escalation rate >= 0.95
+- average final quality satisfies the current contract
 
-```text
-If small-first pass-without-escalation rate >= 0.95
-and average quality satisfies the current contract
-and sample count >= 20:
-    planner may prefer small-first where otherwise optional
+then:
+- COST: may prefer small-first for an otherwise strong-direct HIGH-complexity Standard request, unless risk rules require strong
+- BALANCED: may prefer small-first only where the base policy is already small-first or where a future explicit policy marks the transition eligible
+- QUALITY: does not downgrade a base strong-direct decision in V1
 
-If small-first pass-without-escalation rate < 0.70
-and sample count >= 20:
-    planner may skip an expected-waste small call and go strong directly
-```
+### Poor small-first evidence
+
+If all are true:
+- sample count >= 20
+- small-first pass-without-escalation rate < 0.70
+
+then COST or BALANCED may replace a small-first base policy with `STRONG_DIRECT` to avoid an expected-waste small call.
+
+QUALITY already favors strong execution and may also use this evidence as explanation.
+
+Historical evidence must never bypass explicit safety/risk rules.
 
 Reason codes:
 - `HISTORICAL_SMALL_SUCCESS_HIGH`
@@ -280,7 +334,18 @@ All historical adjustments must record the statistics that supported the change.
 
 ## Step 5: Verification and escalation policy
 
-For `small_verify_escalate`:
+Quality evaluation is mandatory for every normal model-executed plan before OPTIMA claims Quality Contract compliance.
+
+### Small direct
+
+1. Execute small model.
+2. Evaluate.
+3. Return result with contract pass/fail status.
+4. Do not automatically escalate unless the selected model policy includes escalation.
+
+`small_direct` is therefore "direct" only in model-selection terms; it does not bypass quality measurement.
+
+### Small -> Verify -> Escalate
 
 1. Execute small model.
 2. Evaluate its answer.
@@ -288,6 +353,12 @@ For `small_verify_escalate`:
 4. Otherwise record quality failure and execute strong model exactly once.
 5. Evaluate strong-model result.
 6. Return the strong result with final contract status.
+
+### Strong direct
+
+1. Execute strong model.
+2. Evaluate.
+3. Return result with contract pass/fail status.
 
 Reason/event codes:
 - `QUALITY_CONTRACT_MET`
@@ -309,6 +380,7 @@ ExecutionPlan
 - initial_model_role
 - verification_required
 - escalation_model_role (optional)
+- optimization_mode
 - reason_codes[]
 - human_readable_name
 - expected_quality (optional estimate)
@@ -337,12 +409,14 @@ def select_plan(request, contract, modules, cache_candidate, history, config):
         token_count=profile.input_tokens,
         risk=profile.risk_tier,
         contract=contract,
+        optimization_mode=contract.optimization_mode,
         config=config,
     )
 
     model_policy = select_base_model_policy(
         quality_profile=contract.quality_profile,
         complexity=profile.complexity,
+        optimization_mode=contract.optimization_mode,
     )
 
     if modules.historical_policy_enabled:
@@ -358,6 +432,7 @@ def select_plan(request, contract, modules, cache_candidate, history, config):
         profile=profile,
         context_policy=context_policy,
         model_policy=model_policy,
+        optimization_mode=contract.optimization_mode,
         reasons=collect_reason_codes(...),
     )
 ```
@@ -379,15 +454,20 @@ Planner V1 must not contain:
 Tests must include at least:
 - cache hit wins when safe and contract-compatible
 - cache disabled skips cache
-- low/standard selects small direct
-- medium/standard selects small-verify-escalate
-- high/high selects strong direct
-- low/critical selects small-verify-escalate
-- medium/critical selects strong direct
+- low/standard/cost selects small direct
+- medium/standard/balanced selects small-verify-escalate
+- high/standard/balanced selects strong direct
+- high/standard/cost selects small-verify-escalate when risk permits
+- medium/high/quality selects strong direct
+- low/critical/balanced selects small-verify-escalate
+- low/critical/quality selects strong direct
 - context reduction disabled never includes reduction
-- long context selects reduction when allowed
+- 4k-8k context reduces in COST when safe but not BALANCED
+- >=8k context reduces in BALANCED when safe
+- QUALITY mode uses conservative context-reduction rules
 - critical/high-risk skips unsafe reduction
 - insufficient history cannot alter policy
-- strong historical evidence can alter eligible policy
+- positive history changes only explicitly eligible policy
 - poor small-model history can skip expected-waste small call
 - planner reason codes explain every selected component
+- optimization-mode reason code is always present

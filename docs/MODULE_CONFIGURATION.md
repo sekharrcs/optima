@@ -2,13 +2,13 @@
 
 ## Decision
 
-OPTIMA modules must be independently configurable, but the hackathon MVP will not include a full configuration UI or dynamic policy-management service.
+OPTIMA optimization modules must be independently configurable, but the hackathon MVP will not include a full configuration UI or dynamic policy-management service.
 
 The goal is architectural flexibility with minimal MVP complexity.
 
 ## Why
 
-Optimization techniques can introduce tradeoffs. For example, context reduction may lower token cost but could remove information needed for a high-quality answer.
+Optimization techniques can introduce tradeoffs. For example, context reduction may lower token cost but could remove information required for a high-quality answer.
 
 A technique that is harmful for one benchmark or workload must be bypassable without rewriting planner logic.
 
@@ -20,11 +20,17 @@ Support configuration values equivalent to:
 semantic_cache_enabled: true
 context_reduction_enabled: true
 historical_policy_enabled: true
-quality_evaluation_enabled: true
 foundry_router_comparator_enabled: false
 ```
 
-`quality_evaluation_enabled` may be disabled only for local debugging/testing. Normal OPTIMA execution that claims Quality Contract compliance must have a valid evaluator.
+Quality evaluation is **not** a normal optional optimizer module.
+
+A normal OPTIMA run that claims Quality Contract compliance must always use a valid evaluator.
+
+For tests/local development:
+- fake evaluators may be injected
+- evaluation behavior may be stubbed
+- test-only bypasses must never become the normal production/hackathon path
 
 ## Configuration source
 
@@ -34,7 +40,6 @@ For MVP:
 - tests can inject explicit settings
 
 Do not scatter environment-variable reads throughout planner/strategy code.
-
 Do not hard-code flags inside planner conditionals.
 
 ## Planner behavior
@@ -60,13 +65,19 @@ If `historical_policy_enabled == false`:
 - planner uses only deterministic V1 policy
 - historical statistics cannot alter the base plan
 
+### Foundry comparator disabled
+
+If `foundry_router_comparator_enabled == false`:
+- comparator runs are not offered/executed
+- this must not affect normal OPTIMA planning
+
 ## Quality safeguard
 
 Context reduction is an optimization, not a requirement.
 
 If benchmark evidence shows that context reduction materially harms Quality Contract pass rate for a task class, it must be possible to:
 1. disable context reduction globally, or
-2. later disable it selectively by task/risk class.
+2. later disable it selectively by task/risk class
 
 Selective per-task configuration is roadmap scope unless needed during the hackathon.
 
@@ -74,6 +85,7 @@ Selective per-task configuration is roadmap scope unless needed during the hacka
 
 Later versions may add:
 - per-task module policies
+- per-risk-tier policies
 - per-tenant configuration
 - dynamic feature flags
 - experimentation/A-B policies
