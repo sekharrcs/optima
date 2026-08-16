@@ -4,7 +4,7 @@
 
 The UI exists to make OPTIMA's value understandable within seconds:
 
-> OPTIMA selected an execution plan, satisfied the Quality Contract, and used fewer resources than the baseline.
+> OPTIMA selected an execution plan, satisfied the Quality Contract, and used resources efficiently compared with the baseline.
 
 This is not a chatbot-first UI. The answer matters, but the product being demonstrated is the optimization decision and its measured outcome.
 
@@ -29,7 +29,7 @@ The MVP has exactly three primary views:
 Display:
 - Product name: OPTIMA
 - Subtitle: Quality-Constrained AI Execution Optimizer
-- Short value statement: Find the lowest-cost execution plan that satisfies the required quality.
+- Short value statement: Find the most efficient execution plan allowed by the Quality Contract and Optimization Mode.
 
 Avoid generic chatbot branding or a chat-style conversation layout.
 
@@ -48,14 +48,23 @@ Hackathon demo defaults:
 
 Do not expose raw quality thresholds by default. They may appear in an advanced/debug expander.
 
+### Quality Profile vs Optimization Mode
+
+The UI must make the distinction understandable:
+
+- **Quality Profile** defines the minimum acceptable quality.
+- **Optimization Mode** controls how aggressively OPTIMA pursues lower-cost execution paths.
+
+Optimization Mode must never be described as lowering the required quality threshold.
+
 ### Execution trace
 
 After execution begins, show the actual plan steps in order.
 
-Example without escalation:
+Example small-first run without escalation:
 
 ```text
-Request Profiled
+Request Profiled: MEDIUM
       |
 Context Reduction Selected
       |
@@ -67,9 +76,11 @@ Quality Evaluation: 0.93
 Required: 0.90
       |
 QUALITY CONTRACT MET
+      |
+Return
 ```
 
-Example with escalation:
+Example small-first run with escalation:
 
 ```text
 Small Model
@@ -88,24 +99,44 @@ Quality = 0.95
 PASSED
 ```
 
+Example HIGH-complexity run:
+
+```text
+Request Profiled: HIGH
+      |
+Strong Direct Selected
+      |
+Strong Model
+      |
+Quality Evaluation
+      |
+Return
+```
+
 The UI must render trace data returned by the backend. It must not invent execution steps or planner decisions.
 
 ### OPTIMA Decision card
 
 Required fields:
 - Human-readable plan name
+- Request complexity
 - Plan components
 - Reason explanation derived from structured planner reason codes
-- Required quality threshold
+- Quality Profile and required threshold
+- Optimization Mode
 - Final measured quality
 - Contract result: Met / Not Met
 - Whether escalation occurred
 
-Example plan label:
+Example plan labels:
 
 `Context Reduce -> Small -> Verify -> Escalate if needed`
 
+`Strong -> Verify`
+
 Reason text must be deterministic from planner reason codes. Do not call an LLM only to explain the planner.
+
+For HIGH-complexity requests, the UI should be able to explain that Planner V1 selected strong-direct execution rather than spending time/cost on a small-model attempt that is expected to fail.
 
 ### Answer/result section
 
@@ -134,7 +165,7 @@ Preferred emphasis:
 - Cost reduction percentage
 - Both executions' Quality Contract status
 
-Do not present a lower-but-passing OPTIMA quality score as a quality improvement. The correct message is that the required quality was satisfied at lower resource cost.
+Do not present a lower-but-passing OPTIMA quality score as a quality improvement. The correct message is that the required quality was satisfied with a more efficient execution plan.
 
 Clearly distinguish:
 - Measured actuals
@@ -153,23 +184,25 @@ Show:
 
 All values must be computed from stored runs. Never use fabricated demo numbers in production code.
 
-### Strategy / plan usage
+### Execution plan / component usage
 
-Show the distribution of plan types/components, for example:
-- Small direct
-- Small -> verify
-- Context reduce -> small
+Show the distribution of actual plan outcomes/components, for example:
+- Small first -> verified without escalation
+- Small -> Strong escalation
+- Context reduce -> Small -> verified
+- Context reduce -> Strong
 - Semantic cache
 - Strong direct
-- Escalated runs
+
+Do not use `Small direct` as a V1 plan label because every small-first plan includes strong fallback even when escalation was not needed.
 
 ### Savings attribution
 
 When attribution can be measured, show savings associated with:
 - Context reduction
-- Smaller model usage
+- Smaller-model first attempts that passed quality
 - Semantic cache
-- Avoided strong-model escalation
+- Avoided unnecessary small-model attempts for strong-direct requests, when a reliable baseline exists
 
 If attribution is not reliable, omit it rather than inventing it.
 
@@ -188,6 +221,7 @@ Display a compact table with:
 - Run ID
 - Timestamp
 - Task type
+- Complexity
 - Plan name
 - Final quality
 - Cost
@@ -197,6 +231,7 @@ Display a compact table with:
 Selecting a run shows:
 - Request profile
 - Quality Contract
+- Optimization Mode
 - Planner reason codes
 - Execution steps
 - Model usage
@@ -214,7 +249,7 @@ Do not expose secrets, API keys, connection strings, or full sensitive prompts b
 
 Module enable/disable switches are NOT part of the MVP user interface.
 
-The backend must support configuration flags so modules can be disabled during experiments or deployment. See `docs/MODULE_CONFIGURATION.md`.
+The backend must support configuration flags so optional optimizer capabilities can be disabled during experiments or deployment. See `docs/MODULE_CONFIGURATION.md`.
 
 A future admin/settings view may expose these flags after the hackathon.
 
@@ -224,7 +259,7 @@ A future admin/settings view may expose these flags after the hackathon.
 - Use whitespace and clear information hierarchy.
 - Make the selected execution plan visually obvious.
 - Make Quality Contract status visually obvious.
-- Make baseline-vs-OPTIMA savings visually obvious.
+- Make baseline-vs-OPTIMA efficiency visually obvious.
 - Avoid excessive animations; a simple progressive execution trace is sufficient.
 - Keep the primary Execute screen usable on a laptop without horizontal scrolling.
 
@@ -232,7 +267,7 @@ A future admin/settings view may expose these flags after the hackathon.
 
 The Execute screen is complete when a user can:
 1. Enter a request and optional context.
-2. Select Quality and Optimization profiles.
+2. Select Quality Profile and Optimization Mode.
 3. Execute OPTIMA.
 4. See the chosen plan and why it was chosen.
 5. See actual execution steps.
@@ -240,6 +275,6 @@ The Execute screen is complete when a user can:
 7. See the final answer.
 8. Compare measured baseline and OPTIMA cost/tokens/latency/quality.
 
-The Dashboard is complete when aggregate values are derived only from stored measured runs.
+The Dashboard is complete when aggregate values are derived only from stored measured runs and use Planner V1 terminology.
 
 The Run History is complete when a user can inspect the full evidence behind one prior decision.
