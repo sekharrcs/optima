@@ -18,9 +18,33 @@ Before making architectural or product decisions, read:
 - `docs/ARCHITECTURE.md`
 - `docs/QUALITY_CONTRACT.md`
 - `docs/EXECUTION_STRATEGIES.md`
+- `docs/PLANNER_V1.md`
+- `docs/UI_SPEC.md`
+- `docs/MODULE_CONFIGURATION.md`
 - `docs/DECISIONS.md`
 
 If code and documentation conflict, stop and identify the conflict before silently changing behavior.
+
+## Git workflow — mandatory
+
+`main` is the protected integration branch.
+
+Never implement application code, tests, infrastructure, or feature documentation directly on `main`.
+
+Before starting implementation work:
+1. Confirm the current branch.
+2. If currently on `main`, create and switch to a feature branch before editing implementation files.
+3. Use branch naming:
+   - `feature/<short-description>` for product features
+   - `fix/<short-description>` for fixes
+   - `docs/<short-description>` for documentation-only work
+   - `infra/<short-description>` for infrastructure work
+4. Perform implementation and commits only on the working branch.
+5. Run required validation before proposing merge.
+6. Open a pull request targeting `main`.
+7. Do not automatically merge the pull request unless explicitly instructed.
+
+If branch creation fails, stop implementation rather than modifying `main`.
 
 ## Development workflow
 
@@ -52,17 +76,23 @@ Keep these concepts separate:
 - Quality Contract
 - Request Profile
 - Planner
-- Execution Strategy
+- Execution Plan
 - Strategy Executor
 - Quality Evaluator
 - Cost Calculator
 - Telemetry/Run History
 - Learning/Policy Statistics
 
+Planner V1 is defined by `docs/PLANNER_V1.md`.
+The planner must build a composable execution plan across cache, context, model, verification, and escalation policies.
+
 The planner must not contain provider-specific API calls.
 Model access must be behind provider/gateway abstractions.
 Evaluation logic must not be embedded in UI code.
 Cost calculation must use configuration, never scattered hard-coded prices.
+
+Optional optimization modules must be controlled through typed configuration as defined in `docs/MODULE_CONFIGURATION.md`.
+Do not hard-code module enable/disable behavior throughout the codebase.
 
 ## Azure rules
 
@@ -84,54 +114,55 @@ Never commit secrets, API keys, connection strings, or model credentials.
 Prefer managed identity for Azure-to-Azure authentication.
 Local development secrets belong in `.env` and `.env` must remain ignored.
 
-## MVP execution strategies
+## MVP execution capabilities
 
-Only these strategies are MVP unless the docs change:
+Planner V1 composes the following capabilities into an execution plan:
 
-1. `semantic_cache`
+1. Semantic cache
    - Look for a sufficiently similar previously accepted result.
    - Return only results that meet cache safety/quality rules.
    - Record cache similarity and avoided model cost.
 
-2. `small_direct`
-   - Send the optimized request to the configured small model.
-
-3. `reduce_context_small`
-   - Reduce irrelevant context.
-   - Call the small model with reduced context.
+2. Context reduction
+   - Optional, configurable optimization.
+   - Reduce irrelevant context when policy permits.
    - Record before/after token counts.
+   - Must be bypassable through typed configuration.
 
-4. `small_verify_escalate`
-   - Call the small model.
-   - Evaluate the answer.
-   - Return it if the Quality Contract is met.
-   - Otherwise call the strong model and evaluate the final result.
-   - Record the escalation reason.
+3. Small model
+   - Lower-cost first-line model role.
 
-5. `strong_direct`
-   - Control/baseline strategy.
+4. Quality verification
+   - Evaluate output against the Quality Contract.
 
-6. `foundry_model_router`
+5. Strong-model escalation
+   - Used when policy requires strong direct execution or small-model quality is insufficient.
+
+6. Foundry Model Router comparator
    - Comparison strategy only.
    - Do not present Microsoft Foundry Model Router as OPTIMA's own innovation.
 
+Friendly UI strategy labels may combine these capabilities, e.g.:
+`Context Reduce -> Small -> Verify -> Escalate if needed`.
+
 ## Planner principles
 
-The hackathon planner should be deterministic and explainable before attempting ML/RL.
+The hackathon planner must be deterministic and explainable before attempting ML/RL.
 
 Inputs may include:
 - task type
 - estimated complexity
 - input token count
 - context length
+- module configuration
 - semantic-cache similarity
 - Quality Contract
 - historical strategy success/cost by task type
 
 Planner output must include:
-- selected strategy
+- selected plan components
 - reason codes
-- human-readable explanation
+- human-readable explanation/plan name
 - expected quality if available
 - expected cost if available
 
@@ -219,7 +250,8 @@ Avoid global mutable state.
 
 At minimum add:
 - unit tests for Quality Contract translation
-- unit tests for planner decisions
+- unit tests for Planner V1 decisions
+- unit tests for module-disabled planner behavior
 - unit tests for cost calculation
 - unit tests for quality threshold/pass-fail behavior
 - unit tests for escalation
@@ -254,3 +286,4 @@ If a metric cannot be measured, mark it unavailable.
 - enterprise billing
 - complex human feedback pipelines
 - generalized RAG platform
+- full module-configuration admin UI

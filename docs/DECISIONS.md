@@ -43,3 +43,25 @@ Azure implementations plug into interfaces.
 Status: Accepted
 
 Keep Azure deployment reproducible and Copilot-friendly.
+
+## ADR-009: Feature-branch-only development
+Status: Accepted
+
+`main` is the integration branch.
+GitHub Copilot/HVE implementation work must occur on a task branch and merge through a pull request.
+If a feature branch cannot be created, implementation must stop rather than fall back to editing `main`.
+
+## ADR-010: Composable execution plans
+Status: Accepted
+
+Planner V1 selects cache, context, model, verification, and escalation policies as composable plan components rather than permanently encoding every combination as a monolithic strategy.
+
+Friendly combined strategy names may still be shown in the UI.
+
+## ADR-011: Configurable optimizer modules
+Status: Accepted
+
+Optional optimization modules are controlled through typed application configuration.
+
+The MVP does not include a settings/admin UI for these flags.
+This permits semantic cache, context reduction, and historical policy to be bypassed safely without architecture changes when benchmark evidence shows a quality or latency regression.
