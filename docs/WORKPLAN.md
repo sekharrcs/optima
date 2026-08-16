@@ -23,6 +23,7 @@ Implement:
 Acceptance:
 - Pydantic validation tests
 - profile -> threshold translation tests
+- ExecutionPlan can represent `SMALL_FIRST_WITH_FALLBACK` and `STRONG_DIRECT`
 
 ## Slice 2 - Planner with fake dependencies
 Implement:
@@ -35,6 +36,8 @@ Implement:
 Acceptance:
 - planner behavior conforms to `docs/PLANNER_V1.md`
 - planner unit test matrix covers all V1 paths
+- every HIGH-complexity case selects strong-direct
+- every small-first plan contains strong fallback
 - module-disabled cases are covered by unit tests
 
 ## Slice 3 - Model provider abstraction + fake providers
@@ -56,13 +59,14 @@ Implement:
 Acceptance:
 - pass/fail and reasons tested
 
-## Slice 5 - small_verify_escalate vertical slice
+## Slice 5 - small-first-with-fallback vertical slice
 Implement end-to-end through API.
 
 Acceptance:
 - small pass avoids strong call
 - small fail escalates exactly once
-- total tokens/cost includes all calls
+- no normal small-first path returns a failed Quality Contract without attempting configured strong fallback
+- total tokens/cost includes all executed calls
 - explanation contains escalation reason
 
 ## Slice 6 - Cost calculator and baseline comparison

@@ -8,7 +8,7 @@ OPTIMA must optimize the entire execution path, not merely select a model.
 
 The central decision is:
 
-> Select the lowest-cost execution strategy that is expected to satisfy the request's Quality Contract, then verify the result and escalate only when required.
+> Select the most efficient execution plan allowed by the Quality Contract and Optimization Mode, verify the result, and escalate when required.
 
 ## Mandatory source of truth
 
@@ -147,6 +147,7 @@ Friendly UI strategy labels may combine these capabilities, e.g.:
 
 ## Planner principles
 
+
 The hackathon planner must be deterministic and explainable before attempting ML/RL.
 
 Inputs may include:
@@ -167,6 +168,14 @@ Planner output must include:
 - expected cost if available
 
 Every decision must be inspectable in the UI.
+
+- OPTIMA does not always attempt the small model first.
+- Every `HIGH`-complexity request uses `STRONG_DIRECT` in Planner V1, regardless of Quality Profile or Optimization Mode.
+- Every V1 plan that starts with `SMALL` must include quality verification and a configured `STRONG` fallback.
+- There is no normal `small_direct_without_fallback` policy in V1.
+- Historical policy may move an eligible small-first request to strong-direct when small-first performance is poor.
+- Historical policy must not move a HIGH-complexity V1 request from strong-direct to small-first.
+- Context reduction remains independent of model policy and may be disabled through typed configuration.
 
 Planner V1 is authoritative in `docs/PLANNER_V1.md`.
 
@@ -269,6 +278,10 @@ At minimum add:
 - unit tests for escalation
 - integration tests with fake model clients
 - smoke test for API health
+- unit tests proving every HIGH-complexity planner combination selects strong-direct
+- unit tests proving every small-first plan has strong fallback
+- integration test proving failed small-model quality escalates exactly once
+- integration test proving passing small-model quality avoids the strong-model call
 
 Tests must not require paid model calls by default.
 Live Azure model tests must be opt-in.

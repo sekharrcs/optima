@@ -33,13 +33,15 @@ Record:
 
 Do not reuse answers for requests with unsafe context-dependent differences.
 
-Example friendly plan name: `Semantic Cache Hit`
+Example friendly plan name:
+
+`Semantic Cache Hit`
 
 ## Capability 2: Context reduction
 
 Context reduction is an optional, configurable pre-inference capability.
 
-It may be combined with either small- or strong-model execution.
+It may be combined with either small-first or strong-direct execution.
 
 Record:
 - original token estimate/count
@@ -52,16 +54,21 @@ The reducer must preserve information required to answer the request.
 Context reduction may be disabled through typed module configuration.
 
 Example friendly plan names:
-- `Context Reduce -> Small`
 - `Context Reduce -> Small -> Verify -> Escalate if needed`
-- `Context Reduce -> Strong`
+- `Context Reduce -> Strong -> Verify`
 
-## Capability 3: Small model
+## Capability 3: Small-model first attempt
 
-Use a configured lower-cost model role when Planner V1 says the request is eligible.
+Use the configured lower-cost model role only when Planner V1 says the request is eligible.
 
 The planner refers only to the conceptual role `SMALL`.
 Actual deployment/model names belong in provider configuration.
+
+In V1, a small-model first attempt always includes:
+- quality verification
+- configured `STRONG` fallback when quality is not met
+
+There is no normal small-model execution path that knowingly returns a failed Quality Contract without attempting the available strong fallback.
 
 ## Capability 4: Quality verification
 
@@ -75,10 +82,11 @@ Quality verification is mandatory for normal OPTIMA runs that claim contract com
 ## Capability 5: Strong-model execution / escalation
 
 Use the `STRONG` role:
-- directly when Planner V1 determines that risk/complexity/Optimization Mode warrants it
-- after a failed small-model quality check
+- directly for every HIGH-complexity request in Planner V1
+- directly when Quality Profile / Optimization Mode policy requires it
+- after a failed eligible small-model first attempt
 
-Strong-model escalation must occur at most once in the MVP small-verify-escalate pattern.
+Strong-model escalation occurs at most once in V1.
 
 ## Capability 6: Foundry Model Router comparator
 
@@ -95,15 +103,7 @@ The hackathon comparison may include:
 
 These names are presentation conveniences, not separate architectural engines.
 
-### Small Direct
-
-```text
-Small -> Verify -> Return
-```
-
-Even when the model policy is called `small_direct`, the final result must still be evaluated before OPTIMA claims Quality Contract compliance.
-
-### Small -> Verify -> Escalate
+### Small -> Verify -> Escalate if needed
 
 ```text
 Small
@@ -113,7 +113,7 @@ Verify
   | fail -> Strong -> Verify -> Return
 ```
 
-### Context Reduce -> Small -> Verify -> Escalate
+### Context Reduce -> Small -> Verify -> Escalate if needed
 
 ```text
 Reduce Context
@@ -131,6 +131,20 @@ Verify
 Strong -> Verify -> Return
 ```
 
+Planner V1 uses this pattern for all HIGH-complexity requests.
+
+### Context Reduce -> Strong
+
+```text
+Reduce Context
+  |
+Strong
+  |
+Verify
+  |
+Return
+```
+
 ### Semantic Cache
 
 ```text
@@ -146,3 +160,4 @@ The authoritative selection logic is in `docs/PLANNER_V1.md`.
 Do not implement routing rules from friendly plan labels in this document.
 Do not treat context reduction as a model-routing strategy.
 Do not hard-code provider/model names in plan-selection logic.
+Do not introduce `small_direct_without_fallback` in Planner V1.
