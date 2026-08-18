@@ -1,4 +1,5 @@
 ---
+description: "Backend architecture and implementation conventions for OPTIMA Python services"
 applyTo: "src/backend/**/*.py,src/optima/**/*.py"
 ---
 # Backend-specific instructions

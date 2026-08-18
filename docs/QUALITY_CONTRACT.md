@@ -1,3 +1,8 @@
+---
+title: Quality Contract
+description: Quality profiles, optimization modes, and pass conditions for OPTIMA requests
+---
+
 # Quality Contract
 
 ## Purpose

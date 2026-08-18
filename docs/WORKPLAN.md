@@ -1,3 +1,8 @@
+---
+title: Build Workplan
+description: Incremental implementation slices and acceptance criteria for OPTIMA
+---
+
 # Build Workplan
 
 ## Slice 0 - Repository engineering setup

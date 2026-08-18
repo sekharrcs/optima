@@ -1,3 +1,8 @@
+---
+title: Architecture Decision Log
+description: Accepted architecture and engineering decisions for OPTIMA
+---
+
 # Architecture Decision Log
 
 ## ADR-001: Use HVE as an engineering workflow, not a runtime dependency

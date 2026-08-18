@@ -267,6 +267,13 @@ Prefer small pure functions in planner/cost logic.
 Avoid unnecessary inheritance.
 Avoid global mutable state.
 
+## Dependency scope
+
+- Dependencies must serve a current OPTIMA runtime, test, build, or documented development need.
+- Do not add generic notebook or utility packages merely because general HVE guidance recommends them.
+- Add `ipykernel`, `ipywidgets`, notebook tooling, progress libraries, or similar packages only when an approved OPTIMA slice uses them.
+- Project-specific dependency scope takes precedence when generic development guidance would add unused packages.
+
 ## Testing requirements
 
 At minimum add:

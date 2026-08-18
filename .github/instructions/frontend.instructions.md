@@ -1,4 +1,5 @@
 ---
+description: "Streamlit UI conventions for the OPTIMA hackathon experience"
 applyTo: "src/ui/**/*.py"
 ---
 # Demo UI instructions

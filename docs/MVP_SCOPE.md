@@ -1,3 +1,8 @@
+---
+title: OPTIMA Hackathon MVP Scope
+description: Required, optional, and excluded capabilities for the OPTIMA hackathon MVP
+---
+
 # OPTIMA Hackathon MVP Scope
 
 ## Must have

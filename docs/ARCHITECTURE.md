@@ -1,3 +1,8 @@
+---
+title: OPTIMA Architecture
+description: Logical architecture, component boundaries, and Azure target for OPTIMA
+---
+
 # OPTIMA Architecture
 
 ## Logical flow
