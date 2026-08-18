@@ -1,4 +1,5 @@
 ---
+description: "Test conventions for proving OPTIMA optimizer behavior"
 applyTo: "tests/**/*.py"
 ---
 # Test instructions

@@ -1,4 +1,5 @@
 ---
+description: "Azure infrastructure and deployment conventions for OPTIMA"
 applyTo: "infra/**/*.bicep,infra/**/*.json,azure.yaml,.github/workflows/**/*.yml"
 ---
 # Azure infrastructure instructions

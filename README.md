@@ -1,3 +1,8 @@
+---
+title: OPTIMA
+description: Quality-constrained AI execution optimizer for efficient and verifiable model execution
+---
+
 # OPTIMA
 
 OPTIMA is a quality-constrained AI execution optimizer.
@@ -47,7 +52,7 @@ Planner V1 does not always try the small model first. Every HIGH-complexity requ
 
 ## Development method
 
-Use HVE Core's Research -> Plan -> Implement workflow with GitHub Copilot.
+Use HVE Core's Research -> Plan -> Implement -> Review workflow with GitHub Copilot.
 
 Before implementing any feature:
 1. Read `docs/PRODUCT_SPEC.md`
@@ -61,6 +66,37 @@ Before implementing any feature:
 9. Review against acceptance criteria
 
 All implementation work must occur on a task branch and merge through a pull request into `main`, as defined in `.github/copilot-instructions.md`.
+
+## Local development
+
+OPTIMA requires Python 3.12 or later and [uv](https://docs.astral.sh/uv/). The project uses the configured Microsoft package feed rather than public PyPI.
+
+Synchronize the locked runtime and development dependencies:
+
+```powershell
+uv sync --all-groups
+```
+
+Run the FastAPI service locally:
+
+```powershell
+uv run uvicorn optima.api.app:app --reload
+```
+
+The lightweight health endpoint is available at `http://127.0.0.1:8000/api/v1/health`.
+
+Run the complete local validation suite:
+
+```powershell
+uv run ruff format --check .
+uv run ruff check .
+uv run mypy src tests
+uv run pytest
+```
+
+## Branch workflow
+
+Create a task branch before changing implementation, tests, infrastructure, or feature documentation. Push the completed branch and open a draft pull request targeting `main`. Do not implement directly on or automatically merge into `main`.
 
 ## Guiding rule
 

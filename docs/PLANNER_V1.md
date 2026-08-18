@@ -1,3 +1,8 @@
+---
+title: OPTIMA Planner V1 Specification
+description: Deterministic and explainable execution-plan selection rules for OPTIMA Planner V1
+---
+
 # OPTIMA Planner V1 Specification
 
 ## Purpose

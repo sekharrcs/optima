@@ -1,3 +1,8 @@
+---
+title: OPTIMA Module Configuration
+description: Typed configuration requirements for independently controlled OPTIMA modules
+---
+
 # OPTIMA Module Configuration
 
 ## Decision

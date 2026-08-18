@@ -1,3 +1,8 @@
+---
+title: OPTIMA Execution Capabilities and Plan Patterns
+description: Composable execution capabilities and presentation patterns for OPTIMA plans
+---
+
 # OPTIMA Execution Capabilities and Plan Patterns
 
 ## Purpose

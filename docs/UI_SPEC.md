@@ -1,3 +1,8 @@
+---
+title: OPTIMA Hackathon UI Specification
+description: Required Streamlit views and evidence presentation for the OPTIMA hackathon UI
+---
+
 # OPTIMA Hackathon UI Specification
 
 ## Purpose
