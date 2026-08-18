@@ -10,17 +10,20 @@ Different requests require different amounts of intelligence and context. Paying
 
 OPTIMA treats AI execution as a constrained optimization problem.
 
-For each request, OPTIMA selects an execution strategy expected to minimize cost while satisfying a Quality Contract.
+For each request, OPTIMA selects the most efficient execution plan allowed by the Quality Contract and Optimization Mode, verifies the result, and escalates when required.
 
-The strategy may use:
+The plan may use:
 - a cached result
-- a small model
+- a small model first
 - context reduction
-- a small model followed by verification
+- quality verification
 - escalation to a stronger model
 - a strong model directly
 
-Model routing is one possible tool, not the product definition.
+Model routing is one possible capability, not the product definition.
+
+OPTIMA is not "always start with the cheapest model."
+For requests where a small-model attempt is expected to waste cost or latency, the planner should go directly to the strong model.
 
 ## Primary hackathon user
 
@@ -28,7 +31,7 @@ An application developer/team operating an LLM-powered workload who wants measur
 
 ## Core user story
 
-As an AI application owner, I want OPTIMA to execute each request using the least expensive strategy that satisfies my quality requirement, so that I can reduce token/model spend while seeing evidence that quality was preserved.
+As an AI application owner, I want OPTIMA to use the most efficient execution plan that satisfies my quality requirement, so that I can reduce token/model spend while seeing evidence that quality was preserved.
 
 ## Quality Contract UX
 
@@ -39,10 +42,13 @@ Expose simple controls:
 
 Internally translate profiles into explicit thresholds/configuration.
 
+Quality Profile sets the minimum acceptable quality.
+Optimization Mode changes how aggressively OPTIMA pursues savings; it never lowers the minimum quality threshold.
+
 ## Required explanation
 
 For each run OPTIMA must be able to answer:
-- What strategy was chosen?
+- What execution plan was chosen?
 - Why?
 - What steps actually ran?
 - Did the result meet the Quality Contract?
@@ -70,3 +76,5 @@ Secondary:
 OPTIMA must never report hypothetical savings as actual savings.
 Predicted metrics and measured metrics must be visually distinguishable.
 Quality evaluation limitations must be visible.
+
+A normal model-executed OPTIMA run must not knowingly stop at a failed Quality Contract when the selected plan includes an available strong-model fallback.

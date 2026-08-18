@@ -1,8 +1,28 @@
-# Execution Strategies
+# OPTIMA Execution Capabilities and Plan Patterns
 
-## 1. semantic_cache
+## Purpose
 
-Use when a sufficiently similar accepted result exists and cache policy allows reuse.
+OPTIMA does not permanently encode every possible optimization combination as a separate strategy.
+
+Planner V1 composes execution plans from capabilities:
+
+```text
+Cache Policy
++
+Context Policy
++
+Model Policy
++
+Verification / Escalation Policy
+```
+
+See `docs/PLANNER_V1.md` for authoritative planner behavior.
+
+Friendly combined plan names may still be shown in the UI.
+
+## Capability 1: Semantic cache
+
+Use when a sufficiently similar previously accepted result exists and cache policy allows reuse.
 
 Record:
 - similarity
@@ -13,69 +33,131 @@ Record:
 
 Do not reuse answers for requests with unsafe context-dependent differences.
 
-## 2. small_direct
+Example friendly plan name:
 
-Use a configured lower-cost model.
+`Semantic Cache Hit`
 
-Best initial candidate:
-- low/medium complexity
-- short context
-- Standard/High contracts where history shows a good pass rate
+## Capability 2: Context reduction
 
-## 3. reduce_context_small
+Context reduction is an optional, configurable pre-inference capability.
 
-Reduce context before inference.
+It may be combined with either small-first or strong-direct execution.
 
 Record:
-- original token estimate
-- reduced token estimate
+- original token estimate/count
+- reduced token estimate/count
 - reduction ratio
 - reduction method
-- model-call tokens
+- preservation/safety metadata when available
 
-The reducer must preserve information required to answer the user request.
+The reducer must preserve information required to answer the request.
+Context reduction may be disabled through typed module configuration.
 
-## 4. small_verify_escalate
+Example friendly plan names:
+- `Context Reduce -> Small -> Verify -> Escalate if needed`
+- `Context Reduce -> Strong -> Verify`
 
-1. Call small model.
-2. Evaluate answer.
-3. If pass, return it.
-4. If fail, call strong model.
-5. Evaluate final answer.
-6. Record escalation and both model calls.
+## Capability 3: Small-model first attempt
 
-This is the primary OPTIMA demo strategy.
+Use the configured lower-cost model role only when Planner V1 says the request is eligible.
 
-## 5. strong_direct
+The planner refers only to the conceptual role `SMALL`.
+Actual deployment/model names belong in provider configuration.
 
-Use as:
-- baseline/control
-- high-risk fallback
-- strategy for requests planner considers difficult
+In V1, a small-model first attempt always includes:
+- quality verification
+- configured `STRONG` fallback when quality is not met
 
-## 6. foundry_model_router
+There is no normal small-model execution path that knowingly returns a failed Quality Contract without attempting the available strong fallback.
 
-Adapter used to compare OPTIMA with Microsoft Foundry Model Router.
+## Capability 4: Quality verification
 
-It is not an OPTIMA-owned innovation and should be labeled clearly in demos.
+Measure output against the current Quality Contract.
 
-## Planner V1
+Use deterministic evaluators when possible.
+Use LLM-as-judge only where deterministic evaluation is insufficient.
 
-Start with deterministic rules plus historical evidence.
+Quality verification is mandatory for normal OPTIMA runs that claim contract compliance.
 
-Example conceptual policy:
+## Capability 5: Strong-model execution / escalation
+
+Use the `STRONG` role:
+- directly for every HIGH-complexity request in Planner V1
+- directly when Quality Profile / Optimization Mode policy requires it
+- after a failed eligible small-model first attempt
+
+Strong-model escalation occurs at most once in V1.
+
+## Capability 6: Foundry Model Router comparator
+
+Microsoft Foundry Model Router is a comparison baseline/candidate execution path.
+
+It is not OPTIMA's planner and must not be presented as OPTIMA's own innovation.
+
+The hackathon comparison may include:
+- fixed strong model baseline
+- Foundry Model Router
+- OPTIMA
+
+## Common friendly plan patterns
+
+These names are presentation conveniences, not separate architectural engines.
+
+### Small -> Verify -> Escalate if needed
 
 ```text
-if safe semantic cache hit:
-    semantic_cache
-elif very long context:
-    reduce_context_small
-elif low complexity and historical pass rate is strong:
-    small_direct
-elif medium/uncertain complexity:
-    small_verify_escalate
-else:
-    strong_direct
+Small
+  |
+Verify
+  | pass -> Return
+  | fail -> Strong -> Verify -> Return
 ```
 
-Every branch must generate reason codes for explainability.
+### Context Reduce -> Small -> Verify -> Escalate if needed
+
+```text
+Reduce Context
+  |
+Small
+  |
+Verify
+  | pass -> Return
+  | fail -> Strong -> Verify -> Return
+```
+
+### Strong Direct
+
+```text
+Strong -> Verify -> Return
+```
+
+Planner V1 uses this pattern for all HIGH-complexity requests.
+
+### Context Reduce -> Strong
+
+```text
+Reduce Context
+  |
+Strong
+  |
+Verify
+  |
+Return
+```
+
+### Semantic Cache
+
+```text
+Safe Accepted Cache Result -> Return
+```
+
+The cache result must already have valid quality evidence compatible with the current contract.
+
+## Planner authority
+
+The authoritative selection logic is in `docs/PLANNER_V1.md`.
+
+Do not implement routing rules from friendly plan labels in this document.
+Do not treat context reduction as a model-routing strategy.
+Do not hard-code provider/model names in plan-selection logic.
+Do not introduce `small_direct_without_fallback` in Planner V1.

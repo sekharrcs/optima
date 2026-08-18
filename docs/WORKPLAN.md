@@ -7,6 +7,8 @@ Acceptance:
 - Python project initializes
 - lint/type/test commands run
 - no product code beyond health endpoint
+- branch workflow is documented and implementation does not occur directly on `main`
+- typed application settings skeleton supports MVP module flags
 
 ## Slice 1 - Domain contracts
 Implement:
@@ -21,15 +23,22 @@ Implement:
 Acceptance:
 - Pydantic validation tests
 - profile -> threshold translation tests
+- ExecutionPlan can represent `SMALL_FIRST_WITH_FALLBACK` and `STRONG_DIRECT`
 
 ## Slice 2 - Planner with fake dependencies
 Implement:
-- deterministic planner
+- deterministic Planner V1
+- composable plan policies
+- module configuration gates
 - reason codes
 - plan explanation
 
 Acceptance:
-- planner unit test matrix covers all MVP strategies
+- planner behavior conforms to `docs/PLANNER_V1.md`
+- planner unit test matrix covers all V1 paths
+- every HIGH-complexity case selects strong-direct
+- every small-first plan contains strong fallback
+- module-disabled cases are covered by unit tests
 
 ## Slice 3 - Model provider abstraction + fake providers
 Implement:
@@ -50,13 +59,14 @@ Implement:
 Acceptance:
 - pass/fail and reasons tested
 
-## Slice 5 - small_verify_escalate vertical slice
+## Slice 5 - small-first-with-fallback vertical slice
 Implement end-to-end through API.
 
 Acceptance:
 - small pass avoids strong call
 - small fail escalates exactly once
-- total tokens/cost includes all calls
+- no normal small-first path returns a failed Quality Contract without attempting configured strong fallback
+- total tokens/cost includes all executed calls
 - explanation contains escalation reason
 
 ## Slice 6 - Cost calculator and baseline comparison
@@ -67,17 +77,23 @@ Acceptance:
 
 ## Slice 7 - Streamlit decision demo
 Acceptance:
-- submit request
+- UI conforms to `docs/UI_SPEC.md`
+- Execute, Dashboard, and Run History views exist
+- submit request and optional context
 - select Quality Contract
-- see result, chosen strategy, execution steps, quality, token/cost comparison
+- see result, chosen plan, execution steps, quality, token/cost comparison
+- UI renders backend trace/reason codes rather than inventing execution facts
 
 ## Slice 8 - Context reduction
 Acceptance:
+- module can be enabled/disabled through typed configuration
+- disabled state bypasses context reduction without changing planner code
 - before/after token metrics
 - tests verify required facts preserved on benchmark fixtures
 
 ## Slice 9 - Semantic cache
 Acceptance:
+- module can be enabled/disabled through typed configuration
 - hit/miss flow
 - similarity and source run surfaced
 - cache results must have previously passed quality
