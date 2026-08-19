@@ -16,9 +16,11 @@ from optima.evaluation import (
     MANDATORY_CHECK_FAILED_PREFIX,
     DeterministicCheckResult,
     DeterministicEvaluator,
+    DeterministicMeasurement,
     EvaluationEvidence,
     EvaluationReasonCode,
     EvaluationRequest,
+    ExactReferenceMeasurement,
     FakeEvaluator,
     QualityEvaluator,
     ThresholdEngine,
@@ -110,11 +112,42 @@ def evaluation_request(**updates: object) -> EvaluationRequest:
     """Build one provider-independent evaluator request."""
     values: dict[str, object] = {
         "run_id": "run-1",
+        "input_text": "Summarize the supplied incident report",
         "output_text": "Candidate answer",
-        "evidence": evidence(),
+        "context": "Incident report contents",
+        "reference_output": "Candidate answer",
+        "criteria": ("Preserve the reported outcome",),
+        "metadata": {"task": "summarization"},
     }
     values.update(updates)
     return EvaluationRequest.model_validate(values)
+
+
+class RecordingMeasurement:
+    """Deterministic test measurement that records complete requests."""
+
+    def __init__(self, measured_evidence: EvaluationEvidence) -> None:
+        self._measured_evidence = measured_evidence
+        self.calls: list[EvaluationRequest] = []
+
+    def measure(self, request: EvaluationRequest) -> EvaluationEvidence:
+        """Record the request and return evaluator-owned measured facts."""
+        self.calls.append(request)
+        return self._measured_evidence
+
+
+class InputAwareMeasurement:
+    """Test measurement whose score depends on source and candidate text."""
+
+    def measure(self, request: EvaluationRequest) -> EvaluationEvidence:
+        """Use both sides of the evaluation boundary to derive evidence."""
+        expected_output = f"Answer: {request.input_text}"
+        return EvaluationEvidence(
+            evaluator_type="input_aware",
+            evaluator_valid=True,
+            score=float(request.output_text == expected_output),
+            metadata={"method": "input_aware"},
+        )
 
 
 @pytest.mark.parametrize(
@@ -228,21 +261,65 @@ def test_threshold_always_comes_from_quality_contract() -> None:
     assert result.threshold == contract.minimum_quality_score
 
 
-def test_deterministic_evaluator_preserves_measured_facts_and_metadata() -> None:
-    """Return explicit evidence without claiming unmeasured quality facts."""
+def test_evaluation_request_contains_source_candidate_and_optional_inputs() -> None:
+    """Carry provider-independent inputs without caller-declared measurements."""
+    request = evaluation_request()
+
+    assert request.input_text == "Summarize the supplied incident report"
+    assert request.output_text == "Candidate answer"
+    assert request.context == "Incident report contents"
+    assert request.reference_output == "Candidate answer"
+    assert request.criteria == ("Preserve the reported outcome",)
+    assert request.metadata == {"task": "summarization"}
+    assert "evidence" not in EvaluationRequest.model_fields
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("evidence", evidence()),
+        ("score", 0.9),
+        ("evaluator_valid", True),
+        ("mandatory_checks", ()),
+    ],
+)
+def test_evaluation_request_rejects_caller_declared_measurements(
+    field: str,
+    value: object,
+) -> None:
+    """Prevent callers from asserting facts owned by evaluator implementations."""
+    values = evaluation_request().model_dump()
+    values[field] = value
+
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        EvaluationRequest.model_validate(values)
+
+
+def test_deterministic_evaluator_passes_complete_request_to_measurement() -> None:
+    """Give the measurement component every source and candidate input unchanged."""
     measured = evidence(
         score=0.92,
         metadata={"method": "exact-reference", "reference_count": 2},
     )
-    evaluator = DeterministicEvaluator()
+    measurement = RecordingMeasurement(measured)
+    evaluator = DeterministicEvaluator(measurement=measurement)
+    request = evaluation_request(
+        input_text="Original task",
+        output_text="Measured candidate",
+        context="Relevant context",
+        reference_output="Expected candidate",
+        criteria=("Be exact", "Be complete"),
+        metadata={"request_kind": "fixture"},
+    )
 
     result = asyncio.run(
         evaluator.evaluate(
-            evaluation_request(evidence=measured),
+            request,
             quality_contract(threshold=0.9),
         )
     )
 
+    assert measurement.calls == [request]
     assert result.evaluator_type == "deterministic"
     assert result.score == 0.92
     assert result.threshold == 0.9
@@ -250,8 +327,79 @@ def test_deterministic_evaluator_preserves_measured_facts_and_metadata() -> None
     assert result.metadata is not measured.metadata
 
 
+def test_measurement_derives_evidence_from_original_input_and_candidate() -> None:
+    """Make source and candidate text materially affect evaluator-owned evidence."""
+    evaluator = DeterministicEvaluator(measurement=InputAwareMeasurement())
+    contract = quality_contract(threshold=1.0)
+    matching_request = evaluation_request(
+        input_text="Classify this record",
+        output_text="Answer: Classify this record",
+    )
+    nonmatching_request = matching_request.model_copy(
+        update={"output_text": "Unrelated answer"}
+    )
+
+    matching = asyncio.run(evaluator.evaluate(matching_request, contract))
+    nonmatching = asyncio.run(evaluator.evaluate(nonmatching_request, contract))
+
+    assert matching.passed is True
+    assert nonmatching.passed is False
+    assert matching.evaluator_type == "input_aware"
+
+
+@pytest.mark.parametrize(
+    ("reference_output", "output_text", "expected_valid", "expected_score"),
+    [
+        ("Expected", "Expected", True, 1.0),
+        ("Expected", "Different", True, 0.0),
+        (None, "Candidate", False, 0.0),
+    ],
+)
+def test_exact_reference_measurement_obtains_evidence_internally(
+    reference_output: str | None,
+    output_text: str,
+    expected_valid: bool,
+    expected_score: float,
+) -> None:
+    """Measure exact-reference evidence from request inputs without caller facts."""
+    evaluator = DeterministicEvaluator(measurement=ExactReferenceMeasurement())
+
+    result = asyncio.run(
+        evaluator.evaluate(
+            evaluation_request(
+                output_text=output_text,
+                reference_output=reference_output,
+            ),
+            quality_contract(threshold=1.0),
+        )
+    )
+
+    assert result.evaluator_valid is expected_valid
+    assert result.score == expected_score
+    assert result.passed is (expected_valid and expected_score == 1.0)
+    assert result.metadata == {
+        "method": "exact_reference",
+        "reference_supplied": reference_output is not None,
+    }
+
+
+def test_request_metadata_is_json_safe_and_does_not_affect_measurement() -> None:
+    """Validate request metadata without letting it alter exact-match semantics."""
+    evaluator = DeterministicEvaluator(measurement=ExactReferenceMeasurement())
+    contract = quality_contract(threshold=1.0)
+    first = evaluation_request(metadata={"attempt": 1, "tags": ["a"]})
+    second = evaluation_request(metadata={"attempt": 2, "tags": ["b"]})
+
+    first_result = asyncio.run(evaluator.evaluate(first, contract))
+    second_result = asyncio.run(evaluator.evaluate(second, contract))
+
+    assert first_result == second_result
+    with pytest.raises(ValidationError):
+        evaluation_request(metadata={"unsafe": object()})
+
+
 def test_fake_evaluator_cycles_configured_results_and_records_calls() -> None:
-    """Return configured outcomes repeatably while preserving invocation order."""
+    """Keep configured evidence internal while preserving complete call history."""
     fake = FakeEvaluator(
         responses=(
             evidence(score=0.8),
@@ -278,6 +426,8 @@ def test_fake_evaluator_cycles_configured_results_and_records_calls() -> None:
     )
     assert fake.calls[0].quality_contract == contract
     assert fake.calls[0].result == results[0]
+    assert fake.calls[0].request == requests[0]
+    assert "evidence" not in EvaluationRequest.model_fields
 
 
 def test_fake_evaluator_supports_mandatory_check_failure() -> None:
@@ -318,9 +468,9 @@ def test_fake_evaluator_supports_mandatory_check_failure() -> None:
         lambda: EvaluationRequest.model_validate(
             {
                 "run_id": "run-1",
+                "input_text": "task",
                 "output_text": "answer",
                 "evidence": evidence(),
-                "unexpected": True,
             }
         ),
         lambda: DeterministicCheckResult.model_validate(
@@ -345,35 +495,26 @@ def test_fake_evaluator_requires_a_configured_response() -> None:
 
 def test_evaluators_implement_async_protocol() -> None:
     """Keep deterministic and fake implementations injectable by one boundary."""
-    assert isinstance(DeterministicEvaluator(), QualityEvaluator)
+    measurement = ExactReferenceMeasurement()
+
+    assert isinstance(measurement, DeterministicMeasurement)
+    assert isinstance(
+        DeterministicEvaluator(measurement=measurement),
+        QualityEvaluator,
+    )
     assert isinstance(FakeEvaluator(responses=(evidence(),)), QualityEvaluator)
 
 
-def test_evaluator_does_not_invoke_provider_or_planner(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Keep evaluation isolated from model execution and plan selection."""
-
-    async def unexpected_provider_call(*args: object, **kwargs: object) -> object:
-        raise AssertionError("model provider must not be invoked by evaluator")
-
-    def unexpected_planner_call(*args: object, **kwargs: object) -> object:
-        raise AssertionError("planner must not be invoked by evaluator")
-
-    monkeypatch.setattr(
-        "optima.providers.fakes.FakeModelProvider.generate",
-        unexpected_provider_call,
-    )
-    monkeypatch.setattr(
-        "optima.planner.planner.select_plan",
-        unexpected_planner_call,
-    )
-
+def test_deterministic_evaluator_applies_threshold_to_measured_evidence() -> None:
+    """Compose measurement and thresholding without routing or escalation behavior."""
+    measurement = RecordingMeasurement(evidence(score=0.89))
     result = asyncio.run(
-        DeterministicEvaluator().evaluate(
+        DeterministicEvaluator(measurement=measurement).evaluate(
             evaluation_request(),
-            quality_contract(),
+            quality_contract(threshold=0.9),
         )
     )
 
-    assert result.passed is True
+    assert result.passed is False
+    assert result.threshold == 0.9
+    assert result.reasons[-1] == EvaluationReasonCode.QUALITY_CONTRACT_NOT_MET

@@ -46,8 +46,20 @@ class EvaluationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     run_id: NonEmptyString
+    input_text: NonEmptyString
     output_text: NonEmptyString
-    evidence: EvaluationEvidence
+    context: NonEmptyString | None = None
+    reference_output: NonEmptyString | None = None
+    criteria: tuple[NonEmptyString, ...] = ()
+    metadata: dict[str, JsonValue] = Field(default_factory=dict)
+
+
+@runtime_checkable
+class DeterministicMeasurement(Protocol):
+    """Synchronous boundary for measuring explicit deterministic evidence."""
+
+    def measure(self, request: EvaluationRequest) -> EvaluationEvidence:
+        """Inspect a complete evaluation request and return measured facts."""
 
 
 class EvaluatorCall(BaseModel):
