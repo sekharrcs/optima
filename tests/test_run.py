@@ -143,6 +143,9 @@ def model_usage(
     request_id: str = "provider-request-1",
     run_id: str = "run-1",
     model_role: ModelRole = ModelRole.SMALL,
+    input_tokens: int = 100,
+    output_tokens: int = 20,
+    calculated_cost: Decimal | None = None,
 ) -> ModelUsage:
     """Build one measured model-call usage record."""
     return ModelUsage(
@@ -151,9 +154,10 @@ def model_usage(
         provider="foundry",
         deployment=f"{model_role.value.lower()}-deployment",
         model_role=model_role,
-        input_tokens=100,
-        output_tokens=20,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
         latency_ms=125,
+        calculated_cost=calculated_cost,
     )
 
 
@@ -272,6 +276,124 @@ def test_completed_run_preserves_request_profile_and_measured_contract_result() 
     assert result.contract_met is True
 
 
+def test_run_aggregates_one_complete_model_call() -> None:
+    """Expose exact token and Decimal cost totals for a small-only run."""
+    result = completed_run(
+        model_usages=(
+            model_usage(
+                input_tokens=101,
+                output_tokens=19,
+                calculated_cost=Decimal("0.0011"),
+            ),
+        )
+    )
+
+    assert result.total_input_tokens == 101
+    assert result.total_output_tokens == 19
+    assert result.total_tokens == 120
+    assert result.total_calculated_cost == Decimal("0.0011")
+
+
+def test_run_aggregates_escalated_calls_in_execution_order() -> None:
+    """Include both measured calls using exact Decimal arithmetic."""
+    small_evaluation = EvaluationResult(
+        evaluator_type="deterministic",
+        evaluator_valid=True,
+        score=0.80,
+        threshold=0.90,
+        mandatory_checks_passed=True,
+        passed=False,
+        reasons=("Small result did not meet quality",),
+    )
+    final_evaluation = passing_evaluation()
+    result = completed_run(
+        steps=(
+            successful_step(0, ExecutionStepType.MODEL_CALL),
+            successful_step(1, ExecutionStepType.QUALITY_EVALUATION),
+            successful_step(2, ExecutionStepType.ESCALATION),
+            successful_step(3, ExecutionStepType.MODEL_CALL),
+            successful_step(4, ExecutionStepType.QUALITY_EVALUATION),
+            successful_step(5, ExecutionStepType.RETURN),
+        ),
+        model_usages=(
+            model_usage(
+                input_tokens=100,
+                output_tokens=20,
+                calculated_cost=Decimal("0.0011"),
+            ),
+            model_usage(
+                request_id="provider-request-2",
+                model_role=ModelRole.STRONG,
+                input_tokens=110,
+                output_tokens=30,
+                calculated_cost=Decimal("0.0022"),
+            ),
+        ),
+        evaluations=(small_evaluation, final_evaluation),
+        final_evaluation=final_evaluation,
+        escalated=True,
+    )
+
+    assert tuple(usage.model_role for usage in result.model_usages) == (
+        ModelRole.SMALL,
+        ModelRole.STRONG,
+    )
+    assert result.total_input_tokens == 210
+    assert result.total_output_tokens == 50
+    assert result.total_tokens == 260
+    assert result.total_calculated_cost == Decimal("0.0033")
+
+
+def test_run_does_not_convert_unavailable_cost_to_zero() -> None:
+    """Keep total cost unavailable when an executed call has no measured cost."""
+    result = completed_run(
+        model_usages=(
+            model_usage(input_tokens=9, output_tokens=4, calculated_cost=None),
+        )
+    )
+
+    assert result.total_tokens == 13
+    assert result.total_calculated_cost is None
+
+
+def test_escalated_known_and_unknown_costs_do_not_form_partial_total() -> None:
+    """Keep aggregate cost unavailable if either executed call lacks cost."""
+    first_evaluation = EvaluationResult(
+        evaluator_type="deterministic",
+        evaluator_valid=True,
+        score=0.80,
+        threshold=0.90,
+        mandatory_checks_passed=True,
+        passed=False,
+        reasons=("Small result did not meet quality",),
+    )
+    final_evaluation = passing_evaluation()
+    result = completed_run(
+        steps=(
+            successful_step(0, ExecutionStepType.MODEL_CALL),
+            successful_step(1, ExecutionStepType.QUALITY_EVALUATION),
+            successful_step(2, ExecutionStepType.ESCALATION),
+            successful_step(3, ExecutionStepType.MODEL_CALL),
+            successful_step(4, ExecutionStepType.QUALITY_EVALUATION),
+            successful_step(5, ExecutionStepType.RETURN),
+        ),
+        model_usages=(
+            model_usage(calculated_cost=Decimal("0.00125")),
+            model_usage(
+                request_id="provider-request-2",
+                model_role=ModelRole.STRONG,
+                calculated_cost=None,
+            ),
+        ),
+        evaluations=(first_evaluation, final_evaluation),
+        final_evaluation=final_evaluation,
+        escalated=True,
+    )
+
+    assert result.total_tokens == 240
+    assert result.total_calculated_cost is None
+
+
 def test_completed_run_can_record_measured_contract_failure() -> None:
     """Use False only when a valid final evaluation measured failure."""
     failed_evaluation = EvaluationResult(
@@ -323,6 +445,10 @@ def test_completed_semantic_cache_run_has_no_model_usage() -> None:
 
     assert result.execution_plan.cache_policy is CachePolicy.USE_CACHED_RESULT
     assert result.model_usages == ()
+    assert result.total_input_tokens == 0
+    assert result.total_output_tokens == 0
+    assert result.total_tokens == 0
+    assert result.total_calculated_cost == Decimal("0")
 
 
 @pytest.mark.parametrize("status", [RunStatus.FAILED, RunStatus.TIMED_OUT])
@@ -530,6 +656,50 @@ def test_unsuccessful_model_call_preserves_available_usage(
     )
 
     assert result.model_usages == (usage,)
+
+
+def test_incomplete_attempt_measurements_do_not_fabricate_totals() -> None:
+    """Keep totals unavailable when a failed fallback has no usage record."""
+    small_evaluation = EvaluationResult(
+        evaluator_type="deterministic",
+        evaluator_valid=True,
+        score=0.80,
+        threshold=0.90,
+        mandatory_checks_passed=True,
+        passed=False,
+        reasons=("Small result did not meet quality",),
+    )
+    result = completed_run(
+        status=RunStatus.FAILED,
+        steps=(
+            successful_step(0, ExecutionStepType.MODEL_CALL),
+            successful_step(1, ExecutionStepType.QUALITY_EVALUATION),
+            successful_step(2, ExecutionStepType.ESCALATION),
+            unsuccessful_step(
+                3,
+                ExecutionStepType.MODEL_CALL,
+                ExecutionStatus.FAILED,
+            ),
+        ),
+        model_usages=(
+            model_usage(
+                input_tokens=100,
+                output_tokens=20,
+                calculated_cost=Decimal("0.0011"),
+            ),
+        ),
+        evaluations=(small_evaluation,),
+        final_evaluation=None,
+        final_output=None,
+        contract_met=None,
+        escalated=True,
+        error="Strong provider failed",
+    )
+
+    assert result.total_input_tokens is None
+    assert result.total_output_tokens is None
+    assert result.total_tokens is None
+    assert result.total_calculated_cost is None
 
 
 def test_skipped_model_call_does_not_require_usage() -> None:
