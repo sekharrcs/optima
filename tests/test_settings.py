@@ -23,6 +23,12 @@ def isolate_settings_sources(
         "OPTIMA_STANDARD_QUALITY_THRESHOLD",
         "OPTIMA_HIGH_QUALITY_THRESHOLD",
         "OPTIMA_CRITICAL_QUALITY_THRESHOLD",
+        "OPTIMA_CACHE_SIMILARITY_THRESHOLD",
+        "OPTIMA_CONTEXT_REDUCTION_CONSIDER_TOKENS",
+        "OPTIMA_CONTEXT_REDUCTION_REQUIRED_TOKENS",
+        "OPTIMA_HISTORY_MINIMUM_SAMPLES",
+        "OPTIMA_HISTORY_SMALL_PREFER_PASS_RATE",
+        "OPTIMA_HISTORY_SMALL_AVOID_PASS_RATE",
     ):
         monkeypatch.delenv(variable, raising=False)
 
@@ -38,6 +44,41 @@ def test_settings_defaults_match_mvp_module_configuration() -> None:
     assert settings.standard_quality_threshold == 0.80
     assert settings.high_quality_threshold == 0.90
     assert settings.critical_quality_threshold == 0.95
+    assert settings.planner_thresholds().model_dump() == {
+        "cache_similarity_threshold": 0.95,
+        "context_reduction_consider_tokens": 4_000,
+        "context_reduction_required_tokens": 8_000,
+        "history_minimum_samples": 20,
+        "history_small_prefer_pass_rate": 0.95,
+        "history_small_avoid_pass_rate": 0.70,
+    }
+
+
+def test_module_configuration_maps_default_setting_flags() -> None:
+    """Map all default application flags into immutable planner input."""
+    assert AppSettings().module_configuration().model_dump() == {
+        "semantic_cache_enabled": True,
+        "context_reduction_enabled": True,
+        "historical_policy_enabled": True,
+        "foundry_router_comparator_enabled": False,
+    }
+
+
+def test_module_configuration_maps_explicit_setting_overrides() -> None:
+    """Map mixed explicit application flags without changing their values."""
+    settings = AppSettings(
+        semantic_cache_enabled=False,
+        context_reduction_enabled=True,
+        historical_policy_enabled=False,
+        foundry_router_comparator_enabled=True,
+    )
+
+    assert settings.module_configuration().model_dump() == {
+        "semantic_cache_enabled": False,
+        "context_reduction_enabled": True,
+        "historical_policy_enabled": False,
+        "foundry_router_comparator_enabled": True,
+    }
 
 
 def test_settings_accept_explicit_injection() -> None:
@@ -57,6 +98,12 @@ def test_settings_accept_explicit_injection() -> None:
         "standard_quality_threshold": 0.80,
         "high_quality_threshold": 0.90,
         "critical_quality_threshold": 0.95,
+        "cache_similarity_threshold": 0.95,
+        "context_reduction_consider_tokens": 4_000,
+        "context_reduction_required_tokens": 8_000,
+        "history_minimum_samples": 20,
+        "history_small_prefer_pass_rate": 0.95,
+        "history_small_avoid_pass_rate": 0.70,
     }
 
 
@@ -122,6 +169,50 @@ def test_settings_reject_malformed_boolean(
 
     with pytest.raises(ValidationError):
         AppSettings()
+
+
+def test_settings_read_planner_threshold_environment_variables(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Read all Planner V1 thresholds from the centralized environment."""
+    monkeypatch.setenv("OPTIMA_CACHE_SIMILARITY_THRESHOLD", "0.91")
+    monkeypatch.setenv("OPTIMA_CONTEXT_REDUCTION_CONSIDER_TOKENS", "3000")
+    monkeypatch.setenv("OPTIMA_CONTEXT_REDUCTION_REQUIRED_TOKENS", "7000")
+    monkeypatch.setenv("OPTIMA_HISTORY_MINIMUM_SAMPLES", "12")
+    monkeypatch.setenv("OPTIMA_HISTORY_SMALL_PREFER_PASS_RATE", "0.92")
+    monkeypatch.setenv("OPTIMA_HISTORY_SMALL_AVOID_PASS_RATE", "0.60")
+
+    settings = AppSettings()
+
+    assert settings.planner_thresholds().model_dump() == {
+        "cache_similarity_threshold": 0.91,
+        "context_reduction_consider_tokens": 3_000,
+        "context_reduction_required_tokens": 7_000,
+        "history_minimum_samples": 12,
+        "history_small_prefer_pass_rate": 0.92,
+        "history_small_avoid_pass_rate": 0.60,
+    }
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {
+            "context_reduction_consider_tokens": 8_001,
+            "context_reduction_required_tokens": 8_000,
+        },
+        {
+            "history_small_avoid_pass_rate": 0.95,
+            "history_small_prefer_pass_rate": 0.95,
+        },
+    ],
+)
+def test_settings_reject_incoherent_planner_thresholds(
+    updates: dict[str, object],
+) -> None:
+    """Reject threshold combinations that cannot define deterministic policy."""
+    with pytest.raises(ValidationError):
+        AppSettings.model_validate(updates)
 
 
 def test_settings_ignore_unrelated_dotenv_values(tmp_path: Path) -> None:

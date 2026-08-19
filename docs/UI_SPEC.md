@@ -135,7 +135,7 @@ Required fields:
 
 Example plan labels:
 
-`Context Reduce -> Small -> Verify -> Escalate if needed`
+`Reduce Context -> Small -> Verify -> Escalate if needed`
 
 `Strong -> Verify`
 

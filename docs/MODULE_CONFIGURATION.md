@@ -51,6 +51,18 @@ Do not hard-code flags inside planner conditionals.
 
 The planner receives module capabilities/configuration as input.
 
+The selected plan records an immutable typed snapshot of the relevant module
+states for explainability. Module enablement is distinct from conceptual
+capability availability. For example, context reduction can be enabled while a
+task-safe reducer is unavailable, and model execution can be structurally
+unavailable when a required conceptual model role or evaluator is not
+configured.
+
+When mandatory conceptual capabilities cannot form a Quality Contract-compliant
+plan, the planner returns a typed planning failure. This capability metadata is
+configuration input only; provider and evaluator implementations remain outside
+the planner.
+
 ### Context reduction disabled
 
 If `context_reduction_enabled == false`:
