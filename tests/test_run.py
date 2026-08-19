@@ -16,6 +16,8 @@ from optima.domain.execution import (
     ExecutionStepType,
     ModelPolicy,
     ModelRole,
+    PlannerDecisionEvidence,
+    PlannerModuleStates,
     PlannerReasonCode,
 )
 from optima.domain.quality_contract import (
@@ -49,6 +51,29 @@ def request_profile() -> RequestProfile:
     )
 
 
+def decision_evidence(
+    *,
+    base_model_policy: ModelPolicy | None,
+    final_model_policy: ModelPolicy | None,
+    cache_candidate_assessed: bool = False,
+) -> PlannerDecisionEvidence:
+    """Build typed evidence shared by run-result plan fixtures."""
+    return PlannerDecisionEvidence(
+        profile_risk_tier=RiskTier.MEDIUM,
+        contract_risk_tier=RiskTier.MEDIUM,
+        effective_risk_tier=RiskTier.MEDIUM,
+        module_states=PlannerModuleStates(
+            semantic_cache_enabled=True,
+            context_reduction_enabled=True,
+            historical_policy_enabled=True,
+            foundry_router_comparator_enabled=False,
+        ),
+        cache_candidate_assessed=cache_candidate_assessed,
+        base_model_policy=base_model_policy,
+        final_model_policy=final_model_policy,
+    )
+
+
 def execution_plan() -> ExecutionPlan:
     """Build the shared small-first execution plan."""
     return ExecutionPlan(
@@ -64,6 +89,10 @@ def execution_plan() -> ExecutionPlan:
             PlannerReasonCode.SMALL_FIRST_SELECTED,
         ),
         human_readable_name="Small -> Verify -> Escalate if needed",
+        decision_evidence=decision_evidence(
+            base_model_policy=ModelPolicy.SMALL_FIRST_WITH_FALLBACK,
+            final_model_policy=ModelPolicy.SMALL_FIRST_WITH_FALLBACK,
+        ),
     )
 
 
@@ -276,6 +305,11 @@ def test_completed_semantic_cache_run_has_no_model_usage() -> None:
             PlannerReasonCode.CACHE_HIGH_CONFIDENCE_MATCH,
         ),
         human_readable_name="Semantic Cache Hit",
+        decision_evidence=decision_evidence(
+            base_model_policy=None,
+            final_model_policy=None,
+            cache_candidate_assessed=True,
+        ),
     )
 
     result = completed_run(

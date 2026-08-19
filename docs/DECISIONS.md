@@ -101,3 +101,39 @@ When `SMALL` is selected first:
 Reason:
 
 OPTIMA should not knowingly stop at a failed small-model result when its selected execution plan has an available stronger fallback.
+
+## ADR-014: Planner V1 uses the highest supplied risk tier
+
+Status: Accepted
+
+Planner V1 calculates effective risk as the more severe of the profiled request
+risk and Quality Contract risk, using `LOW < MEDIUM < HIGH`. Safeguards use the
+effective value, while typed decision evidence preserves all three values.
+
+## ADR-015: Planner decisions carry typed evidence
+
+Status: Accepted
+
+Pre-execution plans contain immutable typed evidence for risk, module state,
+cache assessment, historical statistics, and base/final model policy. Core
+planner evidence must not use an arbitrary dictionary or include runtime
+measurements.
+
+## ADR-016: Historical adjustment is deterministic and bounded
+
+Status: Accepted
+
+With sufficient comparable evidence, poor small-first performance below the
+configured avoid threshold moves an eligible COST or BALANCED small-first plan
+to strong-direct. Positive evidence only strengthens an existing small-first
+decision. History applies at most one adjustment and never downgrades a
+strong-direct decision.
+
+## ADR-017: Structurally invalid plans return typed failure
+
+Status: Accepted
+
+When configured conceptual capabilities cannot satisfy mandatory plan
+constraints, Planner V1 returns a typed planning failure instead of selecting a
+knowingly invalid plan. Provider calls and runtime quality failure handling
+remain outside the planner.

@@ -15,9 +15,34 @@ from optima.domain.execution import (
     ExecutionStepType,
     ModelPolicy,
     ModelRole,
+    PlannerDecisionEvidence,
+    PlannerModuleStates,
     PlannerReasonCode,
 )
-from optima.domain.quality_contract import OptimizationMode
+from optima.domain.quality_contract import OptimizationMode, RiskTier
+
+
+def decision_evidence(
+    *,
+    base_model_policy: ModelPolicy | None,
+    final_model_policy: ModelPolicy | None,
+    cache_candidate_assessed: bool = False,
+) -> PlannerDecisionEvidence:
+    """Build valid typed planner evidence for execution-plan tests."""
+    return PlannerDecisionEvidence(
+        profile_risk_tier=RiskTier.LOW,
+        contract_risk_tier=RiskTier.MEDIUM,
+        effective_risk_tier=RiskTier.MEDIUM,
+        module_states=PlannerModuleStates(
+            semantic_cache_enabled=True,
+            context_reduction_enabled=True,
+            historical_policy_enabled=True,
+            foundry_router_comparator_enabled=False,
+        ),
+        cache_candidate_assessed=cache_candidate_assessed,
+        base_model_policy=base_model_policy,
+        final_model_policy=final_model_policy,
+    )
 
 
 def small_first_plan(**updates: object) -> ExecutionPlan:
@@ -35,6 +60,10 @@ def small_first_plan(**updates: object) -> ExecutionPlan:
             PlannerReasonCode.SMALL_FIRST_SELECTED,
         ),
         "human_readable_name": "Small -> Verify -> Escalate if needed",
+        "decision_evidence": decision_evidence(
+            base_model_policy=ModelPolicy.SMALL_FIRST_WITH_FALLBACK,
+            final_model_policy=ModelPolicy.SMALL_FIRST_WITH_FALLBACK,
+        ),
     }
     values.update(updates)
     return ExecutionPlan.model_validate(values)
@@ -55,6 +84,10 @@ def strong_direct_plan(**updates: object) -> ExecutionPlan:
             PlannerReasonCode.STRONG_MODEL_REQUIRED,
         ),
         "human_readable_name": "Context Reduce -> Strong -> Verify",
+        "decision_evidence": decision_evidence(
+            base_model_policy=ModelPolicy.STRONG_DIRECT,
+            final_model_policy=ModelPolicy.STRONG_DIRECT,
+        ),
     }
     values.update(updates)
     return ExecutionPlan.model_validate(values)
@@ -75,6 +108,11 @@ def semantic_cache_plan(**updates: object) -> ExecutionPlan:
             PlannerReasonCode.CACHE_HIGH_CONFIDENCE_MATCH,
         ),
         "human_readable_name": "Semantic Cache Hit",
+        "decision_evidence": decision_evidence(
+            base_model_policy=None,
+            final_model_policy=None,
+            cache_candidate_assessed=True,
+        ),
     }
     values.update(updates)
     return ExecutionPlan.model_validate(values)
@@ -212,6 +250,29 @@ def test_execution_plan_rejects_measured_runtime_fields() -> None:
     """Keep actual quality, usage, and latency outside pre-execution plans."""
     with pytest.raises(ValidationError):
         small_first_plan(actual_quality_score=0.9)
+
+
+def test_model_plan_rejects_final_policy_evidence_mismatch() -> None:
+    """Keep the selected model policy aligned with typed decision evidence."""
+    with pytest.raises(ValidationError, match="final evidence policy"):
+        small_first_plan(
+            decision_evidence=decision_evidence(
+                base_model_policy=ModelPolicy.SMALL_FIRST_WITH_FALLBACK,
+                final_model_policy=ModelPolicy.STRONG_DIRECT,
+            )
+        )
+
+
+def test_cache_plan_rejects_unassessed_candidate_evidence() -> None:
+    """Require evidence that an accepted cache candidate was assessed."""
+    with pytest.raises(ValidationError, match="candidate assessment"):
+        semantic_cache_plan(
+            decision_evidence=decision_evidence(
+                base_model_policy=None,
+                final_model_policy=None,
+                cache_candidate_assessed=False,
+            )
+        )
 
 
 @pytest.mark.parametrize("expected_cost", [Decimal("-0.01"), Decimal("NaN")])

@@ -40,7 +40,7 @@ Do not reuse answers for requests with unsafe context-dependent differences.
 
 Example friendly plan name:
 
-`Semantic Cache Hit`
+`Cached Result`
 
 ## Capability 2: Context reduction
 
@@ -59,8 +59,8 @@ The reducer must preserve information required to answer the request.
 Context reduction may be disabled through typed module configuration.
 
 Example friendly plan names:
-- `Context Reduce -> Small -> Verify -> Escalate if needed`
-- `Context Reduce -> Strong -> Verify`
+- `Reduce Context -> Small -> Verify -> Escalate if needed`
+- `Reduce Context -> Strong -> Verify`
 
 ## Capability 3: Small-model first attempt
 
@@ -118,7 +118,7 @@ Verify
   | fail -> Strong -> Verify -> Return
 ```
 
-### Context Reduce -> Small -> Verify -> Escalate if needed
+### Reduce Context -> Small -> Verify -> Escalate if needed
 
 ```text
 Reduce Context
@@ -138,7 +138,7 @@ Strong -> Verify -> Return
 
 Planner V1 uses this pattern for all HIGH-complexity requests.
 
-### Context Reduce -> Strong
+### Reduce Context -> Strong
 
 ```text
 Reduce Context

@@ -45,11 +45,21 @@ Execution Plan
 
 A friendly plan name may be derived for the UI, such as:
 
-`Context Reduce -> Small -> Verify -> Escalate if needed`
+`Reduce Context -> Small -> Verify -> Escalate if needed`
 
 or
 
 `Strong -> Verify`
+
+Planner V1 uses only these component-derived names:
+
+- `Cached Result`
+- `Small -> Verify -> Escalate if needed`
+- `Reduce Context -> Small -> Verify -> Escalate if needed`
+- `Strong -> Verify`
+- `Reduce Context -> Strong -> Verify`
+
+Names are presentation labels. They do not select or implement routing behavior.
 
 ## Separation of responsibilities
 
@@ -70,9 +80,24 @@ Planner input includes:
 - Request Profile
 - Quality Contract, including Optimization Mode
 - Module Configuration
+- configured conceptual model and evaluator capabilities
+- typed context-reducer capability
 - Cache candidate metadata, if cache is enabled
 - Historical Policy Statistics, if enabled
 - Planner thresholds/configuration
+
+### Effective risk tier
+
+`RequestProfile.risk_tier` is inferred during profiling, while
+`QualityContract.risk_tier` is supplied as a contract constraint. Planner V1
+does not require them to be equal. It calculates:
+
+```text
+effective_risk_tier = max(profile.risk_tier, contract.risk_tier)
+```
+
+using `LOW < MEDIUM < HIGH`. All planner safeguards use the effective value.
+Typed decision evidence preserves both original values and the effective value.
 
 ## Request Profile
 
@@ -200,6 +225,21 @@ if (
 Primary reason code:
 - `CACHE_HIGH_CONFIDENCE_MATCH`
 
+Cache rejection reason codes, evaluated in this precedence order, are:
+
+- `SEMANTIC_CACHE_DISABLED`
+- `CACHE_REQUEST_NOT_ELIGIBLE`
+- `CACHE_CANDIDATE_NOT_SUPPLIED`
+- `CACHE_SIMILARITY_BELOW_THRESHOLD`
+- `CACHE_PRIOR_EVALUATOR_INVALID`
+- `CACHE_PRIOR_EVALUATION_FAILED`
+- `CACHE_QUALITY_BELOW_CONTRACT_THRESHOLD`
+- `CACHE_CONTRACT_INCOMPATIBLE`
+- `CACHE_REUSE_UNSAFE`
+
+A rejected candidate continues through context and model planning. Similarity
+and quality comparisons are inclusive at their configured thresholds.
+
 Optimization Mode does not override cache safety or contract compatibility.
 
 ## Step 2: Context policy
@@ -214,7 +254,8 @@ V1 must make a deterministic decision. There is no unresolved `CONSIDER` state i
 
 ### COST mode
 
-If a safe reducer is available and the request is not blocked by risk safeguards:
+If the reducer is available and task-safe, and the request is not blocked by
+risk safeguards:
 
 ```text
 input tokens < 4,000       -> KEEP_ORIGINAL
@@ -223,7 +264,8 @@ input tokens >= 4,000      -> REDUCE
 
 ### BALANCED mode
 
-If a safe reducer is available and the request is not blocked by risk safeguards:
+If the reducer is available and task-safe, and the request is not blocked by
+risk safeguards:
 
 ```text
 input tokens < 8,000       -> KEEP_ORIGINAL
@@ -235,15 +277,23 @@ input tokens >= 8,000      -> REDUCE
 ```text
 input tokens < 8,000       -> KEEP_ORIGINAL
 input tokens >= 8,000      -> REDUCE only when:
-                               - a task-safe reducer is available
-                               - risk tier is LOW or MEDIUM
-                               - contract is not Critical + HIGH risk
+                               - the reducer is available and task-safe
+                               - effective risk is LOW or MEDIUM
                              otherwise KEEP_ORIGINAL
 ```
 
-### Hard safeguard
+### Hard safeguard and explicit exception
 
-For `CRITICAL` quality with `HIGH` risk, V1 must keep original context unless an explicitly task-safe reducer is configured and approved for that task class.
+For `CRITICAL` quality with `HIGH` effective risk, V1 keeps original context
+unless the available task-safe reducer has explicit approval for that
+task/risk case. With that approval, reduction follows the selected mode's
+inclusive token threshold. In QUALITY mode, other HIGH-effective-risk requests
+keep original context.
+
+The context decision uses `input_tokens` as its authoritative threshold input.
+`has_large_context` remains descriptive and never overrides configured token
+thresholds. The comparisons are inclusive: 4,000 and 8,000 tokens meet their
+respective thresholds.
 
 Potential reason codes:
 - `CONTEXT_WITHIN_NORMAL_RANGE`
@@ -253,6 +303,14 @@ Potential reason codes:
 - `CONTEXT_REDUCTION_SKIPPED_QUALITY_MODE`
 - `CONTEXT_REDUCTION_DISABLED`
 - `SAFE_REDUCER_UNAVAILABLE`
+
+`CONTEXT_REDUCTION_SKIPPED_QUALITY_MODE` is emitted only when the token and
+reducer-capability gates permit reduction but QUALITY mode's conservative risk
+rule keeps the original context. When HIGH effective risk is also the safety
+cause, the plan includes both `CONTEXT_REDUCTION_SKIPPED_HIGH_RISK` and
+`CONTEXT_REDUCTION_SKIPPED_QUALITY_MODE`. Earlier gates such as disabled context
+reduction, insufficient tokens, or an unavailable or unsafe reducer do not emit
+the QUALITY-mode reason.
 
 The context reducer must emit before/after token counts and preserve evidence needed by evaluation.
 
@@ -362,13 +420,27 @@ If all are true:
 - sample count >= 20
 - small-first pass-without-escalation rate < 0.70
 
-then COST or BALANCED may replace an eligible small-first base policy with `STRONG_DIRECT` to avoid an expected-waste small call.
+then COST or BALANCED must replace an eligible small-first base policy with
+`STRONG_DIRECT` to avoid an expected-waste small call. A pass rate exactly equal
+to the avoid threshold is not poor evidence.
 
 ### V1 historical-policy guardrail
 
 Historical policy must **not** change a HIGH-complexity request from `STRONG_DIRECT` to small-first in V1.
 
 Historical evidence must never bypass explicit safety/risk rules.
+
+Historical policy applies at most one bounded adjustment. Positive evidence
+strengthens confidence only in an already selected small-first plan. It never
+changes `STRONG_DIRECT` to small-first, and QUALITY-mode strong-direct decisions
+are never downgraded. Missing or insufficient evidence leaves the base policy
+unchanged and remains explainable.
+
+Execution-plan reason codes describe the final selected plan. When history
+changes small-first to strong-direct, the reasons include
+`HISTORICAL_SMALL_SUCCESS_LOW` and `STRONG_MODEL_REQUIRED`, but not
+`SMALL_FIRST_SELECTED`. Typed decision evidence preserves the base small-first
+policy and final strong-direct policy as the adjustment audit trail.
 
 Reason codes:
 - `HISTORICAL_SMALL_SUCCESS_HIGH`
@@ -429,7 +501,13 @@ ExecutionPlan
 - human_readable_name
 - expected_quality (optional estimate)
 - expected_cost (optional estimate)
+- typed decision evidence
 ```
+
+Decision evidence contains the profile, contract, and effective risk tiers;
+module states; whether a cache candidate was assessed; historical statistics
+used for an adjustment or confidence decision; and base/final model policies.
+Core evidence is immutable and typed rather than stored in an arbitrary map.
 
 For `SMALL_FIRST_WITH_FALLBACK`:
 
@@ -448,12 +526,19 @@ escalation_model_role = null
 ```
 
 Actual measured quality/cost do not belong in the pre-execution plan.
+Slice 2 does not produce expected-quality or expected-cost estimates, so both
+values remain unavailable.
+
+If mandatory conceptual capabilities cannot form a valid plan, for example a
+required evaluator or STRONG fallback is not configured, the planner returns a
+typed planning failure. It does not execute or return a knowingly invalid plan.
 
 ## Reference pseudocode
 
 ```python
 def select_plan(request, contract, modules, cache_candidate, history, config):
     profile = profile_request(request)
+  effective_risk = max_risk(profile.risk_tier, contract.risk_tier)
 
     if safe_cache_match(
         enabled=modules.semantic_cache_enabled,
@@ -467,7 +552,7 @@ def select_plan(request, contract, modules, cache_candidate, history, config):
     context_policy = select_context_policy(
         enabled=modules.context_reduction_enabled,
         token_count=profile.input_tokens,
-        risk=profile.risk_tier,
+        risk=effective_risk,
         contract=contract,
         optimization_mode=contract.optimization_mode,
         config=config,
@@ -525,8 +610,6 @@ Tests must include at least:
 - low/critical/balanced selects small-first-with-fallback
 - low/critical/quality selects strong-direct
 - every small-first plan has `STRONG` fallback configured
-- failed small evaluation escalates exactly once
-- passing small evaluation does not call strong
 - context reduction disabled never includes reduction
 - 4k-8k context reduces in COST when safe but not BALANCED
 - >=8k context reduces in BALANCED when safe
@@ -537,3 +620,8 @@ Tests must include at least:
 - poor small-model history can skip expected-waste small call
 - planner reason codes explain every selected component
 - optimization-mode reason code is always present
+
+The executor-level cases "failed small evaluation escalates exactly once" and
+"passing small evaluation does not call strong" remain required V1 behavior,
+but belong to the Slice 5 integration suite. Slice 2 proves the plan structure
+that requires verification and a configured STRONG fallback.
