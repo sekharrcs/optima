@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from optima.domain.evaluation import EvaluationResult
 from optima.domain.execution import (
     ExecutionPlan,
+    ExecutionStatus,
     ExecutionStep,
     ExecutionStepType,
     ModelPolicy,
@@ -97,21 +98,48 @@ class RunResult(BaseModel):
         if any(usage.run_id != self.run_id for usage in self.model_usages):
             raise ValueError("every model usage must belong to this run")
 
-        model_call_count = sum(
-            step.step_type is ExecutionStepType.MODEL_CALL for step in self.steps
-        )
-        if model_call_count != len(self.model_usages):
-            raise ValueError("every model-call step requires one model usage record")
-
-        evaluation_step_count = sum(
-            step.step_type is ExecutionStepType.QUALITY_EVALUATION
+        model_call_steps = tuple(
+            step
             for step in self.steps
+            if step.step_type is ExecutionStepType.MODEL_CALL
+        )
+        successful_model_calls = sum(
+            step.status is ExecutionStatus.SUCCEEDED for step in model_call_steps
+        )
+        attempted_model_calls = sum(
+            step.status is not ExecutionStatus.SKIPPED for step in model_call_steps
         )
         if (
-            self.execution_plan.model_policy is not None
-            and evaluation_step_count != len(self.evaluations)
+            not successful_model_calls
+            <= len(self.model_usages)
+            <= attempted_model_calls
         ):
-            raise ValueError("every evaluation step requires one evaluation result")
+            raise ValueError(
+                "model usage count must cover successful calls without exceeding "
+                "non-skipped attempts"
+            )
+
+        evaluation_steps = tuple(
+            step
+            for step in self.steps
+            if step.step_type is ExecutionStepType.QUALITY_EVALUATION
+        )
+        if self.execution_plan.model_policy is not None:
+            successful_evaluations = sum(
+                step.status is ExecutionStatus.SUCCEEDED for step in evaluation_steps
+            )
+            attempted_evaluations = sum(
+                step.status is not ExecutionStatus.SKIPPED for step in evaluation_steps
+            )
+            if (
+                not successful_evaluations
+                <= len(self.evaluations)
+                <= attempted_evaluations
+            ):
+                raise ValueError(
+                    "evaluation result count must cover successful evaluations without "
+                    "exceeding non-skipped attempts"
+                )
 
         if any(
             evaluation.threshold != self.quality_contract.minimum_quality_score

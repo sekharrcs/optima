@@ -90,6 +90,25 @@ def successful_step(sequence: int, step_type: ExecutionStepType) -> ExecutionSte
     )
 
 
+def unsuccessful_step(
+    sequence: int,
+    step_type: ExecutionStepType,
+    status: ExecutionStatus,
+) -> ExecutionStep:
+    """Build one failed, timed-out, or skipped execution trace step."""
+    return ExecutionStep(
+        sequence=sequence,
+        step_type=step_type,
+        status=status,
+        latency_ms=10,
+        error=(
+            "Step did not complete"
+            if status in {ExecutionStatus.FAILED, ExecutionStatus.TIMED_OUT}
+            else None
+        ),
+    )
+
+
 def model_usage(
     *,
     request_id: str = "provider-request-1",
@@ -136,6 +155,27 @@ def completed_run(**updates: object) -> RunResult:
     }
     values.update(updates)
     return RunResult.model_validate(values)
+
+
+def interrupted_run(
+    *,
+    status: RunStatus,
+    steps: tuple[ExecutionStep, ...],
+    model_usages: tuple[ModelUsage, ...] = (),
+    evaluations: tuple[EvaluationResult, ...] = (),
+) -> RunResult:
+    """Build a failed or timed-out run without fabricating measurements."""
+    return completed_run(
+        status=status,
+        steps=steps,
+        model_usages=model_usages,
+        evaluations=evaluations,
+        final_evaluation=None,
+        final_output=None,
+        contract_met=None,
+        latency_ms=30,
+        error="Run did not complete",
+    )
 
 
 @pytest.mark.parametrize("calculated_cost", [Decimal("0"), Decimal("0.00125")])
@@ -259,23 +299,15 @@ def test_interrupted_run_uses_none_for_unmeasured_contract(status: RunStatus) ->
         if status is RunStatus.FAILED
         else ExecutionStatus.TIMED_OUT
     )
-    result = completed_run(
+    result = interrupted_run(
         status=status,
         steps=(
-            ExecutionStep(
+            unsuccessful_step(
                 sequence=0,
                 step_type=ExecutionStepType.MODEL_CALL,
                 status=failed_step_status,
-                latency_ms=30,
-                error="Provider unavailable",
             ),
         ),
-        evaluations=(),
-        final_evaluation=None,
-        final_output=None,
-        contract_met=None,
-        latency_ms=30,
-        error="Provider unavailable",
     )
 
     assert result.contract_met is None
@@ -410,7 +442,7 @@ def test_run_rejects_usage_from_another_run() -> None:
 
 def test_run_rejects_model_call_without_usage_record() -> None:
     """Require structured usage facts for every model-call trace step."""
-    with pytest.raises(ValidationError, match="model usage record"):
+    with pytest.raises(ValidationError, match="successful calls"):
         completed_run(model_usages=())
 
 
@@ -421,4 +453,136 @@ def test_run_rejects_evaluation_step_without_result() -> None:
             evaluations=(),
             final_evaluation=None,
             contract_met=None,
+        )
+
+
+@pytest.mark.parametrize(
+    ("run_status", "step_status"),
+    [
+        (RunStatus.FAILED, ExecutionStatus.FAILED),
+        (RunStatus.TIMED_OUT, ExecutionStatus.TIMED_OUT),
+    ],
+)
+def test_unsuccessful_model_call_allows_unavailable_usage(
+    run_status: RunStatus,
+    step_status: ExecutionStatus,
+) -> None:
+    """Represent an attempted call without inventing unavailable usage."""
+    result = interrupted_run(
+        status=run_status,
+        steps=(unsuccessful_step(0, ExecutionStepType.MODEL_CALL, step_status),),
+    )
+
+    assert result.model_usages == ()
+
+
+@pytest.mark.parametrize(
+    ("run_status", "step_status"),
+    [
+        (RunStatus.FAILED, ExecutionStatus.FAILED),
+        (RunStatus.TIMED_OUT, ExecutionStatus.TIMED_OUT),
+    ],
+)
+def test_unsuccessful_model_call_preserves_available_usage(
+    run_status: RunStatus,
+    step_status: ExecutionStatus,
+) -> None:
+    """Retain measured usage when an unsuccessful provider call supplied it."""
+    usage = model_usage()
+    result = interrupted_run(
+        status=run_status,
+        steps=(unsuccessful_step(0, ExecutionStepType.MODEL_CALL, step_status),),
+        model_usages=(usage,),
+    )
+
+    assert result.model_usages == (usage,)
+
+
+def test_skipped_model_call_does_not_require_usage() -> None:
+    """Do not fabricate usage for a model call that was never attempted."""
+    result = interrupted_run(
+        status=RunStatus.FAILED,
+        steps=(
+            unsuccessful_step(
+                0,
+                ExecutionStepType.MODEL_CALL,
+                ExecutionStatus.SKIPPED,
+            ),
+        ),
+    )
+
+    assert result.model_usages == ()
+
+
+def test_run_rejects_more_usage_than_non_skipped_model_calls() -> None:
+    """Reject usage records that cannot map to an attempted model call."""
+    with pytest.raises(ValidationError, match="non-skipped attempts"):
+        interrupted_run(
+            status=RunStatus.FAILED,
+            steps=(
+                unsuccessful_step(
+                    0,
+                    ExecutionStepType.MODEL_CALL,
+                    ExecutionStatus.SKIPPED,
+                ),
+            ),
+            model_usages=(model_usage(),),
+        )
+
+
+@pytest.mark.parametrize(
+    ("run_status", "step_status"),
+    [
+        (RunStatus.FAILED, ExecutionStatus.FAILED),
+        (RunStatus.TIMED_OUT, ExecutionStatus.TIMED_OUT),
+    ],
+)
+def test_unsuccessful_evaluation_allows_unavailable_result(
+    run_status: RunStatus,
+    step_status: ExecutionStatus,
+) -> None:
+    """Represent an unsuccessful evaluation without fabricated evidence."""
+    result = interrupted_run(
+        status=run_status,
+        steps=(
+            unsuccessful_step(
+                0,
+                ExecutionStepType.QUALITY_EVALUATION,
+                step_status,
+            ),
+        ),
+    )
+
+    assert result.evaluations == ()
+
+
+def test_skipped_evaluation_does_not_require_result() -> None:
+    """Do not fabricate evidence for an evaluation that was never attempted."""
+    result = interrupted_run(
+        status=RunStatus.FAILED,
+        steps=(
+            unsuccessful_step(
+                0,
+                ExecutionStepType.QUALITY_EVALUATION,
+                ExecutionStatus.SKIPPED,
+            ),
+        ),
+    )
+
+    assert result.evaluations == ()
+
+
+def test_run_rejects_more_results_than_non_skipped_evaluations() -> None:
+    """Reject evaluation evidence that cannot map to an attempted evaluation."""
+    with pytest.raises(ValidationError, match="non-skipped attempts"):
+        interrupted_run(
+            status=RunStatus.FAILED,
+            steps=(
+                unsuccessful_step(
+                    0,
+                    ExecutionStepType.QUALITY_EVALUATION,
+                    ExecutionStatus.SKIPPED,
+                ),
+            ),
+            evaluations=(passing_evaluation(),),
         )
