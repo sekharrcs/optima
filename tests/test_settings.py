@@ -20,6 +20,9 @@ def isolate_settings_sources(
         "OPTIMA_CONTEXT_REDUCTION_ENABLED",
         "OPTIMA_HISTORICAL_POLICY_ENABLED",
         "OPTIMA_FOUNDRY_ROUTER_COMPARATOR_ENABLED",
+        "OPTIMA_STANDARD_QUALITY_THRESHOLD",
+        "OPTIMA_HIGH_QUALITY_THRESHOLD",
+        "OPTIMA_CRITICAL_QUALITY_THRESHOLD",
     ):
         monkeypatch.delenv(variable, raising=False)
 
@@ -32,6 +35,9 @@ def test_settings_defaults_match_mvp_module_configuration() -> None:
     assert settings.context_reduction_enabled is True
     assert settings.historical_policy_enabled is True
     assert settings.foundry_router_comparator_enabled is False
+    assert settings.standard_quality_threshold == 0.80
+    assert settings.high_quality_threshold == 0.90
+    assert settings.critical_quality_threshold == 0.95
 
 
 def test_settings_accept_explicit_injection() -> None:
@@ -48,6 +54,9 @@ def test_settings_accept_explicit_injection() -> None:
         "context_reduction_enabled": False,
         "historical_policy_enabled": False,
         "foundry_router_comparator_enabled": True,
+        "standard_quality_threshold": 0.80,
+        "high_quality_threshold": 0.90,
+        "critical_quality_threshold": 0.95,
     }
 
 
@@ -77,6 +86,32 @@ def test_explicit_settings_take_precedence_over_environment(
     settings = AppSettings(semantic_cache_enabled=False)
 
     assert settings.semantic_cache_enabled is False
+
+
+def test_settings_read_quality_threshold_environment_variables(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Read configurable Quality Profile thresholds from the environment."""
+    monkeypatch.setenv("OPTIMA_STANDARD_QUALITY_THRESHOLD", "0.70")
+    monkeypatch.setenv("OPTIMA_HIGH_QUALITY_THRESHOLD", "0.85")
+    monkeypatch.setenv("OPTIMA_CRITICAL_QUALITY_THRESHOLD", "0.99")
+
+    settings = AppSettings()
+
+    assert settings.quality_thresholds().model_dump() == {
+        "standard": 0.70,
+        "high": 0.85,
+        "critical": 0.99,
+    }
+
+
+def test_settings_reject_nonmonotonic_quality_thresholds() -> None:
+    """Reject settings that weaken a stricter Quality Profile."""
+    with pytest.raises(ValidationError, match="STANDARD <= HIGH <= CRITICAL"):
+        AppSettings(
+            standard_quality_threshold=0.90,
+            high_quality_threshold=0.80,
+        )
 
 
 def test_settings_reject_malformed_boolean(

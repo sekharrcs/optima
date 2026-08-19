@@ -1,0 +1,424 @@
+"""Tests for measured model usage and actual run results."""
+
+from datetime import UTC, datetime
+from decimal import Decimal
+
+import pytest
+from pydantic import ValidationError
+
+from optima.domain.evaluation import EvaluationResult
+from optima.domain.execution import (
+    CachePolicy,
+    ContextPolicy,
+    ExecutionPlan,
+    ExecutionStatus,
+    ExecutionStep,
+    ExecutionStepType,
+    ModelPolicy,
+    ModelRole,
+    PlannerReasonCode,
+)
+from optima.domain.quality_contract import (
+    OptimizationMode,
+    QualityProfile,
+    RiskTier,
+    build_quality_contract,
+)
+from optima.domain.request_profile import Complexity, RequestProfile, TaskType
+from optima.domain.run import ModelUsage, RunResult, RunStatus
+
+
+def quality_contract() -> object:
+    """Build the shared High Quality Contract."""
+    return build_quality_contract(
+        quality_profile=QualityProfile.HIGH,
+        optimization_mode=OptimizationMode.COST,
+        risk_tier=RiskTier.MEDIUM,
+    )
+
+
+def request_profile() -> RequestProfile:
+    """Build the shared Request Profile."""
+    return RequestProfile(
+        task_type=TaskType.LOG_ANALYSIS,
+        complexity=Complexity.MEDIUM,
+        input_tokens=2500,
+        risk_tier=RiskTier.MEDIUM,
+        cache_eligible=True,
+        has_large_context=False,
+    )
+
+
+def execution_plan() -> ExecutionPlan:
+    """Build the shared small-first execution plan."""
+    return ExecutionPlan(
+        cache_policy=CachePolicy.SKIP,
+        context_policy=ContextPolicy.KEEP_ORIGINAL,
+        model_policy=ModelPolicy.SMALL_FIRST_WITH_FALLBACK,
+        initial_model_role=ModelRole.SMALL,
+        verification_required=True,
+        escalation_model_role=ModelRole.STRONG,
+        optimization_mode=OptimizationMode.COST,
+        reason_codes=(
+            PlannerReasonCode.OPTIMIZATION_MODE_COST,
+            PlannerReasonCode.SMALL_FIRST_SELECTED,
+        ),
+        human_readable_name="Small -> Verify -> Escalate if needed",
+    )
+
+
+def passing_evaluation() -> EvaluationResult:
+    """Build final evidence that meets the shared contract."""
+    return EvaluationResult(
+        evaluator_type="deterministic",
+        evaluator_valid=True,
+        score=0.93,
+        threshold=0.90,
+        mandatory_checks_passed=True,
+        passed=True,
+        reasons=("Required quality met",),
+    )
+
+
+def successful_step(sequence: int, step_type: ExecutionStepType) -> ExecutionStep:
+    """Build one successful execution trace step."""
+    return ExecutionStep(
+        sequence=sequence,
+        step_type=step_type,
+        status=ExecutionStatus.SUCCEEDED,
+        latency_ms=10,
+    )
+
+
+def model_usage(
+    *,
+    request_id: str = "provider-request-1",
+    run_id: str = "run-1",
+    model_role: ModelRole = ModelRole.SMALL,
+) -> ModelUsage:
+    """Build one measured model-call usage record."""
+    return ModelUsage(
+        request_id=request_id,
+        run_id=run_id,
+        provider="foundry",
+        deployment=f"{model_role.value.lower()}-deployment",
+        model_role=model_role,
+        input_tokens=100,
+        output_tokens=20,
+        latency_ms=125,
+    )
+
+
+def completed_run(**updates: object) -> RunResult:
+    """Build a valid completed run with optional test overrides."""
+    evaluation = passing_evaluation()
+    values: dict[str, object] = {
+        "run_id": "run-1",
+        "correlation_id": "correlation-1",
+        "created_at": datetime(2026, 8, 18, 12, 0, tzinfo=UTC),
+        "status": RunStatus.COMPLETED,
+        "quality_contract": quality_contract(),
+        "request_profile": request_profile(),
+        "execution_plan": execution_plan(),
+        "steps": (
+            successful_step(0, ExecutionStepType.MODEL_CALL),
+            successful_step(1, ExecutionStepType.QUALITY_EVALUATION),
+            successful_step(2, ExecutionStepType.RETURN),
+        ),
+        "model_usages": (model_usage(),),
+        "evaluations": (evaluation,),
+        "final_evaluation": evaluation,
+        "final_output": "Final answer",
+        "contract_met": True,
+        "escalated": False,
+        "latency_ms": 30,
+        "error": None,
+    }
+    values.update(updates)
+    return RunResult.model_validate(values)
+
+
+@pytest.mark.parametrize("calculated_cost", [Decimal("0"), Decimal("0.00125")])
+def test_model_usage_preserves_measured_call_facts_and_decimal_cost(
+    calculated_cost: Decimal,
+) -> None:
+    """Represent every required model-call usage fact."""
+    usage = ModelUsage(
+        request_id="provider-request-1",
+        run_id="run-1",
+        provider="foundry",
+        deployment="small-deployment",
+        model_role=ModelRole.SMALL,
+        input_tokens=100,
+        output_tokens=20,
+        cached_tokens=10,
+        latency_ms=125,
+        calculated_cost=calculated_cost,
+    )
+
+    assert usage.calculated_cost == calculated_cost
+    assert usage.cached_tokens == 10
+
+
+def test_model_usage_allows_unavailable_cost_without_placeholder_zero() -> None:
+    """Use None when Slice 6 has not calculated a model-call cost."""
+    usage = ModelUsage(
+        request_id="provider-request-1",
+        run_id="run-1",
+        provider="foundry",
+        deployment="small-deployment",
+        model_role=ModelRole.SMALL,
+        input_tokens=100,
+        output_tokens=20,
+        latency_ms=125,
+    )
+
+    assert usage.calculated_cost is None
+    assert usage.cached_tokens is None
+
+
+@pytest.mark.parametrize("cost", [Decimal("-0.01"), Decimal("NaN")])
+def test_model_usage_rejects_invalid_cost(cost: Decimal) -> None:
+    """Reject negative or non-finite calculated monetary values."""
+    with pytest.raises(ValidationError):
+        ModelUsage(
+            request_id="provider-request-1",
+            run_id="run-1",
+            provider="foundry",
+            deployment="small-deployment",
+            model_role=ModelRole.SMALL,
+            input_tokens=100,
+            output_tokens=20,
+            latency_ms=125,
+            calculated_cost=cost,
+        )
+
+
+def test_completed_run_preserves_request_profile_and_measured_contract_result() -> None:
+    """Expose profile facts and valid final quality evidence in Run History."""
+    result = completed_run()
+
+    assert result.request_profile.task_type is TaskType.LOG_ANALYSIS
+    assert result.request_profile.complexity is Complexity.MEDIUM
+    assert result.contract_met is True
+
+
+def test_completed_run_can_record_measured_contract_failure() -> None:
+    """Use False only when a valid final evaluation measured failure."""
+    failed_evaluation = EvaluationResult(
+        evaluator_type="deterministic",
+        evaluator_valid=True,
+        score=0.80,
+        threshold=0.90,
+        mandatory_checks_passed=True,
+        passed=False,
+        reasons=("Required quality not met",),
+    )
+
+    result = completed_run(
+        evaluations=(failed_evaluation,),
+        final_evaluation=failed_evaluation,
+        contract_met=False,
+    )
+
+    assert result.contract_met is False
+
+
+def test_completed_semantic_cache_run_has_no_model_usage() -> None:
+    """Represent accepted cache reuse with compatible evaluation evidence."""
+    cache_plan = ExecutionPlan(
+        cache_policy=CachePolicy.USE_CACHED_RESULT,
+        context_policy=ContextPolicy.NOT_APPLICABLE,
+        verification_required=False,
+        optimization_mode=OptimizationMode.COST,
+        reason_codes=(
+            PlannerReasonCode.OPTIMIZATION_MODE_COST,
+            PlannerReasonCode.CACHE_HIGH_CONFIDENCE_MATCH,
+        ),
+        human_readable_name="Semantic Cache Hit",
+    )
+
+    result = completed_run(
+        execution_plan=cache_plan,
+        steps=(
+            successful_step(0, ExecutionStepType.SEMANTIC_CACHE),
+            successful_step(1, ExecutionStepType.RETURN),
+        ),
+        model_usages=(),
+    )
+
+    assert result.execution_plan.cache_policy is CachePolicy.USE_CACHED_RESULT
+    assert result.model_usages == ()
+
+
+@pytest.mark.parametrize("status", [RunStatus.FAILED, RunStatus.TIMED_OUT])
+def test_interrupted_run_uses_none_for_unmeasured_contract(status: RunStatus) -> None:
+    """Do not convert unavailable compliance evidence into False."""
+    failed_step_status = (
+        ExecutionStatus.FAILED
+        if status is RunStatus.FAILED
+        else ExecutionStatus.TIMED_OUT
+    )
+    result = completed_run(
+        status=status,
+        steps=(
+            ExecutionStep(
+                sequence=0,
+                step_type=ExecutionStepType.MODEL_CALL,
+                status=failed_step_status,
+                latency_ms=30,
+                error="Provider unavailable",
+            ),
+        ),
+        evaluations=(),
+        final_evaluation=None,
+        final_output=None,
+        contract_met=None,
+        latency_ms=30,
+        error="Provider unavailable",
+    )
+
+    assert result.contract_met is None
+
+
+def test_run_rejects_naive_created_at() -> None:
+    """Require an unambiguous timezone-aware run timestamp."""
+    with pytest.raises(ValidationError, match="timezone-aware"):
+        completed_run(created_at=datetime(2026, 8, 18, 12, 0))
+
+
+def test_escalated_true_requires_escalation_step() -> None:
+    """Reject an escalation flag unsupported by the execution trace."""
+    with pytest.raises(ValidationError, match="ESCALATION"):
+        completed_run(escalated=True)
+
+
+def test_escalation_step_requires_escalated_true() -> None:
+    """Reject an escalation trace hidden by a false summary flag."""
+    with pytest.raises(ValidationError, match="ESCALATION"):
+        completed_run(
+            steps=(
+                successful_step(0, ExecutionStepType.MODEL_CALL),
+                successful_step(1, ExecutionStepType.ESCALATION),
+                successful_step(2, ExecutionStepType.MODEL_CALL),
+                successful_step(3, ExecutionStepType.QUALITY_EVALUATION),
+                successful_step(4, ExecutionStepType.RETURN),
+            )
+        )
+
+
+def test_escalated_run_accepts_bidirectionally_consistent_trace() -> None:
+    """Accept escalation only when both trace and summary record it."""
+    first_evaluation = EvaluationResult(
+        evaluator_type="deterministic",
+        evaluator_valid=True,
+        score=0.80,
+        threshold=0.90,
+        mandatory_checks_passed=True,
+        passed=False,
+        reasons=("Small result did not meet quality",),
+    )
+    final_evaluation = passing_evaluation()
+    result = completed_run(
+        steps=(
+            successful_step(0, ExecutionStepType.MODEL_CALL),
+            successful_step(1, ExecutionStepType.QUALITY_EVALUATION),
+            successful_step(2, ExecutionStepType.ESCALATION),
+            successful_step(3, ExecutionStepType.MODEL_CALL),
+            successful_step(4, ExecutionStepType.QUALITY_EVALUATION),
+            successful_step(5, ExecutionStepType.RETURN),
+        ),
+        model_usages=(
+            model_usage(),
+            model_usage(
+                request_id="provider-request-2",
+                model_role=ModelRole.STRONG,
+            ),
+        ),
+        evaluations=(first_evaluation, final_evaluation),
+        final_evaluation=final_evaluation,
+        escalated=True,
+    )
+
+    assert result.escalated is True
+
+
+@pytest.mark.parametrize(
+    "contract_met",
+    [False, None],
+)
+def test_run_rejects_contract_result_inconsistent_with_final_evaluation(
+    contract_met: bool | None,
+) -> None:
+    """Require three-state compliance to follow valid final evidence."""
+    with pytest.raises(ValidationError, match="contract_met"):
+        completed_run(contract_met=contract_met)
+
+
+def test_run_rejects_final_evaluation_not_last_in_trace() -> None:
+    """Identify the final quality measurement unambiguously."""
+    earlier_evaluation = EvaluationResult(
+        evaluator_type="deterministic",
+        evaluator_valid=True,
+        score=0.80,
+        threshold=0.90,
+        mandatory_checks_passed=True,
+        passed=False,
+        reasons=("Small result did not meet quality",),
+    )
+
+    with pytest.raises(ValidationError, match="final recorded evaluation"):
+        completed_run(
+            steps=(
+                successful_step(0, ExecutionStepType.MODEL_CALL),
+                successful_step(1, ExecutionStepType.QUALITY_EVALUATION),
+                successful_step(2, ExecutionStepType.QUALITY_EVALUATION),
+                successful_step(3, ExecutionStepType.RETURN),
+            ),
+            evaluations=(passing_evaluation(), earlier_evaluation),
+            final_evaluation=passing_evaluation(),
+        )
+
+
+def test_run_rejects_unordered_or_duplicate_execution_steps() -> None:
+    """Require a deterministic actual execution trace."""
+    with pytest.raises(ValidationError, match="unique and ascending"):
+        completed_run(
+            steps=(
+                successful_step(1, ExecutionStepType.MODEL_CALL),
+                successful_step(1, ExecutionStepType.RETURN),
+            )
+        )
+
+
+def test_run_rejects_usage_from_another_run() -> None:
+    """Keep model-call usage correlated to its owning run."""
+    usage = ModelUsage(
+        request_id="provider-request-1",
+        run_id="other-run",
+        provider="foundry",
+        deployment="small-deployment",
+        model_role=ModelRole.SMALL,
+        input_tokens=100,
+        output_tokens=20,
+        latency_ms=125,
+    )
+
+    with pytest.raises(ValidationError, match="belong to this run"):
+        completed_run(model_usages=(usage,))
+
+
+def test_run_rejects_model_call_without_usage_record() -> None:
+    """Require structured usage facts for every model-call trace step."""
+    with pytest.raises(ValidationError, match="model usage record"):
+        completed_run(model_usages=())
+
+
+def test_run_rejects_evaluation_step_without_result() -> None:
+    """Require structured evidence for every model-plan evaluation step."""
+    with pytest.raises(ValidationError, match="evaluation result"):
+        completed_run(
+            evaluations=(),
+            final_evaluation=None,
+            contract_met=None,
+        )
