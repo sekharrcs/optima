@@ -1,0 +1,487 @@
+"""Plan-honoring runtime orchestration for small-first execution."""
+
+from collections.abc import Callable
+from datetime import UTC, datetime
+from time import perf_counter
+
+from optima.domain.evaluation import EvaluationResult
+from optima.domain.execution import (
+    CachePolicy,
+    ContextPolicy,
+    ExecutionEventCode,
+    ExecutionStatus,
+    ExecutionStep,
+    ExecutionStepType,
+    ModelPolicy,
+    ModelRole,
+)
+from optima.domain.run import ModelUsage, RunResult, RunStatus
+from optima.evaluation import EvaluationRequest, QualityEvaluator
+from optima.execution.contracts import ExecutionRequest, UnsupportedExecutionPlanError
+from optima.providers import (
+    ModelProvider,
+    ModelProviderRequest,
+    ModelProviderResult,
+    MonotonicClock,
+)
+
+
+def system_utc_now() -> datetime:
+    """Return the current timezone-aware UTC timestamp."""
+    return datetime.now(UTC)
+
+
+class SystemMonotonicClock:
+    """Default monotonic clock for executor elapsed-time measurements."""
+
+    def now(self) -> float:
+        """Return the current monotonic timestamp in seconds."""
+        return perf_counter()
+
+
+class SmallFirstExecutor:
+    """Execute an existing small-first plan without making routing policy."""
+
+    def __init__(
+        self,
+        *,
+        small_provider: ModelProvider,
+        strong_provider: ModelProvider,
+        evaluator: QualityEvaluator,
+        monotonic_clock: MonotonicClock | None = None,
+        utc_now: Callable[[], datetime] = system_utc_now,
+    ) -> None:
+        if small_provider.model_role is not ModelRole.SMALL:
+            raise ValueError("small_provider must implement the SMALL role")
+        if strong_provider.model_role is not ModelRole.STRONG:
+            raise ValueError("strong_provider must implement the STRONG role")
+        self._small_provider = small_provider
+        self._strong_provider = strong_provider
+        self._evaluator = evaluator
+        self._clock = monotonic_clock or SystemMonotonicClock()
+        self._utc_now = utc_now
+
+    async def execute(self, request: ExecutionRequest) -> RunResult:
+        """Execute SMALL, verify, and use the configured STRONG fallback once."""
+        self._validate_supported_plan(request)
+        started_at = self._clock.now()
+        created_at = self._utc_now()
+        if created_at.utcoffset() is None:
+            raise ValueError("utc_now must return a timezone-aware datetime")
+
+        steps: list[ExecutionStep] = []
+        usages: list[ModelUsage] = []
+        evaluations: list[EvaluationResult] = []
+
+        small_result = await self._call_provider(
+            request=request,
+            provider=self._small_provider,
+            role=ModelRole.SMALL,
+            steps=steps,
+        )
+        if isinstance(small_result, RunStatus):
+            return self._interrupted_result(
+                request=request,
+                created_at=created_at,
+                started_at=started_at,
+                status=small_result,
+                steps=steps,
+                usages=usages,
+                evaluations=evaluations,
+                error=steps[-1].error or "Small provider call did not complete",
+            )
+        usages.append(small_result.usage)
+
+        small_evaluation = await self._evaluate_candidate(
+            request=request,
+            output_text=small_result.output_text,
+            role=ModelRole.SMALL,
+            steps=steps,
+        )
+        if isinstance(small_evaluation, RunStatus):
+            return self._interrupted_result(
+                request=request,
+                created_at=created_at,
+                started_at=started_at,
+                status=small_evaluation,
+                steps=steps,
+                usages=usages,
+                evaluations=evaluations,
+                error=steps[-1].error or "Small evaluation did not complete",
+            )
+        evaluations.append(small_evaluation)
+        if small_evaluation.passed:
+            steps.append(
+                self._return_step(
+                    sequence=len(steps),
+                    role=ModelRole.SMALL,
+                    contract_met=True,
+                )
+            )
+            return self._completed_result(
+                request=request,
+                created_at=created_at,
+                started_at=started_at,
+                steps=steps,
+                usages=usages,
+                evaluations=evaluations,
+                final_output=small_result.output_text,
+                final_evaluation=small_evaluation,
+                escalated=False,
+            )
+
+        steps.append(
+            ExecutionStep(
+                sequence=len(steps),
+                step_type=ExecutionStepType.ESCALATION,
+                status=ExecutionStatus.SUCCEEDED,
+                latency_ms=0,
+                event_codes=(
+                    ExecutionEventCode.ESCALATION_REQUIRED,
+                    ExecutionEventCode.ESCALATED_TO_STRONG,
+                ),
+                facts={
+                    "from_model_role": ModelRole.SMALL.value,
+                    "to_model_role": ModelRole.STRONG.value,
+                },
+            )
+        )
+        strong_result = await self._call_provider(
+            request=request,
+            provider=self._strong_provider,
+            role=ModelRole.STRONG,
+            steps=steps,
+        )
+        if isinstance(strong_result, RunStatus):
+            return self._interrupted_result(
+                request=request,
+                created_at=created_at,
+                started_at=started_at,
+                status=strong_result,
+                steps=steps,
+                usages=usages,
+                evaluations=evaluations,
+                error=steps[-1].error or "Strong provider call did not complete",
+            )
+        usages.append(strong_result.usage)
+
+        strong_evaluation = await self._evaluate_candidate(
+            request=request,
+            output_text=strong_result.output_text,
+            role=ModelRole.STRONG,
+            steps=steps,
+        )
+        if isinstance(strong_evaluation, RunStatus):
+            return self._interrupted_result(
+                request=request,
+                created_at=created_at,
+                started_at=started_at,
+                status=strong_evaluation,
+                steps=steps,
+                usages=usages,
+                evaluations=evaluations,
+                error=steps[-1].error or "Strong evaluation did not complete",
+            )
+        evaluations.append(strong_evaluation)
+        if not strong_evaluation.evaluator_valid:
+            steps.append(
+                ExecutionStep(
+                    sequence=len(steps),
+                    step_type=ExecutionStepType.RETURN,
+                    status=ExecutionStatus.FAILED,
+                    latency_ms=0,
+                    facts={"model_role": ModelRole.STRONG.value},
+                    error="Final evaluation evidence is invalid",
+                )
+            )
+            return self._interrupted_result(
+                request=request,
+                created_at=created_at,
+                started_at=started_at,
+                status=RunStatus.FAILED,
+                steps=steps,
+                usages=usages,
+                evaluations=evaluations,
+                final_evaluation=strong_evaluation,
+                error="Final evaluation evidence is invalid",
+            )
+
+        steps.append(
+            self._return_step(
+                sequence=len(steps),
+                role=ModelRole.STRONG,
+                contract_met=strong_evaluation.passed,
+            )
+        )
+        return self._completed_result(
+            request=request,
+            created_at=created_at,
+            started_at=started_at,
+            steps=steps,
+            usages=usages,
+            evaluations=evaluations,
+            final_output=strong_result.output_text,
+            final_evaluation=strong_evaluation,
+            escalated=True,
+        )
+
+    async def _call_provider(
+        self,
+        *,
+        request: ExecutionRequest,
+        provider: ModelProvider,
+        role: ModelRole,
+        steps: list[ExecutionStep],
+    ) -> ModelProviderResult | RunStatus:
+        started_at = self._clock.now()
+        try:
+            result = await provider.generate(
+                ModelProviderRequest(
+                    run_id=request.run_id,
+                    model_role=role,
+                    input_text=request.input_text,
+                    context=request.context,
+                    metadata={
+                        "task_type": request.request_profile.task_type.value,
+                        "complexity": request.request_profile.complexity.value,
+                    },
+                )
+            )
+            if result.usage.run_id != request.run_id:
+                raise ValueError("provider usage run_id does not match the request")
+            if result.usage.model_role is not role:
+                raise ValueError("provider usage role does not match the request")
+        except TimeoutError as error:
+            self._append_failed_step(
+                steps=steps,
+                step_type=ExecutionStepType.MODEL_CALL,
+                status=ExecutionStatus.TIMED_OUT,
+                started_at=started_at,
+                role=role,
+                error=error,
+            )
+            return RunStatus.TIMED_OUT
+        except Exception as error:
+            self._append_failed_step(
+                steps=steps,
+                step_type=ExecutionStepType.MODEL_CALL,
+                status=ExecutionStatus.FAILED,
+                started_at=started_at,
+                role=role,
+                error=error,
+            )
+            return RunStatus.FAILED
+
+        steps.append(
+            ExecutionStep(
+                sequence=len(steps),
+                step_type=ExecutionStepType.MODEL_CALL,
+                status=ExecutionStatus.SUCCEEDED,
+                latency_ms=self._elapsed_ms(started_at),
+                facts={
+                    "model_role": role.value,
+                    "provider": result.usage.provider,
+                    "deployment": result.usage.deployment,
+                    "request_id": result.usage.request_id,
+                },
+            )
+        )
+        return result
+
+    async def _evaluate_candidate(
+        self,
+        *,
+        request: ExecutionRequest,
+        output_text: str,
+        role: ModelRole,
+        steps: list[ExecutionStep],
+    ) -> EvaluationResult | RunStatus:
+        started_at = self._clock.now()
+        try:
+            result = await self._evaluator.evaluate(
+                EvaluationRequest(
+                    run_id=request.run_id,
+                    input_text=request.input_text,
+                    output_text=output_text,
+                    context=request.context,
+                    reference_output=request.reference_output,
+                    criteria=request.criteria,
+                    metadata={
+                        **request.metadata,
+                        "model_role": role.value,
+                        "task_type": request.request_profile.task_type.value,
+                        "complexity": request.request_profile.complexity.value,
+                    },
+                ),
+                request.quality_contract,
+            )
+            if result.threshold != request.quality_contract.minimum_quality_score:
+                raise ValueError(
+                    "evaluation threshold does not match the Quality Contract"
+                )
+        except TimeoutError as error:
+            self._append_failed_step(
+                steps=steps,
+                step_type=ExecutionStepType.QUALITY_EVALUATION,
+                status=ExecutionStatus.TIMED_OUT,
+                started_at=started_at,
+                role=role,
+                error=error,
+            )
+            return RunStatus.TIMED_OUT
+        except Exception as error:
+            self._append_failed_step(
+                steps=steps,
+                step_type=ExecutionStepType.QUALITY_EVALUATION,
+                status=ExecutionStatus.FAILED,
+                started_at=started_at,
+                role=role,
+                error=error,
+            )
+            return RunStatus.FAILED
+
+        event_codes: tuple[ExecutionEventCode, ...] = ()
+        if result.passed:
+            event_codes = (ExecutionEventCode.QUALITY_CONTRACT_MET,)
+        else:
+            if result.evaluator_valid and result.score < result.threshold:
+                event_codes += (ExecutionEventCode.QUALITY_THRESHOLD_NOT_MET,)
+            if role is ModelRole.STRONG and result.evaluator_valid:
+                event_codes += (ExecutionEventCode.FINAL_QUALITY_CONTRACT_NOT_MET,)
+        steps.append(
+            ExecutionStep(
+                sequence=len(steps),
+                step_type=ExecutionStepType.QUALITY_EVALUATION,
+                status=ExecutionStatus.SUCCEEDED,
+                latency_ms=self._elapsed_ms(started_at),
+                event_codes=event_codes,
+                facts={
+                    "model_role": role.value,
+                    "evaluator_type": result.evaluator_type,
+                    "evaluator_valid": result.evaluator_valid,
+                    "score": result.score,
+                    "threshold": result.threshold,
+                    "passed": result.passed,
+                },
+            )
+        )
+        return result
+
+    def _validate_supported_plan(self, request: ExecutionRequest) -> None:
+        plan = request.execution_plan
+        if not (
+            plan.cache_policy is CachePolicy.SKIP
+            and plan.context_policy is ContextPolicy.KEEP_ORIGINAL
+            and plan.model_policy is ModelPolicy.SMALL_FIRST_WITH_FALLBACK
+            and plan.initial_model_role is ModelRole.SMALL
+            and plan.escalation_model_role is ModelRole.STRONG
+            and plan.verification_required
+        ):
+            raise UnsupportedExecutionPlanError(
+                "Slice 5 supports KEEP_ORIGINAL SMALL_FIRST_WITH_FALLBACK only"
+            )
+
+    def _append_failed_step(
+        self,
+        *,
+        steps: list[ExecutionStep],
+        step_type: ExecutionStepType,
+        status: ExecutionStatus,
+        started_at: float,
+        role: ModelRole,
+        error: Exception,
+    ) -> None:
+        operation = step_type.value.lower().replace("_", " ")
+        steps.append(
+            ExecutionStep(
+                sequence=len(steps),
+                step_type=step_type,
+                status=status,
+                latency_ms=self._elapsed_ms(started_at),
+                facts={"model_role": role.value},
+                error=f"{role.value} {operation} {type(error).__name__}",
+            )
+        )
+
+    def _return_step(
+        self,
+        *,
+        sequence: int,
+        role: ModelRole,
+        contract_met: bool,
+    ) -> ExecutionStep:
+        return ExecutionStep(
+            sequence=sequence,
+            step_type=ExecutionStepType.RETURN,
+            status=ExecutionStatus.SUCCEEDED,
+            latency_ms=0,
+            facts={"model_role": role.value, "contract_met": contract_met},
+        )
+
+    def _completed_result(
+        self,
+        *,
+        request: ExecutionRequest,
+        created_at: datetime,
+        started_at: float,
+        steps: list[ExecutionStep],
+        usages: list[ModelUsage],
+        evaluations: list[EvaluationResult],
+        final_output: str,
+        final_evaluation: EvaluationResult,
+        escalated: bool,
+    ) -> RunResult:
+        return RunResult(
+            run_id=request.run_id,
+            correlation_id=request.correlation_id,
+            created_at=created_at,
+            status=RunStatus.COMPLETED,
+            quality_contract=request.quality_contract,
+            request_profile=request.request_profile,
+            execution_plan=request.execution_plan,
+            steps=tuple(steps),
+            model_usages=tuple(usages),
+            evaluations=tuple(evaluations),
+            final_evaluation=final_evaluation,
+            final_output=final_output,
+            contract_met=final_evaluation.passed,
+            escalated=escalated,
+            latency_ms=self._elapsed_ms(started_at),
+        )
+
+    def _interrupted_result(
+        self,
+        *,
+        request: ExecutionRequest,
+        created_at: datetime,
+        started_at: float,
+        status: RunStatus,
+        steps: list[ExecutionStep],
+        usages: list[ModelUsage],
+        evaluations: list[EvaluationResult],
+        error: str,
+        final_evaluation: EvaluationResult | None = None,
+    ) -> RunResult:
+        return RunResult(
+            run_id=request.run_id,
+            correlation_id=request.correlation_id,
+            created_at=created_at,
+            status=status,
+            quality_contract=request.quality_contract,
+            request_profile=request.request_profile,
+            execution_plan=request.execution_plan,
+            steps=tuple(steps),
+            model_usages=tuple(usages),
+            evaluations=tuple(evaluations),
+            final_evaluation=final_evaluation,
+            final_output=None,
+            contract_met=None,
+            escalated=any(
+                step.step_type is ExecutionStepType.ESCALATION for step in steps
+            ),
+            latency_ms=self._elapsed_ms(started_at),
+            error=error,
+        )
+
+    def _elapsed_ms(self, started_at: float) -> int:
+        return max(0, int(round((self._clock.now() - started_at) * 1000)))

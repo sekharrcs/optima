@@ -5,7 +5,7 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
 from optima.domain.evaluation import EvaluationResult
 from optima.domain.execution import (
@@ -73,6 +73,48 @@ class RunResult(BaseModel):
     escalated: Annotated[bool, Field(strict=True)]
     latency_ms: NonNegativeCount
     error: NonEmptyString | None = None
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def total_input_tokens(self) -> int | None:
+        """Return exact input tokens only when every attempted call has usage."""
+        usages = self._complete_model_usages()
+        if usages is None:
+            return None
+        return sum(usage.input_tokens for usage in usages)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def total_output_tokens(self) -> int | None:
+        """Return exact output tokens only when every attempted call has usage."""
+        usages = self._complete_model_usages()
+        if usages is None:
+            return None
+        return sum(usage.output_tokens for usage in usages)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def total_tokens(self) -> int | None:
+        """Return exact combined tokens without double-counting cached tokens."""
+        input_tokens = self.total_input_tokens
+        output_tokens = self.total_output_tokens
+        if input_tokens is None or output_tokens is None:
+            return None
+        return input_tokens + output_tokens
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def total_calculated_cost(self) -> Decimal | None:
+        """Sum exact Decimal costs only when every attempted cost is available."""
+        usages = self._complete_model_usages()
+        if usages is None:
+            return None
+        total = Decimal("0")
+        for usage in usages:
+            if usage.calculated_cost is None:
+                return None
+            total += usage.calculated_cost
+        return total
 
     @model_validator(mode="after")
     def validate_actual_run_facts(self) -> "RunResult":
@@ -181,3 +223,14 @@ class RunResult(BaseModel):
                 "failed or timed-out runs require an error and no final output"
             )
         return self
+
+    def _complete_model_usages(self) -> tuple[ModelUsage, ...] | None:
+        """Return usage only when every attempted model call has measurements."""
+        attempted_model_calls = sum(
+            step.step_type is ExecutionStepType.MODEL_CALL
+            and step.status is not ExecutionStatus.SKIPPED
+            for step in self.steps
+        )
+        if len(self.model_usages) != attempted_model_calls:
+            return None
+        return self.model_usages

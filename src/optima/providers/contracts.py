@@ -34,6 +34,7 @@ class ModelProviderRequest(BaseModel):
     run_id: NonEmptyString
     model_role: ModelRole
     input_text: NonEmptyString
+    context: NonEmptyString | None = None
     metadata: Mapping[str, str] = Field(default_factory=dict)
 
 
