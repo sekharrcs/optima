@@ -114,12 +114,15 @@ def test_calculator_uses_exact_decimal_rates_for_each_token_category() -> None:
         )
     )
 
-    cost = calculator.calculate(
+    calculation = calculator.calculate(
         model_usage(input_tokens=11, cached_tokens=3, output_tokens=7)
     )
 
-    assert cost == Decimal("0.0000079382715957")
-    assert isinstance(cost, Decimal)
+    assert calculation is not None
+    assert calculation.amount == Decimal("0.0000079382715957")
+    assert isinstance(calculation.amount, Decimal)
+    assert calculation.provenance.catalog_version == "2026-08-20"
+    assert calculation.provenance.currency == "USD"
 
 
 @pytest.mark.parametrize(
@@ -150,7 +153,7 @@ def test_calculator_handles_individual_categories_and_zero_values(
         )
     )
 
-    cost = calculator.calculate(
+    calculation = calculator.calculate(
         model_usage(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
@@ -158,7 +161,8 @@ def test_calculator_handles_individual_categories_and_zero_values(
         )
     )
 
-    assert cost == expected
+    assert calculation is not None
+    assert calculation.amount == expected
 
 
 def test_calculator_does_not_double_count_cached_input_tokens() -> None:
@@ -173,11 +177,12 @@ def test_calculator_does_not_double_count_cached_input_tokens() -> None:
         )
     )
 
-    cost = calculator.calculate(
+    calculation = calculator.calculate(
         model_usage(input_tokens=1_000, cached_tokens=250, output_tokens=100)
     )
 
-    assert cost == Decimal("0.002025")
+    assert calculation is not None
+    assert calculation.amount == Decimal("0.002025")
 
 
 def test_calculator_requires_cached_measurement_for_distinct_cached_rate() -> None:
@@ -191,11 +196,12 @@ def test_calculator_accepts_explicit_zero_cached_tokens() -> None:
     """Distinguish a measured zero cached subset from missing measurement."""
     calculator = CostCalculator(price_catalog(price_entry()))
 
-    cost = calculator.calculate(
+    calculation = calculator.calculate(
         model_usage(input_tokens=1_000, cached_tokens=0, output_tokens=200)
     )
 
-    assert cost == Decimal("0.00225")
+    assert calculation is not None
+    assert calculation.amount == Decimal("0.00225")
 
 
 @pytest.mark.parametrize("cached_tokens", [None, 100])
@@ -207,9 +213,10 @@ def test_calculator_uses_normal_input_rate_without_distinct_cached_pricing(
         price_catalog(price_entry(cached_input_rate_per_million_tokens=None))
     )
 
-    cost = calculator.calculate(model_usage(cached_tokens=cached_tokens))
+    calculation = calculator.calculate(model_usage(cached_tokens=cached_tokens))
 
-    assert cost == Decimal("0.00225")
+    assert calculation is not None
+    assert calculation.amount == Decimal("0.00225")
 
 
 @pytest.mark.parametrize(

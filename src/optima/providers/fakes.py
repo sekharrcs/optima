@@ -6,7 +6,7 @@ from typing import Annotated
 from pydantic import BaseModel, ConfigDict, Field
 
 from optima.domain.execution import ModelRole
-from optima.domain.run import ModelUsage
+from optima.domain.run import ModelUsage, PricingProvenance
 from optima.providers.contracts import (
     ModelProvider,
     ModelProviderCall,
@@ -32,6 +32,7 @@ class FakeProviderResponse(BaseModel):
     cached_tokens: NonNegativeCount | None = None
     request_id: NonEmptyString | None = None
     calculated_cost: Decimal | None = None
+    pricing_provenance: PricingProvenance | None = None
 
 
 class FakeModelProvider(ModelProvider):
@@ -97,6 +98,7 @@ class FakeModelProvider(ModelProvider):
             cached_tokens=response.cached_tokens,
             latency_ms=latency_ms,
             calculated_cost=response.calculated_cost,
+            pricing_provenance=response.pricing_provenance,
         )
         validate_usage_alignment(
             run_id=request.run_id,

@@ -83,6 +83,7 @@ class BaselineComparisonService:
             output_tokens=run_result.total_output_tokens,
             total_tokens=run_result.total_tokens,
             cost=run_result.total_calculated_cost,
+            cost_provenance=run_result.total_cost_provenance,
             latency_ms=run_result.latency_ms,
             evaluator_type=(
                 valid_evaluation.evaluator_type

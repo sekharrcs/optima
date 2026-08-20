@@ -12,6 +12,7 @@ from optima.comparison import (
     BenchmarkCaseIdentity,
     ComparableRun,
     ComparisonArm,
+    ExecutionMetrics,
 )
 from optima.domain.evaluation import EvaluationResult
 from optima.domain.execution import (
@@ -35,7 +36,7 @@ from optima.domain.quality_contract import (
     build_quality_contract,
 )
 from optima.domain.request_profile import Complexity, RequestProfile, TaskType
-from optima.domain.run import ModelUsage, RunResult, RunStatus
+from optima.domain.run import ModelUsage, PricingProvenance, RunResult, RunStatus
 
 
 def quality_contract(
@@ -50,16 +51,18 @@ def quality_contract(
     )
 
 
-def request_profile() -> RequestProfile:
+def request_profile(**updates: object) -> RequestProfile:
     """Build the shared comparison Request Profile."""
-    return RequestProfile(
-        task_type=TaskType.LOG_ANALYSIS,
-        complexity=Complexity.MEDIUM,
-        input_tokens=800,
-        risk_tier=RiskTier.MEDIUM,
-        cache_eligible=False,
-        has_large_context=False,
-    )
+    values: dict[str, object] = {
+        "task_type": TaskType.LOG_ANALYSIS,
+        "complexity": Complexity.MEDIUM,
+        "input_tokens": 800,
+        "risk_tier": RiskTier.MEDIUM,
+        "cache_eligible": False,
+        "has_large_context": False,
+    }
+    values.update(updates)
+    return RequestProfile.model_validate(values)
 
 
 def execution_plan() -> ExecutionPlan:
@@ -140,6 +143,7 @@ def usage(
     input_tokens: int,
     output_tokens: int,
     cost: Decimal | None,
+    provenance: PricingProvenance | None,
     model_role: ModelRole = ModelRole.SMALL,
 ) -> ModelUsage:
     """Build one measured provider usage record."""
@@ -153,6 +157,7 @@ def usage(
         output_tokens=output_tokens,
         latency_ms=100,
         calculated_cost=cost,
+        pricing_provenance=provenance,
     )
 
 
@@ -167,7 +172,10 @@ def completed_run(
     contract_met: bool = True,
     evaluator_type: str = "deterministic",
     contract: QualityContract | None = None,
+    profile: RequestProfile | None = None,
     model_calls: int = 1,
+    catalog_version: str = "benchmark-v1",
+    currency: str = "USD",
 ) -> RunResult:
     """Build a complete measured run with one or two model calls."""
     final_evaluation = evaluation(
@@ -178,6 +186,14 @@ def completed_run(
     steps: tuple[ExecutionStep, ...]
     usages: tuple[ModelUsage, ...]
     evaluations: tuple[EvaluationResult, ...]
+    provenance = (
+        PricingProvenance(
+            catalog_version=catalog_version,
+            currency=currency,
+        )
+        if cost is not None
+        else None
+    )
     if model_calls == 1:
         steps = (
             step(0, ExecutionStepType.MODEL_CALL),
@@ -191,6 +207,7 @@ def completed_run(
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 cost=cost,
+                provenance=provenance,
             ),
         )
         evaluations = (final_evaluation,)
@@ -218,6 +235,7 @@ def completed_run(
                 input_tokens=input_tokens // 2,
                 output_tokens=output_tokens // 2,
                 cost=first_cost,
+                provenance=provenance,
             ),
             usage(
                 run_id=run_id,
@@ -225,6 +243,7 @@ def completed_run(
                 input_tokens=input_tokens - input_tokens // 2,
                 output_tokens=output_tokens - output_tokens // 2,
                 cost=second_cost,
+                provenance=provenance,
                 model_role=ModelRole.STRONG,
             ),
         )
@@ -237,7 +256,7 @@ def completed_run(
         created_at=datetime(2026, 8, 20, 12, 0, tzinfo=UTC),
         status=RunStatus.COMPLETED,
         quality_contract=contract or quality_contract(),
-        request_profile=request_profile(),
+        request_profile=profile or request_profile(),
         execution_plan=execution_plan(),
         steps=steps,
         model_usages=usages,
@@ -277,6 +296,10 @@ def invalid_evaluation_run(*, run_id: str, evaluator_type: str) -> RunResult:
                 input_tokens=100,
                 output_tokens=20,
                 cost=Decimal("1"),
+                provenance=PricingProvenance(
+                    catalog_version="benchmark-v1",
+                    currency="USD",
+                ),
             ),
         ),
         evaluations=(final_evaluation,),
@@ -367,6 +390,11 @@ def test_comparison_preserves_metrics_and_computes_positive_savings() -> None:
     assert result.optima.total_tokens == 500
     assert result.baseline.cost == Decimal("4")
     assert result.optima.cost == Decimal("1")
+    assert result.baseline.cost_provenance == PricingProvenance(
+        catalog_version="benchmark-v1",
+        currency="USD",
+    )
+    assert result.optima.cost_provenance == result.baseline.cost_provenance
     assert result.baseline.latency_ms == 1000
     assert result.optima.quality_score == 0.92
     assert result.optima.contract_met is True
@@ -449,6 +477,55 @@ def test_missing_complete_measurements_remain_unavailable() -> None:
     assert result.cost_delta is None
     assert result.token_reduction_percentage is None
     assert result.cost_reduction_percentage is None
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("task_type", TaskType.SUMMARIZATION),
+        ("complexity", Complexity.HIGH),
+        ("input_tokens", 801),
+        ("risk_tier", RiskTier.HIGH),
+        ("cache_eligible", True),
+        ("has_large_context", True),
+    ],
+)
+def test_request_rejects_different_request_profiles(
+    field: str,
+    value: object,
+) -> None:
+    """Require every typed RequestProfile fact to match between both arms."""
+    with pytest.raises(ValidationError, match="same RequestProfile"):
+        comparison_request(
+            completed_run(run_id="baseline"),
+            completed_run(
+                run_id="optima",
+                profile=request_profile(**{field: value}),
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    ("catalog_version", "currency"),
+    [
+        ("benchmark-v2", "USD"),
+        ("benchmark-v1", "EUR"),
+    ],
+)
+def test_request_rejects_incompatible_pricing_provenance(
+    catalog_version: str,
+    currency: str,
+) -> None:
+    """Reject cost comparisons across catalog versions or currencies."""
+    with pytest.raises(ValidationError, match="same pricing provenance"):
+        comparison_request(
+            completed_run(run_id="baseline"),
+            completed_run(
+                run_id="optima",
+                catalog_version=catalog_version,
+                currency=currency,
+            ),
+        )
 
 
 def test_missing_optima_measurements_remain_unavailable() -> None:
@@ -671,4 +748,39 @@ def test_comparison_contracts_are_immutable_and_forbid_extra_fields() -> None:
                 "input_fingerprint": "sha256:canonical-input",
                 "unexpected": True,
             }
+        )
+
+
+@pytest.mark.parametrize(
+    ("cost", "cost_provenance"),
+    [
+        (Decimal("1"), None),
+        (
+            None,
+            PricingProvenance(
+                catalog_version="benchmark-v1",
+                currency="USD",
+            ),
+        ),
+    ],
+)
+def test_execution_metrics_reject_cost_without_matching_provenance(
+    cost: Decimal | None,
+    cost_provenance: PricingProvenance | None,
+) -> None:
+    """Keep comparison output amounts inseparable from catalog identity."""
+    with pytest.raises(ValidationError, match="must be provided together"):
+        ExecutionMetrics(
+            arm=ComparisonArm.BASELINE,
+            run_id="baseline",
+            model_calls=1,
+            input_tokens=10,
+            output_tokens=5,
+            total_tokens=15,
+            cost=cost,
+            cost_provenance=cost_provenance,
+            latency_ms=100,
+            evaluator_type="deterministic",
+            quality_score=0.95,
+            contract_met=True,
         )

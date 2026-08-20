@@ -297,6 +297,7 @@ class SmallFirstExecutor:
         result: ModelProviderResult,
     ) -> ModelProviderResult:
         usage = result.usage
+        calculation = self._cost_calculator.calculate(usage)
         priced_usage = ModelUsage(
             request_id=usage.request_id,
             run_id=usage.run_id,
@@ -307,7 +308,10 @@ class SmallFirstExecutor:
             output_tokens=usage.output_tokens,
             cached_tokens=usage.cached_tokens,
             latency_ms=usage.latency_ms,
-            calculated_cost=self._cost_calculator.calculate(usage),
+            calculated_cost=(calculation.amount if calculation is not None else None),
+            pricing_provenance=(
+                calculation.provenance if calculation is not None else None
+            ),
         )
         return ModelProviderResult(
             output_text=result.output_text,

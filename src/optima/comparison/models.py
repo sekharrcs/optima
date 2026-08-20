@@ -7,7 +7,7 @@ from typing import Annotated
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from optima.domain.quality_contract import QualityScore
-from optima.domain.run import RunResult
+from optima.domain.run import PricingProvenance, RunResult
 
 NonEmptyString = Annotated[str, Field(strict=True, min_length=1)]
 NonNegativeCount = Annotated[int, Field(strict=True, ge=0)]
@@ -67,8 +67,24 @@ class BaselineComparisonRequest(BaseModel):
         optima_result = self.optima.run_result
         if baseline_result.run_id == optima_result.run_id:
             raise ValueError("comparison runs must have different run IDs")
+        if baseline_result.request_profile != optima_result.request_profile:
+            raise ValueError("comparison runs must have the same RequestProfile")
         if baseline_result.quality_contract != optima_result.quality_contract:
             raise ValueError("comparison runs must have the same Quality Contract")
+
+        baseline_cost = baseline_result.total_calculated_cost
+        optima_cost = optima_result.total_calculated_cost
+        if baseline_cost is not None and optima_cost is not None:
+            baseline_provenance = baseline_result.total_cost_provenance
+            optima_provenance = optima_result.total_cost_provenance
+            if baseline_provenance is None or optima_provenance is None:
+                raise ValueError(
+                    "calculated cost comparisons require pricing provenance"
+                )
+            if baseline_provenance != optima_provenance:
+                raise ValueError(
+                    "calculated cost comparisons require the same pricing provenance"
+                )
 
         baseline_evaluation = baseline_result.final_evaluation
         optima_evaluation = optima_result.final_evaluation
@@ -95,10 +111,18 @@ class ExecutionMetrics(BaseModel):
     output_tokens: NonNegativeCount | None
     total_tokens: NonNegativeCount | None
     cost: NonNegativeDecimal | None
+    cost_provenance: PricingProvenance | None
     latency_ms: NonNegativeCount
     evaluator_type: NonEmptyString | None
     quality_score: QualityScore | None
     contract_met: StrictBoolean | None
+
+    @model_validator(mode="after")
+    def validate_cost_provenance_pair(self) -> "ExecutionMetrics":
+        """Prevent comparison metrics from separating cost and provenance."""
+        if (self.cost is None) is not (self.cost_provenance is None):
+            raise ValueError("cost and cost_provenance must be provided together")
+        return self
 
 
 class BaselineComparison(BaseModel):

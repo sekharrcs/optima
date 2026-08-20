@@ -35,6 +35,15 @@ class RunStatus(StrEnum):
     TIMED_OUT = "TIMED_OUT"
 
 
+class PricingProvenance(BaseModel):
+    """Catalog identity governing one authoritative calculated cost."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    catalog_version: NonEmptyString
+    currency: NonEmptyString
+
+
 class ModelUsage(BaseModel):
     """Measured facts for one provider model call."""
 
@@ -50,12 +59,17 @@ class ModelUsage(BaseModel):
     cached_tokens: NonNegativeCount | None = None
     latency_ms: NonNegativeCount
     calculated_cost: NonNegativeDecimal | None = None
+    pricing_provenance: PricingProvenance | None = None
 
     @model_validator(mode="after")
-    def validate_cached_token_subset(self) -> "ModelUsage":
-        """Require cached input to be a measured subset of all input tokens."""
+    def validate_usage_measurements(self) -> "ModelUsage":
+        """Validate cached input and the authoritative cost/provenance pair."""
         if self.cached_tokens is not None and self.cached_tokens > self.input_tokens:
             raise ValueError("cached_tokens must not exceed input_tokens")
+        if (self.calculated_cost is None) is not (self.pricing_provenance is None):
+            raise ValueError(
+                "calculated_cost and pricing_provenance must be provided together"
+            )
         return self
 
 
@@ -114,7 +128,7 @@ class RunResult(BaseModel):
     def total_calculated_cost(self) -> Decimal | None:
         """Sum exact Decimal costs only when every attempted cost is available."""
         usages = self._complete_model_usages()
-        if usages is None:
+        if usages is None or not usages:
             return None
         total = Decimal("0")
         for usage in usages:
@@ -122,6 +136,23 @@ class RunResult(BaseModel):
                 return None
             total += usage.calculated_cost
         return total
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def total_cost_provenance(self) -> PricingProvenance | None:
+        """Return provenance only for one complete compatible run total."""
+        usages = self._complete_model_usages()
+        if usages is None or not usages:
+            return None
+        provenance = usages[0].pricing_provenance
+        if provenance is None:
+            return None
+        if any(
+            usage.calculated_cost is None or usage.pricing_provenance != provenance
+            for usage in usages
+        ):
+            return None
+        return provenance
 
     @model_validator(mode="after")
     def validate_actual_run_facts(self) -> "RunResult":
@@ -146,6 +177,19 @@ class RunResult(BaseModel):
 
         if any(usage.run_id != self.run_id for usage in self.model_usages):
             raise ValueError("every model usage must belong to this run")
+
+        cost_provenances = {
+            (
+                usage.pricing_provenance.catalog_version,
+                usage.pricing_provenance.currency,
+            )
+            for usage in self.model_usages
+            if usage.pricing_provenance is not None
+        }
+        if len(cost_provenances) > 1:
+            raise ValueError(
+                "all calculated costs in one run must use compatible provenance"
+            )
 
         model_call_steps = tuple(
             step

@@ -5,11 +5,26 @@ from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from optima.domain.run import PricingProvenance
+
 NonEmptyString = Annotated[str, Field(strict=True, min_length=1)]
 NonNegativeRate = Annotated[
     Decimal,
     Field(ge=Decimal("0"), allow_inf_nan=False),
 ]
+NonNegativeDecimal = Annotated[
+    Decimal,
+    Field(ge=Decimal("0"), allow_inf_nan=False),
+]
+
+
+class CalculatedCost(BaseModel):
+    """Exact authoritative amount with its source catalog identity."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    amount: NonNegativeDecimal
+    provenance: PricingProvenance
 
 
 class PriceCatalogEntry(BaseModel):

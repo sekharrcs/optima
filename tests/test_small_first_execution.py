@@ -21,7 +21,7 @@ from optima.domain.quality_contract import (
     RiskTier,
 )
 from optima.domain.request_profile import Complexity, RequestProfile, TaskType
-from optima.domain.run import RunStatus
+from optima.domain.run import PricingProvenance, RunStatus
 from optima.evaluation import (
     DeterministicCheckResult,
     EvaluationEvidence,
@@ -165,7 +165,8 @@ def provider_response(
     *,
     input_tokens: int,
     output_tokens: int,
-    cost: Decimal | None,
+    cost: Decimal | None = None,
+    provenance: PricingProvenance | None = None,
 ) -> FakeProviderResponse:
     """Build one measured fake provider response."""
     return FakeProviderResponse(
@@ -173,6 +174,7 @@ def provider_response(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         calculated_cost=cost,
+        pricing_provenance=provenance,
     )
 
 
@@ -217,7 +219,6 @@ def build_executor(
                 "small output",
                 input_tokens=100,
                 output_tokens=20,
-                cost=Decimal("0.001"),
             ),
         ),
         clock=IncrementingClock(),
@@ -230,7 +231,6 @@ def build_executor(
                 "strong output",
                 input_tokens=110,
                 output_tokens=30,
-                cost=Decimal("0.009"),
             ),
         ),
         clock=IncrementingClock(),
@@ -266,8 +266,16 @@ def test_small_passes_without_strong_call() -> None:
     assert len(evaluator.calls) == 1
     assert result.total_tokens == 120
     assert result.total_calculated_cost == Decimal("0.001")
-    assert small.calls[0].result.usage.calculated_cost == Decimal("0.001")  # type: ignore[attr-defined]
+    assert small.calls[0].result.usage.calculated_cost is None  # type: ignore[attr-defined]
     assert result.model_usages[0].calculated_cost == Decimal("0.001")
+    assert result.model_usages[0].pricing_provenance == PricingProvenance(
+        catalog_version="test-v1",
+        currency="TEST",
+    )
+    assert result.total_cost_provenance == PricingProvenance(
+        catalog_version="test-v1",
+        currency="TEST",
+    )
 
 
 def test_small_fails_then_strong_passes_exactly_once() -> None:
@@ -298,6 +306,13 @@ def test_small_fails_then_strong_passes_exactly_once() -> None:
     assert result.total_input_tokens == 210
     assert result.total_output_tokens == 50
     assert result.total_calculated_cost == Decimal("0.010")
+    assert {usage.pricing_provenance for usage in result.model_usages} == {
+        PricingProvenance(catalog_version="test-v1", currency="TEST")
+    }
+    assert result.total_cost_provenance == PricingProvenance(
+        catalog_version="test-v1",
+        currency="TEST",
+    )
 
 
 def test_central_pricing_overwrites_provider_supplied_cost() -> None:
@@ -311,6 +326,10 @@ def test_central_pricing_overwrites_provider_supplied_cost() -> None:
                 input_tokens=100,
                 output_tokens=20,
                 cost=Decimal("999"),
+                provenance=PricingProvenance(
+                    catalog_version="provider-v0",
+                    currency="WRONG",
+                ),
             ),
         ),
         clock=IncrementingClock(),
@@ -323,7 +342,15 @@ def test_central_pricing_overwrites_provider_supplied_cost() -> None:
     result = asyncio.run(executor.execute(execution_request()))
 
     assert small.calls[0].result.usage.calculated_cost == Decimal("999")
+    assert small.calls[0].result.usage.pricing_provenance == PricingProvenance(
+        catalog_version="provider-v0",
+        currency="WRONG",
+    )
     assert result.model_usages[0].calculated_cost == Decimal("0.001")
+    assert result.model_usages[0].pricing_provenance == PricingProvenance(
+        catalog_version="test-v1",
+        currency="TEST",
+    )
     assert result.total_calculated_cost == Decimal("0.001")
 
 
@@ -341,6 +368,10 @@ def test_unknown_pricing_overwrites_provider_cost_with_unavailable() -> None:
                     input_tokens=100,
                     output_tokens=20,
                     cost=Decimal("999"),
+                    provenance=PricingProvenance(
+                        catalog_version="provider-v0",
+                        currency="WRONG",
+                    ),
                 ),
             ),
             clock=IncrementingClock(),
@@ -351,7 +382,9 @@ def test_unknown_pricing_overwrites_provider_cost_with_unavailable() -> None:
 
     assert result.status is RunStatus.COMPLETED
     assert result.model_usages[0].calculated_cost is None
+    assert result.model_usages[0].pricing_provenance is None
     assert result.total_calculated_cost is None
+    assert result.total_cost_provenance is None
 
 
 def test_both_models_validly_fail_returns_final_strong_measurement() -> None:
@@ -502,7 +535,6 @@ def test_misaligned_provider_usage_becomes_domain_valid_failure() -> None:
                 "small output",
                 input_tokens=100,
                 output_tokens=20,
-                cost=Decimal("0.001"),
             ),
         ),
         clock=IncrementingClock(),

@@ -2,8 +2,8 @@
 
 from decimal import Decimal
 
-from optima.cost.models import PriceCatalog
-from optima.domain.run import ModelUsage
+from optima.cost.models import CalculatedCost, PriceCatalog
+from optima.domain.run import ModelUsage, PricingProvenance
 
 TOKENS_PER_MILLION = Decimal("1000000")
 
@@ -14,8 +14,8 @@ class CostCalculator:
     def __init__(self, catalog: PriceCatalog) -> None:
         self._catalog = catalog
 
-    def calculate(self, usage: ModelUsage) -> Decimal | None:
-        """Return exact cost, or None when required pricing is unavailable."""
+    def calculate(self, usage: ModelUsage) -> CalculatedCost | None:
+        """Return exact cost and catalog identity, or None when unavailable."""
         entry = self._catalog.find_entry(
             provider=usage.provider,
             deployment=usage.deployment,
@@ -36,4 +36,10 @@ class CostCalculator:
             )
 
         output_cost = usage.output_tokens * entry.output_rate_per_million_tokens
-        return (input_cost + output_cost) / TOKENS_PER_MILLION
+        return CalculatedCost(
+            amount=(input_cost + output_cost) / TOKENS_PER_MILLION,
+            provenance=PricingProvenance(
+                catalog_version=self._catalog.version,
+                currency=self._catalog.currency,
+            ),
+        )
