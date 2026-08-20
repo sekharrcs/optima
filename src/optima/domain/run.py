@@ -51,6 +51,13 @@ class ModelUsage(BaseModel):
     latency_ms: NonNegativeCount
     calculated_cost: NonNegativeDecimal | None = None
 
+    @model_validator(mode="after")
+    def validate_cached_token_subset(self) -> "ModelUsage":
+        """Require cached input to be a measured subset of all input tokens."""
+        if self.cached_tokens is not None and self.cached_tokens > self.input_tokens:
+            raise ValueError("cached_tokens must not exceed input_tokens")
+        return self
+
 
 class RunResult(BaseModel):
     """Final result and actual decision trace for one OPTIMA run."""

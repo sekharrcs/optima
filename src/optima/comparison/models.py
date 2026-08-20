@@ -1,0 +1,121 @@
+"""Immutable contracts for measured baseline-versus-OPTIMA comparisons."""
+
+from decimal import Decimal
+from enum import StrEnum
+from typing import Annotated
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from optima.domain.quality_contract import QualityScore
+from optima.domain.run import RunResult
+
+NonEmptyString = Annotated[str, Field(strict=True, min_length=1)]
+NonNegativeCount = Annotated[int, Field(strict=True, ge=0)]
+NonNegativeDecimal = Annotated[
+    Decimal,
+    Field(ge=Decimal("0"), allow_inf_nan=False),
+]
+FiniteDecimal = Annotated[Decimal, Field(allow_inf_nan=False)]
+StrictBoolean = Annotated[bool, Field(strict=True)]
+
+
+class ComparisonArm(StrEnum):
+    """Explicit role of one run in a measured comparison."""
+
+    BASELINE = "BASELINE"
+    OPTIMA = "OPTIMA"
+
+
+class BenchmarkCaseIdentity(BaseModel):
+    """Stable identity proving that two runs used the same benchmark input."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    benchmark_case_id: NonEmptyString
+    input_fingerprint: NonEmptyString
+
+
+class ComparableRun(BaseModel):
+    """One explicitly labeled measured run and its benchmark identity."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    arm: ComparisonArm
+    identity: BenchmarkCaseIdentity
+    run_result: RunResult
+
+
+class BaselineComparisonRequest(BaseModel):
+    """Validated baseline and OPTIMA runs eligible for comparison."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    baseline: ComparableRun
+    optima: ComparableRun
+
+    @model_validator(mode="after")
+    def validate_compatibility(self) -> "BaselineComparisonRequest":
+        """Reject mislabeled or incompatible measurements."""
+        if self.baseline.arm is not ComparisonArm.BASELINE:
+            raise ValueError("baseline run must use the BASELINE arm")
+        if self.optima.arm is not ComparisonArm.OPTIMA:
+            raise ValueError("OPTIMA run must use the OPTIMA arm")
+        if self.baseline.identity != self.optima.identity:
+            raise ValueError("comparison runs must have the same benchmark identity")
+
+        baseline_result = self.baseline.run_result
+        optima_result = self.optima.run_result
+        if baseline_result.run_id == optima_result.run_id:
+            raise ValueError("comparison runs must have different run IDs")
+        if baseline_result.quality_contract != optima_result.quality_contract:
+            raise ValueError("comparison runs must have the same Quality Contract")
+
+        baseline_evaluation = baseline_result.final_evaluation
+        optima_evaluation = optima_result.final_evaluation
+        if (
+            baseline_evaluation is not None
+            and baseline_evaluation.evaluator_valid
+            and optima_evaluation is not None
+            and optima_evaluation.evaluator_valid
+            and baseline_evaluation.evaluator_type != optima_evaluation.evaluator_type
+        ):
+            raise ValueError("valid final evaluations must use the same evaluator type")
+        return self
+
+
+class ExecutionMetrics(BaseModel):
+    """Measured execution and valid final-quality facts for one arm."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    arm: ComparisonArm
+    run_id: NonEmptyString
+    model_calls: NonNegativeCount
+    input_tokens: NonNegativeCount | None
+    output_tokens: NonNegativeCount | None
+    total_tokens: NonNegativeCount | None
+    cost: NonNegativeDecimal | None
+    latency_ms: NonNegativeCount
+    evaluator_type: NonEmptyString | None
+    quality_score: QualityScore | None
+    contract_met: StrictBoolean | None
+
+
+class BaselineComparison(BaseModel):
+    """Side-by-side measurements and truthful OPTIMA-relative differences."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    identity: BenchmarkCaseIdentity
+    baseline: ExecutionMetrics
+    optima: ExecutionMetrics
+    model_calls_delta: int
+    input_tokens_delta: int | None
+    output_tokens_delta: int | None
+    total_tokens_delta: int | None
+    cost_delta: FiniteDecimal | None
+    latency_ms_delta: int
+    quality_score_delta: float | None
+    token_reduction_percentage: FiniteDecimal | None
+    cost_reduction_percentage: FiniteDecimal | None
+    latency_percentage_change: FiniteDecimal | None

@@ -6,6 +6,7 @@ from decimal import Decimal
 
 import pytest
 
+from optima.cost import CostCalculator, PriceCatalog, PriceCatalogEntry
 from optima.domain.execution import (
     ExecutionEventCode,
     ExecutionPlan,
@@ -175,11 +176,37 @@ def provider_response(
     )
 
 
+def cost_calculator(*entries: PriceCatalogEntry) -> CostCalculator:
+    """Build deterministic artificial pricing for execution tests."""
+    configured_entries = entries or (
+        PriceCatalogEntry(
+            provider="fake",
+            deployment="small",
+            input_rate_per_million_tokens=Decimal("2"),
+            output_rate_per_million_tokens=Decimal("40"),
+        ),
+        PriceCatalogEntry(
+            provider="fake",
+            deployment="strong",
+            input_rate_per_million_tokens=Decimal("30"),
+            output_rate_per_million_tokens=Decimal("190"),
+        ),
+    )
+    return CostCalculator(
+        PriceCatalog(
+            version="test-v1",
+            currency="TEST",
+            entries=configured_entries,
+        )
+    )
+
+
 def build_executor(
     *,
     evaluator: object,
     small_provider: object | None = None,
     strong_provider: object | None = None,
+    calculator: CostCalculator | None = None,
 ) -> tuple[SmallFirstExecutor, object, object]:
     """Build fresh dependencies for one isolated execution test."""
     small = small_provider or build_fake_small_provider(
@@ -213,6 +240,7 @@ def build_executor(
             small_provider=small,  # type: ignore[arg-type]
             strong_provider=strong,  # type: ignore[arg-type]
             evaluator=evaluator,  # type: ignore[arg-type]
+            cost_calculator=calculator or cost_calculator(),
             monotonic_clock=IncrementingClock(),
             utc_now=lambda: datetime(2026, 8, 19, 12, 0, tzinfo=UTC),
         ),
@@ -238,6 +266,8 @@ def test_small_passes_without_strong_call() -> None:
     assert len(evaluator.calls) == 1
     assert result.total_tokens == 120
     assert result.total_calculated_cost == Decimal("0.001")
+    assert small.calls[0].result.usage.calculated_cost == Decimal("0.001")  # type: ignore[attr-defined]
+    assert result.model_usages[0].calculated_cost == Decimal("0.001")
 
 
 def test_small_fails_then_strong_passes_exactly_once() -> None:
@@ -268,6 +298,60 @@ def test_small_fails_then_strong_passes_exactly_once() -> None:
     assert result.total_input_tokens == 210
     assert result.total_output_tokens == 50
     assert result.total_calculated_cost == Decimal("0.010")
+
+
+def test_central_pricing_overwrites_provider_supplied_cost() -> None:
+    """Prevent provider cost from competing with centralized calculation."""
+    small = build_fake_small_provider(
+        provider_name="fake",
+        deployment_name="small",
+        responses=(
+            provider_response(
+                "small output",
+                input_tokens=100,
+                output_tokens=20,
+                cost=Decimal("999"),
+            ),
+        ),
+        clock=IncrementingClock(),
+    )
+    executor, _, _ = build_executor(
+        evaluator=FakeEvaluator(responses=(evidence(0.93),)),
+        small_provider=small,
+    )
+
+    result = asyncio.run(executor.execute(execution_request()))
+
+    assert small.calls[0].result.usage.calculated_cost == Decimal("999")
+    assert result.model_usages[0].calculated_cost == Decimal("0.001")
+    assert result.total_calculated_cost == Decimal("0.001")
+
+
+def test_unknown_pricing_overwrites_provider_cost_with_unavailable() -> None:
+    """Keep successful execution cost unavailable when catalog pricing is absent."""
+    executor, _, _ = build_executor(
+        evaluator=FakeEvaluator(responses=(evidence(0.93),)),
+        calculator=cost_calculator(),
+        small_provider=build_fake_small_provider(
+            provider_name="unpriced",
+            deployment_name="small",
+            responses=(
+                provider_response(
+                    "small output",
+                    input_tokens=100,
+                    output_tokens=20,
+                    cost=Decimal("999"),
+                ),
+            ),
+            clock=IncrementingClock(),
+        ),
+    )
+
+    result = asyncio.run(executor.execute(execution_request()))
+
+    assert result.status is RunStatus.COMPLETED
+    assert result.model_usages[0].calculated_cost is None
+    assert result.total_calculated_cost is None
 
 
 def test_both_models_validly_fail_returns_final_strong_measurement() -> None:
