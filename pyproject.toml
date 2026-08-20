@@ -5,8 +5,10 @@ description = "Quality-constrained AI execution optimizer"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.141.1",
+    "httpx>=0.28.1",
     "pydantic>=2.13.4",
     "pydantic-settings>=2.15.0",
+    "streamlit>=1.50,<1.51",
     "uvicorn>=0.52.1",
 ]
 
@@ -20,7 +22,6 @@ default = true
 
 [dependency-groups]
 dev = [
-    "httpx>=0.28.1",
     "mypy>=2.3.0",
     "pytest>=9.1.1",
     "ruff>=0.16.2",
@@ -35,7 +36,7 @@ select = ["B", "E", "F", "I", "UP"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
-files = ["src/optima", "tests"]
+files = ["src/optima", "src/ui", "tests"]
 warn_unused_configs = true
 
 [tool.pytest.ini_options]

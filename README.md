@@ -85,6 +85,40 @@ uv run uvicorn optima.api.app:app --reload
 
 The lightweight health endpoint is available at `http://127.0.0.1:8000/api/v1/health`.
 
+The default API intentionally has no model or evaluator composition. Start the
+explicit local demo API to exercise the existing planner and executor with
+deterministic fake providers, a fake evaluator, and the centralized price
+catalog:
+
+```powershell
+uv run uvicorn optima.api.demo:app --port 8000
+```
+
+In a second terminal, start the Streamlit decision demo:
+
+```powershell
+uv run streamlit run src/ui/app.py
+```
+
+The UI uses `http://127.0.0.1:8000` by default. Set `OPTIMA_API_BASE_URL` or use
+the advanced demo input to target another configured OPTIMA API.
+
+The local demo remains intentionally narrow:
+
+- Request Profile fields are supplied demo inputs because no backend request
+  profiler exists yet.
+- The current executor supports small-first with mandatory verification and
+  strong fallback. Planner-selected strong-direct plans return an honest
+  unsupported-plan error.
+- Baseline savings remain unavailable until a compatible measured baseline is
+  supplied through a future API boundary.
+- Dashboard and Run History retain actual results only for the current
+  Streamlit session; refreshing or restarting clears them.
+
+On Windows ARM64, use an x64 Python 3.12 interpreter for Streamlit because its
+Pandas and PyArrow dependencies may not have Windows ARM64 wheels in the
+configured package feed.
+
 Run the complete local validation suite:
 
 ```powershell
