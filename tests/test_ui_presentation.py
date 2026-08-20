@@ -13,8 +13,9 @@ from optima.comparison import (
     ComparableRun,
     ComparisonArm,
 )
-from optima.domain.execution import ExecutionStatus, PlannerReasonCode
-from optima.domain.quality_contract import QualityProfile
+from optima.domain.execution import ExecutionStatus, ModelRole, PlannerReasonCode
+from optima.domain.quality_contract import OptimizationMode, QualityProfile
+from optima.domain.request_profile import Complexity
 from optima.domain.run import PricingProvenance, RunResult, RunStatus
 from ui.api_client import OptimaApiClient
 from ui.history import (
@@ -59,6 +60,28 @@ def execute_reduction_result() -> RunResult:
             "Priya Nair owns incident INC-204.\nPriya Nair owns incident INC-204."
         ),
         input_tokens=4_000,
+        has_large_context=True,
+    )
+
+
+def execute_strong_direct_result() -> RunResult:
+    """Execute one passing HIGH request through the real local demo API."""
+    return execute_result(
+        input_text="Design a distributed architecture",
+        complexity=Complexity.HIGH,
+    )
+
+
+def execute_reduced_strong_direct_result() -> RunResult:
+    """Execute measured reduction plus direct STRONG through the real demo API."""
+    return execute_result(
+        input_text="Summarize incident requirements",
+        context=(
+            "Priya Nair owns incident INC-204.\nPriya Nair owns incident INC-204."
+        ),
+        quality_profile=QualityProfile.CRITICAL,
+        optimization_mode=OptimizationMode.QUALITY,
+        input_tokens=8_000,
         has_large_context=True,
     )
 
@@ -199,6 +222,73 @@ def test_decision_exposes_escalation_and_final_contract_failure() -> None:
     assert result.escalated is True
     assert decision.escalation == "Occurred"
     assert decision.contract_state is ContractState.NOT_MET
+
+
+def test_strong_direct_projects_backend_decision_trace_history_and_dashboard() -> None:
+    """Render measured direct STRONG evidence without inferred escalation facts."""
+    result = execute_strong_direct_result()
+    decision = decision_view(result)
+    trace = trace_rows(result.steps)
+    row = history_rows((HistoryEntry(result=result),))[0]
+    summary = aggregate_dashboard((HistoryEntry(result=result),))
+
+    assert decision.plan_name == "Strong -> Verify"
+    assert decision.model_calls == 1
+    assert decision.escalation == "Not required"
+    assert decision.final_quality == "0.92"
+    assert decision.contract_state is ContractState.MET
+    assert outcome_label(result) == "Strong direct"
+    assert len(result.model_usages) == 1
+    assert result.model_usages[0].model_role is ModelRole.STRONG
+    assert result.total_tokens == 772
+    assert str(result.total_calculated_cost) == "0.00277"
+    assert result.total_cost_provenance is not None
+    assert result.total_cost_provenance.catalog_version == "local-demo-v1"
+    assert result.latency_ms >= 0
+    assert [item.step for item in trace] == [
+        "Model Call",
+        "Quality Evaluation",
+        "Return",
+    ]
+    assert trace[0].facts["model_role"] == "STRONG"
+    assert trace[0].context_source == "ORIGINAL"
+    assert all("Escalat" not in item.step for item in trace)
+    assert row.plan_name == result.execution_plan.human_readable_name
+    assert row.final_quality == 0.92
+    assert row.cost == result.total_calculated_cost
+    assert row.cost_provenance == result.total_cost_provenance
+    assert row.contract_state is ContractState.MET
+    assert summary.plan_distribution == {"Strong direct": 1}
+    assert summary.contract_pass_rate == 1.0
+
+
+def test_reduced_strong_direct_projects_backend_reduction_and_contract_evidence() -> (
+    None
+):
+    """Preserve reduced STRONG context and measured final contract evidence."""
+    result = execute_reduced_strong_direct_result()
+    decision = decision_view(result)
+    reduction = context_reduction_view(result)
+    trace = trace_rows(result.steps)
+
+    assert result.execution_plan.human_readable_name == (
+        "Reduce Context -> Strong -> Verify"
+    )
+    assert decision.model_calls == 1
+    assert decision.escalation == "Not required"
+    assert decision.final_quality == "0.92"
+    assert decision.contract_state is ContractState.NOT_MET
+    assert outcome_label(result) == "Context reduce -> Strong direct"
+    assert reduction is not None
+    assert reduction.context_source == "Reduced"
+    assert trace[1].facts["model_role"] == "STRONG"
+    assert trace[1].context_source == "REDUCED"
+    assert result.model_usages[0].model_role is ModelRole.STRONG
+    assert result.total_tokens == 772
+    assert result.total_cost_provenance is not None
+    assert result.final_evaluation is not None
+    assert result.final_evaluation.score == 0.92
+    assert result.final_evaluation.passed is False
 
 
 def test_contract_state_and_cost_formatting_preserve_exact_values() -> None:

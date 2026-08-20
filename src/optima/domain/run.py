@@ -12,6 +12,7 @@ from optima.domain.execution import (
     ContextPolicy,
     ContextReductionOutcome,
     ContextSource,
+    ExecutionEventCode,
     ExecutionPlan,
     ExecutionStatus,
     ExecutionStep,
@@ -170,6 +171,20 @@ class RunResult(BaseModel):
         has_escalation_step = any(
             step.step_type is ExecutionStepType.ESCALATION for step in self.steps
         )
+        if self.execution_plan.model_policy is ModelPolicy.STRONG_DIRECT:
+            escalation_events = {
+                ExecutionEventCode.ESCALATION_REQUIRED,
+                ExecutionEventCode.ESCALATED_TO_STRONG,
+            }
+            if (
+                has_escalation_step
+                or self.escalated
+                or any(
+                    escalation_events.intersection(step.event_codes)
+                    for step in self.steps
+                )
+            ):
+                raise ValueError("strong-direct runs cannot record escalation evidence")
         if self.escalated is not has_escalation_step:
             raise ValueError("escalated and ESCALATION execution step must agree")
         if self.escalated and (
@@ -205,6 +220,35 @@ class RunResult(BaseModel):
         attempted_model_calls = sum(
             step.status is not ExecutionStatus.SKIPPED for step in model_call_steps
         )
+        if self.execution_plan.model_policy is ModelPolicy.STRONG_DIRECT:
+            if attempted_model_calls != 1:
+                raise ValueError(
+                    "strong-direct runs require exactly one model-call attempt"
+                )
+            if any(
+                step.facts.get("model_role") != ModelRole.STRONG.value
+                for step in model_call_steps
+            ):
+                raise ValueError(
+                    "strong-direct model-call steps require STRONG model_role facts"
+                )
+            if any(
+                usage.model_role is not ModelRole.STRONG for usage in self.model_usages
+            ):
+                raise ValueError("strong-direct runs require STRONG model usage")
+            if any(
+                step.step_type
+                in {
+                    ExecutionStepType.QUALITY_EVALUATION,
+                    ExecutionStepType.RETURN,
+                }
+                and step.facts.get("model_role") != ModelRole.STRONG.value
+                for step in self.steps
+            ):
+                raise ValueError(
+                    "strong-direct evaluation and return steps require STRONG "
+                    "model_role facts"
+                )
         if (
             not successful_model_calls
             <= len(self.model_usages)
@@ -254,6 +298,13 @@ class RunResult(BaseModel):
             attempted_evaluations = sum(
                 step.status is not ExecutionStatus.SKIPPED for step in evaluation_steps
             )
+            if self.execution_plan.model_policy is ModelPolicy.STRONG_DIRECT:
+                expected_evaluation_attempts = int(successful_model_calls == 1)
+                if attempted_evaluations != expected_evaluation_attempts:
+                    raise ValueError(
+                        "strong-direct evaluation attempts must match "
+                        "model-call success"
+                    )
             if (
                 not successful_evaluations
                 <= len(self.evaluations)

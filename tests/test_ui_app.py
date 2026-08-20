@@ -79,3 +79,55 @@ _render_execute_result(HistoryEntry(result=result))
     )
     assert metrics["Context reduction"].endswith("%")
     assert metrics["Reduction method"] == "RELEVANCE_AND_FACT_EXTRACTIVE_V1"
+
+
+def test_execute_result_renders_actual_strong_direct_evidence() -> None:
+    """Render one real HIGH strong-direct result through stable AppTest elements."""
+    app = AppTest.from_string(
+        """
+import httpx
+from fastapi.testclient import TestClient
+from optima.api.demo import app as demo_app
+from optima.domain.request_profile import Complexity
+from ui.api_client import OptimaApiClient
+from ui.app import _render_execute_result
+from ui.history import HistoryEntry
+from ui.models import ExecuteInputs
+
+inputs = ExecuteInputs(
+    input_text="Design a distributed architecture",
+    complexity=Complexity.HIGH,
+)
+response = TestClient(demo_app).post(
+    "/api/v1/runs",
+    json=inputs.to_run_request().model_dump(mode="json", exclude_none=True),
+)
+transport = httpx.MockTransport(
+    lambda request: httpx.Response(response.status_code, json=response.json())
+)
+result = OptimaApiClient(transport=transport).execute(inputs.to_run_request())
+_render_execute_result(HistoryEntry(result=result))
+"""
+    ).run()
+
+    metrics = {metric.label: metric.value for metric in app.metric}
+    markdown_values = [element.value for element in app.markdown]
+    trace_facts = " ".join(str(element.value) for element in app.json)
+
+    assert not app.exception
+    assert "Strong -> Verify" in [element.value for element in app.subheader]
+    assert metrics["Model calls"] == "1"
+    assert metrics["Escalation"] == "Not required"
+    assert metrics["Total tokens"] == "772"
+    assert metrics["Calculated cost"] == "USD 0.00277 (catalog local-demo-v1)"
+    assert metrics["Latency"].endswith(" ms")
+    assert int(metrics["Latency"].removesuffix(" ms")) >= 0
+    assert metrics["Contract"] == "Contract Met"
+    assert metrics["Final quality"] == "0.92"
+    assert any(
+        "Local demo response from the configured STRONG model role." in value
+        for value in markdown_values
+    )
+    assert any("Model: STRONG_DIRECT" in value for value in markdown_values)
+    assert "STRONG" in trace_facts
+    assert any("Model Call: Succeeded" in element.value for element in app.success)

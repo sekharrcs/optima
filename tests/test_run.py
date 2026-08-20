@@ -14,6 +14,7 @@ from optima.domain.execution import (
     ContextReductionEvidence,
     ContextReductionOutcome,
     ContextSource,
+    ExecutionEventCode,
     ExecutionPlan,
     ExecutionStatus,
     ExecutionStep,
@@ -112,6 +113,26 @@ def reduction_execution_plan() -> ExecutionPlan:
     )
 
 
+def strong_direct_execution_plan() -> ExecutionPlan:
+    """Build a valid strong-direct plan for run invariant tests."""
+    return execution_plan().model_copy(
+        update={
+            "model_policy": ModelPolicy.STRONG_DIRECT,
+            "initial_model_role": ModelRole.STRONG,
+            "escalation_model_role": None,
+            "reason_codes": (
+                PlannerReasonCode.OPTIMIZATION_MODE_COST,
+                PlannerReasonCode.STRONG_MODEL_REQUIRED,
+            ),
+            "human_readable_name": "Strong -> Verify",
+            "decision_evidence": decision_evidence(
+                base_model_policy=ModelPolicy.STRONG_DIRECT,
+                final_model_policy=ModelPolicy.STRONG_DIRECT,
+            ),
+        }
+    )
+
+
 def applied_reduction_step(sequence: int = 0) -> ExecutionStep:
     """Build one valid measured context-reduction execution step."""
     return ExecutionStep(
@@ -177,6 +198,39 @@ def unsuccessful_step(
             if status in {ExecutionStatus.FAILED, ExecutionStatus.TIMED_OUT}
             else None
         ),
+    )
+
+
+def strong_direct_model_step(
+    sequence: int,
+    status: ExecutionStatus = ExecutionStatus.SUCCEEDED,
+    *,
+    model_role: str | None = ModelRole.STRONG.value,
+) -> ExecutionStep:
+    """Build one strong-direct model-call step with explicit role facts."""
+    return strong_direct_role_step(
+        sequence,
+        ExecutionStepType.MODEL_CALL,
+        status,
+        model_role=model_role,
+    )
+
+
+def strong_direct_role_step(
+    sequence: int,
+    step_type: ExecutionStepType,
+    status: ExecutionStatus = ExecutionStatus.SUCCEEDED,
+    *,
+    model_role: str | None = ModelRole.STRONG.value,
+) -> ExecutionStep:
+    """Build one strong-direct step with explicit role facts."""
+    step = (
+        successful_step(sequence, step_type)
+        if status is ExecutionStatus.SUCCEEDED
+        else unsuccessful_step(sequence, step_type, status)
+    )
+    return step.model_copy(
+        update={"facts": {} if model_role is None else {"model_role": model_role}}
     )
 
 
@@ -754,6 +808,301 @@ def test_escalated_run_accepts_bidirectionally_consistent_trace() -> None:
     )
 
     assert result.escalated is True
+
+
+def test_strong_direct_run_rejects_multiple_model_attempts() -> None:
+    """Prevent a direct plan from hiding a retry or second model call."""
+    with pytest.raises(ValidationError, match="exactly one model-call attempt"):
+        completed_run(
+            execution_plan=strong_direct_execution_plan(),
+            steps=(
+                strong_direct_model_step(0),
+                strong_direct_model_step(1),
+                successful_step(2, ExecutionStepType.QUALITY_EVALUATION),
+                successful_step(3, ExecutionStepType.RETURN),
+            ),
+            model_usages=(
+                model_usage(model_role=ModelRole.STRONG),
+                model_usage(
+                    request_id="provider-request-2",
+                    model_role=ModelRole.STRONG,
+                ),
+            ),
+        )
+
+
+def test_strong_direct_run_rejects_missing_model_attempt() -> None:
+    """Require one attempted provider call even for interrupted direct runs."""
+    with pytest.raises(ValidationError, match="exactly one model-call attempt"):
+        completed_run(
+            execution_plan=strong_direct_execution_plan(),
+            status=RunStatus.FAILED,
+            steps=(
+                unsuccessful_step(
+                    0,
+                    ExecutionStepType.MODEL_CALL,
+                    ExecutionStatus.SKIPPED,
+                ),
+            ),
+            model_usages=(),
+            evaluations=(),
+            final_evaluation=None,
+            final_output=None,
+            contract_met=None,
+            error="Run did not complete",
+        )
+
+
+@pytest.mark.parametrize("model_role", [None, ModelRole.SMALL.value])
+def test_strong_direct_run_rejects_non_strong_model_step_facts(
+    model_role: str | None,
+) -> None:
+    """Require every direct model-call trace step to identify STRONG."""
+    with pytest.raises(ValidationError, match="STRONG model_role facts"):
+        completed_run(
+            execution_plan=strong_direct_execution_plan(),
+            steps=(
+                strong_direct_model_step(0, model_role=model_role),
+                successful_step(1, ExecutionStepType.QUALITY_EVALUATION),
+                successful_step(2, ExecutionStepType.RETURN),
+            ),
+            model_usages=(model_usage(model_role=ModelRole.STRONG),),
+        )
+
+
+def test_strong_direct_run_rejects_non_strong_usage() -> None:
+    """Require direct-plan usage to come only from the STRONG role."""
+    with pytest.raises(ValidationError, match="STRONG model usage"):
+        completed_run(
+            execution_plan=strong_direct_execution_plan(),
+            steps=(
+                strong_direct_model_step(0),
+                successful_step(1, ExecutionStepType.QUALITY_EVALUATION),
+                successful_step(2, ExecutionStepType.RETURN),
+            ),
+        )
+
+
+def test_strong_direct_run_accepts_one_strong_call_and_one_evaluation() -> None:
+    """Accept the exact successful strong-direct runtime shape."""
+    usage = model_usage(model_role=ModelRole.STRONG)
+    result = completed_run(
+        execution_plan=strong_direct_execution_plan(),
+        steps=(
+            strong_direct_model_step(0),
+            strong_direct_role_step(1, ExecutionStepType.QUALITY_EVALUATION),
+            strong_direct_role_step(2, ExecutionStepType.RETURN),
+        ),
+        model_usages=(usage,),
+    )
+
+    assert result.model_usages == (usage,)
+    assert len(result.evaluations) == 1
+    assert result.escalated is False
+
+
+@pytest.mark.parametrize(
+    ("step_type", "model_role"),
+    [
+        (ExecutionStepType.QUALITY_EVALUATION, None),
+        (ExecutionStepType.QUALITY_EVALUATION, ModelRole.SMALL.value),
+        (ExecutionStepType.RETURN, None),
+        (ExecutionStepType.RETURN, ModelRole.SMALL.value),
+    ],
+    ids=[
+        "evaluation-missing-role",
+        "evaluation-small-role",
+        "return-missing-role",
+        "return-small-role",
+    ],
+)
+def test_strong_direct_run_rejects_non_strong_evaluation_and_return_facts(
+    step_type: ExecutionStepType,
+    model_role: str | None,
+) -> None:
+    """Require direct evaluation and return steps to identify STRONG."""
+    evaluation_role = (
+        model_role
+        if step_type is ExecutionStepType.QUALITY_EVALUATION
+        else ModelRole.STRONG.value
+    )
+    return_role = (
+        model_role if step_type is ExecutionStepType.RETURN else ModelRole.STRONG.value
+    )
+
+    with pytest.raises(ValidationError, match="STRONG model_role facts"):
+        completed_run(
+            execution_plan=strong_direct_execution_plan(),
+            steps=(
+                strong_direct_model_step(0),
+                strong_direct_role_step(
+                    1,
+                    ExecutionStepType.QUALITY_EVALUATION,
+                    model_role=evaluation_role,
+                ),
+                strong_direct_role_step(
+                    2,
+                    ExecutionStepType.RETURN,
+                    model_role=return_role,
+                ),
+            ),
+            model_usages=(model_usage(model_role=ModelRole.STRONG),),
+        )
+
+
+def test_strong_direct_run_rejects_multiple_evaluation_attempts() -> None:
+    """Prevent a direct plan from recording evaluator retries."""
+    evaluation = passing_evaluation()
+    with pytest.raises(ValidationError, match="must match model-call success"):
+        completed_run(
+            execution_plan=strong_direct_execution_plan(),
+            steps=(
+                strong_direct_model_step(0),
+                strong_direct_role_step(1, ExecutionStepType.QUALITY_EVALUATION),
+                strong_direct_role_step(2, ExecutionStepType.QUALITY_EVALUATION),
+                strong_direct_role_step(3, ExecutionStepType.RETURN),
+            ),
+            model_usages=(model_usage(model_role=ModelRole.STRONG),),
+            evaluations=(evaluation, evaluation),
+            final_evaluation=evaluation,
+        )
+
+
+def test_strong_direct_run_rejects_missing_evaluation_after_successful_call() -> None:
+    """Require one evaluation attempt after the direct model call succeeds."""
+    with pytest.raises(ValidationError, match="must match model-call success"):
+        completed_run(
+            execution_plan=strong_direct_execution_plan(),
+            status=RunStatus.FAILED,
+            steps=(strong_direct_model_step(0),),
+            model_usages=(model_usage(model_role=ModelRole.STRONG),),
+            evaluations=(),
+            final_evaluation=None,
+            final_output=None,
+            contract_met=None,
+            error="Run did not complete",
+        )
+
+
+def test_strong_direct_run_rejects_evaluation_after_failed_provider_call() -> None:
+    """Do not record evaluation attempts when STRONG produced no candidate."""
+    with pytest.raises(ValidationError, match="must match model-call success"):
+        completed_run(
+            execution_plan=strong_direct_execution_plan(),
+            status=RunStatus.FAILED,
+            steps=(
+                strong_direct_model_step(0, ExecutionStatus.FAILED),
+                strong_direct_role_step(
+                    1,
+                    ExecutionStepType.QUALITY_EVALUATION,
+                    ExecutionStatus.FAILED,
+                ),
+            ),
+            model_usages=(),
+            evaluations=(),
+            final_evaluation=None,
+            final_output=None,
+            contract_met=None,
+            error="Strong provider failed",
+        )
+
+
+@pytest.mark.parametrize(
+    ("run_status", "step_status"),
+    [
+        (RunStatus.FAILED, ExecutionStatus.FAILED),
+        (RunStatus.TIMED_OUT, ExecutionStatus.TIMED_OUT),
+    ],
+)
+def test_strong_direct_run_accepts_provider_interruption_without_evaluation(
+    run_status: RunStatus,
+    step_status: ExecutionStatus,
+) -> None:
+    """Keep truthful direct provider failures valid without invented evidence."""
+    result = completed_run(
+        execution_plan=strong_direct_execution_plan(),
+        status=run_status,
+        steps=(strong_direct_model_step(0, step_status),),
+        model_usages=(),
+        evaluations=(),
+        final_evaluation=None,
+        final_output=None,
+        contract_met=None,
+        error="Strong provider did not complete",
+    )
+
+    assert result.status is run_status
+    assert result.model_usages == ()
+    assert result.evaluations == ()
+
+
+@pytest.mark.parametrize(
+    ("run_status", "step_status"),
+    [
+        (RunStatus.FAILED, ExecutionStatus.FAILED),
+        (RunStatus.TIMED_OUT, ExecutionStatus.TIMED_OUT),
+    ],
+)
+def test_strong_direct_run_accepts_evaluator_interruption_after_successful_call(
+    run_status: RunStatus,
+    step_status: ExecutionStatus,
+) -> None:
+    """Retain completed STRONG usage when its sole evaluation is interrupted."""
+    usage = model_usage(model_role=ModelRole.STRONG)
+    result = completed_run(
+        execution_plan=strong_direct_execution_plan(),
+        status=run_status,
+        steps=(
+            strong_direct_model_step(0),
+            strong_direct_role_step(
+                1,
+                ExecutionStepType.QUALITY_EVALUATION,
+                step_status,
+            ),
+        ),
+        model_usages=(usage,),
+        evaluations=(),
+        final_evaluation=None,
+        final_output=None,
+        contract_met=None,
+        error="Strong evaluation did not complete",
+    )
+
+    assert result.model_usages == (usage,)
+    assert result.evaluations == ()
+
+
+def test_strong_direct_run_rejects_escalation_events() -> None:
+    """Reject escalation claims even when no escalation step is present."""
+    evaluation_step = successful_step(
+        1, ExecutionStepType.QUALITY_EVALUATION
+    ).model_copy(update={"event_codes": (ExecutionEventCode.ESCALATED_TO_STRONG,)})
+    with pytest.raises(ValidationError, match="escalation evidence"):
+        completed_run(
+            execution_plan=strong_direct_execution_plan(),
+            steps=(
+                strong_direct_model_step(0),
+                evaluation_step,
+                successful_step(2, ExecutionStepType.RETURN),
+            ),
+            model_usages=(model_usage(model_role=ModelRole.STRONG),),
+        )
+
+
+def test_strong_direct_run_rejects_escalation_step() -> None:
+    """Reject a direct trace containing an escalation transition."""
+    with pytest.raises(ValidationError, match="escalation evidence"):
+        completed_run(
+            execution_plan=strong_direct_execution_plan(),
+            steps=(
+                strong_direct_model_step(0),
+                successful_step(1, ExecutionStepType.QUALITY_EVALUATION),
+                successful_step(2, ExecutionStepType.ESCALATION),
+                successful_step(3, ExecutionStepType.RETURN),
+            ),
+            model_usages=(model_usage(model_role=ModelRole.STRONG),),
+            escalated=True,
+        )
 
 
 @pytest.mark.parametrize(

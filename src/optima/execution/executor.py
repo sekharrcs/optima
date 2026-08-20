@@ -1,4 +1,4 @@
-"""Plan-honoring runtime orchestration for small-first execution."""
+"""Plan-honoring runtime orchestration for Planner V1 model execution."""
 
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -53,8 +53,8 @@ class SystemMonotonicClock:
         return perf_counter()
 
 
-class SmallFirstExecutor:
-    """Execute an existing small-first plan without making routing policy."""
+class PlanExecutor:
+    """Execute an existing Planner V1 model plan without making routing policy."""
 
     def __init__(
         self,
@@ -82,7 +82,7 @@ class SmallFirstExecutor:
         self._utc_now = utc_now
 
     async def execute(self, request: ExecutionRequest) -> RunResult:
-        """Execute SMALL, verify, and use the configured STRONG fallback once."""
+        """Execute the selected model policy and its mandatory verification."""
         self._validate_supported_plan(request)
         started_at = self._clock.now()
         created_at = self._utc_now()
@@ -98,45 +98,65 @@ class SmallFirstExecutor:
             steps=steps,
         )
 
-        small_result = await self._call_provider(
+        if request.execution_plan.model_policy is ModelPolicy.STRONG_DIRECT:
+            strong_attempt = await self._attempt_candidate(
+                request=request,
+                provider=self._strong_provider,
+                role=ModelRole.STRONG,
+                effective_context=effective_context,
+                context_source=context_source,
+                steps=steps,
+                usages=usages,
+                evaluations=evaluations,
+            )
+            if isinstance(strong_attempt, RunStatus):
+                return self._interrupted_result(
+                    request=request,
+                    created_at=created_at,
+                    started_at=started_at,
+                    status=strong_attempt,
+                    steps=steps,
+                    usages=usages,
+                    evaluations=evaluations,
+                    error=steps[-1].error
+                    or "Strong candidate attempt did not complete",
+                )
+            strong_result, strong_evaluation = strong_attempt
+            return self._finalize_candidate(
+                request=request,
+                created_at=created_at,
+                started_at=started_at,
+                steps=steps,
+                usages=usages,
+                evaluations=evaluations,
+                result=strong_result,
+                evaluation=strong_evaluation,
+                role=ModelRole.STRONG,
+                escalated=False,
+            )
+
+        small_attempt = await self._attempt_candidate(
             request=request,
             provider=self._small_provider,
             role=ModelRole.SMALL,
             effective_context=effective_context,
             context_source=context_source,
             steps=steps,
+            usages=usages,
+            evaluations=evaluations,
         )
-        if isinstance(small_result, RunStatus):
+        if isinstance(small_attempt, RunStatus):
             return self._interrupted_result(
                 request=request,
                 created_at=created_at,
                 started_at=started_at,
-                status=small_result,
+                status=small_attempt,
                 steps=steps,
                 usages=usages,
                 evaluations=evaluations,
-                error=steps[-1].error or "Small provider call did not complete",
+                error=steps[-1].error or "Small candidate attempt did not complete",
             )
-        usages.append(small_result.usage)
-
-        small_evaluation = await self._evaluate_candidate(
-            request=request,
-            output_text=small_result.output_text,
-            role=ModelRole.SMALL,
-            steps=steps,
-        )
-        if isinstance(small_evaluation, RunStatus):
-            return self._interrupted_result(
-                request=request,
-                created_at=created_at,
-                started_at=started_at,
-                status=small_evaluation,
-                steps=steps,
-                usages=usages,
-                evaluations=evaluations,
-                error=steps[-1].error or "Small evaluation did not complete",
-            )
-        evaluations.append(small_evaluation)
+        small_result, small_evaluation = small_attempt
         if small_evaluation.passed:
             steps.append(
                 self._return_step(
@@ -173,53 +193,100 @@ class SmallFirstExecutor:
                 },
             )
         )
-        strong_result = await self._call_provider(
+        strong_attempt = await self._attempt_candidate(
             request=request,
             provider=self._strong_provider,
             role=ModelRole.STRONG,
             effective_context=effective_context,
             context_source=context_source,
             steps=steps,
+            usages=usages,
+            evaluations=evaluations,
         )
-        if isinstance(strong_result, RunStatus):
+        if isinstance(strong_attempt, RunStatus):
             return self._interrupted_result(
                 request=request,
                 created_at=created_at,
                 started_at=started_at,
-                status=strong_result,
+                status=strong_attempt,
                 steps=steps,
                 usages=usages,
                 evaluations=evaluations,
-                error=steps[-1].error or "Strong provider call did not complete",
+                error=steps[-1].error or "Strong candidate attempt did not complete",
             )
-        usages.append(strong_result.usage)
-
-        strong_evaluation = await self._evaluate_candidate(
+        strong_result, strong_evaluation = strong_attempt
+        return self._finalize_candidate(
             request=request,
-            output_text=strong_result.output_text,
+            created_at=created_at,
+            started_at=started_at,
+            steps=steps,
+            usages=usages,
+            evaluations=evaluations,
+            result=strong_result,
+            evaluation=strong_evaluation,
             role=ModelRole.STRONG,
+            escalated=True,
+        )
+
+    async def _attempt_candidate(
+        self,
+        *,
+        request: ExecutionRequest,
+        provider: ModelProvider,
+        role: ModelRole,
+        effective_context: str | None,
+        context_source: ContextSource,
+        steps: list[ExecutionStep],
+        usages: list[ModelUsage],
+        evaluations: list[EvaluationResult],
+    ) -> tuple[ModelProviderResult, EvaluationResult] | RunStatus:
+        """Call and evaluate one model role while preserving completed evidence."""
+        result = await self._call_provider(
+            request=request,
+            provider=provider,
+            role=role,
+            effective_context=effective_context,
+            context_source=context_source,
             steps=steps,
         )
-        if isinstance(strong_evaluation, RunStatus):
-            return self._interrupted_result(
-                request=request,
-                created_at=created_at,
-                started_at=started_at,
-                status=strong_evaluation,
-                steps=steps,
-                usages=usages,
-                evaluations=evaluations,
-                error=steps[-1].error or "Strong evaluation did not complete",
-            )
-        evaluations.append(strong_evaluation)
-        if not strong_evaluation.evaluator_valid:
+        if isinstance(result, RunStatus):
+            return result
+        usages.append(result.usage)
+
+        evaluation = await self._evaluate_candidate(
+            request=request,
+            output_text=result.output_text,
+            role=role,
+            steps=steps,
+        )
+        if isinstance(evaluation, RunStatus):
+            return evaluation
+        evaluations.append(evaluation)
+        return result, evaluation
+
+    def _finalize_candidate(
+        self,
+        *,
+        request: ExecutionRequest,
+        created_at: datetime,
+        started_at: float,
+        steps: list[ExecutionStep],
+        usages: list[ModelUsage],
+        evaluations: list[EvaluationResult],
+        result: ModelProviderResult,
+        evaluation: EvaluationResult,
+        role: ModelRole,
+        escalated: bool,
+    ) -> RunResult:
+        """Return a valid final candidate or fail closed on invalid evidence."""
+        if not evaluation.evaluator_valid:
             steps.append(
                 ExecutionStep(
                     sequence=len(steps),
                     step_type=ExecutionStepType.RETURN,
                     status=ExecutionStatus.FAILED,
                     latency_ms=0,
-                    facts={"model_role": ModelRole.STRONG.value},
+                    facts={"model_role": role.value},
                     error="Final evaluation evidence is invalid",
                 )
             )
@@ -231,15 +298,15 @@ class SmallFirstExecutor:
                 steps=steps,
                 usages=usages,
                 evaluations=evaluations,
-                final_evaluation=strong_evaluation,
+                final_evaluation=evaluation,
                 error="Final evaluation evidence is invalid",
             )
 
         steps.append(
             self._return_step(
                 sequence=len(steps),
-                role=ModelRole.STRONG,
-                contract_met=strong_evaluation.passed,
+                role=role,
+                contract_met=evaluation.passed,
             )
         )
         return self._completed_result(
@@ -249,9 +316,9 @@ class SmallFirstExecutor:
             steps=steps,
             usages=usages,
             evaluations=evaluations,
-            final_output=strong_result.output_text,
-            final_evaluation=strong_evaluation,
-            escalated=True,
+            final_output=result.output_text,
+            final_evaluation=evaluation,
+            escalated=escalated,
         )
 
     async def _call_provider(
@@ -282,6 +349,12 @@ class SmallFirstExecutor:
                 raise ValueError("provider usage run_id does not match the request")
             if result.usage.model_role is not role:
                 raise ValueError("provider usage role does not match the request")
+            if result.usage.provider != provider.provider_name:
+                raise ValueError("provider usage identity does not match the provider")
+            if result.usage.deployment != provider.deployment_name:
+                raise ValueError(
+                    "provider usage deployment does not match the provider"
+                )
             result = self._with_authoritative_cost(result)
         except TimeoutError as error:
             self._append_failed_step(
@@ -543,17 +616,25 @@ class SmallFirstExecutor:
 
     def _validate_supported_plan(self, request: ExecutionRequest) -> None:
         plan = request.execution_plan
-        if not (
+        common_model_plan = (
             plan.cache_policy is CachePolicy.SKIP
             and plan.context_policy
             in {ContextPolicy.KEEP_ORIGINAL, ContextPolicy.REDUCE}
-            and plan.model_policy is ModelPolicy.SMALL_FIRST_WITH_FALLBACK
+            and plan.verification_required
+        )
+        small_first = (
+            plan.model_policy is ModelPolicy.SMALL_FIRST_WITH_FALLBACK
             and plan.initial_model_role is ModelRole.SMALL
             and plan.escalation_model_role is ModelRole.STRONG
-            and plan.verification_required
-        ):
+        )
+        strong_direct = (
+            plan.model_policy is ModelPolicy.STRONG_DIRECT
+            and plan.initial_model_role is ModelRole.STRONG
+            and plan.escalation_model_role is None
+        )
+        if not (common_model_plan and (small_first or strong_direct)):
             raise UnsupportedExecutionPlanError(
-                "Slice 8 supports SMALL_FIRST_WITH_FALLBACK model execution only"
+                "Plan executor supports Planner V1 model execution plans only"
             )
 
     def _append_failed_step(

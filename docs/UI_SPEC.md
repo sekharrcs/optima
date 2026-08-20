@@ -130,8 +130,11 @@ Required fields:
 - Quality Profile and required threshold
 - Optimization Mode
 - Final measured quality
-- Contract result: Met / Not Met
+- Contract result: Met / Not Met / Unavailable
 - Whether escalation occurred
+
+Unavailable means no valid final evaluation was returned. It is distinct from a
+valid evaluation that measured the contract as Not Met.
 
 Example plan labels:
 

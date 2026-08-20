@@ -81,6 +81,14 @@ A final answer passes when:
 - its measured score is at or above the threshold
 - any mandatory deterministic checks pass
 
+Contract status has three states:
+- `true` when valid final evidence passes
+- `false` when valid final evidence does not pass
+- unavailable when valid final evidence does not exist
+
+Unavailable evidence must fail closed and must not be reported as a measured
+contract failure.
+
 ## Quality evaluation is mandatory for normal OPTIMA runs
 
 A normal run that claims Quality Contract compliance must produce a valid evaluation result.
