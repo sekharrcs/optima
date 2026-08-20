@@ -238,7 +238,7 @@ def _render_execute_result(entry: HistoryEntry) -> None:
     resource_columns = st.columns(4)
     resource_columns[0].metric(
         "Model calls",
-        len(result.model_usages) if result.model_usages else "Unavailable",
+        decision.model_calls,
     )
     resource_columns[1].metric(
         "Total tokens",

@@ -13,9 +13,9 @@ from optima.comparison import (
     ComparableRun,
     ComparisonArm,
 )
-from optima.domain.execution import PlannerReasonCode
+from optima.domain.execution import ExecutionStatus, PlannerReasonCode
 from optima.domain.quality_contract import QualityProfile
-from optima.domain.run import PricingProvenance, RunResult
+from optima.domain.run import PricingProvenance, RunResult, RunStatus
 from ui.api_client import OptimaApiClient
 from ui.history import (
     HistoryEntry,
@@ -28,6 +28,7 @@ from ui.models import ExecuteInputs
 from ui.presentation import (
     REASON_EXPLANATIONS,
     ContractState,
+    attempted_model_call_count,
     contract_state,
     decision_view,
     format_cost,
@@ -46,6 +47,44 @@ def execute_result(**updates: object) -> RunResult:
         lambda request: httpx.Response(response.status_code, json=response.json())
     )
     return OptimaApiClient(transport=transport).execute(inputs.to_run_request())
+
+
+def interrupted_model_call_result(step_status: ExecutionStatus) -> RunResult:
+    """Build a validated interrupted run with no usage measurement."""
+    payload = execute_result().model_dump(mode="json", exclude_computed_fields=True)
+    payload.update(
+        {
+            "status": (
+                RunStatus.TIMED_OUT
+                if step_status is ExecutionStatus.TIMED_OUT
+                else RunStatus.FAILED
+            ),
+            "steps": [
+                {
+                    "sequence": 0,
+                    "step_type": "MODEL_CALL",
+                    "status": step_status,
+                    "latency_ms": 0,
+                    "event_codes": [],
+                    "facts": {},
+                    "error": (
+                        None
+                        if step_status is ExecutionStatus.SKIPPED
+                        else "Provider interrupted"
+                    ),
+                }
+            ],
+            "model_usages": [],
+            "evaluations": [],
+            "final_evaluation": None,
+            "final_output": None,
+            "contract_met": None,
+            "escalated": False,
+            "latency_ms": 0,
+            "error": "Execution interrupted",
+        }
+    )
+    return RunResult.model_validate(payload)
 
 
 def test_reason_explanations_cover_every_planner_code() -> None:
@@ -79,18 +118,46 @@ def test_decision_exposes_escalation_and_final_contract_failure() -> None:
     assert decision.contract_state is ContractState.NOT_MET
 
 
-def test_contract_state_and_cost_formatting_preserve_unavailable_values() -> None:
+def test_contract_state_and_cost_formatting_preserve_exact_values() -> None:
     """Keep False, None, exact Decimal cost, currency, and catalog identity distinct."""
     provenance = PricingProvenance(catalog_version="prices-v2", currency="USD")
 
     assert contract_state(True) is ContractState.MET
     assert contract_state(False) is ContractState.NOT_MET
     assert contract_state(None) is ContractState.UNAVAILABLE
+    assert format_cost(Decimal("10"), provenance) == "USD 10 (catalog prices-v2)"
+    assert format_cost(Decimal("100.00"), provenance) == ("USD 100 (catalog prices-v2)")
     assert format_cost(Decimal("0.0012300"), provenance) == (
         "USD 0.00123 (catalog prices-v2)"
     )
+    assert format_cost(Decimal("0"), provenance) == "USD 0 (catalog prices-v2)"
     assert format_cost(None, provenance) == "Unavailable"
     assert format_cost(Decimal("0"), None) == "Unavailable"
+
+
+def test_attempted_model_call_count_uses_non_skipped_trace_steps() -> None:
+    """Count attempts independently from optional model usage measurements."""
+    successful = execute_result()
+    failed = interrupted_model_call_result(ExecutionStatus.FAILED)
+    timed_out = interrupted_model_call_result(ExecutionStatus.TIMED_OUT)
+    skipped = interrupted_model_call_result(ExecutionStatus.SKIPPED)
+    escalated = execute_result(quality_profile=QualityProfile.CRITICAL)
+
+    assert len(successful.model_usages) == 1
+    assert attempted_model_call_count(successful.steps) == 1
+    assert failed.model_usages == ()
+    assert attempted_model_call_count(failed.steps) == 1
+    assert timed_out.model_usages == ()
+    assert attempted_model_call_count(timed_out.steps) == 1
+    assert attempted_model_call_count(skipped.steps) == 0
+    assert attempted_model_call_count(escalated.steps) == 2
+
+
+def test_execute_decision_uses_trace_based_model_call_count() -> None:
+    """Expose a failed attempt in Execute even when no usage was measured."""
+    result = interrupted_model_call_result(ExecutionStatus.FAILED)
+
+    assert decision_view(result).model_calls == 1
 
 
 def test_session_history_add_select_and_dashboard_use_actual_runs() -> None:

@@ -7,7 +7,9 @@ from enum import StrEnum
 from optima.comparison import BaselineComparison
 from optima.domain.execution import (
     ExecutionEventCode,
+    ExecutionStatus,
     ExecutionStep,
+    ExecutionStepType,
     ModelPolicy,
     PlannerReasonCode,
 )
@@ -52,6 +54,7 @@ class DecisionView:
     final_quality: str
     contract_state: ContractState
     escalation: str
+    model_calls: int
 
 
 REASON_EXPLANATIONS: dict[PlannerReasonCode, str] = {
@@ -202,6 +205,15 @@ def trace_rows(steps: tuple[ExecutionStep, ...]) -> tuple[TraceRow, ...]:
     )
 
 
+def attempted_model_call_count(steps: tuple[ExecutionStep, ...]) -> int:
+    """Count actual model-call attempts from backend execution trace facts."""
+    return sum(
+        step.step_type is ExecutionStepType.MODEL_CALL
+        and step.status is not ExecutionStatus.SKIPPED
+        for step in steps
+    )
+
+
 def decision_view(result: RunResult) -> DecisionView:
     """Build the decision card entirely from one validated RunResult."""
     plan = result.execution_plan
@@ -231,6 +243,7 @@ def decision_view(result: RunResult) -> DecisionView:
         final_quality=final_quality,
         contract_state=contract_state(result.contract_met),
         escalation="Occurred" if result.escalated else "Not required",
+        model_calls=attempted_model_call_count(result.steps),
     )
 
 
@@ -260,7 +273,9 @@ def format_cost(
     """Format exact Decimal cost only with compatible pricing provenance."""
     if amount is None or provenance is None:
         return "Unavailable"
-    normalized = format(amount, "f").rstrip("0").rstrip(".") or "0"
+    normalized = format(amount, "f")
+    if "." in normalized:
+        normalized = normalized.rstrip("0").rstrip(".")
     return f"{provenance.currency} {normalized} (catalog {provenance.catalog_version})"
 
 
