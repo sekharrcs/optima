@@ -7,8 +7,10 @@ from fastapi import FastAPI
 from optima.api.app import create_app
 from optima.api.dependencies import ExecutionDependencies
 from optima.config import AppSettings
+from optima.context import DeterministicExtractiveReducer, RegexTokenCounter
 from optima.cost import CostCalculator, PriceCatalog, PriceCatalogEntry
 from optima.evaluation import EvaluationEvidence, FakeEvaluator
+from optima.planner import ContextReducerCapability
 from optima.providers import (
     FakeProviderResponse,
     build_fake_small_provider,
@@ -22,6 +24,7 @@ DEMO_CURRENCY = "USD"
 
 def create_demo_app() -> FastAPI:
     """Create an API that executes the real planner/executor flow with local fakes."""
+    token_counter = RegexTokenCounter()
     calculator = CostCalculator(
         PriceCatalog(
             version=DEMO_CATALOG_VERSION,
@@ -45,7 +48,7 @@ def create_demo_app() -> FastAPI:
     dependencies = ExecutionDependencies(
         settings=AppSettings(
             semantic_cache_enabled=False,
-            context_reduction_enabled=False,
+            context_reduction_enabled=True,
             historical_policy_enabled=False,
             foundry_router_comparator_enabled=False,
         ),
@@ -86,6 +89,13 @@ def create_demo_app() -> FastAPI:
             )
         ),
         cost_calculator=calculator,
+        context_reducer=DeterministicExtractiveReducer(token_counter),
+        token_counter=token_counter,
+        context_reducer_capability=ContextReducerCapability(
+            available=True,
+            task_safe=True,
+            approved_for_critical_high_risk=False,
+        ),
     )
     return create_app(execution_dependencies=dependencies)
 

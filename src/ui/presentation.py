@@ -6,6 +6,7 @@ from enum import StrEnum
 
 from optima.comparison import BaselineComparison
 from optima.domain.execution import (
+    ContextReductionOutcome,
     ExecutionEventCode,
     ExecutionStatus,
     ExecutionStep,
@@ -36,6 +37,8 @@ class TraceRow:
     latency: str
     events: tuple[str, ...]
     facts: dict[str, object]
+    context_reduction: dict[str, object] | None
+    context_source: str | None
     error: str | None
 
 
@@ -55,6 +58,19 @@ class DecisionView:
     contract_state: ContractState
     escalation: str
     model_calls: int
+
+
+@dataclass(frozen=True)
+class ContextReductionView:
+    """Measured context-reduction evidence ready for direct rendering."""
+
+    status: str
+    original_tokens: int
+    effective_tokens: int
+    reduction_percentage: str
+    method: str
+    token_counter: str
+    context_source: str
 
 
 REASON_EXPLANATIONS: dict[PlannerReasonCode, str] = {
@@ -199,6 +215,14 @@ def trace_rows(steps: tuple[ExecutionStep, ...]) -> tuple[TraceRow, ...]:
             latency=f"{step.latency_ms} ms",
             events=tuple(EVENT_EXPLANATIONS[event] for event in step.event_codes),
             facts=dict(step.facts),
+            context_reduction=(
+                step.context_reduction.model_dump(mode="json")
+                if step.context_reduction is not None
+                else None
+            ),
+            context_source=(
+                step.context_source.value if step.context_source is not None else None
+            ),
             error=step.error,
         )
         for step in steps
@@ -256,9 +280,42 @@ def outcome_label(result: RunResult) -> str:
         label = "Small -> Strong escalation"
     else:
         label = "Small first -> verified without escalation"
-    if plan.context_policy.value == "REDUCE":
+    reduction = context_reduction_view(result)
+    if reduction is not None and reduction.context_source == "Reduced":
         return f"Context reduce -> {label}"
+    if reduction is not None:
+        return f"Context reduction failed; original context -> {label}"
     return label
+
+
+def context_reduction_view(result: RunResult) -> ContextReductionView | None:
+    """Project measured reduction facts without inferring from the selected plan."""
+    evidence = next(
+        (
+            step.context_reduction
+            for step in result.steps
+            if step.context_reduction is not None
+        ),
+        None,
+    )
+    if evidence is None:
+        return None
+    applied = evidence.outcome is ContextReductionOutcome.APPLIED
+    percentage = "Unavailable"
+    if applied:
+        reduction = (
+            evidence.original_token_count - evidence.effective_token_count
+        ) / evidence.original_token_count
+        percentage = f"{reduction * 100:.1f}%"
+    return ContextReductionView(
+        status="Applied" if applied else "Failed; original context used",
+        original_tokens=evidence.original_token_count,
+        effective_tokens=evidence.effective_token_count,
+        reduction_percentage=percentage,
+        method=evidence.method or "Unavailable",
+        token_counter=evidence.token_counter_name,
+        context_source=evidence.context_source.value.title(),
+    )
 
 
 def format_score(value: float | None) -> str:

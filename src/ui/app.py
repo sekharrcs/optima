@@ -23,6 +23,7 @@ from ui.history import (
 from ui.models import ExecuteInputs
 from ui.presentation import (
     ContractState,
+    context_reduction_view,
     decision_view,
     format_cost,
     format_score,
@@ -250,6 +251,8 @@ def _render_execute_result(entry: HistoryEntry) -> None:
     )
     resource_columns[3].metric("Latency", f"{result.latency_ms} ms")
 
+    _render_context_reduction(result)
+
     _render_comparison(entry.comparison)
 
     st.header("Final answer")
@@ -288,9 +291,42 @@ def _render_trace(result: RunResult) -> None:
             st.caption(" | ".join(row.events))
         if row.error:
             st.caption(f"Error: {row.error}")
-        if row.facts:
+        step_evidence = dict(row.facts)
+        if row.context_reduction is not None:
+            step_evidence["context_reduction"] = row.context_reduction
+        if row.context_source is not None:
+            step_evidence["context_source"] = row.context_source
+        if step_evidence:
             with st.expander(f"Step {row.sequence + 1} facts"):
-                st.json(row.facts)
+                st.json(step_evidence)
+
+
+def _render_context_reduction(result: RunResult) -> None:
+    """Render measured backend evidence or an explicit unavailable state."""
+    reduction = context_reduction_view(result)
+    st.subheader("Measured context reduction")
+    if reduction is None:
+        st.info(
+            "Context reduction did not run; measured reduction evidence is "
+            "unavailable for this run."
+        )
+        return
+    if reduction.context_source == "Reduced":
+        st.success("Context reduction applied before model execution.")
+    else:
+        st.warning(
+            "Context reduction did not apply. Model execution used the original "
+            "context."
+        )
+    columns = st.columns(4)
+    columns[0].metric("Original context tokens", reduction.original_tokens)
+    columns[1].metric("Effective context tokens", reduction.effective_tokens)
+    columns[2].metric("Context reduction", reduction.reduction_percentage)
+    columns[3].metric("Reduction method", reduction.method)
+    st.caption(
+        f"Step status: {reduction.status} | Context source: "
+        f"{reduction.context_source} | Counter: {reduction.token_counter}"
+    )
 
 
 def _render_comparison(comparison: BaselineComparison | None) -> None:

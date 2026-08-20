@@ -6,10 +6,14 @@ from decimal import Decimal
 import pytest
 from pydantic import ValidationError
 
+from optima.context import ContextPreservationEvidence
 from optima.domain.evaluation import EvaluationResult
 from optima.domain.execution import (
     CachePolicy,
     ContextPolicy,
+    ContextReductionEvidence,
+    ContextReductionOutcome,
+    ContextSource,
     ExecutionPlan,
     ExecutionStatus,
     ExecutionStep,
@@ -92,6 +96,44 @@ def execution_plan() -> ExecutionPlan:
         decision_evidence=decision_evidence(
             base_model_policy=ModelPolicy.SMALL_FIRST_WITH_FALLBACK,
             final_model_policy=ModelPolicy.SMALL_FIRST_WITH_FALLBACK,
+        ),
+    )
+
+
+def reduction_execution_plan() -> ExecutionPlan:
+    """Build the shared plan with reduction selected before small-first."""
+    return execution_plan().model_copy(
+        update={
+            "context_policy": ContextPolicy.REDUCE,
+            "human_readable_name": (
+                "Reduce Context -> Small -> Verify -> Escalate if needed"
+            ),
+        }
+    )
+
+
+def applied_reduction_step(sequence: int = 0) -> ExecutionStep:
+    """Build one valid measured context-reduction execution step."""
+    return ExecutionStep(
+        sequence=sequence,
+        step_type=ExecutionStepType.CONTEXT_REDUCTION,
+        status=ExecutionStatus.SUCCEEDED,
+        latency_ms=10,
+        context_reduction=ContextReductionEvidence(
+            outcome=ContextReductionOutcome.APPLIED,
+            original_token_count=100,
+            effective_token_count=40,
+            reducer_name="extractive-v1",
+            method="EXTRACTIVE",
+            token_counter_name="counter-v1",
+            context_source=ContextSource.REDUCED,
+            preservation=ContextPreservationEvidence(
+                source_order_preserved=True,
+                original_segment_count=2,
+                retained_segment_indexes=(0,),
+                removed_duplicate_count=0,
+                removed_irrelevant_count=1,
+            ),
         ),
     )
 
@@ -321,6 +363,86 @@ def test_completed_run_preserves_request_profile_and_measured_contract_result() 
     assert result.request_profile.task_type is TaskType.LOG_ANALYSIS
     assert result.request_profile.complexity is Complexity.MEDIUM
     assert result.contract_met is True
+
+
+def test_reduce_run_requires_one_leading_step_and_matching_model_source() -> None:
+    """Accept a trace only when its model context source matches applied evidence."""
+    result = completed_run(
+        execution_plan=reduction_execution_plan(),
+        steps=(
+            applied_reduction_step(),
+            successful_step(1, ExecutionStepType.MODEL_CALL).model_copy(
+                update={"context_source": ContextSource.REDUCED}
+            ),
+            successful_step(2, ExecutionStepType.QUALITY_EVALUATION),
+            successful_step(3, ExecutionStepType.RETURN),
+        ),
+    )
+
+    assert result.steps[0].context_reduction is not None
+    assert result.steps[1].context_source is ContextSource.REDUCED
+
+
+def test_reduce_run_rejects_missing_reduction_step() -> None:
+    """Prevent a selected reduction plan from omitting runtime evidence."""
+    with pytest.raises(ValidationError, match="one leading context-reduction step"):
+        completed_run(execution_plan=reduction_execution_plan())
+
+
+def test_reduce_run_rejects_late_or_duplicate_reduction_steps() -> None:
+    """Require the optional optimization to execute exactly once before models."""
+    model_step = successful_step(0, ExecutionStepType.MODEL_CALL).model_copy(
+        update={"context_source": ContextSource.REDUCED}
+    )
+    late_steps = (
+        model_step,
+        applied_reduction_step(1),
+        successful_step(2, ExecutionStepType.QUALITY_EVALUATION),
+        successful_step(3, ExecutionStepType.RETURN),
+    )
+    duplicate_steps = (
+        applied_reduction_step(0),
+        applied_reduction_step(1),
+        successful_step(2, ExecutionStepType.MODEL_CALL).model_copy(
+            update={"context_source": ContextSource.REDUCED}
+        ),
+        successful_step(3, ExecutionStepType.QUALITY_EVALUATION),
+        successful_step(4, ExecutionStepType.RETURN),
+    )
+
+    with pytest.raises(ValidationError, match="one leading context-reduction step"):
+        completed_run(execution_plan=reduction_execution_plan(), steps=late_steps)
+    with pytest.raises(ValidationError, match="one leading context-reduction step"):
+        completed_run(execution_plan=reduction_execution_plan(), steps=duplicate_steps)
+
+
+def test_reduce_run_rejects_model_context_source_mismatch() -> None:
+    """Prevent applied evidence when a model step reports original context."""
+    with pytest.raises(ValidationError, match="must match reduction outcome"):
+        completed_run(
+            execution_plan=reduction_execution_plan(),
+            steps=(
+                applied_reduction_step(),
+                successful_step(1, ExecutionStepType.MODEL_CALL).model_copy(
+                    update={"context_source": ContextSource.ORIGINAL}
+                ),
+                successful_step(2, ExecutionStepType.QUALITY_EVALUATION),
+                successful_step(3, ExecutionStepType.RETURN),
+            ),
+        )
+
+
+def test_keep_original_run_rejects_reduction_evidence() -> None:
+    """Prevent a bypassed module from fabricating a reduction attempt."""
+    with pytest.raises(ValidationError, match="cannot record reduction attempts"):
+        completed_run(
+            steps=(
+                applied_reduction_step(),
+                successful_step(1, ExecutionStepType.MODEL_CALL),
+                successful_step(2, ExecutionStepType.QUALITY_EVALUATION),
+                successful_step(3, ExecutionStepType.RETURN),
+            )
+        )
 
 
 def test_run_aggregates_one_complete_model_call() -> None:

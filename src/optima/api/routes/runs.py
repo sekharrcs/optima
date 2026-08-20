@@ -10,6 +10,7 @@ from optima.domain.execution import ExecutionPlan
 from optima.domain.quality_contract import build_quality_contract
 from optima.domain.run import RunResult
 from optima.execution import (
+    ContextReductionDependencyError,
     ExecutionRequest,
     SmallFirstExecutor,
     UnsupportedExecutionPlanError,
@@ -46,6 +47,12 @@ def build_runs_router(
             max_latency_ms=run_request.max_latency_ms,
             thresholds=dependencies.settings.quality_thresholds(),
         )
+        reducer_configured = (
+            dependencies.context_reducer is not None
+            and dependencies.token_counter is not None
+            and run_request.context is not None
+        )
+        configured_capability = dependencies.context_reducer_capability
         planner_result = select_plan(
             PlannerInput(
                 request_profile=run_request.request_profile,
@@ -53,9 +60,12 @@ def build_runs_router(
                 modules=dependencies.settings.module_configuration(),
                 thresholds=dependencies.settings.planner_thresholds(),
                 reducer_capability=ContextReducerCapability(
-                    available=False,
-                    task_safe=False,
-                    approved_for_critical_high_risk=False,
+                    available=(reducer_configured and configured_capability.available),
+                    task_safe=(reducer_configured and configured_capability.task_safe),
+                    approved_for_critical_high_risk=(
+                        reducer_configured
+                        and configured_capability.approved_for_critical_high_risk
+                    ),
                 ),
                 capabilities=PlannerCapabilities(
                     small_model_configured=True,
@@ -77,6 +87,8 @@ def build_runs_router(
             strong_provider=dependencies.strong_provider,
             evaluator=dependencies.evaluator,
             cost_calculator=dependencies.cost_calculator,
+            context_reducer=dependencies.context_reducer,
+            token_counter=dependencies.token_counter,
             monotonic_clock=dependencies.monotonic_clock,
             utc_now=dependencies.utc_now,
         )
@@ -108,6 +120,13 @@ def build_runs_router(
                     ),
                     "context_policy": execution_plan.context_policy.value,
                 },
+            )
+        except ContextReductionDependencyError as error:
+            _raise_api_error(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                code="CONTEXT_REDUCTION_NOT_CONFIGURED",
+                message=str(error),
+                facts={"context_policy": execution_plan.context_policy.value},
             )
 
     return router

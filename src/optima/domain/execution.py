@@ -6,6 +6,7 @@ from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
+from optima.context.contracts import ContextPreservationEvidence
 from optima.domain.quality_contract import OptimizationMode, QualityScore, RiskTier
 
 NonNegativeMilliseconds = Annotated[int, Field(strict=True, ge=0)]
@@ -184,6 +185,54 @@ class ExecutionStatus(StrEnum):
     SKIPPED = "SKIPPED"
 
 
+class ContextReductionOutcome(StrEnum):
+    """Actual runtime result of a selected context-reduction attempt."""
+
+    APPLIED = "APPLIED"
+    FAILED_USING_ORIGINAL = "FAILED_USING_ORIGINAL"
+
+
+class ContextSource(StrEnum):
+    """Context variant supplied to a runtime operation."""
+
+    ORIGINAL = "ORIGINAL"
+    REDUCED = "REDUCED"
+
+
+class ContextReductionEvidence(BaseModel):
+    """Measured context-reduction facts for one runtime attempt."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    outcome: ContextReductionOutcome
+    original_token_count: NonNegativeCount
+    effective_token_count: NonNegativeCount
+    reducer_name: NonEmptyString
+    method: NonEmptyString | None = None
+    token_counter_name: NonEmptyString
+    context_source: ContextSource
+    preservation: ContextPreservationEvidence | None = None
+
+    @model_validator(mode="after")
+    def validate_outcome(self) -> "ContextReductionEvidence":
+        """Align applied and recovered outcomes with their measured evidence."""
+        if self.outcome is ContextReductionOutcome.APPLIED:
+            if self.context_source is not ContextSource.REDUCED:
+                raise ValueError("applied reduction must use reduced context")
+            if self.effective_token_count >= self.original_token_count:
+                raise ValueError("applied reduction must reduce measured tokens")
+            if self.method is None or self.preservation is None:
+                raise ValueError("applied reduction requires method and preservation")
+            return self
+        if self.context_source is not ContextSource.ORIGINAL:
+            raise ValueError("failed reduction must use original context")
+        if self.effective_token_count != self.original_token_count:
+            raise ValueError("failed reduction cannot claim changed token counts")
+        if self.preservation is not None:
+            raise ValueError("failed reduction cannot claim preservation evidence")
+        return self
+
+
 class ExecutionPlan(BaseModel):
     """Provider-independent pre-execution plan selected by Planner V1."""
 
@@ -292,6 +341,8 @@ class ExecutionStep(BaseModel):
     latency_ms: NonNegativeMilliseconds
     event_codes: tuple[ExecutionEventCode, ...] = ()
     facts: dict[str, JsonValue] = Field(default_factory=dict)
+    context_reduction: ContextReductionEvidence | None = None
+    context_source: ContextSource | None = None
     error: NonEmptyString | None = None
 
     @model_validator(mode="after")
@@ -304,4 +355,21 @@ class ExecutionStep(BaseModel):
         }
         if has_error != requires_error:
             raise ValueError("failed or timed-out steps require an error exclusively")
+        if self.step_type is ExecutionStepType.CONTEXT_REDUCTION:
+            if self.context_reduction is None or self.context_source is not None:
+                raise ValueError(
+                    "context-reduction steps require reduction evidence exclusively"
+                )
+            applied = self.context_reduction.outcome is ContextReductionOutcome.APPLIED
+            if applied is not (self.status is ExecutionStatus.SUCCEEDED):
+                raise ValueError("reduction outcome and step status must agree")
+            return self
+        if self.context_reduction is not None:
+            raise ValueError(
+                "only context-reduction steps can carry reduction evidence"
+            )
+        if self.context_source is not None and (
+            self.step_type is not ExecutionStepType.MODEL_CALL
+        ):
+            raise ValueError("only model-call steps can identify effective context")
         return self

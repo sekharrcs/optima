@@ -6,8 +6,17 @@ from decimal import Decimal
 
 import pytest
 
+from optima.context import (
+    ContextPreservationEvidence,
+    ContextReductionResult,
+    FakeContextReducer,
+    RecordingTokenCounter,
+    RegexTokenCounter,
+)
 from optima.cost import CostCalculator, PriceCatalog, PriceCatalogEntry
 from optima.domain.execution import (
+    ContextReductionOutcome,
+    ContextSource,
     ExecutionEventCode,
     ExecutionPlan,
     ExecutionStatus,
@@ -28,7 +37,11 @@ from optima.evaluation import (
     EvaluationRequest,
     FakeEvaluator,
 )
-from optima.execution import ExecutionRequest, SmallFirstExecutor
+from optima.execution import (
+    ContextReductionDependencyError,
+    ExecutionRequest,
+    SmallFirstExecutor,
+)
 from optima.planner import (
     ContextReducerCapability,
     ModuleConfiguration,
@@ -134,6 +147,32 @@ def plan() -> ExecutionPlan:
     return result
 
 
+def reduction_plan() -> ExecutionPlan:
+    """Build a small-first plan with context reduction selected."""
+    reduction_profile = profile().model_copy(
+        update={"input_tokens": 4_000, "has_large_context": True}
+    )
+    result = select_plan(
+        PlannerInput(
+            request_profile=reduction_profile,
+            quality_contract=contract(),
+            modules=ModuleConfiguration(
+                semantic_cache_enabled=False,
+                context_reduction_enabled=True,
+                historical_policy_enabled=False,
+                foundry_router_comparator_enabled=False,
+            ),
+            reducer_capability=ContextReducerCapability(
+                available=True,
+                task_safe=True,
+                approved_for_critical_high_risk=False,
+            ),
+        )
+    )
+    assert not isinstance(result, PlanningFailure)
+    return result
+
+
 def execution_request() -> ExecutionRequest:
     """Build complete executor input with evaluator-owned measurement inputs."""
     return ExecutionRequest(
@@ -147,6 +186,52 @@ def execution_request() -> ExecutionRequest:
         quality_contract=contract(),
         request_profile=profile(),
         execution_plan=plan(),
+    )
+
+
+def reduction_request() -> ExecutionRequest:
+    """Build executor input whose authoritative plan selects reduction."""
+    original_context = (
+        "Priya Nair owns incident INC-204.\n"
+        "INC-204 affected 37 requests.\n"
+        "Unrelated social update for the wider team."
+    )
+    reduction_profile = profile().model_copy(
+        update={"input_tokens": 4_000, "has_large_context": True}
+    )
+    return execution_request().model_copy(
+        update={
+            "context": original_context,
+            "request_profile": reduction_profile,
+            "execution_plan": reduction_plan(),
+        }
+    )
+
+
+def measured_reduction_result(
+    *,
+    original_context: str | None = None,
+    reduced_context: str = "Priya Nair owns incident INC-204.",
+) -> ContextReductionResult:
+    """Build reduction evidence measured with the runtime counter."""
+    counter = RegexTokenCounter()
+    original = original_context or reduction_request().context
+    assert original is not None
+    return ContextReductionResult(
+        reduced_context=reduced_context,
+        original_token_count=counter.count(original),
+        reduced_token_count=counter.count(reduced_context),
+        reducer_name="fake-context-reducer",
+        method="EXTRACTIVE_TEST",
+        token_counter_name=counter.counter_name,
+        preservation=ContextPreservationEvidence(
+            source_order_preserved=True,
+            original_segment_count=3,
+            retained_segment_indexes=(0,),
+            removed_duplicate_count=0,
+            removed_irrelevant_count=2,
+            task_terms_used=("incident",),
+        ),
     )
 
 
@@ -209,6 +294,8 @@ def build_executor(
     small_provider: object | None = None,
     strong_provider: object | None = None,
     calculator: CostCalculator | None = None,
+    context_reducer: object | None = None,
+    token_counter: object | None = None,
 ) -> tuple[SmallFirstExecutor, object, object]:
     """Build fresh dependencies for one isolated execution test."""
     small = small_provider or build_fake_small_provider(
@@ -241,12 +328,209 @@ def build_executor(
             strong_provider=strong,  # type: ignore[arg-type]
             evaluator=evaluator,  # type: ignore[arg-type]
             cost_calculator=calculator or cost_calculator(),
+            context_reducer=context_reducer,  # type: ignore[arg-type]
+            token_counter=token_counter,  # type: ignore[arg-type]
             monotonic_clock=IncrementingClock(),
             utc_now=lambda: datetime(2026, 8, 19, 12, 0, tzinfo=UTC),
         ),
         small,
         strong,
     )
+
+
+def test_reduction_runs_once_before_small_pass_and_preserves_original_evaluation() -> (
+    None
+):
+    """Use measured reduced context for SMALL while evaluating against original."""
+    request = reduction_request()
+    reduced = measured_reduction_result()
+    reducer = FakeContextReducer((reduced,))
+    evaluator = FakeEvaluator(responses=(evidence(0.93),))
+    executor, small, strong = build_executor(
+        evaluator=evaluator,
+        context_reducer=reducer,
+        token_counter=RegexTokenCounter(),
+    )
+
+    result = asyncio.run(executor.execute(request))
+
+    assert len(reducer.calls) == 1
+    assert reducer.calls[0].input_text == request.input_text
+    assert reducer.calls[0].context == request.context
+    assert len(small.calls) == 1  # type: ignore[attr-defined]
+    assert small.calls[0].request.input_text == request.input_text  # type: ignore[attr-defined]
+    assert small.calls[0].request.context == reduced.reduced_context  # type: ignore[attr-defined]
+    assert len(strong.calls) == 0  # type: ignore[attr-defined]
+    assert evaluator.calls[0].request.context == request.context
+    assert result.steps[0].step_type is ExecutionStepType.CONTEXT_REDUCTION
+    assert result.steps[0].status is ExecutionStatus.SUCCEEDED
+    reduction = result.steps[0].context_reduction
+    assert reduction is not None
+    assert reduction.outcome is ContextReductionOutcome.APPLIED
+    assert reduction.original_token_count == reduced.original_token_count
+    assert reduction.effective_token_count == reduced.reduced_token_count
+    assert result.steps[1].context_source is ContextSource.REDUCED
+
+
+def test_escalation_reuses_same_validated_reduced_context() -> None:
+    """Send one reduced context to both model calls after failed SMALL quality."""
+    request = reduction_request()
+    reduced = measured_reduction_result()
+    reducer = FakeContextReducer((reduced,))
+    evaluator = FakeEvaluator(responses=(evidence(0.80), evidence(0.95)))
+    executor, small, strong = build_executor(
+        evaluator=evaluator,
+        context_reducer=reducer,
+        token_counter=RegexTokenCounter(),
+    )
+
+    result = asyncio.run(executor.execute(request))
+
+    assert len(reducer.calls) == 1
+    assert small.calls[0].request.context == reduced.reduced_context  # type: ignore[attr-defined]
+    assert strong.calls[0].request.context == reduced.reduced_context  # type: ignore[attr-defined]
+    assert tuple(call.request.context for call in evaluator.calls) == (
+        request.context,
+        request.context,
+    )
+    assert result.escalated is True
+    assert [step.step_type for step in result.steps] == [
+        ExecutionStepType.CONTEXT_REDUCTION,
+        ExecutionStepType.MODEL_CALL,
+        ExecutionStepType.QUALITY_EVALUATION,
+        ExecutionStepType.ESCALATION,
+        ExecutionStepType.MODEL_CALL,
+        ExecutionStepType.QUALITY_EVALUATION,
+        ExecutionStepType.RETURN,
+    ]
+
+
+def test_keep_original_bypasses_configured_reducer_and_preserves_context() -> None:
+    """Do not invoke or report reduction when the selected policy keeps context."""
+    reducer = FakeContextReducer((measured_reduction_result(),))
+    counter = RecordingTokenCounter(RegexTokenCounter())
+    executor, small, _ = build_executor(
+        evaluator=FakeEvaluator(responses=(evidence(0.93),)),
+        context_reducer=reducer,
+        token_counter=counter,
+    )
+
+    result = asyncio.run(executor.execute(execution_request()))
+
+    assert reducer.calls == ()
+    assert counter.calls == ()
+    assert small.calls[0].request.context == execution_request().context  # type: ignore[attr-defined]
+    assert all(
+        step.step_type is not ExecutionStepType.CONTEXT_REDUCTION
+        for step in result.steps
+    )
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_status"),
+    [
+        (RuntimeError("reducer failed"), ExecutionStatus.FAILED),
+        (TimeoutError("reducer timed out"), ExecutionStatus.TIMED_OUT),
+    ],
+)
+def test_reducer_operational_fault_uses_original_context_truthfully(
+    error: Exception,
+    expected_status: ExecutionStatus,
+) -> None:
+    """Recover optional optimization faults without claiming token reduction."""
+    request = reduction_request()
+    reducer = FakeContextReducer((error,))
+    executor, small, _ = build_executor(
+        evaluator=FakeEvaluator(responses=(evidence(0.93),)),
+        context_reducer=reducer,
+        token_counter=RegexTokenCounter(),
+    )
+
+    result = asyncio.run(executor.execute(request))
+
+    reduction_step = result.steps[0]
+    reduction = reduction_step.context_reduction
+    assert result.status is RunStatus.COMPLETED
+    assert reduction_step.status is expected_status
+    assert reduction is not None
+    assert reduction.outcome is ContextReductionOutcome.FAILED_USING_ORIGINAL
+    assert reduction.original_token_count == reduction.effective_token_count
+    assert reduction.context_source is ContextSource.ORIGINAL
+    assert small.calls[0].request.context == request.context  # type: ignore[attr-defined]
+    assert result.steps[1].context_source is ContextSource.ORIGINAL
+
+
+def test_invalid_reducer_count_evidence_falls_back_to_original() -> None:
+    """Independently reject reducer counts that disagree with the runtime counter."""
+    request = reduction_request()
+    valid = measured_reduction_result()
+    inconsistent = valid.model_copy(
+        update={"original_token_count": valid.original_token_count + 1}
+    )
+    reducer = FakeContextReducer((inconsistent,))
+    executor, small, _ = build_executor(
+        evaluator=FakeEvaluator(responses=(evidence(0.93),)),
+        context_reducer=reducer,
+        token_counter=RegexTokenCounter(),
+    )
+
+    result = asyncio.run(executor.execute(request))
+
+    assert result.steps[0].status is ExecutionStatus.FAILED
+    assert result.steps[0].error == "Context reduction ValueError"
+    assert small.calls[0].request.context == request.context  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("invalid_context", ["", None])
+def test_reducer_output_contract_violation_falls_back_to_original(
+    invalid_context: str | None,
+) -> None:
+    """Reject empty or non-reducing output after revalidating the reducer result."""
+    request = reduction_request()
+    assert request.context is not None
+    invalid_output = request.context if invalid_context is None else invalid_context
+    malicious = measured_reduction_result().model_copy(
+        update={"reduced_context": invalid_output}
+    )
+    reducer = FakeContextReducer((malicious,))
+    executor, small, _ = build_executor(
+        evaluator=FakeEvaluator(responses=(evidence(0.93),)),
+        context_reducer=reducer,
+        token_counter=RegexTokenCounter(),
+    )
+
+    result = asyncio.run(executor.execute(request))
+
+    assert result.steps[0].status is ExecutionStatus.FAILED
+    assert result.steps[0].context_reduction is not None
+    assert result.steps[0].context_reduction.outcome is (
+        ContextReductionOutcome.FAILED_USING_ORIGINAL
+    )
+    assert small.calls[0].request.context == request.context  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    ("reducer", "counter"),
+    [
+        (None, RegexTokenCounter()),
+        (FakeContextReducer((measured_reduction_result(),)), None),
+    ],
+)
+def test_reduction_plan_requires_reducer_and_counter_before_model_calls(
+    reducer: object | None,
+    counter: object | None,
+) -> None:
+    """Fail structurally when a selected plan cannot execute its first component."""
+    executor, small, strong = build_executor(
+        evaluator=FakeEvaluator(responses=(evidence(0.93),)),
+        context_reducer=reducer,
+        token_counter=counter,
+    )
+
+    with pytest.raises(ContextReductionDependencyError, match="requires a configured"):
+        asyncio.run(executor.execute(reduction_request()))
+    assert len(small.calls) == 0  # type: ignore[attr-defined]
+    assert len(strong.calls) == 0  # type: ignore[attr-defined]
 
 
 def test_small_passes_without_strong_call() -> None:

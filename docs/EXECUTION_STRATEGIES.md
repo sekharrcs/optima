@@ -58,6 +58,20 @@ Record:
 The reducer must preserve information required to answer the request.
 Context reduction may be disabled through typed module configuration.
 
+Runtime reduction evidence comes from an injected token counter applied to the
+original and reduced context. `RequestProfile.input_tokens` remains a planning
+input and is not treated as measured runtime proof.
+
+If a configured reducer fails, times out, returns invalid evidence, reports token
+counts that disagree with the runtime counter, or does not reduce measured tokens,
+the small-first executor records the unsuccessful reduction step and continues with
+the unchanged original context. The model-call trace identifies that original context
+was used. A selected reduction plan without its reducer or token-counter dependency
+fails structurally before any model call.
+
+Deterministic fixture checks can prove that named benchmark facts survive one local
+extractive reduction. They do not establish general semantic preservation.
+
 Example friendly plan names:
 - `Reduce Context -> Small -> Verify -> Escalate if needed`
 - `Reduce Context -> Strong -> Verify`

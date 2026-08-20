@@ -9,6 +9,9 @@ from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validat
 
 from optima.domain.evaluation import EvaluationResult
 from optima.domain.execution import (
+    ContextPolicy,
+    ContextReductionOutcome,
+    ContextSource,
     ExecutionPlan,
     ExecutionStatus,
     ExecutionStep,
@@ -211,6 +214,33 @@ class RunResult(BaseModel):
                 "model usage count must cover successful calls without exceeding "
                 "non-skipped attempts"
             )
+
+        reduction_steps = tuple(
+            step
+            for step in self.steps
+            if step.step_type is ExecutionStepType.CONTEXT_REDUCTION
+        )
+        if self.execution_plan.context_policy is ContextPolicy.REDUCE:
+            if len(reduction_steps) != 1 or reduction_steps[0] is not self.steps[0]:
+                raise ValueError(
+                    "REDUCE plans require one leading context-reduction step"
+                )
+            reduction = reduction_steps[0].context_reduction
+            if reduction is None:
+                raise ValueError("context-reduction step requires typed evidence")
+            expected_source = (
+                ContextSource.REDUCED
+                if reduction.outcome is ContextReductionOutcome.APPLIED
+                else ContextSource.ORIGINAL
+            )
+            if any(
+                step.context_source is not expected_source for step in model_call_steps
+            ):
+                raise ValueError(
+                    "model-call context source must match reduction outcome"
+                )
+        elif reduction_steps:
+            raise ValueError("non-REDUCE plans cannot record reduction attempts")
 
         evaluation_steps = tuple(
             step

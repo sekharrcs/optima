@@ -37,3 +37,46 @@ def test_empty_dashboard_and_history_views_start() -> None:
     assert not history.exception
     assert history.title[0].value == "Run History"
     assert "No runs" in history.info[0].value
+
+
+def test_execute_result_renders_measured_context_reduction_facts() -> None:
+    """Render backend counts, ratio, and method through Streamlit AppTest."""
+    app = AppTest.from_string(
+        """
+import httpx
+from fastapi.testclient import TestClient
+from optima.api.demo import app as demo_app
+from ui.api_client import OptimaApiClient
+from ui.app import _render_execute_result
+from ui.history import HistoryEntry
+from ui.models import ExecuteInputs
+
+inputs = ExecuteInputs(
+    input_text="Summarize incident requirements",
+    context=(
+        "Priya Nair owns incident INC-204.\\n"
+        "INC-204 affected 37 requests.\\n"
+        "Unrelated social update for the wider team."
+    ),
+    input_tokens=4_000,
+    has_large_context=True,
+)
+response = TestClient(demo_app).post(
+    "/api/v1/runs",
+    json=inputs.to_run_request().model_dump(mode="json", exclude_none=True),
+)
+transport = httpx.MockTransport(
+    lambda request: httpx.Response(response.status_code, json=response.json())
+)
+result = OptimaApiClient(transport=transport).execute(inputs.to_run_request())
+_render_execute_result(HistoryEntry(result=result))
+"""
+    ).run()
+
+    metrics = {metric.label: metric.value for metric in app.metric}
+    assert not app.exception
+    assert int(metrics["Original context tokens"]) > int(
+        metrics["Effective context tokens"]
+    )
+    assert metrics["Context reduction"].endswith("%")
+    assert metrics["Reduction method"] == "RELEVANCE_AND_FACT_EXTRACTIVE_V1"
