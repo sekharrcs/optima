@@ -6,14 +6,23 @@ from fastapi import APIRouter, HTTPException, status
 
 from optima.api.dependencies import ExecutionDependencies
 from optima.api.models import ApiError, RunRequest
+from optima.cache import SemanticCacheLookupRequest
 from optima.context.safety import ContextReducerSafetyRequest
-from optima.domain.execution import ExecutionPlan
+from optima.domain.cache import CacheCandidate
+from optima.domain.execution import (
+    CachePolicy,
+    ExecutionPlan,
+    PlannerReasonCode,
+    SemanticCacheEvidence,
+    SemanticCacheOutcome,
+)
 from optima.domain.quality_contract import build_quality_contract
 from optima.domain.run import RunResult
 from optima.execution import (
     ContextReductionDependencyError,
     ExecutionRequest,
     PlanExecutor,
+    SystemMonotonicClock,
     UnsupportedExecutionPlanError,
 )
 from optima.planner import (
@@ -48,6 +57,51 @@ def build_runs_router(
             max_latency_ms=run_request.max_latency_ms,
             thresholds=dependencies.settings.quality_thresholds(),
         )
+        run_id = dependencies.run_id_factory()
+        correlation_id = dependencies.correlation_id_factory()
+        clock = dependencies.monotonic_clock or SystemMonotonicClock()
+        request_started_at = clock.now()
+        cache_candidate: CacheCandidate | None = None
+        cache_outcome: SemanticCacheOutcome
+        cache_error: str | None = None
+        cache_lookup_latency_ms = 0
+        if not dependencies.settings.semantic_cache_enabled:
+            cache_outcome = SemanticCacheOutcome.DISABLED_BYPASSED
+        elif dependencies.semantic_cache is None:
+            _raise_api_error(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                code="SEMANTIC_CACHE_NOT_CONFIGURED",
+                message=(
+                    "Semantic cache is enabled but no runtime dependency is configured"
+                ),
+            )
+        elif not run_request.request_profile.cache_eligible:
+            cache_outcome = SemanticCacheOutcome.INELIGIBLE_BYPASSED
+        else:
+            lookup_started_at = clock.now()
+            try:
+                cache_candidate = await dependencies.semantic_cache.lookup(
+                    SemanticCacheLookupRequest(
+                        run_id=run_id,
+                        input_text=run_request.input_text,
+                        context=run_request.context,
+                        quality_contract=quality_contract,
+                        request_profile=run_request.request_profile,
+                        metadata=run_request.metadata,
+                    )
+                )
+                cache_outcome = (
+                    SemanticCacheOutcome.MISS
+                    if cache_candidate is None
+                    else SemanticCacheOutcome.MATCH_REJECTED
+                )
+            except TimeoutError as error:
+                cache_outcome = SemanticCacheOutcome.LOOKUP_TIMED_OUT
+                cache_error = f"Semantic cache {type(error).__name__}"
+            except Exception as error:
+                cache_outcome = SemanticCacheOutcome.LOOKUP_FAILED
+                cache_error = f"Semantic cache {type(error).__name__}"
+            cache_lookup_latency_ms = _elapsed_ms(clock.now(), lookup_started_at)
         reducer_configured = (
             dependencies.context_reducer is not None
             and dependencies.token_counter is not None
@@ -85,6 +139,7 @@ def build_runs_router(
                     strong_model_configured=True,
                     evaluator_configured=True,
                 ),
+                cache_candidate=cache_candidate,
             )
         )
         if isinstance(planner_result, PlanningFailure):
@@ -94,6 +149,26 @@ def build_runs_router(
                 message=planner_result.message,
             )
         execution_plan = _require_execution_plan(planner_result)
+        cache_reason = _cache_reason(execution_plan)
+        if execution_plan.cache_policy is CachePolicy.USE_CACHED_RESULT:
+            cache_outcome = SemanticCacheOutcome.REUSED
+        cache_evidence = SemanticCacheEvidence(
+            outcome=cache_outcome,
+            lookup_latency_ms=cache_lookup_latency_ms,
+            planner_reason_code=cache_reason,
+            source_run_id=(
+                cache_candidate.source_run_id if cache_candidate is not None else None
+            ),
+            similarity=(
+                cache_candidate.similarity if cache_candidate is not None else None
+            ),
+            prior_evaluation=(
+                cache_candidate.prior_evaluation
+                if cache_candidate is not None
+                else None
+            ),
+            error=cache_error,
+        )
 
         executor = PlanExecutor(
             small_provider=dependencies.small_provider,
@@ -102,14 +177,14 @@ def build_runs_router(
             cost_calculator=dependencies.cost_calculator,
             context_reducer=dependencies.context_reducer,
             token_counter=dependencies.token_counter,
-            monotonic_clock=dependencies.monotonic_clock,
+            monotonic_clock=clock,
             utc_now=dependencies.utc_now,
         )
         try:
             return await executor.execute(
                 ExecutionRequest(
-                    run_id=dependencies.run_id_factory(),
-                    correlation_id=dependencies.correlation_id_factory(),
+                    run_id=run_id,
+                    correlation_id=correlation_id,
                     input_text=run_request.input_text,
                     context=run_request.context,
                     reference_output=run_request.reference_output,
@@ -118,7 +193,9 @@ def build_runs_router(
                     quality_contract=quality_contract,
                     request_profile=run_request.request_profile,
                     execution_plan=execution_plan,
-                )
+                    semantic_cache=cache_evidence,
+                ),
+                started_at=request_started_at,
             )
         except UnsupportedExecutionPlanError as error:
             _raise_api_error(
@@ -143,6 +220,34 @@ def build_runs_router(
             )
 
     return router
+
+
+def _cache_reason(execution_plan: ExecutionPlan) -> PlannerReasonCode:
+    """Return the controlling Planner V1 semantic-cache reason."""
+    cache_reasons = {
+        PlannerReasonCode.SEMANTIC_CACHE_DISABLED,
+        PlannerReasonCode.CACHE_REQUEST_NOT_ELIGIBLE,
+        PlannerReasonCode.CACHE_CANDIDATE_NOT_SUPPLIED,
+        PlannerReasonCode.CACHE_SIMILARITY_BELOW_THRESHOLD,
+        PlannerReasonCode.CACHE_PRIOR_EVALUATOR_INVALID,
+        PlannerReasonCode.CACHE_PRIOR_EVALUATION_FAILED,
+        PlannerReasonCode.CACHE_QUALITY_BELOW_CONTRACT_THRESHOLD,
+        PlannerReasonCode.CACHE_CONTRACT_INCOMPATIBLE,
+        PlannerReasonCode.CACHE_REUSE_UNSAFE,
+        PlannerReasonCode.CACHE_HIGH_CONFIDENCE_MATCH,
+    }
+    reason = next(
+        (code for code in execution_plan.reason_codes if code in cache_reasons),
+        None,
+    )
+    if reason is None:
+        raise AssertionError("Planner V1 plan must contain one cache reason")
+    return reason
+
+
+def _elapsed_ms(ended_at: float, started_at: float) -> int:
+    """Return one non-negative rounded elapsed duration."""
+    return max(0, int(round((ended_at - started_at) * 1000)))
 
 
 def _require_execution_plan(

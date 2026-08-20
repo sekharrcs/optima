@@ -7,6 +7,8 @@ from typing import Annotated
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 from optima.context.contracts import ContextPreservationEvidence
+from optima.domain.cache import CacheCandidate
+from optima.domain.evaluation import EvaluationResult
 from optima.domain.quality_contract import OptimizationMode, QualityScore, RiskTier
 
 NonNegativeMilliseconds = Annotated[int, Field(strict=True, ge=0)]
@@ -17,6 +19,7 @@ NonNegativeDecimal = Annotated[
 NonEmptyString = Annotated[str, Field(strict=True, min_length=1)]
 NonNegativeCount = Annotated[int, Field(strict=True, ge=0)]
 StrictBoolean = Annotated[bool, Field(strict=True)]
+Rate = Annotated[float, Field(strict=True, ge=0.0, le=1.0, allow_inf_nan=False)]
 
 
 class CachePolicy(StrEnum):
@@ -129,6 +132,7 @@ class PlannerDecisionEvidence(BaseModel):
     contract_risk_tier: RiskTier
     effective_risk_tier: RiskTier
     module_states: PlannerModuleStates
+    cache_similarity_threshold: Rate = 0.95
     cache_candidate_assessed: StrictBoolean
     historical_statistics: HistoricalDecisionEvidence | None = None
     base_model_policy: ModelPolicy | None = None
@@ -158,6 +162,11 @@ class PlannerDecisionEvidence(BaseModel):
 class ExecutionEventCode(StrEnum):
     """Runtime result and escalation events defined by Planner V1."""
 
+    CACHE_RESULT_REUSED = "CACHE_RESULT_REUSED"
+    CACHE_MISS = "CACHE_MISS"
+    CACHE_MATCH_REJECTED = "CACHE_MATCH_REJECTED"
+    CACHE_LOOKUP_FAILED = "CACHE_LOOKUP_FAILED"
+    CACHE_LOOKUP_TIMED_OUT = "CACHE_LOOKUP_TIMED_OUT"
     QUALITY_CONTRACT_MET = "QUALITY_CONTRACT_MET"
     QUALITY_THRESHOLD_NOT_MET = "QUALITY_THRESHOLD_NOT_MET"
     ESCALATION_REQUIRED = "ESCALATION_REQUIRED"
@@ -197,6 +206,98 @@ class ContextSource(StrEnum):
 
     ORIGINAL = "ORIGINAL"
     REDUCED = "REDUCED"
+
+
+class SemanticCacheOutcome(StrEnum):
+    """Actual semantic-cache outcome for one request."""
+
+    DISABLED_BYPASSED = "DISABLED_BYPASSED"
+    INELIGIBLE_BYPASSED = "INELIGIBLE_BYPASSED"
+    MISS = "MISS"
+    MATCH_REJECTED = "MATCH_REJECTED"
+    REUSED = "REUSED"
+    LOOKUP_FAILED = "LOOKUP_FAILED"
+    LOOKUP_TIMED_OUT = "LOOKUP_TIMED_OUT"
+
+
+class SemanticCacheEvidence(BaseModel):
+    """Typed lookup, planner-assessment, and reuse facts for one request."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    outcome: SemanticCacheOutcome
+    lookup_latency_ms: NonNegativeMilliseconds
+    planner_reason_code: PlannerReasonCode
+    source_run_id: NonEmptyString | None = None
+    similarity: Rate | None = None
+    prior_evaluation: EvaluationResult | None = None
+    error: NonEmptyString | None = None
+
+    @model_validator(mode="after")
+    def validate_outcome(self) -> "SemanticCacheEvidence":
+        """Reject impossible combinations of cache outcome and evidence."""
+        source_values = (
+            self.source_run_id,
+            self.similarity,
+            self.prior_evaluation,
+        )
+        has_all_source = all(value is not None for value in source_values)
+        has_any_source = any(value is not None for value in source_values)
+        bypass_reasons = {
+            SemanticCacheOutcome.DISABLED_BYPASSED: (
+                PlannerReasonCode.SEMANTIC_CACHE_DISABLED
+            ),
+            SemanticCacheOutcome.INELIGIBLE_BYPASSED: (
+                PlannerReasonCode.CACHE_REQUEST_NOT_ELIGIBLE
+            ),
+        }
+        if self.outcome in bypass_reasons:
+            if self.planner_reason_code is not bypass_reasons[self.outcome]:
+                raise ValueError("cache bypass outcome and planner reason must agree")
+            if self.lookup_latency_ms != 0 or has_any_source or self.error is not None:
+                raise ValueError("cache bypass cannot claim lookup or source evidence")
+            return self
+        if self.outcome is SemanticCacheOutcome.MISS:
+            if (
+                self.planner_reason_code
+                is not PlannerReasonCode.CACHE_CANDIDATE_NOT_SUPPLIED
+                or has_any_source
+                or self.error is not None
+            ):
+                raise ValueError("cache miss must contain only truthful miss evidence")
+            return self
+        if self.outcome in {
+            SemanticCacheOutcome.LOOKUP_FAILED,
+            SemanticCacheOutcome.LOOKUP_TIMED_OUT,
+        }:
+            if (
+                self.planner_reason_code
+                is not PlannerReasonCode.CACHE_CANDIDATE_NOT_SUPPLIED
+                or has_any_source
+                or self.error is None
+            ):
+                raise ValueError("cache lookup failure requires only an error")
+            return self
+        if not has_all_source or self.error is not None:
+            raise ValueError("assessed cache outcomes require complete source evidence")
+        if self.outcome is SemanticCacheOutcome.REUSED:
+            if (
+                self.planner_reason_code
+                is not PlannerReasonCode.CACHE_HIGH_CONFIDENCE_MATCH
+            ):
+                raise ValueError("cache reuse requires the accepted planner reason")
+            return self
+        rejection_reasons = {
+            PlannerReasonCode.CACHE_SIMILARITY_BELOW_THRESHOLD,
+            PlannerReasonCode.CACHE_PRIOR_EVALUATOR_INVALID,
+            PlannerReasonCode.CACHE_PRIOR_EVALUATION_FAILED,
+            PlannerReasonCode.CACHE_QUALITY_BELOW_CONTRACT_THRESHOLD,
+            PlannerReasonCode.CACHE_CONTRACT_INCOMPATIBLE,
+            PlannerReasonCode.CACHE_REUSE_UNSAFE,
+        }
+        if self.planner_reason_code not in rejection_reasons:
+            raise ValueError("rejected cache match requires a rejection reason")
+        return self
 
 
 class ContextReductionEvidence(BaseModel):
@@ -248,6 +349,7 @@ class ExecutionPlan(BaseModel):
     reason_codes: Annotated[tuple[PlannerReasonCode, ...], Field(min_length=1)]
     human_readable_name: NonEmptyString
     decision_evidence: PlannerDecisionEvidence
+    cache_candidate: CacheCandidate | None = None
     expected_quality_score: QualityScore | None = None
     expected_cost: NonNegativeDecimal | None = None
 
@@ -295,6 +397,8 @@ class ExecutionPlan(BaseModel):
                 raise ValueError("semantic-cache plans require a cache-match reason")
             if not self.decision_evidence.cache_candidate_assessed:
                 raise ValueError("semantic-cache plans require candidate assessment")
+            if self.cache_candidate is None:
+                raise ValueError("semantic-cache plans require the resolved candidate")
             if any(
                 policy is not None
                 for policy in (
@@ -305,6 +409,8 @@ class ExecutionPlan(BaseModel):
                 raise ValueError("semantic-cache evidence cannot contain model policy")
             return self
 
+        if self.cache_candidate is not None:
+            raise ValueError("model-executed plans cannot carry a cache candidate")
         if self.context_policy is ContextPolicy.NOT_APPLICABLE:
             raise ValueError("model-executed plans require a context policy")
         if self.decision_evidence.base_model_policy is None:
@@ -341,6 +447,7 @@ class ExecutionStep(BaseModel):
     latency_ms: NonNegativeMilliseconds
     event_codes: tuple[ExecutionEventCode, ...] = ()
     facts: dict[str, JsonValue] = Field(default_factory=dict)
+    semantic_cache: SemanticCacheEvidence | None = None
     context_reduction: ContextReductionEvidence | None = None
     context_source: ContextSource | None = None
     error: NonEmptyString | None = None
@@ -356,7 +463,11 @@ class ExecutionStep(BaseModel):
         if has_error != requires_error:
             raise ValueError("failed or timed-out steps require an error exclusively")
         if self.step_type is ExecutionStepType.CONTEXT_REDUCTION:
-            if self.context_reduction is None or self.context_source is not None:
+            if (
+                self.context_reduction is None
+                or self.semantic_cache is not None
+                or self.context_source is not None
+            ):
                 raise ValueError(
                     "context-reduction steps require reduction evidence exclusively"
                 )
@@ -368,6 +479,23 @@ class ExecutionStep(BaseModel):
             raise ValueError(
                 "only context-reduction steps can carry reduction evidence"
             )
+        if self.step_type is ExecutionStepType.SEMANTIC_CACHE:
+            if self.semantic_cache is None or self.context_source is not None:
+                raise ValueError(
+                    "semantic-cache steps require cache evidence exclusively"
+                )
+            expected_status = {
+                SemanticCacheOutcome.MISS: ExecutionStatus.SUCCEEDED,
+                SemanticCacheOutcome.MATCH_REJECTED: ExecutionStatus.SUCCEEDED,
+                SemanticCacheOutcome.REUSED: ExecutionStatus.SUCCEEDED,
+                SemanticCacheOutcome.LOOKUP_FAILED: ExecutionStatus.FAILED,
+                SemanticCacheOutcome.LOOKUP_TIMED_OUT: ExecutionStatus.TIMED_OUT,
+            }.get(self.semantic_cache.outcome)
+            if expected_status is None or self.status is not expected_status:
+                raise ValueError("cache outcome and execution status must agree")
+            return self
+        if self.semantic_cache is not None:
+            raise ValueError("only semantic-cache steps can carry cache evidence")
         if self.context_source is not None and (
             self.step_type is not ExecutionStepType.MODEL_CALL
         ):

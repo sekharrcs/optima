@@ -137,3 +137,21 @@ When configured conceptual capabilities cannot satisfy mandatory plan
 constraints, Planner V1 returns a typed planning failure instead of selecting a
 knowingly invalid plan. Provider calls and runtime quality failure handling
 remain outside the planner.
+
+## ADR-018: Semantic-cache reuse binds one pre-planning lookup
+
+Status: Accepted
+
+The application performs at most one provider-independent semantic-cache lookup
+before Planner V1. A resolved value contains the exact cached output and its
+source-run, similarity, prior-evaluation, contract-compatibility, and reuse-safety
+evidence. The cache abstraction retrieves evidence but makes no reuse decision.
+
+Planner V1 applies all cache gates. An accepted plan carries a detached snapshot
+of the exact resolved value, and the executor consumes that snapshot without a
+second lookup. This prevents time-of-check/time-of-use substitution.
+
+Source evaluation evidence remains unchanged and is exposed separately from
+current-run evaluations. Cache failures and timeouts fall back to normal model
+execution with typed runtime evidence. Redis persistence, cache writes,
+invalidation, embeddings, and cloud adapters remain Slice 10 or later.

@@ -24,6 +24,8 @@ from optima.domain.execution import (
     ExecutionStepType,
     ModelPolicy,
     ModelRole,
+    SemanticCacheEvidence,
+    SemanticCacheOutcome,
 )
 from optima.domain.run import ModelUsage, RunResult, RunStatus
 from optima.evaluation import EvaluationRequest, QualityEvaluator
@@ -81,10 +83,15 @@ class PlanExecutor:
         self._clock = monotonic_clock or SystemMonotonicClock()
         self._utc_now = utc_now
 
-    async def execute(self, request: ExecutionRequest) -> RunResult:
+    async def execute(
+        self,
+        request: ExecutionRequest,
+        *,
+        started_at: float | None = None,
+    ) -> RunResult:
         """Execute the selected model policy and its mandatory verification."""
         self._validate_supported_plan(request)
-        started_at = self._clock.now()
+        run_started_at = self._clock.now() if started_at is None else started_at
         created_at = self._utc_now()
         if created_at.utcoffset() is None:
             raise ValueError("utc_now must return a timezone-aware datetime")
@@ -92,6 +99,15 @@ class PlanExecutor:
         steps: list[ExecutionStep] = []
         usages: list[ModelUsage] = []
         evaluations: list[EvaluationResult] = []
+
+        self._append_cache_step(request.semantic_cache, steps)
+        if request.execution_plan.cache_policy is CachePolicy.USE_CACHED_RESULT:
+            return self._complete_cache_hit(
+                request=request,
+                created_at=created_at,
+                started_at=run_started_at,
+                steps=steps,
+            )
 
         effective_context, context_source = await self._prepare_context(
             request=request,
@@ -113,7 +129,7 @@ class PlanExecutor:
                 return self._interrupted_result(
                     request=request,
                     created_at=created_at,
-                    started_at=started_at,
+                    started_at=run_started_at,
                     status=strong_attempt,
                     steps=steps,
                     usages=usages,
@@ -125,7 +141,7 @@ class PlanExecutor:
             return self._finalize_candidate(
                 request=request,
                 created_at=created_at,
-                started_at=started_at,
+                started_at=run_started_at,
                 steps=steps,
                 usages=usages,
                 evaluations=evaluations,
@@ -149,7 +165,7 @@ class PlanExecutor:
             return self._interrupted_result(
                 request=request,
                 created_at=created_at,
-                started_at=started_at,
+                started_at=run_started_at,
                 status=small_attempt,
                 steps=steps,
                 usages=usages,
@@ -168,7 +184,7 @@ class PlanExecutor:
             return self._completed_result(
                 request=request,
                 created_at=created_at,
-                started_at=started_at,
+                started_at=run_started_at,
                 steps=steps,
                 usages=usages,
                 evaluations=evaluations,
@@ -207,7 +223,7 @@ class PlanExecutor:
             return self._interrupted_result(
                 request=request,
                 created_at=created_at,
-                started_at=started_at,
+                started_at=run_started_at,
                 status=strong_attempt,
                 steps=steps,
                 usages=usages,
@@ -218,7 +234,7 @@ class PlanExecutor:
         return self._finalize_candidate(
             request=request,
             created_at=created_at,
-            started_at=started_at,
+            started_at=run_started_at,
             steps=steps,
             usages=usages,
             evaluations=evaluations,
@@ -616,6 +632,13 @@ class PlanExecutor:
 
     def _validate_supported_plan(self, request: ExecutionRequest) -> None:
         plan = request.execution_plan
+        cache_hit = (
+            plan.cache_policy is CachePolicy.USE_CACHED_RESULT
+            and plan.context_policy is ContextPolicy.NOT_APPLICABLE
+            and plan.model_policy is None
+            and not plan.verification_required
+            and plan.cache_candidate is not None
+        )
         common_model_plan = (
             plan.cache_policy is CachePolicy.SKIP
             and plan.context_policy
@@ -632,10 +655,99 @@ class PlanExecutor:
             and plan.initial_model_role is ModelRole.STRONG
             and plan.escalation_model_role is None
         )
-        if not (common_model_plan and (small_first or strong_direct)):
+        if not (cache_hit or (common_model_plan and (small_first or strong_direct))):
             raise UnsupportedExecutionPlanError(
-                "Plan executor supports Planner V1 model execution plans only"
+                "Plan executor supports Planner V1 cache and model plans only"
             )
+
+    def _append_cache_step(
+        self,
+        evidence: SemanticCacheEvidence | None,
+        steps: list[ExecutionStep],
+    ) -> None:
+        """Record only actual lookup attempts, never disabled or ineligible bypasses."""
+        if evidence is None or evidence.outcome in {
+            SemanticCacheOutcome.DISABLED_BYPASSED,
+            SemanticCacheOutcome.INELIGIBLE_BYPASSED,
+        }:
+            return
+        status = {
+            SemanticCacheOutcome.MISS: ExecutionStatus.SUCCEEDED,
+            SemanticCacheOutcome.MATCH_REJECTED: ExecutionStatus.SUCCEEDED,
+            SemanticCacheOutcome.REUSED: ExecutionStatus.SUCCEEDED,
+            SemanticCacheOutcome.LOOKUP_FAILED: ExecutionStatus.FAILED,
+            SemanticCacheOutcome.LOOKUP_TIMED_OUT: ExecutionStatus.TIMED_OUT,
+        }[evidence.outcome]
+        event = {
+            SemanticCacheOutcome.MISS: ExecutionEventCode.CACHE_MISS,
+            SemanticCacheOutcome.MATCH_REJECTED: (
+                ExecutionEventCode.CACHE_MATCH_REJECTED
+            ),
+            SemanticCacheOutcome.REUSED: ExecutionEventCode.CACHE_RESULT_REUSED,
+            SemanticCacheOutcome.LOOKUP_FAILED: (
+                ExecutionEventCode.CACHE_LOOKUP_FAILED
+            ),
+            SemanticCacheOutcome.LOOKUP_TIMED_OUT: (
+                ExecutionEventCode.CACHE_LOOKUP_TIMED_OUT
+            ),
+        }[evidence.outcome]
+        events: tuple[ExecutionEventCode, ...] = (event,)
+        if evidence.outcome is SemanticCacheOutcome.REUSED:
+            events += (ExecutionEventCode.QUALITY_CONTRACT_MET,)
+        steps.append(
+            ExecutionStep(
+                sequence=len(steps),
+                step_type=ExecutionStepType.SEMANTIC_CACHE,
+                status=status,
+                latency_ms=evidence.lookup_latency_ms,
+                event_codes=events,
+                semantic_cache=evidence,
+                error=evidence.error,
+            )
+        )
+
+    def _complete_cache_hit(
+        self,
+        *,
+        request: ExecutionRequest,
+        created_at: datetime,
+        started_at: float,
+        steps: list[ExecutionStep],
+    ) -> RunResult:
+        """Return the exact planner-assessed cache output without new execution."""
+        candidate = request.execution_plan.cache_candidate
+        if candidate is None:
+            raise AssertionError("validated cache plan must contain its candidate")
+        steps.append(
+            ExecutionStep(
+                sequence=len(steps),
+                step_type=ExecutionStepType.RETURN,
+                status=ExecutionStatus.SUCCEEDED,
+                latency_ms=0,
+                facts={
+                    "contract_met": True,
+                    "source_run_id": candidate.source_run_id,
+                },
+            )
+        )
+        return RunResult(
+            run_id=request.run_id,
+            correlation_id=request.correlation_id,
+            created_at=created_at,
+            status=RunStatus.COMPLETED,
+            quality_contract=request.quality_contract,
+            request_profile=request.request_profile,
+            execution_plan=request.execution_plan,
+            semantic_cache=request.semantic_cache,
+            steps=tuple(steps),
+            model_usages=(),
+            evaluations=(),
+            final_evaluation=None,
+            final_output=candidate.output_text,
+            contract_met=True,
+            escalated=False,
+            latency_ms=self._elapsed_ms(started_at),
+        )
 
     def _append_failed_step(
         self,
@@ -697,6 +809,7 @@ class PlanExecutor:
             quality_contract=request.quality_contract,
             request_profile=request.request_profile,
             execution_plan=request.execution_plan,
+            semantic_cache=request.semantic_cache,
             steps=tuple(steps),
             model_usages=tuple(usages),
             evaluations=tuple(evaluations),
@@ -728,6 +841,7 @@ class PlanExecutor:
             quality_contract=request.quality_contract,
             request_profile=request.request_profile,
             execution_plan=request.execution_plan,
+            semantic_cache=request.semantic_cache,
             steps=tuple(steps),
             model_usages=tuple(usages),
             evaluations=tuple(evaluations),

@@ -110,9 +110,15 @@ Acceptance:
 ## Slice 9 - Semantic cache
 Acceptance:
 - module can be enabled/disabled through typed configuration
-- hit/miss flow
-- similarity and source run surfaced
-- cache results must have previously passed quality
+- one provider-independent lookup occurs before planning without a second lookup
+- hit, miss, rejected-match, failure, and timeout flows carry typed runtime evidence
+- similarity, source run, lookup latency, and cached quality evidence are surfaced
+- accepted plans bind the exact resolved output and source evidence
+- source evaluation identity, threshold, pass result, checks, and metadata remain unchanged
+- cache results must have valid prior passing evidence and satisfy the current contract
+- cache hits perform no model, context-reduction, or current evaluator calls
+- cache failures and timeouts fall back to unchanged model execution
+- the local exact-match demo proves integration only; Redis remains Slice 10
 
 ## Slice 10 - Azure adapters
 Implement:

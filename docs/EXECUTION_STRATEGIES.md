@@ -33,10 +33,25 @@ Record:
 - similarity
 - source run
 - cached quality score
-- model call avoided
-- estimated/known avoided cost
+- actual cache lookup latency and outcome
+- zero current-run model calls and model tokens
 
 Do not reuse answers for requests with unsafe context-dependent differences.
+
+The runtime performs one lookup before planning and binds the exact resolved
+output and source evidence to an accepted plan. It does not search again during
+execution. Planner V1 remains the sole authority for similarity, prior quality,
+current-threshold compatibility, contract compatibility, and reuse safety.
+
+The source evaluation remains unchanged, including its source threshold, pass
+result, checks, reasons, and metadata. A cache hit does not run or claim a new
+evaluation. The current contract result is derived from Planner V1's acceptance
+of that valid source evidence and its inclusive score comparison against the
+current threshold.
+
+Actual cache-run model cost is unavailable because no model usage exists. Avoided
+cost is reported only when a compatible measured baseline supports it; source or
+estimated cost must not be presented as current calculated cost.
 
 Example friendly plan name:
 

@@ -6,6 +6,8 @@ import pytest
 from pydantic import ValidationError
 
 from optima.context import ContextPreservationEvidence
+from optima.domain.cache import CacheCandidate
+from optima.domain.evaluation import EvaluationResult
 from optima.domain.execution import (
     CachePolicy,
     ContextPolicy,
@@ -116,6 +118,22 @@ def semantic_cache_plan(**updates: object) -> ExecutionPlan:
             final_model_policy=None,
             cache_candidate_assessed=True,
         ),
+        "cache_candidate": CacheCandidate(
+            source_run_id="run-source-1",
+            output_text="cached output",
+            similarity=0.99,
+            prior_evaluation=EvaluationResult(
+                evaluator_type="deterministic",
+                evaluator_valid=True,
+                score=0.95,
+                threshold=0.90,
+                mandatory_checks_passed=True,
+                passed=True,
+                reasons=("Accepted",),
+            ),
+            contract_compatible=True,
+            safe_to_reuse=True,
+        ),
     }
     values.update(updates)
     return ExecutionPlan.model_validate(values)
@@ -180,6 +198,7 @@ def test_semantic_cache_plan_bypasses_context_and_models() -> None:
     assert plan.model_policy is None
     assert plan.initial_model_role is None
     assert plan.verification_required is False
+    assert plan.cache_candidate is not None
 
 
 @pytest.mark.parametrize(
@@ -191,6 +210,7 @@ def test_semantic_cache_plan_bypasses_context_and_models() -> None:
         ("verification_required", True),
         ("escalation_model_role", ModelRole.STRONG),
         ("reason_codes", (PlannerReasonCode.OPTIMIZATION_MODE_QUALITY,)),
+        ("cache_candidate", None),
     ],
 )
 def test_semantic_cache_plan_rejects_model_execution_shape(
@@ -276,6 +296,12 @@ def test_cache_plan_rejects_unassessed_candidate_evidence() -> None:
                 cache_candidate_assessed=False,
             )
         )
+
+
+def test_model_plan_rejects_resolved_cache_payload() -> None:
+    """Prevent a rejected candidate from leaking into model execution."""
+    with pytest.raises(ValidationError, match="cannot carry a cache candidate"):
+        small_first_plan(cache_candidate=semantic_cache_plan().cache_candidate)
 
 
 @pytest.mark.parametrize("expected_cost", [Decimal("-0.01"), Decimal("NaN")])

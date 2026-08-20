@@ -59,6 +59,9 @@ def select_plan(planner_input: PlannerInput) -> PlannerResult:
             contract_risk_tier=contract.risk_tier,
             effective_risk_tier=effective_risk,
             module_states=module_states,
+            cache_similarity_threshold=(
+                planner_input.thresholds.cache_similarity_threshold
+            ),
             cache_candidate_assessed=cache_decision.candidate_assessed,
         )
         return ExecutionPlan(
@@ -79,6 +82,9 @@ def select_plan(planner_input: PlannerInput) -> PlannerResult:
                 model_policy=None,
             ),
             decision_evidence=evidence,
+            cache_candidate=planner_input.cache_candidate.detached_copy()
+            if planner_input.cache_candidate is not None
+            else None,
         )
 
     context_decision = select_context_policy(
@@ -109,6 +115,7 @@ def select_plan(planner_input: PlannerInput) -> PlannerResult:
         contract_risk_tier=contract.risk_tier,
         effective_risk_tier=effective_risk,
         module_states=module_states,
+        cache_similarity_threshold=planner_input.thresholds.cache_similarity_threshold,
         cache_candidate_assessed=cache_decision.candidate_assessed,
         historical_statistics=history_decision.evidence,
         base_model_policy=base_model_decision.policy,

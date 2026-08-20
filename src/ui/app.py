@@ -27,6 +27,7 @@ from ui.presentation import (
     decision_view,
     format_cost,
     format_score,
+    semantic_cache_view,
     trace_rows,
 )
 
@@ -251,6 +252,8 @@ def _render_execute_result(entry: HistoryEntry) -> None:
     )
     resource_columns[3].metric("Latency", f"{result.latency_ms} ms")
 
+    _render_semantic_cache(result)
+
     _render_context_reduction(result)
 
     _render_comparison(entry.comparison)
@@ -292,6 +295,8 @@ def _render_trace(result: RunResult) -> None:
         if row.error:
             st.caption(f"Error: {row.error}")
         step_evidence = dict(row.facts)
+        if row.semantic_cache is not None:
+            step_evidence["semantic_cache"] = row.semantic_cache
         if row.context_reduction is not None:
             step_evidence["context_reduction"] = row.context_reduction
         if row.context_source is not None:
@@ -326,6 +331,38 @@ def _render_context_reduction(result: RunResult) -> None:
     st.caption(
         f"Step status: {reduction.status} | Context source: "
         f"{reduction.context_source} | Counter: {reduction.token_counter}"
+    )
+
+
+def _render_semantic_cache(result: RunResult) -> None:
+    """Render typed backend lookup and source-quality evidence without inference."""
+    cache = semantic_cache_view(result)
+    st.subheader("Semantic cache evidence")
+    if cache is None:
+        st.info("Semantic cache evidence is unavailable for this run.")
+        return
+    columns = st.columns(4)
+    columns[0].metric("Cache outcome", cache.outcome)
+    columns[1].metric("Cache similarity", cache.similarity)
+    columns[2].metric("Cache source run", cache.source_run_id)
+    columns[3].metric("Cache lookup latency", cache.lookup_latency)
+    st.caption(f"Planner cache reason: {cache.planner_reason}")
+    if cache.error is not None:
+        st.warning(cache.error)
+    if cache.evaluator_type == "Unavailable":
+        st.info("Cached quality evidence is unavailable because no match was assessed.")
+        return
+    st.write("**Cached quality evidence**")
+    quality_columns = st.columns(4)
+    quality_columns[0].metric("Cached quality", cache.cached_quality)
+    quality_columns[1].metric("Source threshold", cache.source_threshold)
+    quality_columns[2].metric("Source evaluation", cache.source_passed)
+    quality_columns[3].metric("Source evaluator", cache.evaluator_type)
+    st.caption(
+        "The source evaluation is preserved from the cached run. Planner V1 "
+        f"compared its score with the current threshold "
+        f"{format_score(result.quality_contract.minimum_quality_score)}; no current "
+        "evaluator call is claimed."
     )
 
 

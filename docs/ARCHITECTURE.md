@@ -128,6 +128,27 @@ It does not invoke models, evaluators, Redis, Cosmos DB, or provider SDKs.
 Executes the selected plan components in order and emits structured step results.
 It honors the planner's verification/escalation policy rather than inventing routing decisions.
 
+### Semantic cache runtime boundary
+
+The application resolves at most one provider-independent semantic-cache match
+after building the current Quality Contract and before invoking Planner V1. The
+lookup returns a typed cached output with source-run identity, similarity, prior
+evaluation, contract compatibility, and reuse-safety evidence. It does not decide
+whether reuse is allowed.
+
+Planner V1 remains authoritative for every threshold, quality, compatibility,
+and safety gate. When Planner V1 accepts the match, the selected plan carries a
+detached snapshot of that exact resolved value. The executor consumes the bound
+snapshot and never performs a second lookup, preventing a different output or
+source run from being substituted between planning and execution.
+
+A healthy miss, rejected match, lookup failure, or timeout continues through the
+existing context and model path. Typed runtime evidence distinguishes those
+outcomes. An enabled application without a semantic-cache dependency fails as a
+structural configuration error before model execution. The local in-memory
+implementation is deterministic test and demo infrastructure only; the Redis
+adapter remains Slice 10.
+
 ### Provider abstraction
 Hides Microsoft Foundry/APIM request details from planner and execution-policy logic.
 Maps conceptual model roles such as `SMALL` and `STRONG` to configured deployments.

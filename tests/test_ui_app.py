@@ -131,3 +131,58 @@ _render_execute_result(HistoryEntry(result=result))
     assert any("Model: STRONG_DIRECT" in value for value in markdown_values)
     assert "STRONG" in trace_facts
     assert any("Model Call: Succeeded" in element.value for element in app.success)
+
+
+def test_execute_result_renders_backend_cache_hit_evidence() -> None:
+    """Render the exact local hit, source quality, and zero model execution."""
+    app = AppTest.from_string(
+        """
+import httpx
+from fastapi.testclient import TestClient
+from optima.api.demo import (
+    DEMO_CACHE_CONTEXT,
+    DEMO_CACHE_INPUT,
+    app as demo_app,
+)
+from ui.api_client import OptimaApiClient
+from ui.app import _render_execute_result
+from ui.history import HistoryEntry
+from ui.models import ExecuteInputs
+
+inputs = ExecuteInputs(
+    input_text=DEMO_CACHE_INPUT,
+    context=DEMO_CACHE_CONTEXT,
+    cache_eligible=True,
+)
+response = TestClient(demo_app).post(
+    "/api/v1/runs",
+    json=inputs.to_run_request().model_dump(mode="json", exclude_none=True),
+)
+transport = httpx.MockTransport(
+    lambda request: httpx.Response(response.status_code, json=response.json())
+)
+result = OptimaApiClient(transport=transport).execute(inputs.to_run_request())
+_render_execute_result(HistoryEntry(result=result))
+"""
+    ).run()
+
+    metrics = {metric.label: metric.value for metric in app.metric}
+    markdown_values = [element.value for element in app.markdown]
+
+    assert not app.exception
+    assert "Cached Result" in [element.value for element in app.subheader]
+    assert metrics["Model calls"] == "0"
+    assert metrics["Escalation"] == "Not required"
+    assert metrics["Contract"] == "Contract Met"
+    assert metrics["Cache outcome"] == "Reused"
+    assert metrics["Cache similarity"] == "1.000"
+    assert metrics["Cache source run"] == "run-local-cache-source-1"
+    assert metrics["Cached quality"] == "0.96"
+    assert metrics["Source threshold"] == "0.80"
+    assert metrics["Source evaluation"] == "Passed"
+    assert metrics["Latency"].endswith(" ms")
+    assert any(
+        "Incident OPT-9 was resolved after validation." in value
+        for value in markdown_values
+    )
+    assert any("Semantic Cache: Succeeded" in item.value for item in app.success)

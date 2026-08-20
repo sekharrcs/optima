@@ -219,6 +219,7 @@ def candidate(**updates: object) -> CacheCandidate:
     """Build a safe cache candidate with optional overrides."""
     values: dict[str, object] = {
         "source_run_id": "run-1",
+        "output_text": "cached output",
         "similarity": 0.95,
         "prior_evaluation": evaluation(),
         "contract_compatible": True,

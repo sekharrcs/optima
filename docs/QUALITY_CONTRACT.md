@@ -95,6 +95,21 @@ A normal run that claims Quality Contract compliance must produce a valid evalua
 
 Tests and local development may inject fake evaluators, but production/hackathon execution must not silently bypass quality evaluation.
 
+## Cached source evaluation
+
+A semantic-cache hit reuses previously accepted evidence rather than executing a
+new evaluator. The source evaluation retains its original evaluator identity,
+score, threshold, mandatory-check result, pass result, reasons, and metadata.
+OPTIMA must not copy the score into a synthetic current-run evaluation or replace
+the source threshold.
+
+Planner V1 may accept the evidence only when the prior evaluator was valid, the
+source evaluation passed, mandatory checks passed, the score is at or above the
+current contract threshold, the contracts are compatible, and reuse is safe. The
+current run can then report the contract as met while keeping current-run
+evaluation results empty and exposing the source evaluation separately as cache
+evidence.
+
 ## Important limitation
 
 An LLM judge score is an estimate, not ground truth.

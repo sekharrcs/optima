@@ -7,6 +7,7 @@ import pytest
 from pydantic import ValidationError
 
 from optima.context import ContextPreservationEvidence
+from optima.domain.cache import CacheCandidate
 from optima.domain.evaluation import EvaluationResult
 from optima.domain.execution import (
     CachePolicy,
@@ -24,6 +25,8 @@ from optima.domain.execution import (
     PlannerDecisionEvidence,
     PlannerModuleStates,
     PlannerReasonCode,
+    SemanticCacheEvidence,
+    SemanticCacheOutcome,
 )
 from optima.domain.quality_contract import (
     OptimizationMode,
@@ -691,6 +694,24 @@ def test_completed_run_can_record_measured_contract_failure() -> None:
 
 def test_completed_semantic_cache_run_has_no_model_usage() -> None:
     """Represent accepted cache reuse with compatible evaluation evidence."""
+    source_evaluation = EvaluationResult(
+        evaluator_type="source-deterministic",
+        evaluator_valid=True,
+        score=0.93,
+        threshold=0.80,
+        mandatory_checks_passed=True,
+        passed=True,
+        reasons=("Source contract passed",),
+        metadata={"source_run_id": "run-source-1"},
+    )
+    candidate = CacheCandidate(
+        source_run_id="run-source-1",
+        output_text="Cached final answer",
+        similarity=0.97,
+        prior_evaluation=source_evaluation,
+        contract_compatible=True,
+        safe_to_reuse=True,
+    )
     cache_plan = ExecutionPlan(
         cache_policy=CachePolicy.USE_CACHED_RESULT,
         context_policy=ContextPolicy.NOT_APPLICABLE,
@@ -700,30 +721,86 @@ def test_completed_semantic_cache_run_has_no_model_usage() -> None:
             PlannerReasonCode.OPTIMIZATION_MODE_COST,
             PlannerReasonCode.CACHE_HIGH_CONFIDENCE_MATCH,
         ),
-        human_readable_name="Semantic Cache Hit",
+        human_readable_name="Cached Result",
         decision_evidence=decision_evidence(
             base_model_policy=None,
             final_model_policy=None,
             cache_candidate_assessed=True,
         ),
+        cache_candidate=candidate,
+    )
+    cache_evidence = SemanticCacheEvidence(
+        outcome=SemanticCacheOutcome.REUSED,
+        lookup_latency_ms=4,
+        planner_reason_code=PlannerReasonCode.CACHE_HIGH_CONFIDENCE_MATCH,
+        source_run_id=candidate.source_run_id,
+        similarity=candidate.similarity,
+        prior_evaluation=source_evaluation,
     )
 
     result = completed_run(
         execution_plan=cache_plan,
         steps=(
-            successful_step(0, ExecutionStepType.SEMANTIC_CACHE),
+            ExecutionStep(
+                sequence=0,
+                step_type=ExecutionStepType.SEMANTIC_CACHE,
+                status=ExecutionStatus.SUCCEEDED,
+                latency_ms=4,
+                event_codes=(
+                    ExecutionEventCode.CACHE_RESULT_REUSED,
+                    ExecutionEventCode.QUALITY_CONTRACT_MET,
+                ),
+                semantic_cache=cache_evidence,
+            ),
             successful_step(1, ExecutionStepType.RETURN),
         ),
+        semantic_cache=cache_evidence,
         model_usages=(),
+        evaluations=(),
+        final_evaluation=None,
+        final_output=candidate.output_text,
+        contract_met=True,
     )
 
     assert result.execution_plan.cache_policy is CachePolicy.USE_CACHED_RESULT
     assert result.model_usages == ()
+    assert result.evaluations == ()
+    assert result.final_evaluation is None
+    assert result.semantic_cache is not None
+    assert result.semantic_cache.prior_evaluation == source_evaluation
+    assert result.semantic_cache.prior_evaluation.threshold == 0.80
     assert result.total_input_tokens == 0
     assert result.total_output_tokens == 0
     assert result.total_tokens == 0
     assert result.total_calculated_cost is None
     assert result.total_cost_provenance is None
+
+
+def test_model_run_rejects_cache_evidence_with_different_planner_reason() -> None:
+    """Prevent transported runtime evidence from contradicting Planner V1."""
+    cache_evidence = SemanticCacheEvidence(
+        outcome=SemanticCacheOutcome.MISS,
+        lookup_latency_ms=2,
+        planner_reason_code=PlannerReasonCode.CACHE_CANDIDATE_NOT_SUPPLIED,
+    )
+
+    with pytest.raises(ValidationError, match="reason must appear"):
+        completed_run(
+            semantic_cache=cache_evidence,
+            steps=(
+                ExecutionStep(
+                    sequence=0,
+                    step_type=ExecutionStepType.SEMANTIC_CACHE,
+                    status=ExecutionStatus.SUCCEEDED,
+                    latency_ms=2,
+                    event_codes=(ExecutionEventCode.CACHE_MISS,),
+                    semantic_cache=cache_evidence,
+                ),
+                successful_step(1, ExecutionStepType.MODEL_CALL),
+                successful_step(2, ExecutionStepType.QUALITY_EVALUATION),
+                successful_step(3, ExecutionStepType.RETURN),
+            ),
+        )
 
 
 @pytest.mark.parametrize("status", [RunStatus.FAILED, RunStatus.TIMED_OUT])

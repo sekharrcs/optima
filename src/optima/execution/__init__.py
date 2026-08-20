@@ -5,11 +5,12 @@ from optima.execution.contracts import (
     ExecutionRequest,
     UnsupportedExecutionPlanError,
 )
-from optima.execution.executor import PlanExecutor
+from optima.execution.executor import PlanExecutor, SystemMonotonicClock
 
 __all__ = [
     "ContextReductionDependencyError",
     "ExecutionRequest",
     "PlanExecutor",
+    "SystemMonotonicClock",
     "UnsupportedExecutionPlanError",
 ]

@@ -118,6 +118,20 @@ Quality Evaluation
 Return
 ```
 
+Example semantic-cache hit:
+
+```text
+Semantic Cache: Reused
+      |
+Source Run + Similarity
+      |
+Preserved Source Quality Evidence
+      |
+QUALITY CONTRACT MET
+      |
+Return (0 model calls)
+```
+
 The UI must render trace data returned by the backend. It must not invent execution steps or planner decisions.
 
 ### OPTIMA Decision card
@@ -252,6 +266,13 @@ Selecting a run shows:
 Raw JSON, provider metadata, evaluator metadata, and correlation IDs belong in expandable debug sections.
 
 Do not expose secrets, API keys, connection strings, or full sensitive prompts by default.
+
+Cache presentation must use typed backend evidence. Show lookup outcome, lookup
+latency, source run and similarity when available, preserved source quality
+evidence, current contract result, actual model-call count, and escalation state.
+A miss, rejected match, failure, or timeout must remain distinct and precede the
+actual context/model trace. Do not infer avoided cost or claim a current evaluator
+call on a cache hit.
 
 ## Module configuration in the UI
 

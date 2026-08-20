@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from uuid import uuid4
 
+from optima.cache import SemanticCache
 from optima.config import AppSettings
 from optima.context import ContextReducer, TokenCounter
 from optima.context.safety import ContextReducerSafetyPolicy
@@ -33,6 +34,7 @@ class ExecutionDependencies:
     strong_provider: ModelProvider
     evaluator: QualityEvaluator
     cost_calculator: CostCalculator
+    semantic_cache: SemanticCache | None = None
     context_reducer: ContextReducer | None = None
     token_counter: TokenCounter | None = None
     context_reducer_safety_policy: ContextReducerSafetyPolicy | None = None

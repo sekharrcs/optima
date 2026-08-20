@@ -5,7 +5,7 @@ from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from optima.domain.evaluation import EvaluationResult
+from optima.domain.cache import CacheCandidate as CacheCandidate
 from optima.domain.execution import (
     CachePolicy,
     ContextPolicy,
@@ -59,18 +59,6 @@ class PlannerThresholds(BaseModel):
         if self.history_small_avoid_pass_rate >= self.history_small_prefer_pass_rate:
             raise ValueError("history avoid rate must be below prefer rate")
         return self
-
-
-class CacheCandidate(BaseModel):
-    """Pre-resolved semantic-cache metadata assessed by the planner."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    source_run_id: NonEmptyString
-    similarity: Rate
-    prior_evaluation: EvaluationResult
-    contract_compatible: StrictBoolean
-    safe_to_reuse: StrictBoolean
 
 
 class ContextReducerCapability(BaseModel):

@@ -25,6 +25,7 @@ from optima.planner import (
     ModuleConfiguration,
     PlannerCapabilities,
     PlannerInput,
+    PlannerThresholds,
     PlanningFailure,
     PlanningFailureCode,
     select_plan,
@@ -86,6 +87,7 @@ def cache_candidate(**updates: object) -> CacheCandidate:
     """Build a safe high-confidence cache candidate."""
     values: dict[str, object] = {
         "source_run_id": "run-1",
+        "output_text": "cached output",
         "similarity": 0.95,
         "prior_evaluation": accepted_evaluation(),
         "contract_compatible": True,
@@ -119,13 +121,36 @@ def require_plan(result: ExecutionPlan | PlanningFailure) -> ExecutionPlan:
 
 def test_safe_cache_hit_short_circuits_model_and_context_planning() -> None:
     """Return only previously accepted compatible cache evidence."""
-    plan = require_plan(select_plan(planner_input(cache_candidate=cache_candidate())))
+    supplied_candidate = cache_candidate()
+    plan = require_plan(select_plan(planner_input(cache_candidate=supplied_candidate)))
 
     assert plan.cache_policy is CachePolicy.USE_CACHED_RESULT
     assert plan.context_policy is ContextPolicy.NOT_APPLICABLE
     assert plan.model_policy is None
     assert plan.human_readable_name == "Cached Result"
     assert plan.decision_evidence.cache_candidate_assessed is True
+    assert plan.cache_candidate == supplied_candidate
+    assert plan.cache_candidate is not supplied_candidate
+    assert plan.cache_candidate is not None
+    assert plan.cache_candidate.prior_evaluation is not (
+        supplied_candidate.prior_evaluation
+    )
+    assert plan.decision_evidence.cache_similarity_threshold == 0.95
+
+
+def test_cache_plan_preserves_configured_similarity_threshold() -> None:
+    """Carry the exact policy threshold into typed execution evidence."""
+    plan = require_plan(
+        select_plan(
+            planner_input(
+                cache_candidate=cache_candidate(similarity=0.91),
+                thresholds=PlannerThresholds(cache_similarity_threshold=0.91),
+            )
+        )
+    )
+
+    assert plan.cache_policy is CachePolicy.USE_CACHED_RESULT
+    assert plan.decision_evidence.cache_similarity_threshold == 0.91
 
 
 @pytest.mark.parametrize(
@@ -146,6 +171,7 @@ def test_rejected_cache_candidate_continues_normal_planning(
     )
 
     assert plan.cache_policy is CachePolicy.SKIP
+    assert plan.cache_candidate is None
     assert plan.model_policy is ModelPolicy.SMALL_FIRST_WITH_FALLBACK
     assert reason in plan.reason_codes
     assert plan.decision_evidence.cache_candidate_assessed is True
