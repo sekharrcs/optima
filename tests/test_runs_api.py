@@ -649,8 +649,56 @@ def test_provider_failure_returns_structured_failed_run_without_fallback() -> No
     assert len(evaluator.calls) == 0
 
 
-def test_strong_direct_plan_returns_structured_unsupported_error() -> None:
-    """Honor Planner V1 without coercing an excluded strong-direct plan."""
+def assert_measured_strong_direct(
+    body: dict[str, Any],
+    *,
+    expected_context_source: str,
+    expected_score: float = 0.93,
+    expected_threshold: float = 0.9,
+) -> None:
+    """Assert one measured direct STRONG attempt without escalation evidence."""
+    assert body["status"] == "COMPLETED"
+    assert body["final_output"] == "strong output"
+    assert body["contract_met"] is True
+    assert body["escalated"] is False
+    assert body["execution_plan"]["model_policy"] == "STRONG_DIRECT"
+    assert body["execution_plan"]["initial_model_role"] == ModelRole.STRONG
+    assert body["execution_plan"]["escalation_model_role"] is None
+    assert [usage["model_role"] for usage in body["model_usages"]] == [ModelRole.STRONG]
+    assert body["model_usages"][0]["input_tokens"] == 110
+    assert body["model_usages"][0]["output_tokens"] == 30
+    assert body["model_usages"][0]["calculated_cost"] == "0.009"
+    assert body["model_usages"][0]["pricing_provenance"] == {
+        "catalog_version": "api-test-v1",
+        "currency": "TEST",
+    }
+    assert body["total_input_tokens"] == 110
+    assert body["total_output_tokens"] == 30
+    assert body["total_tokens"] == 140
+    assert body["total_calculated_cost"] == "0.009"
+    assert body["total_cost_provenance"] == {
+        "catalog_version": "api-test-v1",
+        "currency": "TEST",
+    }
+    assert len(body["evaluations"]) == 1
+    assert body["final_evaluation"] == body["evaluations"][0]
+    assert body["final_evaluation"]["evaluator_type"] == "fake-deterministic"
+    assert body["final_evaluation"]["score"] == expected_score
+    assert body["final_evaluation"]["threshold"] == expected_threshold
+    assert body["final_evaluation"]["passed"] is True
+    model_steps = [step for step in body["steps"] if step["step_type"] == "MODEL_CALL"]
+    assert len(model_steps) == 1
+    assert model_steps[0]["facts"]["model_role"] == ModelRole.STRONG
+    assert model_steps[0]["context_source"] == expected_context_source
+    assert all(step["step_type"] != "ESCALATION" for step in body["steps"])
+    runtime_events = [code for step in body["steps"] for code in step["event_codes"]]
+    assert ExecutionEventCode.QUALITY_CONTRACT_MET in runtime_events
+    assert ExecutionEventCode.ESCALATION_REQUIRED not in runtime_events
+    assert ExecutionEventCode.ESCALATED_TO_STRONG not in runtime_events
+
+
+def test_high_complexity_executes_strong_direct_with_measured_facts() -> None:
+    """Execute HIGH complexity with one verified STRONG call and no SMALL call."""
     configured, small, strong, evaluator = dependencies(0.93)
     high_profile = {
         "task_type": "GENERAL_REASONING",
@@ -665,26 +713,60 @@ def test_strong_direct_plan_returns_structured_unsupported_error() -> None:
         json=request_payload(request_profile=high_profile),
     )
 
-    assert response.status_code == 501
-    assert response.json()["detail"] == {
-        "code": "UNSUPPORTED_EXECUTION_PLAN",
-        "message": "Slice 8 supports SMALL_FIRST_WITH_FALLBACK model execution only",
-        "facts": {
-            "model_policy": "STRONG_DIRECT",
-            "context_policy": "KEEP_ORIGINAL",
-        },
-    }
+    assert response.status_code == 200
+    body = response.json()
+    assert body["execution_plan"]["human_readable_name"] == "Strong -> Verify"
+    assert (
+        PlannerReasonCode.HIGH_COMPLEXITY_STRONG_DIRECT
+        in body["execution_plan"]["reason_codes"]
+    )
+    assert_measured_strong_direct(body, expected_context_source="ORIGINAL")
     assert len(small.calls) == 0
-    assert len(strong.calls) == 0
-    assert len(evaluator.calls) == 0
+    assert len(strong.calls) == 1
+    assert len(evaluator.calls) == 1
 
 
-def test_reduce_strong_direct_plan_remains_unsupported_before_any_calls() -> None:
-    """Keep the excluded REDUCE plus STRONG_DIRECT runtime explicitly truthful."""
+def test_quality_mode_strong_direct_executes_successfully() -> None:
+    """Execute the Quality-mode policy that selects STRONG directly."""
+    configured, small, strong, evaluator = dependencies(0.93)
+    quality_mode_profile = {
+        "task_type": "GENERAL_REASONING",
+        "complexity": "MEDIUM",
+        "input_tokens": 100,
+        "risk_tier": "LOW",
+        "cache_eligible": False,
+        "has_large_context": False,
+    }
+
+    response = TestClient(create_app(execution_dependencies=configured)).post(
+        "/api/v1/runs",
+        json=request_payload(
+            request_profile=quality_mode_profile,
+            optimization_mode="QUALITY",
+        ),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert (
+        PlannerReasonCode.QUALITY_MODE_PREFERS_STRONG
+        in body["execution_plan"]["reason_codes"]
+    )
+    assert body["execution_plan"]["human_readable_name"] == "Strong -> Verify"
+    assert_measured_strong_direct(body, expected_context_source="ORIGINAL")
+    assert len(small.calls) == 0
+    assert len(strong.calls) == 1
+    assert len(evaluator.calls) == 1
+
+
+def test_reduce_strong_direct_uses_reduced_model_context_and_original_evaluation() -> (
+    None
+):
+    """Reduce once for STRONG while evaluating against the original context."""
     original_context = (
         "System ARC-9 requires audit logging.\nSystem ARC-9 requires audit logging."
     )
-    configured, small, strong, evaluator = dependencies(0.93)
+    configured, small, strong, evaluator = dependencies(0.99)
     reducer = FakeContextReducer((reduction_result(original_context),))
     counter = RecordingTokenCounter(RegexTokenCounter())
     configured = replace(
@@ -717,16 +799,85 @@ def test_reduce_strong_direct_plan_remains_unsupported_before_any_calls() -> Non
         ),
     )
 
-    assert response.status_code == 501
-    assert response.json()["detail"]["facts"] == {
-        "model_policy": "STRONG_DIRECT",
-        "context_policy": "REDUCE",
-    }
+    assert response.status_code == 200
+    body = response.json()
+    assert body["execution_plan"]["context_policy"] == "REDUCE"
+    assert body["execution_plan"]["human_readable_name"] == (
+        "Reduce Context -> Strong -> Verify"
+    )
+    assert body["steps"][0]["context_reduction"]["outcome"] == "APPLIED"
+    assert body["steps"][0]["context_reduction"]["context_source"] == "REDUCED"
+    assert_measured_strong_direct(
+        body,
+        expected_context_source="REDUCED",
+        expected_score=0.99,
+        expected_threshold=0.95,
+    )
+    assert len(reducer.calls) == 1
+    assert len(counter.calls) == 2
+    assert len(small.calls) == 0
+    assert len(strong.calls) == 1
+    assert (
+        strong.calls[0].request.context
+        == reduction_result(original_context).reduced_context
+    )
+    assert len(evaluator.calls) == 1
+    assert evaluator.calls[0].request.context == original_context
+
+
+def test_unsafe_reduction_keeps_original_for_strong_direct_without_reducer_call() -> (
+    None
+):
+    """Keep original context when reducer policy does not support the task."""
+    original_context = (
+        "System ARC-9 requires audit logging.\nSystem ARC-9 requires audit logging."
+    )
+    configured, small, strong, evaluator = dependencies(0.93)
+    reducer = FakeContextReducer((reduction_result(original_context),))
+    counter = RecordingTokenCounter(RegexTokenCounter())
+    configured = replace(
+        configured,
+        settings=AppSettings(
+            semantic_cache_enabled=False,
+            context_reduction_enabled=True,
+            historical_policy_enabled=False,
+        ),
+        context_reducer=reducer,
+        token_counter=counter,
+        context_reducer_safety_policy=DeterministicExtractiveSafetyPolicy(),
+    )
+
+    response = TestClient(create_app(execution_dependencies=configured)).post(
+        "/api/v1/runs",
+        json=request_payload(
+            context=original_context,
+            request_profile={
+                "task_type": "Q_AND_A",
+                "complexity": "HIGH",
+                "input_tokens": 8_000,
+                "risk_tier": "LOW",
+                "cache_eligible": False,
+                "has_large_context": True,
+            },
+            optimization_mode="QUALITY",
+        ),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["execution_plan"]["context_policy"] == "KEEP_ORIGINAL"
+    assert (
+        PlannerReasonCode.SAFE_REDUCER_UNAVAILABLE
+        in body["execution_plan"]["reason_codes"]
+    )
+    assert_measured_strong_direct(body, expected_context_source="ORIGINAL")
     assert reducer.calls == ()
     assert counter.calls == ()
     assert len(small.calls) == 0
-    assert len(strong.calls) == 0
-    assert len(evaluator.calls) == 0
+    assert len(strong.calls) == 1
+    assert strong.calls[0].request.context == original_context
+    assert len(evaluator.calls) == 1
+    assert evaluator.calls[0].request.context == original_context
 
 
 def test_separate_apps_do_not_share_mutable_fake_state() -> None:

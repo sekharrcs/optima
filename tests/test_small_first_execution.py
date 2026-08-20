@@ -40,7 +40,7 @@ from optima.evaluation import (
 from optima.execution import (
     ContextReductionDependencyError,
     ExecutionRequest,
-    SmallFirstExecutor,
+    PlanExecutor,
 )
 from optima.planner import (
     ContextReducerCapability,
@@ -296,7 +296,7 @@ def build_executor(
     calculator: CostCalculator | None = None,
     context_reducer: object | None = None,
     token_counter: object | None = None,
-) -> tuple[SmallFirstExecutor, object, object]:
+) -> tuple[PlanExecutor, object, object]:
     """Build fresh dependencies for one isolated execution test."""
     small = small_provider or build_fake_small_provider(
         provider_name="fake",
@@ -323,7 +323,7 @@ def build_executor(
         clock=IncrementingClock(),
     )
     return (
-        SmallFirstExecutor(
+        PlanExecutor(
             small_provider=small,  # type: ignore[arg-type]
             strong_provider=strong,  # type: ignore[arg-type]
             evaluator=evaluator,  # type: ignore[arg-type]
@@ -809,8 +809,18 @@ def test_small_provider_operational_failure_does_not_escalate_or_fabricate(
     assert len(evaluator.calls) == 0
 
 
-def test_misaligned_provider_usage_becomes_domain_valid_failure() -> None:
-    """Reject wrong-run provider measurements without leaking validation errors."""
+@pytest.mark.parametrize(
+    "usage_update",
+    [
+        {"run_id": "other-run"},
+        {"provider": "other-provider"},
+    ],
+    ids=["wrong-run-id", "wrong-provider-identity"],
+)
+def test_misaligned_provider_usage_becomes_domain_valid_failure(
+    usage_update: dict[str, object],
+) -> None:
+    """Reject misaligned SMALL usage without evaluation or fallback."""
     valid_small = build_fake_small_provider(
         provider_name="fake",
         deployment_name="small",
@@ -825,7 +835,7 @@ def test_misaligned_provider_usage_becomes_domain_valid_failure() -> None:
     )
 
     class MisalignedProvider:
-        provider_name = "misaligned"
+        provider_name = "fake"
         deployment_name = "small"
         model_role = ModelRole.SMALL
 
@@ -835,9 +845,7 @@ def test_misaligned_provider_usage_becomes_domain_valid_failure() -> None:
         ) -> ModelProviderResult:
             result = await valid_small.generate(request)
             return result.model_copy(
-                update={
-                    "usage": result.usage.model_copy(update={"run_id": "other-run"})
-                }
+                update={"usage": result.usage.model_copy(update=usage_update)}
             )
 
     evaluator = FakeEvaluator(responses=(evidence(0.95),))
@@ -852,8 +860,10 @@ def test_misaligned_provider_usage_becomes_domain_valid_failure() -> None:
     assert result.final_output is None
     assert result.contract_met is None
     assert result.model_usages == ()
+    assert result.evaluations == ()
     assert result.steps[-1].status is ExecutionStatus.FAILED
     assert len(strong.calls) == 0  # type: ignore[attr-defined]
+    assert len(evaluator.calls) == 0
 
 
 @pytest.mark.parametrize(

@@ -5,11 +5,11 @@ from optima.execution.contracts import (
     ExecutionRequest,
     UnsupportedExecutionPlanError,
 )
-from optima.execution.executor import SmallFirstExecutor
+from optima.execution.executor import PlanExecutor
 
 __all__ = [
     "ContextReductionDependencyError",
     "ExecutionRequest",
-    "SmallFirstExecutor",
+    "PlanExecutor",
     "UnsupportedExecutionPlanError",
 ]

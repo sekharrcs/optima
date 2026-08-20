@@ -96,6 +96,17 @@ Acceptance:
 - before/after token metrics
 - tests verify required facts preserved on benchmark fixtures
 
+## Corrective Slice 8A - Strong-direct execution
+Acceptance:
+- existing Planner V1 `STRONG_DIRECT` decisions execute without new routing
+- optional context reduction retains measured fallback-to-original behavior
+- STRONG executes exactly once and quality evaluation executes exactly once
+- no SMALL call or escalation evidence appears in strong-direct traces
+- valid final evaluation yields measured `true` or `false` contract status
+- unavailable final evaluation fails closed without fabricated output or status
+- actual one-call tokens, cost, latency, and pricing provenance are exposed
+- FastAPI and Streamlit render backend execution evidence
+
 ## Slice 9 - Semantic cache
 Acceptance:
 - module can be enabled/disabled through typed configuration

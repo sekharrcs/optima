@@ -5,7 +5,13 @@ import pytest
 from fastapi.testclient import TestClient
 
 from optima.api.demo import app as demo_app
-from optima.domain.execution import ContextReductionOutcome, ContextSource
+from optima.domain.execution import (
+    ContextReductionOutcome,
+    ContextSource,
+    ExecutionEventCode,
+    ModelPolicy,
+    ModelRole,
+)
 from optima.domain.quality_contract import OptimizationMode, QualityProfile, RiskTier
 from optima.domain.request_profile import Complexity, TaskType
 from ui.api_client import ApiClientError, OptimaApiClient
@@ -94,8 +100,8 @@ def test_api_client_parses_typed_context_reduction_evidence() -> None:
     assert result.steps[1].context_source is ContextSource.REDUCED
 
 
-def test_local_demo_preserves_unsupported_strong_direct_error() -> None:
-    """Do not route around Planner V1 when the current executor lacks a plan."""
+def test_api_client_transports_and_parses_measured_strong_direct_result() -> None:
+    """Carry real HIGH strong-direct backend evidence through the UI client."""
     payload = ExecuteInputs(
         input_text="Design a distributed architecture",
         complexity=Complexity.HIGH,
@@ -104,9 +110,40 @@ def test_local_demo_preserves_unsupported_strong_direct_error() -> None:
     response = TestClient(demo_app).post(
         "/api/v1/runs", json=payload.model_dump(mode="json", exclude_none=True)
     )
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(response.status_code, json=response.json())
+    )
 
-    assert response.status_code == 501
-    assert response.json()["detail"]["code"] == "UNSUPPORTED_EXECUTION_PLAN"
+    result = OptimaApiClient(transport=transport).execute(payload)
+
+    assert response.status_code == 200
+    assert result.execution_plan.model_policy is ModelPolicy.STRONG_DIRECT
+    assert result.execution_plan.human_readable_name == "Strong -> Verify"
+    assert result.final_output == (
+        "Local demo response from the configured STRONG model role."
+    )
+    assert result.escalated is False
+    assert result.contract_met is True
+    assert len(result.model_usages) == 1
+    assert result.model_usages[0].model_role is ModelRole.STRONG
+    assert result.total_input_tokens == 660
+    assert result.total_output_tokens == 112
+    assert result.total_tokens == 772
+    assert result.total_calculated_cost is not None
+    assert str(result.total_calculated_cost) == "0.00277"
+    assert result.total_cost_provenance is not None
+    assert result.total_cost_provenance.catalog_version == "local-demo-v1"
+    assert result.total_cost_provenance.currency == "USD"
+    assert result.final_evaluation is not None
+    assert result.final_evaluation.evaluator_type == "local-demo-deterministic"
+    assert result.final_evaluation.score == 0.92
+    assert result.final_evaluation.passed is True
+    assert result.steps[0].facts["model_role"] == ModelRole.STRONG
+    assert result.steps[0].context_source is ContextSource.ORIGINAL
+    assert all(step.step_type.value != "ESCALATION" for step in result.steps)
+    runtime_events = {code for step in result.steps for code in step.event_codes}
+    assert ExecutionEventCode.ESCALATION_REQUIRED not in runtime_events
+    assert ExecutionEventCode.ESCALATED_TO_STRONG not in runtime_events
 
 
 @pytest.mark.parametrize(

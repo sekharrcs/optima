@@ -107,9 +107,8 @@ The local demo remains intentionally narrow:
 
 - Request Profile fields are supplied demo inputs because no backend request
   profiler exists yet.
-- The current executor supports small-first with mandatory verification and
-  strong fallback. Planner-selected strong-direct plans return an honest
-  unsupported-plan error.
+- The plan executor supports small-first with mandatory verification and strong
+  fallback, plus Planner V1 strong-direct execution with mandatory verification.
 - Baseline savings remain unavailable until a compatible measured baseline is
   supplied through a future API boundary.
 - Dashboard and Run History retain actual results only for the current

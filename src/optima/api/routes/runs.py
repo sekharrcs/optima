@@ -13,7 +13,7 @@ from optima.domain.run import RunResult
 from optima.execution import (
     ContextReductionDependencyError,
     ExecutionRequest,
-    SmallFirstExecutor,
+    PlanExecutor,
     UnsupportedExecutionPlanError,
 )
 from optima.planner import (
@@ -33,7 +33,7 @@ def build_runs_router(
 
     @router.post("/runs", response_model=RunResult)
     async def execute_run(run_request: RunRequest) -> RunResult:
-        """Plan and execute one supported small-first OPTIMA run."""
+        """Plan and execute one supported Planner V1 OPTIMA run."""
         if dependencies is None:
             _raise_api_error(
                 status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -95,7 +95,7 @@ def build_runs_router(
             )
         execution_plan = _require_execution_plan(planner_result)
 
-        executor = SmallFirstExecutor(
+        executor = PlanExecutor(
             small_provider=dependencies.small_provider,
             strong_provider=dependencies.strong_provider,
             evaluator=dependencies.evaluator,
