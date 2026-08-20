@@ -4,6 +4,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from time import perf_counter
 
+from optima.cost import CostCalculator
 from optima.domain.evaluation import EvaluationResult
 from optima.domain.execution import (
     CachePolicy,
@@ -48,6 +49,7 @@ class SmallFirstExecutor:
         small_provider: ModelProvider,
         strong_provider: ModelProvider,
         evaluator: QualityEvaluator,
+        cost_calculator: CostCalculator,
         monotonic_clock: MonotonicClock | None = None,
         utc_now: Callable[[], datetime] = system_utc_now,
     ) -> None:
@@ -58,6 +60,7 @@ class SmallFirstExecutor:
         self._small_provider = small_provider
         self._strong_provider = strong_provider
         self._evaluator = evaluator
+        self._cost_calculator = cost_calculator
         self._clock = monotonic_clock or SystemMonotonicClock()
         self._utc_now = utc_now
 
@@ -251,6 +254,7 @@ class SmallFirstExecutor:
                 raise ValueError("provider usage run_id does not match the request")
             if result.usage.model_role is not role:
                 raise ValueError("provider usage role does not match the request")
+            result = self._with_authoritative_cost(result)
         except TimeoutError as error:
             self._append_failed_step(
                 steps=steps,
@@ -287,6 +291,32 @@ class SmallFirstExecutor:
             )
         )
         return result
+
+    def _with_authoritative_cost(
+        self,
+        result: ModelProviderResult,
+    ) -> ModelProviderResult:
+        usage = result.usage
+        calculation = self._cost_calculator.calculate(usage)
+        priced_usage = ModelUsage(
+            request_id=usage.request_id,
+            run_id=usage.run_id,
+            provider=usage.provider,
+            deployment=usage.deployment,
+            model_role=usage.model_role,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            cached_tokens=usage.cached_tokens,
+            latency_ms=usage.latency_ms,
+            calculated_cost=(calculation.amount if calculation is not None else None),
+            pricing_provenance=(
+                calculation.provenance if calculation is not None else None
+            ),
+        )
+        return ModelProviderResult(
+            output_text=result.output_text,
+            usage=priced_usage,
+        )
 
     async def _evaluate_candidate(
         self,

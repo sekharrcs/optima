@@ -6,6 +6,7 @@ from datetime import datetime
 from uuid import uuid4
 
 from optima.config import AppSettings
+from optima.cost import CostCalculator
 from optima.evaluation import QualityEvaluator
 from optima.execution.executor import system_utc_now
 from optima.providers import ModelProvider, MonotonicClock
@@ -29,6 +30,7 @@ class ExecutionDependencies:
     small_provider: ModelProvider
     strong_provider: ModelProvider
     evaluator: QualityEvaluator
+    cost_calculator: CostCalculator
     monotonic_clock: MonotonicClock | None = None
     utc_now: Callable[[], datetime] = system_utc_now
     run_id_factory: Callable[[], str] = new_run_id

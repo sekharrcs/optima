@@ -76,6 +76,7 @@ def build_runs_router(
             small_provider=dependencies.small_provider,
             strong_provider=dependencies.strong_provider,
             evaluator=dependencies.evaluator,
+            cost_calculator=dependencies.cost_calculator,
             monotonic_clock=dependencies.monotonic_clock,
             utc_now=dependencies.utc_now,
         )

@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from optima.api.app import create_app
 from optima.api.dependencies import ExecutionDependencies
 from optima.config import AppSettings
+from optima.cost import CostCalculator, PriceCatalog, PriceCatalogEntry
 from optima.domain.execution import ExecutionEventCode, ModelRole, PlannerReasonCode
 from optima.evaluation import EvaluationEvidence, FakeEvaluator
 from optima.providers import (
@@ -93,7 +94,6 @@ def dependencies(
                 output_text="small output",
                 input_tokens=100,
                 output_tokens=20,
-                calculated_cost=Decimal("0.001"),
             ),
         ),
         clock=IncrementingClock(),
@@ -106,12 +106,31 @@ def dependencies(
                 output_text="strong output",
                 input_tokens=110,
                 output_tokens=30,
-                calculated_cost=Decimal("0.009"),
             ),
         ),
         clock=IncrementingClock(),
     )
     evaluator = FakeEvaluator(responses=tuple(evidence(score) for score in scores))
+    calculator = CostCalculator(
+        PriceCatalog(
+            version="api-test-v1",
+            currency="TEST",
+            entries=(
+                PriceCatalogEntry(
+                    provider="fake",
+                    deployment="small",
+                    input_rate_per_million_tokens=Decimal("2"),
+                    output_rate_per_million_tokens=Decimal("40"),
+                ),
+                PriceCatalogEntry(
+                    provider="fake",
+                    deployment="strong",
+                    input_rate_per_million_tokens=Decimal("30"),
+                    output_rate_per_million_tokens=Decimal("190"),
+                ),
+            ),
+        )
+    )
     configured = ExecutionDependencies(
         settings=AppSettings(
             semantic_cache_enabled=False,
@@ -121,6 +140,7 @@ def dependencies(
         small_provider=small,
         strong_provider=strong,
         evaluator=evaluator,
+        cost_calculator=calculator,
         monotonic_clock=IncrementingClock(),
         utc_now=lambda: datetime(2026, 8, 19, 12, 0, tzinfo=UTC),
         run_id_factory=lambda: "run-api-1",
@@ -147,6 +167,15 @@ def test_run_endpoint_returns_small_pass_with_plan_and_runtime_facts() -> None:
     assert body["total_output_tokens"] == 20
     assert body["total_tokens"] == 120
     assert body["total_calculated_cost"] == "0.001"
+    assert body["total_cost_provenance"] == {
+        "catalog_version": "api-test-v1",
+        "currency": "TEST",
+    }
+    assert body["model_usages"][0]["calculated_cost"] == "0.001"
+    assert body["model_usages"][0]["pricing_provenance"] == {
+        "catalog_version": "api-test-v1",
+        "currency": "TEST",
+    }
     assert (
         PlannerReasonCode.SMALL_FIRST_SELECTED in body["execution_plan"]["reason_codes"]
     )
@@ -174,6 +203,10 @@ def test_run_endpoint_escalates_once_and_returns_strong_facts() -> None:
     assert body["total_output_tokens"] == 50
     assert body["total_tokens"] == 260
     assert body["total_calculated_cost"] == "0.010"
+    assert body["total_cost_provenance"] == {
+        "catalog_version": "api-test-v1",
+        "currency": "TEST",
+    }
     assert [usage["model_role"] for usage in body["model_usages"]] == [
         ModelRole.SMALL,
         ModelRole.STRONG,

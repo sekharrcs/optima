@@ -27,7 +27,7 @@ from optima.domain.quality_contract import (
     build_quality_contract,
 )
 from optima.domain.request_profile import Complexity, RequestProfile, TaskType
-from optima.domain.run import ModelUsage, RunResult, RunStatus
+from optima.domain.run import ModelUsage, PricingProvenance, RunResult, RunStatus
 
 
 def quality_contract() -> object:
@@ -146,8 +146,15 @@ def model_usage(
     input_tokens: int = 100,
     output_tokens: int = 20,
     calculated_cost: Decimal | None = None,
+    pricing_provenance: PricingProvenance | None = None,
 ) -> ModelUsage:
     """Build one measured model-call usage record."""
+    authoritative_provenance = pricing_provenance
+    if calculated_cost is not None and authoritative_provenance is None:
+        authoritative_provenance = PricingProvenance(
+            catalog_version="test-v1",
+            currency="TEST",
+        )
     return ModelUsage(
         request_id=request_id,
         run_id=run_id,
@@ -158,6 +165,7 @@ def model_usage(
         output_tokens=output_tokens,
         latency_ms=125,
         calculated_cost=calculated_cost,
+        pricing_provenance=authoritative_provenance,
     )
 
 
@@ -227,9 +235,17 @@ def test_model_usage_preserves_measured_call_facts_and_decimal_cost(
         cached_tokens=10,
         latency_ms=125,
         calculated_cost=calculated_cost,
+        pricing_provenance=PricingProvenance(
+            catalog_version="test-v1",
+            currency="TEST",
+        ),
     )
 
     assert usage.calculated_cost == calculated_cost
+    assert usage.pricing_provenance == PricingProvenance(
+        catalog_version="test-v1",
+        currency="TEST",
+    )
     assert usage.cached_tokens == 10
 
 
@@ -247,7 +263,38 @@ def test_model_usage_allows_unavailable_cost_without_placeholder_zero() -> None:
     )
 
     assert usage.calculated_cost is None
+    assert usage.pricing_provenance is None
     assert usage.cached_tokens is None
+
+
+@pytest.mark.parametrize(
+    ("calculated_cost", "pricing_provenance"),
+    [
+        (Decimal("0.001"), None),
+        (
+            None,
+            PricingProvenance(catalog_version="test-v1", currency="TEST"),
+        ),
+    ],
+)
+def test_model_usage_rejects_cost_without_matching_provenance(
+    calculated_cost: Decimal | None,
+    pricing_provenance: PricingProvenance | None,
+) -> None:
+    """Prevent an amount or catalog assertion from appearing independently."""
+    with pytest.raises(ValidationError, match="must be provided together"):
+        ModelUsage(
+            request_id="provider-request-1",
+            run_id="run-1",
+            provider="foundry",
+            deployment="small-deployment",
+            model_role=ModelRole.SMALL,
+            input_tokens=100,
+            output_tokens=20,
+            latency_ms=125,
+            calculated_cost=calculated_cost,
+            pricing_provenance=pricing_provenance,
+        )
 
 
 @pytest.mark.parametrize("cost", [Decimal("-0.01"), Decimal("NaN")])
@@ -292,6 +339,10 @@ def test_run_aggregates_one_complete_model_call() -> None:
     assert result.total_output_tokens == 19
     assert result.total_tokens == 120
     assert result.total_calculated_cost == Decimal("0.0011")
+    assert result.total_cost_provenance == PricingProvenance(
+        catalog_version="test-v1",
+        currency="TEST",
+    )
 
 
 def test_run_aggregates_escalated_calls_in_execution_order() -> None:
@@ -342,6 +393,10 @@ def test_run_aggregates_escalated_calls_in_execution_order() -> None:
     assert result.total_output_tokens == 50
     assert result.total_tokens == 260
     assert result.total_calculated_cost == Decimal("0.0033")
+    assert result.total_cost_provenance == PricingProvenance(
+        catalog_version="test-v1",
+        currency="TEST",
+    )
 
 
 def test_run_does_not_convert_unavailable_cost_to_zero() -> None:
@@ -354,6 +409,7 @@ def test_run_does_not_convert_unavailable_cost_to_zero() -> None:
 
     assert result.total_tokens == 13
     assert result.total_calculated_cost is None
+    assert result.total_cost_provenance is None
 
 
 def test_escalated_known_and_unknown_costs_do_not_form_partial_total() -> None:
@@ -392,6 +448,48 @@ def test_escalated_known_and_unknown_costs_do_not_form_partial_total() -> None:
 
     assert result.total_tokens == 240
     assert result.total_calculated_cost is None
+    assert result.total_cost_provenance is None
+
+
+def test_run_rejects_incompatible_calculated_cost_provenance() -> None:
+    """Prevent one run from aggregating different currencies or catalogs."""
+    first_evaluation = EvaluationResult(
+        evaluator_type="deterministic",
+        evaluator_valid=True,
+        score=0.80,
+        threshold=0.90,
+        mandatory_checks_passed=True,
+        passed=False,
+        reasons=("Small result did not meet quality",),
+    )
+    final_evaluation = passing_evaluation()
+
+    with pytest.raises(ValidationError, match="compatible provenance"):
+        completed_run(
+            steps=(
+                successful_step(0, ExecutionStepType.MODEL_CALL),
+                successful_step(1, ExecutionStepType.QUALITY_EVALUATION),
+                successful_step(2, ExecutionStepType.ESCALATION),
+                successful_step(3, ExecutionStepType.MODEL_CALL),
+                successful_step(4, ExecutionStepType.QUALITY_EVALUATION),
+                successful_step(5, ExecutionStepType.RETURN),
+            ),
+            model_usages=(
+                model_usage(calculated_cost=Decimal("0.0011")),
+                model_usage(
+                    request_id="provider-request-2",
+                    model_role=ModelRole.STRONG,
+                    calculated_cost=Decimal("0.0022"),
+                    pricing_provenance=PricingProvenance(
+                        catalog_version="test-v2",
+                        currency="TEST",
+                    ),
+                ),
+            ),
+            evaluations=(first_evaluation, final_evaluation),
+            final_evaluation=final_evaluation,
+            escalated=True,
+        )
 
 
 def test_completed_run_can_record_measured_contract_failure() -> None:
@@ -448,7 +546,8 @@ def test_completed_semantic_cache_run_has_no_model_usage() -> None:
     assert result.total_input_tokens == 0
     assert result.total_output_tokens == 0
     assert result.total_tokens == 0
-    assert result.total_calculated_cost == Decimal("0")
+    assert result.total_calculated_cost is None
+    assert result.total_cost_provenance is None
 
 
 @pytest.mark.parametrize("status", [RunStatus.FAILED, RunStatus.TIMED_OUT])
@@ -700,6 +799,7 @@ def test_incomplete_attempt_measurements_do_not_fabricate_totals() -> None:
     assert result.total_output_tokens is None
     assert result.total_tokens is None
     assert result.total_calculated_cost is None
+    assert result.total_cost_provenance is None
 
 
 def test_skipped_model_call_does_not_require_usage() -> None:
