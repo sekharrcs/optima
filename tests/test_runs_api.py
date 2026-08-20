@@ -17,10 +17,10 @@ from optima.context import (
     RecordingTokenCounter,
     RegexTokenCounter,
 )
+from optima.context.safety import DeterministicExtractiveSafetyPolicy
 from optima.cost import CostCalculator, PriceCatalog, PriceCatalogEntry
 from optima.domain.execution import ExecutionEventCode, ModelRole, PlannerReasonCode
 from optima.evaluation import EvaluationEvidence, FakeEvaluator
-from optima.planner import ContextReducerCapability
 from optima.providers import (
     FakeProviderResponse,
     ModelProviderRequest,
@@ -220,7 +220,7 @@ def test_run_endpoint_returns_small_pass_with_plan_and_runtime_facts() -> None:
 def test_run_endpoint_serializes_measured_reduction_evidence() -> None:
     """Return canonical runtime evidence and send measured reduced context to SMALL."""
     original_context = (
-        "Priya Nair owns incident INC-204.\nUnrelated social update for the wider team."
+        "Priya Nair owns incident INC-204.\nPriya Nair owns incident INC-204."
     )
     configured, small, strong, evaluator = dependencies(0.93)
     reducer = FakeContextReducer((reduction_result(original_context),))
@@ -233,11 +233,7 @@ def test_run_endpoint_serializes_measured_reduction_evidence() -> None:
         ),
         context_reducer=reducer,
         token_counter=RegexTokenCounter(),
-        context_reducer_capability=ContextReducerCapability(
-            available=True,
-            task_safe=True,
-            approved_for_critical_high_risk=False,
-        ),
+        context_reducer_safety_policy=DeterministicExtractiveSafetyPolicy(),
     )
 
     response = TestClient(create_app(execution_dependencies=configured)).post(
@@ -282,7 +278,7 @@ def test_run_endpoint_serializes_measured_reduction_evidence() -> None:
 def test_disabled_configuration_bypasses_reducer_and_preserves_original() -> None:
     """Use Planner V1 disabled behavior with zero reducer calls and no fake step."""
     original_context = (
-        "Priya Nair owns incident INC-204.\nUnrelated social update for the wider team."
+        "Priya Nair owns incident INC-204.\nPriya Nair owns incident INC-204."
     )
     configured, small, _, _ = dependencies(0.93)
     reducer = FakeContextReducer((reduction_result(original_context),))
@@ -291,11 +287,7 @@ def test_disabled_configuration_bypasses_reducer_and_preserves_original() -> Non
         configured,
         context_reducer=reducer,
         token_counter=counter,
-        context_reducer_capability=ContextReducerCapability(
-            available=True,
-            task_safe=True,
-            approved_for_critical_high_risk=False,
-        ),
+        context_reducer_safety_policy=DeterministicExtractiveSafetyPolicy(),
     )
 
     response = TestClient(create_app(execution_dependencies=configured)).post(
@@ -326,10 +318,10 @@ def test_disabled_configuration_bypasses_reducer_and_preserves_original() -> Non
     assert small.calls[0].request.context == original_context
 
 
-def test_available_but_unsafe_reducer_is_not_selected_or_called() -> None:
-    """Keep reducer presence separate from task-specific planner safety evidence."""
+def test_unsupported_task_is_not_selected_or_called() -> None:
+    """Reject a configured reducer for a task outside its supported envelope."""
     original_context = (
-        "Priya Nair owns incident INC-204.\nUnrelated social update for the team."
+        "Priya Nair owns incident INC-204.\nPriya Nair owns incident INC-204."
     )
     configured, small, _, _ = dependencies(0.93)
     reducer = FakeContextReducer((reduction_result(original_context),))
@@ -343,11 +335,53 @@ def test_available_but_unsafe_reducer_is_not_selected_or_called() -> None:
         ),
         context_reducer=reducer,
         token_counter=counter,
-        context_reducer_capability=ContextReducerCapability(
-            available=True,
-            task_safe=False,
-            approved_for_critical_high_risk=False,
+        context_reducer_safety_policy=DeterministicExtractiveSafetyPolicy(),
+    )
+
+    response = TestClient(create_app(execution_dependencies=configured)).post(
+        "/api/v1/runs",
+        json=request_payload(
+            context=original_context,
+            request_profile={
+                "task_type": "Q_AND_A",
+                "complexity": "LOW",
+                "input_tokens": 4_000,
+                "risk_tier": "LOW",
+                "cache_eligible": False,
+                "has_large_context": True,
+            },
         ),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["execution_plan"]["context_policy"] == "KEEP_ORIGINAL"
+    assert (
+        PlannerReasonCode.SAFE_REDUCER_UNAVAILABLE
+        in body["execution_plan"]["reason_codes"]
+    )
+    assert reducer.calls == ()
+    assert counter.calls == ()
+    assert small.calls[0].request.context == original_context
+
+
+def test_configured_reducer_without_safety_policy_is_not_task_safe() -> None:
+    """Do not infer task safety merely from configured runtime dependencies."""
+    original_context = (
+        "Priya Nair owns incident INC-204.\nPriya Nair owns incident INC-204."
+    )
+    configured, small, _, _ = dependencies(0.93)
+    reducer = FakeContextReducer((reduction_result(original_context),))
+    counter = RecordingTokenCounter(RegexTokenCounter())
+    configured = replace(
+        configured,
+        settings=AppSettings(
+            semantic_cache_enabled=False,
+            context_reduction_enabled=True,
+            historical_policy_enabled=False,
+        ),
+        context_reducer=reducer,
+        token_counter=counter,
     )
 
     response = TestClient(create_app(execution_dependencies=configured)).post(
@@ -371,6 +405,117 @@ def test_available_but_unsafe_reducer_is_not_selected_or_called() -> None:
     assert (
         PlannerReasonCode.SAFE_REDUCER_UNAVAILABLE
         in body["execution_plan"]["reason_codes"]
+    )
+    assert reducer.calls == ()
+    assert counter.calls == ()
+    assert small.calls[0].request.context == original_context
+
+
+def test_reducer_safety_is_recomputed_for_each_request() -> None:
+    """Do not reuse a supported request's safety decision for a later request."""
+    original_context = (
+        "Priya Nair owns incident INC-204.\nPriya Nair owns incident INC-204."
+    )
+    configured, small, _, _ = dependencies(0.93, 0.93)
+    reducer = FakeContextReducer((reduction_result(original_context),))
+    counter = RecordingTokenCounter(RegexTokenCounter())
+    configured = replace(
+        configured,
+        settings=AppSettings(
+            semantic_cache_enabled=False,
+            context_reduction_enabled=True,
+            historical_policy_enabled=False,
+        ),
+        context_reducer=reducer,
+        token_counter=counter,
+        context_reducer_safety_policy=DeterministicExtractiveSafetyPolicy(),
+    )
+    client = TestClient(create_app(execution_dependencies=configured))
+    profile = {
+        "task_type": "SUMMARIZATION",
+        "complexity": "LOW",
+        "input_tokens": 4_000,
+        "risk_tier": "LOW",
+        "cache_eligible": False,
+        "has_large_context": True,
+    }
+
+    supported = client.post(
+        "/api/v1/runs",
+        json=request_payload(context=original_context, request_profile=profile),
+    )
+    unsupported = client.post(
+        "/api/v1/runs",
+        json=request_payload(
+            context=original_context,
+            request_profile={**profile, "task_type": "Q_AND_A"},
+        ),
+    )
+
+    assert supported.status_code == 200
+    assert supported.json()["execution_plan"]["context_policy"] == "REDUCE"
+    assert unsupported.status_code == 200
+    assert unsupported.json()["execution_plan"]["context_policy"] == "KEEP_ORIGINAL"
+    assert (
+        PlannerReasonCode.SAFE_REDUCER_UNAVAILABLE
+        in unsupported.json()["execution_plan"]["reason_codes"]
+    )
+    assert len(reducer.calls) == 1
+    assert len(counter.calls) == 2
+    assert (
+        small.calls[0].request.context
+        == reduction_result(original_context).reduced_context
+    )
+    assert small.calls[1].request.context == original_context
+
+
+def test_critical_high_risk_preserves_planner_safeguard_without_runtime_calls() -> None:
+    """Let Planner V1 reject a supported task under its critical/high-risk rule."""
+    original_context = (
+        "Priya Nair owns incident INC-204.\nPriya Nair owns incident INC-204."
+    )
+    configured, small, _, _ = dependencies(0.93)
+    reducer = FakeContextReducer((reduction_result(original_context),))
+    counter = RecordingTokenCounter(RegexTokenCounter())
+    configured = replace(
+        configured,
+        settings=AppSettings(
+            semantic_cache_enabled=False,
+            context_reduction_enabled=True,
+            historical_policy_enabled=False,
+        ),
+        context_reducer=reducer,
+        token_counter=counter,
+        context_reducer_safety_policy=DeterministicExtractiveSafetyPolicy(),
+    )
+
+    response = TestClient(create_app(execution_dependencies=configured)).post(
+        "/api/v1/runs",
+        json=request_payload(
+            context=original_context,
+            quality_profile="CRITICAL",
+            risk_tier="HIGH",
+            request_profile={
+                "task_type": "SUMMARIZATION",
+                "complexity": "LOW",
+                "input_tokens": 4_000,
+                "risk_tier": "LOW",
+                "cache_eligible": False,
+                "has_large_context": True,
+            },
+        ),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["execution_plan"]["context_policy"] == "KEEP_ORIGINAL"
+    assert (
+        PlannerReasonCode.CONTEXT_REDUCTION_SKIPPED_HIGH_RISK
+        in body["execution_plan"]["reason_codes"]
+    )
+    assert (
+        PlannerReasonCode.SAFE_REDUCER_UNAVAILABLE
+        not in body["execution_plan"]["reason_codes"]
     )
     assert reducer.calls == ()
     assert counter.calls == ()
@@ -537,8 +682,7 @@ def test_strong_direct_plan_returns_structured_unsupported_error() -> None:
 def test_reduce_strong_direct_plan_remains_unsupported_before_any_calls() -> None:
     """Keep the excluded REDUCE plus STRONG_DIRECT runtime explicitly truthful."""
     original_context = (
-        "System ARC-9 requires audit logging.\n"
-        "Unrelated social update for the architecture group."
+        "System ARC-9 requires audit logging.\nSystem ARC-9 requires audit logging."
     )
     configured, small, strong, evaluator = dependencies(0.93)
     reducer = FakeContextReducer((reduction_result(original_context),))
@@ -552,16 +696,12 @@ def test_reduce_strong_direct_plan_remains_unsupported_before_any_calls() -> Non
         ),
         context_reducer=reducer,
         token_counter=counter,
-        context_reducer_capability=ContextReducerCapability(
-            available=True,
-            task_safe=True,
-            approved_for_critical_high_risk=False,
-        ),
+        context_reducer_safety_policy=DeterministicExtractiveSafetyPolicy(),
     )
-    high_profile = {
-        "task_type": "GENERAL_REASONING",
-        "complexity": "HIGH",
-        "input_tokens": 4_000,
+    strong_direct_profile = {
+        "task_type": "SUMMARIZATION",
+        "complexity": "LOW",
+        "input_tokens": 8_000,
         "risk_tier": "LOW",
         "cache_eligible": False,
         "has_large_context": True,
@@ -569,7 +709,12 @@ def test_reduce_strong_direct_plan_remains_unsupported_before_any_calls() -> Non
 
     response = TestClient(create_app(execution_dependencies=configured)).post(
         "/api/v1/runs",
-        json=request_payload(context=original_context, request_profile=high_profile),
+        json=request_payload(
+            context=original_context,
+            request_profile=strong_direct_profile,
+            quality_profile="CRITICAL",
+            optimization_mode="QUALITY",
+        ),
     )
 
     assert response.status_code == 501

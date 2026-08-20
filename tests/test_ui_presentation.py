@@ -56,9 +56,7 @@ def execute_reduction_result() -> RunResult:
     return execute_result(
         input_text="Summarize incident requirements",
         context=(
-            "Priya Nair owns incident INC-204.\n"
-            "INC-204 affected 37 requests.\n"
-            "Unrelated social update for the wider team."
+            "Priya Nair owns incident INC-204.\nPriya Nair owns incident INC-204."
         ),
         input_tokens=4_000,
         has_large_context=True,

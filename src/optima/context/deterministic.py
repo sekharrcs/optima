@@ -65,13 +65,11 @@ class DeterministicExtractiveReducer:
         request: ContextReductionRequest,
     ) -> ContextReductionResult:
         """Select unique relevant or fact-bearing lines in source order."""
-        segments = tuple(
-            line.strip() for line in request.context.splitlines() if line.strip()
-        )
+        segments = context_segments(request.context)
         if not segments:
             raise ValueError("context must contain a non-empty source segment")
 
-        task_terms = self._task_terms(request.input_text)
+        task_terms = extract_task_terms(request.input_text)
         retained: list[str] = []
         retained_indexes: list[int] = []
         seen: set[str] = set()
@@ -79,19 +77,11 @@ class DeterministicExtractiveReducer:
         irrelevant_count = 0
 
         for index, segment in enumerate(segments):
-            normalized = " ".join(segment.casefold().split())
-            if normalized in seen:
+            if segment in seen:
                 duplicate_count += 1
                 continue
-            seen.add(normalized)
-            segment_terms = {term.casefold() for term in _WORD_PATTERN.findall(segment)}
-            is_relevant = bool(task_terms & segment_terms)
-            is_fact_bearing = bool(
-                _FACT_PATTERN.search(segment)
-                or _IDENTIFIER_PATTERN.search(segment)
-                or _FULL_NAME_PATTERN.search(segment)
-            )
-            if not (is_relevant or is_fact_bearing):
+            seen.add(segment)
+            if not is_retainable_segment(segment, task_terms):
                 irrelevant_count += 1
                 continue
             retained.append(segment)
@@ -118,9 +108,28 @@ class DeterministicExtractiveReducer:
             ),
         )
 
-    def _task_terms(self, input_text: str) -> set[str]:
-        return {
-            term.casefold()
-            for term in _WORD_PATTERN.findall(input_text)
-            if len(term) >= 4 and term.casefold() not in _STOP_WORDS
-        }
+
+def context_segments(context: str) -> tuple[str, ...]:
+    """Return non-blank source lines unchanged and in their original order."""
+    return tuple(line for line in context.splitlines() if line.strip())
+
+
+def extract_task_terms(input_text: str) -> frozenset[str]:
+    """Return normalized task terms used by deterministic relevance checks."""
+    return frozenset(
+        term.casefold()
+        for term in _WORD_PATTERN.findall(input_text)
+        if len(term) >= 4 and term.casefold() not in _STOP_WORDS
+    )
+
+
+def is_retainable_segment(segment: str, task_terms: frozenset[str]) -> bool:
+    """Return whether deterministic extraction retains one unique source line."""
+    segment_terms = {term.casefold() for term in _WORD_PATTERN.findall(segment)}
+    is_relevant = bool(task_terms & segment_terms)
+    is_fact_bearing = bool(
+        _FACT_PATTERN.search(segment)
+        or _IDENTIFIER_PATTERN.search(segment)
+        or _FULL_NAME_PATTERN.search(segment)
+    )
+    return is_relevant or is_fact_bearing

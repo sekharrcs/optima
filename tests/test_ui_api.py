@@ -73,9 +73,7 @@ def test_api_client_parses_typed_context_reduction_evidence() -> None:
     inputs = ExecuteInputs(
         input_text="Summarize incident requirements",
         context=(
-            "Priya Nair owns incident INC-204.\n"
-            "INC-204 affected 37 requests.\n"
-            "Unrelated social update for the wider team."
+            "Priya Nair owns incident INC-204.\nPriya Nair owns incident INC-204."
         ),
         input_tokens=4_000,
         has_large_context=True,

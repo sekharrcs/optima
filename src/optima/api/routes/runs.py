@@ -6,6 +6,7 @@ from fastapi import APIRouter, HTTPException, status
 
 from optima.api.dependencies import ExecutionDependencies
 from optima.api.models import ApiError, RunRequest
+from optima.context.safety import ContextReducerSafetyRequest
 from optima.domain.execution import ExecutionPlan
 from optima.domain.quality_contract import build_quality_contract
 from optima.domain.run import RunResult
@@ -52,7 +53,22 @@ def build_runs_router(
             and dependencies.token_counter is not None
             and run_request.context is not None
         )
-        configured_capability = dependencies.context_reducer_capability
+        reducer_task_safe = False
+        if (
+            reducer_configured
+            and dependencies.context_reducer_safety_policy is not None
+        ):
+            if run_request.context is None:
+                raise AssertionError("configured reducer request must include context")
+            safety_decision = dependencies.context_reducer_safety_policy.evaluate(
+                ContextReducerSafetyRequest(
+                    input_text=run_request.input_text,
+                    context=run_request.context,
+                    task_type=run_request.request_profile.task_type,
+                    complexity=run_request.request_profile.complexity,
+                )
+            )
+            reducer_task_safe = safety_decision.task_safe
         planner_result = select_plan(
             PlannerInput(
                 request_profile=run_request.request_profile,
@@ -60,12 +76,9 @@ def build_runs_router(
                 modules=dependencies.settings.module_configuration(),
                 thresholds=dependencies.settings.planner_thresholds(),
                 reducer_capability=ContextReducerCapability(
-                    available=(reducer_configured and configured_capability.available),
-                    task_safe=(reducer_configured and configured_capability.task_safe),
-                    approved_for_critical_high_risk=(
-                        reducer_configured
-                        and configured_capability.approved_for_critical_high_risk
-                    ),
+                    available=reducer_configured,
+                    task_safe=reducer_task_safe,
+                    approved_for_critical_high_risk=False,
                 ),
                 capabilities=PlannerCapabilities(
                     small_model_configured=True,

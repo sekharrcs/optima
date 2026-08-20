@@ -16,6 +16,11 @@ from optima.context import (
     FakeContextReducer,
     RegexTokenCounter,
 )
+from optima.context.safety import (
+    ContextReducerSafetyRequest,
+    DeterministicExtractiveSafetyPolicy,
+)
+from optima.domain.request_profile import Complexity, TaskType
 
 FIXTURE_PATH = (
     Path(__file__).parent / "fixtures" / "context_reduction" / "preservation_cases.json"
@@ -62,6 +67,94 @@ def test_regex_token_counter_returns_repeatable_actual_counts() -> None:
     assert counter.count("Incident INC-204 affected 37 requests.") == 6
     assert counter.count("Incident INC-204 affected 37 requests.") == 6
     assert counter.count("") == 0
+
+
+def safety_request(**updates: object) -> ContextReducerSafetyRequest:
+    """Build one request inside the local deterministic safety envelope."""
+    values: dict[str, object] = {
+        "input_text": "Summarize the incident facts",
+        "context": (
+            "Priya Nair owns incident INC-204.\nPriya Nair owns incident INC-204."
+        ),
+        "task_type": TaskType.SUMMARIZATION,
+        "complexity": Complexity.LOW,
+    }
+    values.update(updates)
+    return ContextReducerSafetyRequest.model_validate(values)
+
+
+def test_local_safety_policy_allows_only_duplicate_line_summarization() -> None:
+    """Approve the narrow envelope where no unique source line is discarded."""
+    decision = DeterministicExtractiveSafetyPolicy().evaluate(safety_request())
+
+    assert decision.task_safe is True
+    assert decision.policy_name == "local-deterministic-deduplication-v1"
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"task_type": TaskType.Q_AND_A},
+        {"complexity": Complexity.MEDIUM},
+        {"context": "Priya Nair owns incident INC-204."},
+        {
+            "context": (
+                "Priya Nair owns incident INC-204.\nINC-204 affected 37 requests."
+            )
+        },
+        {
+            "context": (
+                "Priya Nair owns incident INC-204.\n"
+                "Priya Nair owns incident INC-204.\n"
+                "Unrelated social update."
+            )
+        },
+        {
+            "context": (
+                "Identifier Foo must be retained.\nIdentifier foo must be retained."
+            )
+        },
+        {
+            "context": (
+                "Identifier Foo must be retained.\n Identifier Foo must be retained."
+            )
+        },
+    ],
+)
+def test_local_safety_policy_rejects_unproven_request_shapes(
+    updates: dict[str, object],
+) -> None:
+    """Default to unsafe outside the explicit duplicate-line envelope."""
+    decision = DeterministicExtractiveSafetyPolicy().evaluate(safety_request(**updates))
+
+    assert decision.task_safe is False
+
+
+def test_reducer_preserves_case_distinct_identifier_lines() -> None:
+    """Do not collapse lines whose identifier case may carry meaning."""
+    counter = RegexTokenCounter()
+    reducer = DeterministicExtractiveReducer(counter)
+    context = (
+        "Identifier Foo must be retained.\n"
+        "Identifier foo must be retained.\n"
+        "Identifier Foo must be retained."
+    )
+
+    result = asyncio.run(
+        reducer.reduce(
+            ContextReductionRequest(
+                run_id="run-case-distinct",
+                input_text="Summarize retained identifiers",
+                context=context,
+            )
+        )
+    )
+
+    assert result.reduced_context == (
+        "Identifier Foo must be retained.\nIdentifier foo must be retained."
+    )
+    assert result.preservation.retained_segment_indexes == (0, 1)
+    assert result.preservation.removed_duplicate_count == 1
 
 
 @pytest.mark.parametrize("case", fixture_cases(), ids=lambda case: case["case_id"])
