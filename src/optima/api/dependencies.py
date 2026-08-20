@@ -6,6 +6,8 @@ from datetime import datetime
 from uuid import uuid4
 
 from optima.config import AppSettings
+from optima.context import ContextReducer, TokenCounter
+from optima.context.safety import ContextReducerSafetyPolicy
 from optima.cost import CostCalculator
 from optima.evaluation import QualityEvaluator
 from optima.execution.executor import system_utc_now
@@ -31,6 +33,9 @@ class ExecutionDependencies:
     strong_provider: ModelProvider
     evaluator: QualityEvaluator
     cost_calculator: CostCalculator
+    context_reducer: ContextReducer | None = None
+    token_counter: TokenCounter | None = None
+    context_reducer_safety_policy: ContextReducerSafetyPolicy | None = None
     monotonic_clock: MonotonicClock | None = None
     utc_now: Callable[[], datetime] = system_utc_now
     run_id_factory: Callable[[], str] = new_run_id

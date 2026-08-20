@@ -5,6 +5,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from optima.api.demo import app as demo_app
+from optima.domain.execution import ContextReductionOutcome, ContextSource
 from optima.domain.quality_contract import OptimizationMode, QualityProfile, RiskTier
 from optima.domain.request_profile import Complexity, TaskType
 from ui.api_client import ApiClientError, OptimaApiClient
@@ -65,6 +66,32 @@ def test_api_client_serializes_request_and_parses_run_result() -> None:
     assert result.total_calculated_cost is not None
     assert result.total_cost_provenance is not None
     assert result.total_cost_provenance.catalog_version == "local-demo-v1"
+
+
+def test_api_client_parses_typed_context_reduction_evidence() -> None:
+    """Validate nested measured reduction facts through the real UI transport."""
+    inputs = ExecuteInputs(
+        input_text="Summarize incident requirements",
+        context=(
+            "Priya Nair owns incident INC-204.\nPriya Nair owns incident INC-204."
+        ),
+        input_tokens=4_000,
+        has_large_context=True,
+    )
+    response = TestClient(demo_app).post(
+        "/api/v1/runs",
+        json=inputs.to_run_request().model_dump(mode="json", exclude_none=True),
+    )
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(response.status_code, json=response.json())
+    )
+
+    result = OptimaApiClient(transport=transport).execute(inputs.to_run_request())
+
+    assert result.steps[0].context_reduction is not None
+    assert result.steps[0].context_reduction.outcome is ContextReductionOutcome.APPLIED
+    assert result.steps[0].context_reduction.context_source is ContextSource.REDUCED
+    assert result.steps[1].context_source is ContextSource.REDUCED
 
 
 def test_local_demo_preserves_unsupported_strong_direct_error() -> None:

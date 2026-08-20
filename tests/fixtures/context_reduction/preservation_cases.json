@@ -1,0 +1,32 @@
+[
+  {
+    "case_id": "incident-ownership-and-dependency",
+    "input_text": "Summarize the incident facts, constraints, ownership, and dependencies.",
+    "context": "Weekly social update for the wider organization.\nPriya Nair owns incident INC-204.\nINC-204 affected 37 checkout requests.\nConstraint: recovery must complete before 18:30 UTC.\nService API-7 depends on Queue Q-12.\nINC-204 affected 37 checkout requests.\nCasual note about office snacks.",
+    "required_facts": [
+      "Priya Nair owns incident INC-204.",
+      "INC-204 affected 37 checkout requests.",
+      "Constraint: recovery must complete before 18:30 UTC.",
+      "Service API-7 depends on Queue Q-12."
+    ],
+    "removed_material": [
+      "Weekly social update for the wider organization.",
+      "Casual note about office snacks."
+    ]
+  },
+  {
+    "case_id": "ordered-migration-requirements",
+    "input_text": "Extract ordered migration requirements and relationships.",
+    "context": "General welcome message for new team members.\nPhase MIG-41 must run before MIG-42.\nElena Ruiz approves MIG-42 only after ticket SEC-9 closes.\nBudget remains 125000 USD.\nDo not disable audit logging.\nPhase MIG-41 must run before MIG-42.\nUnrelated team lunch preferences.",
+    "required_facts": [
+      "Phase MIG-41 must run before MIG-42.",
+      "Elena Ruiz approves MIG-42 only after ticket SEC-9 closes.",
+      "Budget remains 125000 USD.",
+      "Do not disable audit logging."
+    ],
+    "removed_material": [
+      "General welcome message for new team members.",
+      "Unrelated team lunch preferences."
+    ]
+  }
+]

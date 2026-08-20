@@ -58,6 +58,35 @@ Record:
 The reducer must preserve information required to answer the request.
 Context reduction may be disabled through typed module configuration.
 
+Runtime reduction evidence comes from an injected token counter applied to the
+original and reduced context. `RequestProfile.input_tokens` remains a planning
+input and is not treated as measured runtime proof.
+
+If a configured reducer fails, times out, returns invalid evidence, reports token
+counts that disagree with the runtime counter, or does not reduce measured tokens,
+the small-first executor records the unsuccessful reduction step and continues with
+the unchanged original context. The model-call trace identifies that original context
+was used. A selected reduction plan without its reducer or token-counter dependency
+fails structurally before any model call.
+
+Deterministic fixture checks can prove that named benchmark facts survive one local
+extractive reduction. They do not establish general semantic preservation.
+
+The local demo therefore uses a request-aware safety policy with a narrow supported
+envelope. It marks the deterministic reducer task-safe only for `LOW`-complexity
+`SUMMARIZATION` requests whose context contains at least two non-empty lines, at least
+one byte-for-byte duplicate non-blank line, and no unique line that the reducer would
+discard. Within that envelope, runtime reduction removes duplicate lines only and
+preserves retained source-line text. Task types other than
+summarization, `MEDIUM` or `HIGH` complexity, single-line context, context without a
+duplicate, or context containing a unique unsupported line are not established safe
+and keep the original context with `SAFE_REDUCER_UNAVAILABLE`.
+
+This local policy does not claim general semantic preservation. Quality Profile and
+risk safeguards remain Planner V1 decisions. The local policy never approves the
+critical/high-risk exception, so Planner V1's existing critical/high-risk and QUALITY
+mode safeguards remain authoritative.
+
 Example friendly plan names:
 - `Reduce Context -> Small -> Verify -> Escalate if needed`
 - `Reduce Context -> Strong -> Verify`

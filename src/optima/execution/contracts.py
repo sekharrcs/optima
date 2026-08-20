@@ -29,4 +29,8 @@ class ExecutionRequest(BaseModel):
 
 
 class UnsupportedExecutionPlanError(ValueError):
-    """Raised when a selected plan contains runtime outside Slice 5."""
+    """Raised when a selected plan contains runtime outside Slice 8."""
+
+
+class ContextReductionDependencyError(ValueError):
+    """Raised when a REDUCE plan lacks required runtime dependencies or context."""

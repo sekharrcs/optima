@@ -4,11 +4,20 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from time import perf_counter
 
+from optima.context import (
+    ContextReducer,
+    ContextReductionRequest,
+    ContextReductionResult,
+    TokenCounter,
+)
 from optima.cost import CostCalculator
 from optima.domain.evaluation import EvaluationResult
 from optima.domain.execution import (
     CachePolicy,
     ContextPolicy,
+    ContextReductionEvidence,
+    ContextReductionOutcome,
+    ContextSource,
     ExecutionEventCode,
     ExecutionStatus,
     ExecutionStep,
@@ -18,7 +27,11 @@ from optima.domain.execution import (
 )
 from optima.domain.run import ModelUsage, RunResult, RunStatus
 from optima.evaluation import EvaluationRequest, QualityEvaluator
-from optima.execution.contracts import ExecutionRequest, UnsupportedExecutionPlanError
+from optima.execution.contracts import (
+    ContextReductionDependencyError,
+    ExecutionRequest,
+    UnsupportedExecutionPlanError,
+)
 from optima.providers import (
     ModelProvider,
     ModelProviderRequest,
@@ -50,6 +63,8 @@ class SmallFirstExecutor:
         strong_provider: ModelProvider,
         evaluator: QualityEvaluator,
         cost_calculator: CostCalculator,
+        context_reducer: ContextReducer | None = None,
+        token_counter: TokenCounter | None = None,
         monotonic_clock: MonotonicClock | None = None,
         utc_now: Callable[[], datetime] = system_utc_now,
     ) -> None:
@@ -61,6 +76,8 @@ class SmallFirstExecutor:
         self._strong_provider = strong_provider
         self._evaluator = evaluator
         self._cost_calculator = cost_calculator
+        self._context_reducer = context_reducer
+        self._token_counter = token_counter
         self._clock = monotonic_clock or SystemMonotonicClock()
         self._utc_now = utc_now
 
@@ -76,10 +93,17 @@ class SmallFirstExecutor:
         usages: list[ModelUsage] = []
         evaluations: list[EvaluationResult] = []
 
+        effective_context, context_source = await self._prepare_context(
+            request=request,
+            steps=steps,
+        )
+
         small_result = await self._call_provider(
             request=request,
             provider=self._small_provider,
             role=ModelRole.SMALL,
+            effective_context=effective_context,
+            context_source=context_source,
             steps=steps,
         )
         if isinstance(small_result, RunStatus):
@@ -153,6 +177,8 @@ class SmallFirstExecutor:
             request=request,
             provider=self._strong_provider,
             role=ModelRole.STRONG,
+            effective_context=effective_context,
+            context_source=context_source,
             steps=steps,
         )
         if isinstance(strong_result, RunStatus):
@@ -234,6 +260,8 @@ class SmallFirstExecutor:
         request: ExecutionRequest,
         provider: ModelProvider,
         role: ModelRole,
+        effective_context: str | None,
+        context_source: ContextSource,
         steps: list[ExecutionStep],
     ) -> ModelProviderResult | RunStatus:
         started_at = self._clock.now()
@@ -243,7 +271,7 @@ class SmallFirstExecutor:
                     run_id=request.run_id,
                     model_role=role,
                     input_text=request.input_text,
-                    context=request.context,
+                    context=effective_context,
                     metadata={
                         "task_type": request.request_profile.task_type.value,
                         "complexity": request.request_profile.complexity.value,
@@ -263,6 +291,7 @@ class SmallFirstExecutor:
                 started_at=started_at,
                 role=role,
                 error=error,
+                context_source=context_source,
             )
             return RunStatus.TIMED_OUT
         except Exception as error:
@@ -273,6 +302,7 @@ class SmallFirstExecutor:
                 started_at=started_at,
                 role=role,
                 error=error,
+                context_source=context_source,
             )
             return RunStatus.FAILED
 
@@ -288,9 +318,123 @@ class SmallFirstExecutor:
                     "deployment": result.usage.deployment,
                     "request_id": result.usage.request_id,
                 },
+                context_source=context_source,
             )
         )
         return result
+
+    async def _prepare_context(
+        self,
+        *,
+        request: ExecutionRequest,
+        steps: list[ExecutionStep],
+    ) -> tuple[str | None, ContextSource]:
+        """Apply selected reduction once or recover explicitly with original context."""
+        if request.execution_plan.context_policy is ContextPolicy.KEEP_ORIGINAL:
+            return request.context, ContextSource.ORIGINAL
+        if self._context_reducer is None or self._token_counter is None:
+            raise ContextReductionDependencyError(
+                "REDUCE plan requires a configured context reducer and token counter"
+            )
+        if request.context is None:
+            raise ContextReductionDependencyError(
+                "REDUCE plan requires original context"
+            )
+
+        original_count = self._token_counter.count(request.context)
+        started_at = self._clock.now()
+        try:
+            raw_result = await self._context_reducer.reduce(
+                ContextReductionRequest(
+                    run_id=request.run_id,
+                    input_text=request.input_text,
+                    context=request.context,
+                )
+            )
+            result = ContextReductionResult.model_validate(
+                raw_result.model_dump(mode="python")
+            )
+            reduced_count = self._token_counter.count(result.reduced_context)
+            if result.reducer_name != self._context_reducer.reducer_name:
+                raise ValueError("reducer result name does not match dependency")
+            if result.token_counter_name != self._token_counter.counter_name:
+                raise ValueError(
+                    "reducer result token counter does not match dependency"
+                )
+            if result.original_token_count != original_count:
+                raise ValueError("reported original token count disagrees with counter")
+            if result.reduced_token_count != reduced_count:
+                raise ValueError("reported reduced token count disagrees with counter")
+            if reduced_count >= original_count:
+                raise ValueError("reducer output did not reduce measured tokens")
+        except TimeoutError as error:
+            self._append_reduction_fallback(
+                steps=steps,
+                status=ExecutionStatus.TIMED_OUT,
+                started_at=started_at,
+                original_token_count=original_count,
+                error=error,
+            )
+            return request.context, ContextSource.ORIGINAL
+        except Exception as error:
+            self._append_reduction_fallback(
+                steps=steps,
+                status=ExecutionStatus.FAILED,
+                started_at=started_at,
+                original_token_count=original_count,
+                error=error,
+            )
+            return request.context, ContextSource.ORIGINAL
+
+        steps.append(
+            ExecutionStep(
+                sequence=len(steps),
+                step_type=ExecutionStepType.CONTEXT_REDUCTION,
+                status=ExecutionStatus.SUCCEEDED,
+                latency_ms=self._elapsed_ms(started_at),
+                context_reduction=ContextReductionEvidence(
+                    outcome=ContextReductionOutcome.APPLIED,
+                    original_token_count=original_count,
+                    effective_token_count=reduced_count,
+                    reducer_name=result.reducer_name,
+                    method=result.method,
+                    token_counter_name=result.token_counter_name,
+                    context_source=ContextSource.REDUCED,
+                    preservation=result.preservation,
+                ),
+            )
+        )
+        return result.reduced_context, ContextSource.REDUCED
+
+    def _append_reduction_fallback(
+        self,
+        *,
+        steps: list[ExecutionStep],
+        status: ExecutionStatus,
+        started_at: float,
+        original_token_count: int,
+        error: Exception,
+    ) -> None:
+        """Record a failed optional reduction and explicit original-context recovery."""
+        if self._context_reducer is None or self._token_counter is None:
+            raise AssertionError("reduction fallback requires configured dependencies")
+        steps.append(
+            ExecutionStep(
+                sequence=len(steps),
+                step_type=ExecutionStepType.CONTEXT_REDUCTION,
+                status=status,
+                latency_ms=self._elapsed_ms(started_at),
+                context_reduction=ContextReductionEvidence(
+                    outcome=ContextReductionOutcome.FAILED_USING_ORIGINAL,
+                    original_token_count=original_token_count,
+                    effective_token_count=original_token_count,
+                    reducer_name=self._context_reducer.reducer_name,
+                    token_counter_name=self._token_counter.counter_name,
+                    context_source=ContextSource.ORIGINAL,
+                ),
+                error=f"Context reduction {type(error).__name__}",
+            )
+        )
 
     def _with_authoritative_cost(
         self,
@@ -401,14 +545,15 @@ class SmallFirstExecutor:
         plan = request.execution_plan
         if not (
             plan.cache_policy is CachePolicy.SKIP
-            and plan.context_policy is ContextPolicy.KEEP_ORIGINAL
+            and plan.context_policy
+            in {ContextPolicy.KEEP_ORIGINAL, ContextPolicy.REDUCE}
             and plan.model_policy is ModelPolicy.SMALL_FIRST_WITH_FALLBACK
             and plan.initial_model_role is ModelRole.SMALL
             and plan.escalation_model_role is ModelRole.STRONG
             and plan.verification_required
         ):
             raise UnsupportedExecutionPlanError(
-                "Slice 5 supports KEEP_ORIGINAL SMALL_FIRST_WITH_FALLBACK only"
+                "Slice 8 supports SMALL_FIRST_WITH_FALLBACK model execution only"
             )
 
     def _append_failed_step(
@@ -420,6 +565,7 @@ class SmallFirstExecutor:
         started_at: float,
         role: ModelRole,
         error: Exception,
+        context_source: ContextSource | None = None,
     ) -> None:
         operation = step_type.value.lower().replace("_", " ")
         steps.append(
@@ -429,6 +575,7 @@ class SmallFirstExecutor:
                 status=status,
                 latency_ms=self._elapsed_ms(started_at),
                 facts={"model_role": role.value},
+                context_source=context_source,
                 error=f"{role.value} {operation} {type(error).__name__}",
             )
         )

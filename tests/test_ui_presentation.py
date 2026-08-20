@@ -29,9 +29,11 @@ from ui.presentation import (
     REASON_EXPLANATIONS,
     ContractState,
     attempted_model_call_count,
+    context_reduction_view,
     contract_state,
     decision_view,
     format_cost,
+    outcome_label,
     trace_rows,
 )
 
@@ -47,6 +49,48 @@ def execute_result(**updates: object) -> RunResult:
         lambda request: httpx.Response(response.status_code, json=response.json())
     )
     return OptimaApiClient(transport=transport).execute(inputs.to_run_request())
+
+
+def execute_reduction_result() -> RunResult:
+    """Execute one deterministic local request that selects context reduction."""
+    return execute_result(
+        input_text="Summarize incident requirements",
+        context=(
+            "Priya Nair owns incident INC-204.\nPriya Nair owns incident INC-204."
+        ),
+        input_tokens=4_000,
+        has_large_context=True,
+    )
+
+
+def failed_reduction_result() -> RunResult:
+    """Build a validated completed run that recovered with original context."""
+    payload = execute_reduction_result().model_dump(
+        mode="json",
+        exclude_computed_fields=True,
+    )
+    reduction_step = payload["steps"][0]
+    original_tokens = reduction_step["context_reduction"]["original_token_count"]
+    reduction_step.update(
+        {
+            "status": "FAILED",
+            "context_reduction": {
+                "outcome": "FAILED_USING_ORIGINAL",
+                "original_token_count": original_tokens,
+                "effective_token_count": original_tokens,
+                "reducer_name": "deterministic-extractive-reducer-v1",
+                "method": None,
+                "token_counter_name": "regex-token-counter-v1",
+                "context_source": "ORIGINAL",
+                "preservation": None,
+            },
+            "error": "Context reduction RuntimeError",
+        }
+    )
+    for step in payload["steps"]:
+        if step["step_type"] == "MODEL_CALL":
+            step["context_source"] = "ORIGINAL"
+    return RunResult.model_validate(payload)
 
 
 def interrupted_model_call_result(step_status: ExecutionStatus) -> RunResult:
@@ -106,6 +150,45 @@ def test_decision_and_trace_preserve_backend_order_and_non_escalation() -> None:
     )
     assert [row.sequence for row in trace] == [step.sequence for step in result.steps]
     assert len(trace) == len(result.steps)
+
+
+def test_presentation_projects_measured_reduction_facts() -> None:
+    """Display actual backend counts, method, ratio, and reduced context source."""
+    result = execute_reduction_result()
+    reduction = context_reduction_view(result)
+    trace = trace_rows(result.steps)
+
+    assert reduction is not None
+    assert reduction.status == "Applied"
+    assert reduction.original_tokens > reduction.effective_tokens
+    assert reduction.reduction_percentage.endswith("%")
+    assert reduction.method == "RELEVANCE_AND_FACT_EXTRACTIVE_V1"
+    assert reduction.context_source == "Reduced"
+    assert trace[0].context_reduction is not None
+    assert trace[1].context_source == "REDUCED"
+
+
+def test_presentation_does_not_infer_reduction_without_runtime_evidence() -> None:
+    """Keep reduction unavailable when no typed execution step was returned."""
+    result = execute_result()
+
+    assert context_reduction_view(result) is None
+
+
+def test_failed_reduction_shows_original_fallback_without_percentage_claim() -> None:
+    """Render failed optimization evidence without claiming measured reduction."""
+    result = failed_reduction_result()
+    reduction = context_reduction_view(result)
+
+    assert reduction is not None
+    assert reduction.status == "Failed; original context used"
+    assert reduction.original_tokens == reduction.effective_tokens
+    assert reduction.reduction_percentage == "Unavailable"
+    assert reduction.method == "Unavailable"
+    assert reduction.context_source == "Original"
+    assert outcome_label(result).startswith(
+        "Context reduction failed; original context"
+    )
 
 
 def test_decision_exposes_escalation_and_final_contract_failure() -> None:

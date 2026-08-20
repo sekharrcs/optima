@@ -5,10 +5,13 @@ from decimal import Decimal
 import pytest
 from pydantic import ValidationError
 
+from optima.context import ContextPreservationEvidence
 from optima.domain.execution import (
     CachePolicy,
     ContextPolicy,
-    ExecutionEventCode,
+    ContextReductionEvidence,
+    ContextReductionOutcome,
+    ContextSource,
     ExecutionPlan,
     ExecutionStatus,
     ExecutionStep,
@@ -285,17 +288,33 @@ def test_execution_plan_rejects_invalid_estimated_cost(
 
 
 def test_execution_step_preserves_actual_structured_facts() -> None:
-    """Represent ordered execution facts without implementing execution."""
+    """Represent measured applied reduction through canonical typed evidence."""
     step = ExecutionStep(
         sequence=1,
         step_type=ExecutionStepType.CONTEXT_REDUCTION,
         status=ExecutionStatus.SUCCEEDED,
         latency_ms=12,
-        event_codes=(ExecutionEventCode.QUALITY_CONTRACT_MET,),
-        facts={"input_tokens_before": 9000, "input_tokens_after": 3000},
+        context_reduction=ContextReductionEvidence(
+            outcome=ContextReductionOutcome.APPLIED,
+            original_token_count=9000,
+            effective_token_count=3000,
+            reducer_name="extractive-v1",
+            method="EXTRACTIVE",
+            token_counter_name="counter-v1",
+            context_source=ContextSource.REDUCED,
+            preservation=ContextPreservationEvidence(
+                source_order_preserved=True,
+                original_segment_count=2,
+                retained_segment_indexes=(0,),
+                removed_duplicate_count=0,
+                removed_irrelevant_count=1,
+            ),
+        ),
     )
 
-    assert step.facts["input_tokens_before"] == 9000
+    assert step.context_reduction is not None
+    assert step.context_reduction.original_token_count == 9000
+    assert step.context_reduction.effective_token_count == 3000
     assert step.error is None
 
 
