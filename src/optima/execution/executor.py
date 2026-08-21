@@ -540,6 +540,7 @@ class PlanExecutor:
             model_role=usage.model_role,
             input_tokens=usage.input_tokens,
             output_tokens=usage.output_tokens,
+            provider_total_tokens=usage.provider_total_tokens,
             cached_tokens=usage.cached_tokens,
             latency_ms=usage.latency_ms,
             calculated_cost=(calculation.amount if calculation is not None else None),

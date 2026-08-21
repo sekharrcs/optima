@@ -114,6 +114,59 @@ The local demo remains intentionally narrow:
 - Dashboard and Run History retain actual results only for the current
   Streamlit session; refreshing or restarting clears them.
 
+## Foundry and APIM provider configuration
+
+Corrective Slice 10A adds an explicit provider composition for an Azure OpenAI
+v1 endpoint exposed directly by Microsoft Foundry or through Azure API
+Management. The base URL must end at the v1 API root, and each conceptual role
+maps to a configured deployment name:
+
+```powershell
+$env:OPTIMA_FOUNDRY_BASE_URL="https://<gateway-host>/openai/v1"
+$env:OPTIMA_FOUNDRY_SMALL_DEPLOYMENT="<small-deployment-name>"
+$env:OPTIMA_FOUNDRY_STRONG_DEPLOYMENT="<strong-deployment-name>"
+$env:OPTIMA_FOUNDRY_TIMEOUT_SECONDS="30"
+```
+
+Choose one authentication mode. For local API-key development, keep the value
+in your untracked `.env` or process environment:
+
+```powershell
+$env:OPTIMA_FOUNDRY_AUTH_MODE="API_KEY"
+$env:OPTIMA_FOUNDRY_API_KEY="<api-key>"
+```
+
+For local passwordless development, sign in with Azure CLI and configure the
+scope accepted by the APIM inbound policy. A direct Foundry endpoint commonly
+uses `https://ai.azure.com/.default`; an APIM-protected API can require its own
+application ID URI:
+
+```powershell
+az login
+$env:OPTIMA_FOUNDRY_AUTH_MODE="AZURE_CLI"
+$env:OPTIMA_FOUNDRY_TOKEN_SCOPE="api://<apim-application-id>/.default"
+```
+
+For an Azure-hosted deployment, use managed identity. Set the client ID only
+for a user-assigned identity:
+
+```powershell
+$env:OPTIMA_FOUNDRY_AUTH_MODE="MANAGED_IDENTITY"
+$env:OPTIMA_FOUNDRY_TOKEN_SCOPE="api://<apim-application-id>/.default"
+$env:OPTIMA_FOUNDRY_MANAGED_IDENTITY_CLIENT_ID="<user-assigned-client-id>"
+```
+
+`build_foundry_provider_pair(AppSettings())` creates role-specific providers
+that share one asynchronous HTTP client and use only the selected credential.
+Call `FoundryProviderPair.aclose()` during application shutdown. The default
+`optima.api.app` and deterministic `optima.api.demo` do not invoke this builder,
+so importing or starting them never probes Azure credentials.
+
+The adapter sends one request per provider call and does not retry throttling or
+transient service failures. Retry policy requires separate execution evidence
+and is not part of Slice 10A. Evaluation, escalation, and authoritative cost
+calculation remain in their existing OPTIMA components.
+
 On Windows ARM64, use an x64 Python 3.12 interpreter for Streamlit because its
 Pandas and PyArrow dependencies may not have Windows ARM64 wheels in the
 configured package feed.

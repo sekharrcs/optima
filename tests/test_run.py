@@ -368,8 +368,9 @@ def model_usage(
     request_id: str = "provider-request-1",
     run_id: str = "run-1",
     model_role: ModelRole = ModelRole.SMALL,
-    input_tokens: int = 100,
-    output_tokens: int = 20,
+    input_tokens: int | None = 100,
+    output_tokens: int | None = 20,
+    provider_total_tokens: int | None = None,
     calculated_cost: Decimal | None = None,
     pricing_provenance: PricingProvenance | None = None,
 ) -> ModelUsage:
@@ -388,6 +389,7 @@ def model_usage(
         model_role=model_role,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
+        provider_total_tokens=provider_total_tokens,
         latency_ms=125,
         calculated_cost=calculated_cost,
         pricing_provenance=authoritative_provenance,
@@ -490,6 +492,24 @@ def test_model_usage_allows_unavailable_cost_without_placeholder_zero() -> None:
 
     assert usage.calculated_cost is None
     assert usage.pricing_provenance is None
+    assert usage.cached_tokens is None
+
+
+def test_model_usage_preserves_unavailable_tokens_and_provider_total() -> None:
+    """Keep absent token categories unavailable without discarding a reported total."""
+    usage = ModelUsage(
+        request_id="provider-request-1",
+        run_id="run-1",
+        provider="foundry",
+        deployment="small-deployment",
+        model_role=ModelRole.SMALL,
+        provider_total_tokens=37,
+        latency_ms=125,
+    )
+
+    assert usage.input_tokens is None
+    assert usage.output_tokens is None
+    assert usage.provider_total_tokens == 37
     assert usage.cached_tokens is None
 
 
@@ -649,6 +669,35 @@ def test_run_aggregates_one_complete_model_call() -> None:
         catalog_version="test-v1",
         currency="TEST",
     )
+
+
+def test_run_prefers_each_provider_reported_total_without_losing_categories() -> None:
+    """Use a provider total as the exact call total while retaining category facts."""
+    result = completed_run(
+        model_usages=(
+            model_usage(
+                input_tokens=101,
+                output_tokens=19,
+                provider_total_tokens=125,
+            ),
+        )
+    )
+
+    assert result.total_input_tokens == 101
+    assert result.total_output_tokens == 19
+    assert result.total_tokens == 125
+
+
+def test_run_keeps_missing_token_categories_and_total_unavailable() -> None:
+    """Do not turn a missing provider measurement into a zero or partial total."""
+    result = completed_run(
+        model_usages=(model_usage(input_tokens=None, output_tokens=19),)
+    )
+
+    assert result.total_input_tokens is None
+    assert result.total_output_tokens == 19
+    assert result.total_tokens is None
+    assert result.total_calculated_cost is None
 
 
 def test_run_aggregates_escalated_calls_in_execution_order() -> None:

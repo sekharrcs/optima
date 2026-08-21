@@ -3,9 +3,9 @@
 from pathlib import Path
 
 import pytest
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 
-from optima.config import AppSettings
+from optima.config import AppSettings, FoundryAuthMode
 
 
 @pytest.fixture(autouse=True)
@@ -29,6 +29,14 @@ def isolate_settings_sources(
         "OPTIMA_HISTORY_MINIMUM_SAMPLES",
         "OPTIMA_HISTORY_SMALL_PREFER_PASS_RATE",
         "OPTIMA_HISTORY_SMALL_AVOID_PASS_RATE",
+        "OPTIMA_FOUNDRY_BASE_URL",
+        "OPTIMA_FOUNDRY_SMALL_DEPLOYMENT",
+        "OPTIMA_FOUNDRY_STRONG_DEPLOYMENT",
+        "OPTIMA_FOUNDRY_AUTH_MODE",
+        "OPTIMA_FOUNDRY_API_KEY",
+        "OPTIMA_FOUNDRY_TOKEN_SCOPE",
+        "OPTIMA_FOUNDRY_MANAGED_IDENTITY_CLIENT_ID",
+        "OPTIMA_FOUNDRY_TIMEOUT_SECONDS",
     ):
         monkeypatch.delenv(variable, raising=False)
 
@@ -104,6 +112,14 @@ def test_settings_accept_explicit_injection() -> None:
         "history_minimum_samples": 20,
         "history_small_prefer_pass_rate": 0.95,
         "history_small_avoid_pass_rate": 0.70,
+        "foundry_base_url": None,
+        "foundry_small_deployment": None,
+        "foundry_strong_deployment": None,
+        "foundry_auth_mode": None,
+        "foundry_api_key": None,
+        "foundry_token_scope": None,
+        "foundry_managed_identity_client_id": None,
+        "foundry_timeout_seconds": 30.0,
     }
 
 
@@ -226,3 +242,133 @@ def test_settings_ignore_unrelated_dotenv_values(tmp_path: Path) -> None:
     settings = AppSettings()
 
     assert settings.historical_policy_enabled is False
+
+
+def test_default_settings_do_not_request_foundry_composition() -> None:
+    """Keep cloud composition optional for the default API and local demo."""
+    assert AppSettings().foundry_provider_configuration() is None
+
+
+@pytest.mark.parametrize(
+    ("auth_mode", "auth_values"),
+    [
+        (FoundryAuthMode.API_KEY, {"foundry_api_key": "fake-key"}),
+        (
+            FoundryAuthMode.AZURE_CLI,
+            {"foundry_token_scope": "api://optima-apim/.default"},
+        ),
+        (
+            FoundryAuthMode.MANAGED_IDENTITY,
+            {
+                "foundry_token_scope": "api://optima-apim/.default",
+                "foundry_managed_identity_client_id": "managed-client-id",
+            },
+        ),
+    ],
+)
+def test_settings_build_explicit_foundry_authentication_modes(
+    auth_mode: FoundryAuthMode,
+    auth_values: dict[str, str],
+) -> None:
+    """Build each supported mode without adding an implicit credential fallback."""
+    values: dict[str, object] = {
+        "foundry_base_url": "https://gateway.example/openai/v1",
+        "foundry_small_deployment": "small-deployment",
+        "foundry_strong_deployment": "strong-deployment",
+        "foundry_auth_mode": auth_mode,
+    }
+    values.update(auth_values)
+    settings = AppSettings.model_validate(values)
+
+    configuration = settings.foundry_provider_configuration()
+
+    assert configuration is not None
+    assert configuration.auth_mode is auth_mode
+    assert configuration.small_deployment == "small-deployment"
+    assert configuration.strong_deployment == "strong-deployment"
+    assert isinstance(configuration.api_key, SecretStr) or configuration.api_key is None
+
+
+def test_settings_read_foundry_api_key_without_exposing_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Load API-key configuration through the OPTIMA namespace as a secret value."""
+    monkeypatch.setenv(
+        "OPTIMA_FOUNDRY_BASE_URL",
+        "https://gateway.example/openai/v1",
+    )
+    monkeypatch.setenv("OPTIMA_FOUNDRY_SMALL_DEPLOYMENT", "small-deployment")
+    monkeypatch.setenv("OPTIMA_FOUNDRY_STRONG_DEPLOYMENT", "strong-deployment")
+    monkeypatch.setenv("OPTIMA_FOUNDRY_AUTH_MODE", "API_KEY")
+    monkeypatch.setenv("OPTIMA_FOUNDRY_API_KEY", "configured-secret")
+
+    settings = AppSettings()
+    configuration = settings.foundry_provider_configuration()
+
+    assert configuration is not None
+    assert configuration.api_key is not None
+    assert configuration.api_key.get_secret_value() == "configured-secret"
+    assert "configured-secret" not in repr(settings)
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"foundry_base_url": "https://gateway.example/openai/v1"},
+        {
+            "foundry_base_url": "not-a-url",
+            "foundry_small_deployment": "small",
+            "foundry_strong_deployment": "strong",
+            "foundry_auth_mode": "API_KEY",
+            "foundry_api_key": "key",
+        },
+        {
+            "foundry_base_url": "https://gateway.example/not-the-v1-root",
+            "foundry_small_deployment": "small",
+            "foundry_strong_deployment": "strong",
+            "foundry_auth_mode": "API_KEY",
+            "foundry_api_key": "key",
+        },
+        {
+            "foundry_base_url": "https://gateway.example/OPENAI/V1",
+            "foundry_small_deployment": "small",
+            "foundry_strong_deployment": "strong",
+            "foundry_auth_mode": "API_KEY",
+            "foundry_api_key": "key",
+        },
+        {
+            "foundry_base_url": "https://gateway.example/openai/v1",
+            "foundry_small_deployment": "small",
+            "foundry_strong_deployment": "strong",
+            "foundry_auth_mode": "API_KEY",
+        },
+        {
+            "foundry_base_url": "https://gateway.example/openai/v1",
+            "foundry_small_deployment": "small",
+            "foundry_strong_deployment": "strong",
+            "foundry_auth_mode": "AZURE_CLI",
+        },
+        {
+            "foundry_base_url": "https://gateway.example/openai/v1",
+            "foundry_small_deployment": "small",
+            "foundry_strong_deployment": "strong",
+            "foundry_auth_mode": "AZURE_CLI",
+            "foundry_token_scope": "scope",
+            "foundry_api_key": "ambiguous",
+        },
+        {
+            "foundry_base_url": "https://gateway.example/openai/v1",
+            "foundry_small_deployment": "small",
+            "foundry_strong_deployment": "strong",
+            "foundry_auth_mode": "API_KEY",
+            "foundry_api_key": "key",
+            "foundry_token_scope": "ambiguous",
+        },
+    ],
+)
+def test_settings_reject_incomplete_or_ambiguous_foundry_configuration(
+    updates: dict[str, object],
+) -> None:
+    """Fail closed instead of selecting or combining credentials implicitly."""
+    with pytest.raises(ValidationError):
+        AppSettings.model_validate(updates)
