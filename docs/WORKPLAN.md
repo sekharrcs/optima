@@ -141,7 +141,36 @@ Acceptance:
 
 Implement:
 
-- Cosmos DB persistence for OPTIMA run history
+- provider-independent run-history contract and deterministic in-memory store
+- Azure Cosmos DB for NoSQL adapter using `azure.cosmos.aio`
+- immutable versioned documents and bounded read APIs
+
+Acceptance:
+
+- save, point-read, and bounded newest-first list operate on validated
+	`RunResult` evidence
+- the container uses `/id`, and point reads supply the exact run ID as both item
+	and partition key
+- writes use create-only semantics; identical duplicates are idempotent and
+	contradictory duplicates never overwrite evidence
+- authoritative JSON-string payloads preserve exact Decimal costs and unavailable
+	optional measurements
+- every read rejects unsupported, malformed, or contradictory documents
+- recent listing is a parameterized bounded cross-partition query with
+	deterministic run-ID tie ordering
+- items over Cosmos DB's 2-MB UTF-8 JSON limit fail explicitly without truncation
+- account-key, Azure CLI, and managed-identity modes are explicit and mutually
+	exclusive, with no default credential chain
+- one application-lifetime async client and any owned credential are explicitly
+	closeable
+- completed, failed, and timed-out terminal results persist exactly once after
+	execution; persistence failure remains distinct from model-execution failure
+- history reads return structured `404`, `503`, or fail-closed invalid-document
+	responses as appropriate
+- default tests use deterministic fakes without Azure credentials, network
+	access, an emulator, or paid resources
+- planner routing, execution order, provider/evaluator calls, semantic cache,
+	cost calculation, and existing result evidence remain unchanged
 
 ## Slice 10C - Redis semantic-cache adapter
 

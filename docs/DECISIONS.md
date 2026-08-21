@@ -168,3 +168,29 @@ Source evaluation evidence remains unchanged and is exposed separately from
 current-run evaluations. Cache failures and timeouts fall back to normal model
 execution with typed runtime evidence. Redis persistence, cache writes,
 invalidation, embeddings, and cloud adapters remain Slice 10 or later.
+
+## ADR-019: Cosmos run history uses immutable versioned payloads
+
+Status: Accepted
+
+Completed `RunResult` values are immutable execution evidence. The Cosmos
+adapter uses create-only writes and never unconditional upsert. A duplicate run
+ID succeeds only when the existing versioned document validates to the same
+complete result; otherwise the adapter raises a conflict.
+
+Schema version 1 uses `id == RunResult.run_id`, `/id` as the partition-key path,
+canonical UTC `created_at` metadata, and the authoritative
+`RunResult.model_dump_json()` representation stored as a string. The string
+preserves exact Decimal costs that Cosmos binary64 JSON numbers cannot represent
+reliably. Every read validates the strict current model and rejects identity or
+timestamp metadata that contradicts the payload.
+
+The `/id` partition key provides high cardinality and efficient point reads by
+opaque run ID. Its accepted tradeoff is that bounded recent-history listing is a
+cross-partition query. Deterministic ordering uses `created_at DESC, id ASC` and
+requires a matching composite index.
+
+Cosmos authentication is explicit: account key, Azure CLI credential, or
+managed identity. There is no implicit credential chain. One closeable resource
+owner retains the async client and any owned credential for the application
+lifetime. Production lifespan wiring and Cosmos infrastructure remain Slice 11.
