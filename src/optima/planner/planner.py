@@ -1,5 +1,6 @@
 """Deterministic orchestration for composable Planner V1 policies."""
 
+from optima.domain.cache import CacheCandidate, CacheCandidateAssessment
 from optima.domain.execution import (
     CachePolicy,
     ContextPolicy,
@@ -46,12 +47,23 @@ def select_plan(planner_input: PlannerInput) -> PlannerResult:
     module_states = PlannerModuleStates.model_validate(
         planner_input.modules.model_dump()
     )
+    cache_candidate = (
+        CacheCandidate.model_validate(planner_input.cache_candidate)
+        if planner_input.cache_candidate is not None
+        else None
+    )
     cache_decision = evaluate_cache_policy(
         enabled=planner_input.modules.semantic_cache_enabled,
         profile=profile,
-        candidate=planner_input.cache_candidate,
+        request_binding=planner_input.request_binding,
+        candidate=cache_candidate,
         contract=contract,
         thresholds=planner_input.thresholds,
+    )
+    cache_assessment = (
+        CacheCandidateAssessment.from_candidate(cache_candidate)
+        if cache_decision.candidate_assessed and cache_candidate is not None
+        else None
     )
     if cache_decision.policy is CachePolicy.USE_CACHED_RESULT:
         evidence = PlannerDecisionEvidence(
@@ -59,6 +71,9 @@ def select_plan(planner_input: PlannerInput) -> PlannerResult:
             contract_risk_tier=contract.risk_tier,
             effective_risk_tier=effective_risk,
             module_states=module_states,
+            cache_similarity_threshold=(
+                planner_input.thresholds.cache_similarity_threshold
+            ),
             cache_candidate_assessed=cache_decision.candidate_assessed,
         )
         return ExecutionPlan(
@@ -69,6 +84,7 @@ def select_plan(planner_input: PlannerInput) -> PlannerResult:
             verification_required=False,
             escalation_model_role=None,
             optimization_mode=contract.optimization_mode,
+            quality_profile=contract.quality_profile,
             reason_codes=(
                 cache_decision.reason_code,
                 _MODE_REASONS[contract.optimization_mode],
@@ -79,6 +95,11 @@ def select_plan(planner_input: PlannerInput) -> PlannerResult:
                 model_policy=None,
             ),
             decision_evidence=evidence,
+            cache_candidate=cache_candidate.model_copy()
+            if cache_candidate is not None
+            else None,
+            cache_candidate_assessment=cache_assessment,
+            request_binding=planner_input.request_binding.model_copy(),
         )
 
     context_decision = select_context_policy(
@@ -109,6 +130,7 @@ def select_plan(planner_input: PlannerInput) -> PlannerResult:
         contract_risk_tier=contract.risk_tier,
         effective_risk_tier=effective_risk,
         module_states=module_states,
+        cache_similarity_threshold=planner_input.thresholds.cache_similarity_threshold,
         cache_candidate_assessed=cache_decision.candidate_assessed,
         historical_statistics=history_decision.evidence,
         base_model_policy=base_model_decision.policy,
@@ -145,6 +167,7 @@ def select_plan(planner_input: PlannerInput) -> PlannerResult:
         verification_required=True,
         escalation_model_role=ModelRole.STRONG if is_small_first else None,
         optimization_mode=contract.optimization_mode,
+        quality_profile=contract.quality_profile,
         reason_codes=reason_codes,
         human_readable_name=build_plan_name(
             cache_policy=CachePolicy.SKIP,
@@ -152,6 +175,8 @@ def select_plan(planner_input: PlannerInput) -> PlannerResult:
             model_policy=history_decision.final_policy,
         ),
         decision_evidence=evidence,
+        cache_candidate_assessment=cache_assessment,
+        request_binding=planner_input.request_binding.model_copy(),
     )
 
 

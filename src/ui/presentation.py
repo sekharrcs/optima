@@ -6,6 +6,7 @@ from enum import StrEnum
 
 from optima.comparison import BaselineComparison
 from optima.domain.execution import (
+    CachePolicy,
     ContextReductionOutcome,
     ExecutionEventCode,
     ExecutionStatus,
@@ -13,6 +14,7 @@ from optima.domain.execution import (
     ExecutionStepType,
     ModelPolicy,
     PlannerReasonCode,
+    SemanticCacheOutcome,
 )
 from optima.domain.run import PricingProvenance, RunResult
 
@@ -37,6 +39,7 @@ class TraceRow:
     latency: str
     events: tuple[str, ...]
     facts: dict[str, object]
+    semantic_cache: dict[str, object] | None
     context_reduction: dict[str, object] | None
     context_source: str | None
     error: str | None
@@ -73,6 +76,22 @@ class ContextReductionView:
     context_source: str
 
 
+@dataclass(frozen=True)
+class SemanticCacheView:
+    """Backend-authored semantic-cache evidence ready for direct rendering."""
+
+    outcome: str
+    lookup_latency: str
+    source_run_id: str
+    similarity: str
+    evaluator_type: str
+    cached_quality: str
+    source_threshold: str
+    source_passed: str
+    planner_reason: str
+    error: str | None
+
+
 REASON_EXPLANATIONS: dict[PlannerReasonCode, str] = {
     PRC.SEMANTIC_CACHE_DISABLED: "Semantic cache was disabled by configuration.",
     PRC.CACHE_REQUEST_NOT_ELIGIBLE: (
@@ -80,6 +99,9 @@ REASON_EXPLANATIONS: dict[PlannerReasonCode, str] = {
     ),
     PRC.CACHE_CANDIDATE_NOT_SUPPLIED: (
         "No semantic-cache candidate was supplied to Planner V1."
+    ),
+    PRC.CACHE_REQUEST_BINDING_MISMATCH: (
+        "The cache candidate was assessed for a different complete request."
     ),
     PRC.CACHE_SIMILARITY_BELOW_THRESHOLD: (
         "The cache candidate similarity was below the configured threshold."
@@ -181,6 +203,11 @@ REASON_EXPLANATIONS: dict[PlannerReasonCode, str] = {
 }
 
 EVENT_EXPLANATIONS: dict[ExecutionEventCode, str] = {
+    ExecutionEventCode.CACHE_RESULT_REUSED: "Cached result reused",
+    ExecutionEventCode.CACHE_MISS: "Semantic cache miss",
+    ExecutionEventCode.CACHE_MATCH_REJECTED: "Cache match rejected by Planner V1",
+    ExecutionEventCode.CACHE_LOOKUP_FAILED: "Semantic cache lookup failed",
+    ExecutionEventCode.CACHE_LOOKUP_TIMED_OUT: "Semantic cache lookup timed out",
     ExecutionEventCode.QUALITY_CONTRACT_MET: "Quality Contract met",
     ExecutionEventCode.QUALITY_THRESHOLD_NOT_MET: "Quality threshold not met",
     ExecutionEventCode.ESCALATION_REQUIRED: "Escalation required",
@@ -215,6 +242,11 @@ def trace_rows(steps: tuple[ExecutionStep, ...]) -> tuple[TraceRow, ...]:
             latency=f"{step.latency_ms} ms",
             events=tuple(EVENT_EXPLANATIONS[event] for event in step.event_codes),
             facts=dict(step.facts),
+            semantic_cache=(
+                step.semantic_cache.model_dump(mode="json")
+                if step.semantic_cache is not None
+                else None
+            ),
             context_reduction=(
                 step.context_reduction.model_dump(mode="json")
                 if step.context_reduction is not None
@@ -249,12 +281,18 @@ def decision_view(result: RunResult) -> DecisionView:
         "Fallback: "
         + (plan.escalation_model_role.value if plan.escalation_model_role else "NONE"),
     )
-    final_quality = (
-        format_score(result.final_evaluation.score)
-        if result.final_evaluation is not None
-        and result.final_evaluation.evaluator_valid
-        else "Unavailable"
-    )
+    cache = semantic_cache_view(result)
+    final_quality = "Unavailable"
+    if result.final_evaluation is not None and result.final_evaluation.evaluator_valid:
+        final_quality = format_score(result.final_evaluation.score)
+    elif cache is not None and result.semantic_cache is not None:
+        source = result.semantic_cache.prior_evaluation
+        if (
+            result.semantic_cache.outcome is SemanticCacheOutcome.REUSED
+            and source is not None
+            and source.evaluator_valid
+        ):
+            final_quality = format_score(source.score)
     return DecisionView(
         plan_name=plan.human_readable_name,
         complexity=result.request_profile.complexity.value,
@@ -274,6 +312,8 @@ def decision_view(result: RunResult) -> DecisionView:
 def outcome_label(result: RunResult) -> str:
     """Use Planner V1 terminology for one actual execution outcome."""
     plan = result.execution_plan
+    if plan.cache_policy is CachePolicy.USE_CACHED_RESULT:
+        return "Semantic cache"
     if plan.model_policy is ModelPolicy.STRONG_DIRECT:
         label = "Strong direct"
     elif result.escalated:
@@ -286,6 +326,36 @@ def outcome_label(result: RunResult) -> str:
     if reduction is not None:
         return f"Context reduction failed; original context -> {label}"
     return label
+
+
+def semantic_cache_view(result: RunResult) -> SemanticCacheView | None:
+    """Project only typed cache evidence returned by the backend."""
+    evidence = result.semantic_cache
+    if evidence is None:
+        return None
+    source = evidence.prior_evaluation
+    return SemanticCacheView(
+        outcome=evidence.outcome.value.replace("_", " ").title(),
+        lookup_latency=f"{evidence.lookup_latency_ms} ms",
+        source_run_id=evidence.source_run_id or "Unavailable",
+        similarity=(
+            f"{evidence.similarity:.3f}"
+            if evidence.similarity is not None
+            else "Unavailable"
+        ),
+        evaluator_type=source.evaluator_type if source is not None else "Unavailable",
+        cached_quality=format_score(source.score if source is not None else None),
+        source_threshold=format_score(source.threshold if source is not None else None),
+        source_passed=(
+            "Passed"
+            if source is not None and source.passed
+            else "Failed"
+            if source is not None
+            else "Unavailable"
+        ),
+        planner_reason=evidence.planner_reason_code.value,
+        error=evidence.error,
+    )
 
 
 def context_reduction_view(result: RunResult) -> ContextReductionView | None:

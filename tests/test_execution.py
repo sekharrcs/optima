@@ -6,6 +6,8 @@ import pytest
 from pydantic import ValidationError
 
 from optima.context import ContextPreservationEvidence
+from optima.domain.cache import CacheCandidate, CacheCandidateAssessment
+from optima.domain.evaluation import EvaluationResult
 from optima.domain.execution import (
     CachePolicy,
     ContextPolicy,
@@ -22,7 +24,9 @@ from optima.domain.execution import (
     PlannerModuleStates,
     PlannerReasonCode,
 )
-from optima.domain.quality_contract import OptimizationMode, RiskTier
+from optima.domain.quality_contract import OptimizationMode, QualityProfile, RiskTier
+from optima.domain.request_binding import RequestBinding, build_request_binding
+from optima.domain.request_profile import Complexity, TaskType
 
 
 def decision_evidence(
@@ -58,6 +62,7 @@ def small_first_plan(**updates: object) -> ExecutionPlan:
         "verification_required": True,
         "escalation_model_role": ModelRole.STRONG,
         "optimization_mode": OptimizationMode.COST,
+        "quality_profile": QualityProfile.HIGH,
         "reason_codes": (
             PlannerReasonCode.OPTIMIZATION_MODE_COST,
             PlannerReasonCode.SMALL_FIRST_SELECTED,
@@ -67,6 +72,7 @@ def small_first_plan(**updates: object) -> ExecutionPlan:
             base_model_policy=ModelPolicy.SMALL_FIRST_WITH_FALLBACK,
             final_model_policy=ModelPolicy.SMALL_FIRST_WITH_FALLBACK,
         ),
+        "request_binding": cache_request_binding(),
     }
     values.update(updates)
     return ExecutionPlan.model_validate(values)
@@ -82,6 +88,7 @@ def strong_direct_plan(**updates: object) -> ExecutionPlan:
         "verification_required": True,
         "escalation_model_role": None,
         "optimization_mode": OptimizationMode.BALANCED,
+        "quality_profile": QualityProfile.HIGH,
         "reason_codes": (
             PlannerReasonCode.OPTIMIZATION_MODE_BALANCED,
             PlannerReasonCode.STRONG_MODEL_REQUIRED,
@@ -91,13 +98,45 @@ def strong_direct_plan(**updates: object) -> ExecutionPlan:
             base_model_policy=ModelPolicy.STRONG_DIRECT,
             final_model_policy=ModelPolicy.STRONG_DIRECT,
         ),
+        "request_binding": cache_request_binding(),
     }
     values.update(updates)
     return ExecutionPlan.model_validate(values)
 
 
+def cache_request_binding() -> RequestBinding:
+    """Build the complete binding used by cache-plan fixtures."""
+    return build_request_binding(
+        input_text="Summarize incident ARC-9",
+        context="Incident ARC-9 is resolved.",
+        reference_output=None,
+        criteria=(),
+        metadata={},
+        task_type=TaskType.SUMMARIZATION,
+        complexity=Complexity.LOW,
+    )
+
+
 def semantic_cache_plan(**updates: object) -> ExecutionPlan:
     """Build a valid semantic-cache plan with optional test overrides."""
+    request_binding = cache_request_binding()
+    candidate = CacheCandidate(
+        source_run_id="run-source-1",
+        output_text="cached output",
+        request_binding=request_binding,
+        similarity=0.99,
+        prior_evaluation=EvaluationResult(
+            evaluator_type="deterministic",
+            evaluator_valid=True,
+            score=0.95,
+            threshold=0.90,
+            mandatory_checks_passed=True,
+            passed=True,
+            reasons=("Accepted",),
+        ),
+        contract_compatible=True,
+        safe_to_reuse=True,
+    )
     values: dict[str, object] = {
         "cache_policy": CachePolicy.USE_CACHED_RESULT,
         "context_policy": ContextPolicy.NOT_APPLICABLE,
@@ -106,6 +145,7 @@ def semantic_cache_plan(**updates: object) -> ExecutionPlan:
         "verification_required": False,
         "escalation_model_role": None,
         "optimization_mode": OptimizationMode.QUALITY,
+        "quality_profile": QualityProfile.HIGH,
         "reason_codes": (
             PlannerReasonCode.OPTIMIZATION_MODE_QUALITY,
             PlannerReasonCode.CACHE_HIGH_CONFIDENCE_MATCH,
@@ -115,6 +155,11 @@ def semantic_cache_plan(**updates: object) -> ExecutionPlan:
             base_model_policy=None,
             final_model_policy=None,
             cache_candidate_assessed=True,
+        ),
+        "request_binding": request_binding,
+        "cache_candidate": candidate,
+        "cache_candidate_assessment": CacheCandidateAssessment.from_candidate(
+            candidate
         ),
     }
     values.update(updates)
@@ -180,6 +225,7 @@ def test_semantic_cache_plan_bypasses_context_and_models() -> None:
     assert plan.model_policy is None
     assert plan.initial_model_role is None
     assert plan.verification_required is False
+    assert plan.cache_candidate is not None
 
 
 @pytest.mark.parametrize(
@@ -191,6 +237,7 @@ def test_semantic_cache_plan_bypasses_context_and_models() -> None:
         ("verification_required", True),
         ("escalation_model_role", ModelRole.STRONG),
         ("reason_codes", (PlannerReasonCode.OPTIMIZATION_MODE_QUALITY,)),
+        ("cache_candidate", None),
     ],
 )
 def test_semantic_cache_plan_rejects_model_execution_shape(
@@ -249,6 +296,19 @@ def test_plan_rejects_invalid_reason_code_sets(
         small_first_plan(reason_codes=reason_codes)
 
 
+def test_model_plan_rejects_contradictory_cache_reasons() -> None:
+    """Require one unambiguous cache decision reason on model plans."""
+    with pytest.raises(ValidationError, match="cache reason"):
+        small_first_plan(
+            reason_codes=(
+                PlannerReasonCode.OPTIMIZATION_MODE_COST,
+                PlannerReasonCode.CACHE_REUSE_UNSAFE,
+                PlannerReasonCode.CACHE_HIGH_CONFIDENCE_MATCH,
+                PlannerReasonCode.SMALL_FIRST_SELECTED,
+            )
+        )
+
+
 def test_execution_plan_rejects_measured_runtime_fields() -> None:
     """Keep actual quality, usage, and latency outside pre-execution plans."""
     with pytest.raises(ValidationError):
@@ -276,6 +336,12 @@ def test_cache_plan_rejects_unassessed_candidate_evidence() -> None:
                 cache_candidate_assessed=False,
             )
         )
+
+
+def test_model_plan_rejects_resolved_cache_payload() -> None:
+    """Prevent a rejected candidate from leaking into model execution."""
+    with pytest.raises(ValidationError, match="cannot carry a cache candidate"):
+        small_first_plan(cache_candidate=semantic_cache_plan().cache_candidate)
 
 
 @pytest.mark.parametrize("expected_cost", [Decimal("-0.01"), Decimal("NaN")])

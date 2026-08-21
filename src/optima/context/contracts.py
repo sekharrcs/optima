@@ -2,7 +2,9 @@
 
 from typing import Annotated, Protocol, runtime_checkable
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import Field, model_validator
+
+from optima.immutable import ImmutableModel
 
 NonEmptyString = Annotated[str, Field(strict=True, min_length=1)]
 NonNegativeCount = Annotated[int, Field(strict=True, ge=0)]
@@ -10,20 +12,16 @@ PositiveCount = Annotated[int, Field(strict=True, gt=0)]
 StrictBoolean = Annotated[bool, Field(strict=True)]
 
 
-class ContextReductionRequest(BaseModel):
+class ContextReductionRequest(ImmutableModel):
     """Original task and context supplied to one reducer invocation."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
 
     run_id: NonEmptyString
     input_text: NonEmptyString
     context: NonEmptyString
 
 
-class ContextPreservationEvidence(BaseModel):
+class ContextPreservationEvidence(ImmutableModel):
     """Deterministic source-segment evidence emitted by an extractive reducer."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
 
     source_order_preserved: StrictBoolean
     original_segment_count: PositiveCount
@@ -50,10 +48,8 @@ class ContextPreservationEvidence(BaseModel):
         return self
 
 
-class ContextReductionResult(BaseModel):
+class ContextReductionResult(ImmutableModel):
     """Reduced context plus reducer-reported measured evidence."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
 
     reduced_context: NonEmptyString
     original_token_count: PositiveCount

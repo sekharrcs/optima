@@ -128,6 +128,58 @@ It does not invoke models, evaluators, Redis, Cosmos DB, or provider SDKs.
 Executes the selected plan components in order and emits structured step results.
 It honors the planner's verification/escalation policy rather than inventing routing decisions.
 
+### Semantic cache runtime boundary
+
+The application resolves at most one provider-independent semantic-cache match
+after building the current Quality Contract and before invoking Planner V1. The
+lookup returns a typed cached output with source-run identity, similarity, prior
+evaluation, complete source-request binding, contract compatibility, and
+reuse-safety evidence. The API normalizes and deeply revalidates adapter values
+inside the lookup failure boundary before planning. Malformed adapter values
+produce a typed lookup failure and normal model fallback. The adapter does not
+decide whether reuse is allowed.
+
+The request binding is a non-sensitive, versioned SHA-256 fingerprint of
+canonical typed JSON. It covers input text, original context, reference output,
+ordered criteria, caller metadata, task type, and complexity. The API derives it
+before lookup, the lookup request verifies it, Planner V1 compares it with the
+candidate binding, and every plan snapshots it with the selected Quality
+Profile. The serialized binding exposes task type and complexity for profile
+verification but no raw input, context, reference, criteria, or metadata.
+`ExecutionRequest` recomputes the digest from complete request facts.
+`RunResult` verifies profile identity, Quality Profile, Optimization Mode, and
+binding equality across the planner assessment, accepted candidate when
+present, plan, and runtime evidence.
+
+Planner V1 remains authoritative for every threshold, quality, compatibility,
+and safety gate. Every assessed match produces a detached planner assessment
+containing the candidate binding, source identity, similarity, prior evaluation,
+compatibility, and safety facts without the cached output. Rejected runtime
+evidence must match that assessment. When Planner V1 accepts the match, the
+selected plan also carries the exact resolved value. The executor consumes the
+bound snapshot and never performs a second lookup, preventing a different output
+or source run from being substituted between planning and execution.
+
+A binding mismatch is a typed rejected match and continues through normal model
+execution. All semantic-cache outcomes share one domain contract for module and
+profile state, planner reason, candidate assessment, source and error evidence,
+cache policy, execution-step status, and exact event codes. Enabled
+cache-eligible requests must carry an outcome. Attempted lookups produce one
+leading cache step; disabled and ineligible bypasses produce none. A reused hit
+terminates only with one successful cache step and one successful return step.
+Model paths require contiguous step sequences and causal model, evaluation,
+escalation, and return ordering that matches the selected model policy. A
+successful return belongs only to a completed run and carries exact model-role
+and contract-result facts. A failed return is allowed only when invalid final
+evaluator evidence causes the run to fail closed.
+
+A healthy miss, rejected match, lookup failure, or timeout continues through the
+existing context and model path. Typed runtime evidence distinguishes those
+outcomes. An enabled application without a semantic-cache dependency fails as a
+structural configuration error before model execution. The local in-memory
+implementation is deterministic test and demo infrastructure only; the Redis
+adapter remains Slice 10.
+
 ### Provider abstraction
 Hides Microsoft Foundry/APIM request details from planner and execution-policy logic.
 Maps conceptual model roles such as `SMALL` and `STRONG` to configured deployments.

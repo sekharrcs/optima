@@ -76,6 +76,12 @@ If `semantic_cache_enabled == false`:
 - planner skips cache lookup entirely
 - reason code may include `SEMANTIC_CACHE_DISABLED` in debug details
 
+When enabled, the application requires an injected semantic-cache dependency and
+performs one lookup before planning for cache-eligible requests. A missing enabled
+dependency is a structural configuration error. A healthy miss, operational
+failure, or timeout is typed runtime evidence and falls back to normal Planner V1
+model execution; failures and timeouts are not reported as misses.
+
 ### Historical policy disabled
 
 If `historical_policy_enabled == false`:

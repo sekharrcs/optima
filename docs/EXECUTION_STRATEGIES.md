@@ -33,10 +33,55 @@ Record:
 - similarity
 - source run
 - cached quality score
-- model call avoided
-- estimated/known avoided cost
+- actual cache lookup latency and outcome
+- zero current-run model calls and model tokens
 
 Do not reuse answers for requests with unsafe context-dependent differences.
+
+The runtime performs one lookup before planning, deeply revalidates the adapter
+value inside the lookup failure boundary, and binds the exact resolved output
+and source evidence to an accepted plan. Malformed adapter values become typed
+lookup failures and continue through model execution. The runtime does not
+search again during execution. Planner V1 remains the sole authority for
+similarity, prior quality, current-threshold compatibility, contract
+compatibility, and reuse safety.
+
+Reuse also requires exact equality between the candidate's complete source
+request binding and the current request binding. The versioned binding covers
+input text, original context, reference output, ordered criteria, caller
+metadata, task type, and complexity. A mismatch records a rejected match with
+`CACHE_REQUEST_BINDING_MISMATCH`, then follows the selected context and model
+path. The local exact-match cache uses the same complete binding as its key.
+
+Planner V1 snapshots assessed candidate facts separately from the cached output.
+The assessment contains the source request binding, source identity, similarity,
+prior evaluation, contract compatibility, and reuse-safety decision. Rejected
+runtime evidence must equal this planner-owned assessment, while accepted plans
+also retain the exact cached output selected for return.
+
+The source evaluation remains unchanged, including its source threshold, pass
+result, checks, reasons, and metadata. A cache hit does not run or claim a new
+evaluation. The current contract result is derived from Planner V1's acceptance
+of that valid source evidence and its inclusive score comparison against the
+current threshold.
+
+Actual cache-run model cost is unavailable because no model usage exists. Avoided
+cost is reported only when a compatible measured baseline supports it; source or
+estimated cost must not be presented as current calculated cost.
+
+Cache evidence is recursively immutable after validation. Nested JSON objects
+and arrays reject mutation while API and UI serialization still emits ordinary
+JSON objects and arrays. A cache hit has exactly one leading successful cache
+step with reuse and quality-met events, followed by one successful return step.
+Miss, rejection, failure, and timeout each have one exact leading step contract
+before normal model execution. Disabled and ineligible bypasses have no cache
+execution step. Model execution uses contiguous sequence numbers and exact causal
+ordering: a model call must succeed before evaluation, a failed SMALL evaluation
+must precede one SMALL-to-STRONG escalation, and return follows a successful
+evaluation. A successful return requires a completed run and exact model-role
+and contract-result facts. A failed return is valid only when invalid final
+evaluator evidence causes the run to fail closed, with matching role and error
+facts.
 
 Example friendly plan name:
 

@@ -5,7 +5,13 @@ from decimal import Decimal
 import httpx
 from fastapi.testclient import TestClient
 
-from optima.api.demo import app as demo_app
+from optima.api.demo import (
+    DEMO_CACHE_CONTEXT,
+    DEMO_CACHE_INPUT,
+)
+from optima.api.demo import (
+    app as demo_app,
+)
 from optima.comparison import (
     BaselineComparisonRequest,
     BaselineComparisonService,
@@ -13,7 +19,13 @@ from optima.comparison import (
     ComparableRun,
     ComparisonArm,
 )
-from optima.domain.execution import ExecutionStatus, ModelRole, PlannerReasonCode
+from optima.domain.execution import (
+    ExecutionStatus,
+    ExecutionStep,
+    ExecutionStepType,
+    ModelRole,
+    PlannerReasonCode,
+)
 from optima.domain.quality_contract import OptimizationMode, QualityProfile
 from optima.domain.request_profile import Complexity
 from optima.domain.run import PricingProvenance, RunResult, RunStatus
@@ -35,6 +47,8 @@ from ui.presentation import (
     decision_view,
     format_cost,
     outcome_label,
+    reason_explanations,
+    semantic_cache_view,
     trace_rows,
 )
 
@@ -69,6 +83,23 @@ def execute_strong_direct_result() -> RunResult:
     return execute_result(
         input_text="Design a distributed architecture",
         complexity=Complexity.HIGH,
+    )
+
+
+def execute_cache_hit_result() -> RunResult:
+    """Execute the deterministic exact-match local cache entry."""
+    return execute_result(
+        input_text=DEMO_CACHE_INPUT,
+        context=DEMO_CACHE_CONTEXT,
+        cache_eligible=True,
+    )
+
+
+def execute_cache_miss_result() -> RunResult:
+    """Execute one eligible local miss followed by normal model execution."""
+    return execute_result(
+        input_text="A deterministic presentation cache miss",
+        cache_eligible=True,
     )
 
 
@@ -133,7 +164,7 @@ def interrupted_model_call_result(step_status: ExecutionStatus) -> RunResult:
                     "status": step_status,
                     "latency_ms": 0,
                     "event_codes": [],
-                    "facts": {},
+                    "facts": {"model_role": "SMALL"},
                     "error": (
                         None
                         if step_status is ExecutionStatus.SKIPPED
@@ -157,6 +188,17 @@ def interrupted_model_call_result(step_status: ExecutionStatus) -> RunResult:
 def test_reason_explanations_cover_every_planner_code() -> None:
     """Require deterministic text whenever Planner V1 adds or returns a code."""
     assert set(REASON_EXPLANATIONS) == set(PlannerReasonCode)
+
+
+def test_binding_mismatch_reason_has_deterministic_explanation() -> None:
+    """Explain a complete-request cache mismatch without raising a key error."""
+    explanations = reason_explanations(
+        (PlannerReasonCode.CACHE_REQUEST_BINDING_MISMATCH,)
+    )
+
+    assert explanations == (
+        "The cache candidate was assessed for a different complete request.",
+    )
 
 
 def test_decision_and_trace_preserve_backend_order_and_non_escalation() -> None:
@@ -262,6 +304,49 @@ def test_strong_direct_projects_backend_decision_trace_history_and_dashboard() -
     assert summary.contract_pass_rate == 1.0
 
 
+def test_cache_hit_projects_backend_source_evidence_and_dashboard_outcome() -> None:
+    """Render source quality and zero calls without inventing current evaluation."""
+    result = execute_cache_hit_result()
+    decision = decision_view(result)
+    cache = semantic_cache_view(result)
+    trace = trace_rows(result.steps)
+    summary = aggregate_dashboard((HistoryEntry(result=result),))
+
+    assert cache is not None
+    assert cache.outcome == "Reused"
+    assert cache.source_run_id == "run-local-cache-source-1"
+    assert cache.similarity == "1.000"
+    assert cache.cached_quality == "0.96"
+    assert cache.source_threshold == "0.80"
+    assert cache.source_passed == "Passed"
+    assert decision.plan_name == "Cached Result"
+    assert decision.final_quality == "0.96"
+    assert decision.model_calls == 0
+    assert decision.escalation == "Not required"
+    assert decision.contract_state is ContractState.MET
+    assert outcome_label(result) == "Semantic cache"
+    assert summary.plan_distribution == {"Semantic cache": 1}
+    assert [row.step for row in trace] == ["Semantic Cache", "Return"]
+    assert trace[0].semantic_cache is not None
+
+
+def test_cache_miss_projection_does_not_invent_source_facts() -> None:
+    """Show a backend miss and subsequent model facts without fake similarity."""
+    result = execute_cache_miss_result()
+    cache = semantic_cache_view(result)
+    trace = trace_rows(result.steps)
+
+    assert cache is not None
+    assert cache.outcome == "Miss"
+    assert cache.source_run_id == "Unavailable"
+    assert cache.similarity == "Unavailable"
+    assert cache.cached_quality == "Unavailable"
+    assert cache.source_threshold == "Unavailable"
+    assert cache.error is None
+    assert trace[0].step == "Semantic Cache"
+    assert trace[1].step == "Model Call"
+
+
 def test_reduced_strong_direct_projects_backend_reduction_and_contract_evidence() -> (
     None
 ):
@@ -313,7 +398,13 @@ def test_attempted_model_call_count_uses_non_skipped_trace_steps() -> None:
     successful = execute_result()
     failed = interrupted_model_call_result(ExecutionStatus.FAILED)
     timed_out = interrupted_model_call_result(ExecutionStatus.TIMED_OUT)
-    skipped = interrupted_model_call_result(ExecutionStatus.SKIPPED)
+    skipped = ExecutionStep(
+        sequence=0,
+        step_type=ExecutionStepType.MODEL_CALL,
+        status=ExecutionStatus.SKIPPED,
+        latency_ms=0,
+        facts={"model_role": ModelRole.SMALL.value},
+    )
     escalated = execute_result(quality_profile=QualityProfile.CRITICAL)
 
     assert len(successful.model_usages) == 1
@@ -322,7 +413,7 @@ def test_attempted_model_call_count_uses_non_skipped_trace_steps() -> None:
     assert attempted_model_call_count(failed.steps) == 1
     assert timed_out.model_usages == ()
     assert attempted_model_call_count(timed_out.steps) == 1
-    assert attempted_model_call_count(skipped.steps) == 0
+    assert attempted_model_call_count((skipped,)) == 0
     assert attempted_model_call_count(escalated.steps) == 2
 
 
@@ -384,6 +475,13 @@ def test_compatible_measured_baseline_is_aggregated() -> None:
     for index, usage in enumerate(baseline_payload["model_usages"]):
         usage["run_id"] = "run-compatible-baseline"
         usage["request_id"] = f"baseline-request-{index + 1}"
+    model_steps = [
+        step
+        for step in baseline_payload["steps"]
+        if step["step_type"] == ExecutionStepType.MODEL_CALL
+    ]
+    for index, step in enumerate(model_steps):
+        step["facts"]["request_id"] = f"baseline-request-{index + 1}"
     baseline = RunResult.model_validate(baseline_payload)
     identity = BenchmarkCaseIdentity(
         benchmark_case_id="case-compatible-1",

@@ -4,13 +4,21 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from optima.api.demo import app as demo_app
+from optima.api.demo import (
+    DEMO_CACHE_CONTEXT,
+    DEMO_CACHE_INPUT,
+    DEMO_CACHE_OUTPUT,
+)
+from optima.api.demo import (
+    app as demo_app,
+)
 from optima.domain.execution import (
     ContextReductionOutcome,
     ContextSource,
     ExecutionEventCode,
     ModelPolicy,
     ModelRole,
+    SemanticCacheOutcome,
 )
 from optima.domain.quality_contract import OptimizationMode, QualityProfile, RiskTier
 from optima.domain.request_profile import Complexity, TaskType
@@ -144,6 +152,86 @@ def test_api_client_transports_and_parses_measured_strong_direct_result() -> Non
     runtime_events = {code for step in result.steps for code in step.event_codes}
     assert ExecutionEventCode.ESCALATION_REQUIRED not in runtime_events
     assert ExecutionEventCode.ESCALATED_TO_STRONG not in runtime_events
+
+
+def test_api_client_transports_exact_local_cache_hit_evidence() -> None:
+    """Parse a deterministic hit without converting source evidence to a new result."""
+    payload = ExecuteInputs(
+        input_text=DEMO_CACHE_INPUT,
+        context=DEMO_CACHE_CONTEXT,
+        cache_eligible=True,
+    ).to_run_request()
+    response = TestClient(demo_app).post(
+        "/api/v1/runs", json=payload.model_dump(mode="json", exclude_none=True)
+    )
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(response.status_code, json=response.json())
+    )
+
+    result = OptimaApiClient(transport=transport).execute(payload)
+
+    assert response.status_code == 200
+    assert result.execution_plan.human_readable_name == "Cached Result"
+    assert result.final_output == DEMO_CACHE_OUTPUT
+    assert result.semantic_cache is not None
+    assert result.semantic_cache.outcome is SemanticCacheOutcome.REUSED
+    assert result.semantic_cache.source_run_id == "run-local-cache-source-1"
+    assert result.semantic_cache.similarity == 1.0
+    assert result.semantic_cache.prior_evaluation is not None
+    assert result.semantic_cache.prior_evaluation.threshold == 0.80
+    assert result.evaluations == ()
+    assert result.final_evaluation is None
+    assert result.model_usages == ()
+    assert result.total_tokens == 0
+    assert result.total_calculated_cost is None
+
+
+def test_local_cache_exact_match_includes_complete_request_key() -> None:
+    """Treat changed evaluation criteria as a local exact-match cache miss."""
+    payload = ExecuteInputs(
+        input_text=DEMO_CACHE_INPUT,
+        context=DEMO_CACHE_CONTEXT,
+        cache_eligible=True,
+    ).to_run_request()
+    payload.criteria = ("The answer must be JSON.",)
+
+    response = TestClient(demo_app).post(
+        "/api/v1/runs", json=payload.model_dump(mode="json", exclude_none=True)
+    )
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(response.status_code, json=response.json())
+    )
+    result = OptimaApiClient(transport=transport).execute(payload)
+
+    assert response.status_code == 200
+    assert result.execution_plan.human_readable_name != "Cached Result"
+    assert result.semantic_cache is not None
+    assert result.semantic_cache.outcome is SemanticCacheOutcome.MISS
+    assert result.final_output != DEMO_CACHE_OUTPUT
+
+
+def test_api_client_transports_local_cache_miss_before_model_fallback() -> None:
+    """Parse truthful miss evidence followed by actual model execution facts."""
+    payload = ExecuteInputs(
+        input_text="A deterministic local cache miss",
+        cache_eligible=True,
+    ).to_run_request()
+    response = TestClient(demo_app).post(
+        "/api/v1/runs", json=payload.model_dump(mode="json", exclude_none=True)
+    )
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(response.status_code, json=response.json())
+    )
+
+    result = OptimaApiClient(transport=transport).execute(payload)
+
+    assert response.status_code == 200
+    assert result.semantic_cache is not None
+    assert result.semantic_cache.outcome is SemanticCacheOutcome.MISS
+    assert result.semantic_cache.source_run_id is None
+    assert result.semantic_cache.similarity is None
+    assert result.steps[0].event_codes == (ExecutionEventCode.CACHE_MISS,)
+    assert len(result.model_usages) == 1
 
 
 @pytest.mark.parametrize(

@@ -4,9 +4,10 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
-from pydantic import ValidationError
+from pydantic import JsonValue, ValidationError
 
 from optima.context import ContextPreservationEvidence
+from optima.domain.cache import CacheCandidate, CacheCandidateAssessment
 from optima.domain.evaluation import EvaluationResult
 from optima.domain.execution import (
     CachePolicy,
@@ -24,18 +25,22 @@ from optima.domain.execution import (
     PlannerDecisionEvidence,
     PlannerModuleStates,
     PlannerReasonCode,
+    SemanticCacheEvidence,
+    SemanticCacheOutcome,
 )
 from optima.domain.quality_contract import (
     OptimizationMode,
+    QualityContract,
     QualityProfile,
     RiskTier,
     build_quality_contract,
 )
+from optima.domain.request_binding import RequestBinding, build_request_binding
 from optima.domain.request_profile import Complexity, RequestProfile, TaskType
 from optima.domain.run import ModelUsage, PricingProvenance, RunResult, RunStatus
 
 
-def quality_contract() -> object:
+def quality_contract() -> QualityContract:
     """Build the shared High Quality Contract."""
     return build_quality_contract(
         quality_profile=QualityProfile.HIGH,
@@ -51,8 +56,21 @@ def request_profile() -> RequestProfile:
         complexity=Complexity.MEDIUM,
         input_tokens=2500,
         risk_tier=RiskTier.MEDIUM,
-        cache_eligible=True,
+        cache_eligible=False,
         has_large_context=False,
+    )
+
+
+def cache_request_binding() -> RequestBinding:
+    """Build the complete binding shared by cache-run fixtures."""
+    return build_request_binding(
+        input_text="Analyze incident ARC-9",
+        context="Incident ARC-9 is resolved.",
+        reference_output=None,
+        criteria=(),
+        metadata={},
+        task_type=TaskType.LOG_ANALYSIS,
+        complexity=Complexity.MEDIUM,
     )
 
 
@@ -89,6 +107,7 @@ def execution_plan() -> ExecutionPlan:
         verification_required=True,
         escalation_model_role=ModelRole.STRONG,
         optimization_mode=OptimizationMode.COST,
+        quality_profile=QualityProfile.HIGH,
         reason_codes=(
             PlannerReasonCode.OPTIMIZATION_MODE_COST,
             PlannerReasonCode.SMALL_FIRST_SELECTED,
@@ -98,6 +117,7 @@ def execution_plan() -> ExecutionPlan:
             base_model_policy=ModelPolicy.SMALL_FIRST_WITH_FALLBACK,
             final_model_policy=ModelPolicy.SMALL_FIRST_WITH_FALLBACK,
         ),
+        request_binding=cache_request_binding(),
     )
 
 
@@ -174,11 +194,84 @@ def passing_evaluation() -> EvaluationResult:
 
 def successful_step(sequence: int, step_type: ExecutionStepType) -> ExecutionStep:
     """Build one successful execution trace step."""
+    facts: dict[str, JsonValue]
+    event_codes: tuple[ExecutionEventCode, ...]
+    if step_type is ExecutionStepType.ESCALATION:
+        facts = {
+            "from_model_role": ModelRole.SMALL.value,
+            "to_model_role": ModelRole.STRONG.value,
+        }
+        event_codes = (
+            ExecutionEventCode.ESCALATION_REQUIRED,
+            ExecutionEventCode.ESCALATED_TO_STRONG,
+        )
+    else:
+        if step_type is ExecutionStepType.MODEL_CALL:
+            facts = {
+                "model_role": ModelRole.SMALL.value,
+                "provider": "foundry",
+                "deployment": "small-deployment",
+                "request_id": "provider-request-1",
+            }
+            event_codes = ()
+        elif step_type is ExecutionStepType.QUALITY_EVALUATION:
+            facts = {
+                "model_role": ModelRole.SMALL.value,
+                "evaluator_type": "deterministic",
+                "evaluator_valid": True,
+                "score": 0.93,
+                "threshold": 0.90,
+                "passed": True,
+            }
+            event_codes = (ExecutionEventCode.QUALITY_CONTRACT_MET,)
+        elif step_type is ExecutionStepType.RETURN:
+            facts = {
+                "model_role": ModelRole.SMALL.value,
+                "contract_met": True,
+            }
+            event_codes = ()
+        else:
+            facts = {}
+            event_codes = ()
     return ExecutionStep(
         sequence=sequence,
         step_type=step_type,
         status=ExecutionStatus.SUCCEEDED,
         latency_ms=10,
+        event_codes=event_codes,
+        facts=facts,
+    )
+
+
+def evaluation_step(
+    sequence: int,
+    evaluation: EvaluationResult,
+    *,
+    role: ModelRole = ModelRole.SMALL,
+) -> ExecutionStep:
+    """Build one successful evaluation step from its recorded evidence."""
+    event_codes: tuple[ExecutionEventCode, ...] = ()
+    if evaluation.passed:
+        event_codes = (ExecutionEventCode.QUALITY_CONTRACT_MET,)
+    else:
+        if evaluation.evaluator_valid and evaluation.score < evaluation.threshold:
+            event_codes += (ExecutionEventCode.QUALITY_THRESHOLD_NOT_MET,)
+        if role is ModelRole.STRONG and evaluation.evaluator_valid:
+            event_codes += (ExecutionEventCode.FINAL_QUALITY_CONTRACT_NOT_MET,)
+    return ExecutionStep(
+        sequence=sequence,
+        step_type=ExecutionStepType.QUALITY_EVALUATION,
+        status=ExecutionStatus.SUCCEEDED,
+        latency_ms=10,
+        event_codes=event_codes,
+        facts={
+            "model_role": role.value,
+            "evaluator_type": evaluation.evaluator_type,
+            "evaluator_valid": evaluation.evaluator_valid,
+            "score": evaluation.score,
+            "threshold": evaluation.threshold,
+            "passed": evaluation.passed,
+        },
     )
 
 
@@ -188,11 +281,23 @@ def unsuccessful_step(
     status: ExecutionStatus,
 ) -> ExecutionStep:
     """Build one failed, timed-out, or skipped execution trace step."""
+    facts: dict[str, JsonValue]
+    facts = (
+        {"model_role": ModelRole.SMALL.value}
+        if step_type
+        in {
+            ExecutionStepType.MODEL_CALL,
+            ExecutionStepType.QUALITY_EVALUATION,
+            ExecutionStepType.RETURN,
+        }
+        else {}
+    )
     return ExecutionStep(
         sequence=sequence,
         step_type=step_type,
         status=status,
         latency_ms=10,
+        facts=facts,
         error=(
             "Step did not complete"
             if status in {ExecutionStatus.FAILED, ExecutionStatus.TIMED_OUT}
@@ -206,6 +311,7 @@ def strong_direct_model_step(
     status: ExecutionStatus = ExecutionStatus.SUCCEEDED,
     *,
     model_role: str | None = ModelRole.STRONG.value,
+    request_id: str = "provider-request-1",
 ) -> ExecutionStep:
     """Build one strong-direct model-call step with explicit role facts."""
     return strong_direct_role_step(
@@ -213,6 +319,7 @@ def strong_direct_model_step(
         ExecutionStepType.MODEL_CALL,
         status,
         model_role=model_role,
+        request_id=request_id,
     )
 
 
@@ -222,6 +329,8 @@ def strong_direct_role_step(
     status: ExecutionStatus = ExecutionStatus.SUCCEEDED,
     *,
     model_role: str | None = ModelRole.STRONG.value,
+    contract_met: bool = True,
+    request_id: str = "provider-request-1",
 ) -> ExecutionStep:
     """Build one strong-direct step with explicit role facts."""
     step = (
@@ -229,9 +338,29 @@ def strong_direct_role_step(
         if status is ExecutionStatus.SUCCEEDED
         else unsuccessful_step(sequence, step_type, status)
     )
-    return step.model_copy(
-        update={"facts": {} if model_role is None else {"model_role": model_role}}
-    )
+    facts: dict[str, JsonValue] = {}
+    if model_role is not None:
+        if step_type is ExecutionStepType.MODEL_CALL:
+            facts = {
+                "model_role": model_role,
+                "provider": "foundry",
+                "deployment": "strong-deployment",
+                "request_id": request_id,
+            }
+        elif step_type is ExecutionStepType.QUALITY_EVALUATION:
+            facts = {
+                "model_role": model_role,
+                "evaluator_type": "deterministic",
+                "evaluator_valid": True,
+                "score": 0.93,
+                "threshold": 0.90,
+                "passed": True,
+            }
+        else:
+            facts = {"model_role": model_role}
+        if step_type is ExecutionStepType.RETURN:
+            facts["contract_met"] = contract_met
+    return step.model_copy(update={"facts": facts})
 
 
 def model_usage(
@@ -275,6 +404,7 @@ def completed_run(**updates: object) -> RunResult:
         "status": RunStatus.COMPLETED,
         "quality_contract": quality_contract(),
         "request_profile": request_profile(),
+        "request_binding": cache_request_binding(),
         "execution_plan": execution_plan(),
         "steps": (
             successful_step(0, ExecutionStepType.MODEL_CALL),
@@ -536,11 +666,11 @@ def test_run_aggregates_escalated_calls_in_execution_order() -> None:
     result = completed_run(
         steps=(
             successful_step(0, ExecutionStepType.MODEL_CALL),
-            successful_step(1, ExecutionStepType.QUALITY_EVALUATION),
+            evaluation_step(1, small_evaluation),
             successful_step(2, ExecutionStepType.ESCALATION),
-            successful_step(3, ExecutionStepType.MODEL_CALL),
-            successful_step(4, ExecutionStepType.QUALITY_EVALUATION),
-            successful_step(5, ExecutionStepType.RETURN),
+            strong_direct_model_step(3, request_id="provider-request-2"),
+            evaluation_step(4, final_evaluation, role=ModelRole.STRONG),
+            strong_direct_role_step(5, ExecutionStepType.RETURN),
         ),
         model_usages=(
             model_usage(
@@ -603,11 +733,11 @@ def test_escalated_known_and_unknown_costs_do_not_form_partial_total() -> None:
     result = completed_run(
         steps=(
             successful_step(0, ExecutionStepType.MODEL_CALL),
-            successful_step(1, ExecutionStepType.QUALITY_EVALUATION),
+            evaluation_step(1, first_evaluation),
             successful_step(2, ExecutionStepType.ESCALATION),
-            successful_step(3, ExecutionStepType.MODEL_CALL),
-            successful_step(4, ExecutionStepType.QUALITY_EVALUATION),
-            successful_step(5, ExecutionStepType.RETURN),
+            strong_direct_model_step(3, request_id="provider-request-2"),
+            evaluation_step(4, final_evaluation, role=ModelRole.STRONG),
+            strong_direct_role_step(5, ExecutionStepType.RETURN),
         ),
         model_usages=(
             model_usage(calculated_cost=Decimal("0.00125")),
@@ -644,11 +774,11 @@ def test_run_rejects_incompatible_calculated_cost_provenance() -> None:
         completed_run(
             steps=(
                 successful_step(0, ExecutionStepType.MODEL_CALL),
-                successful_step(1, ExecutionStepType.QUALITY_EVALUATION),
+                evaluation_step(1, first_evaluation),
                 successful_step(2, ExecutionStepType.ESCALATION),
-                successful_step(3, ExecutionStepType.MODEL_CALL),
-                successful_step(4, ExecutionStepType.QUALITY_EVALUATION),
-                successful_step(5, ExecutionStepType.RETURN),
+                strong_direct_model_step(3, request_id="provider-request-2"),
+                evaluation_step(4, final_evaluation, role=ModelRole.STRONG),
+                strong_direct_role_step(5, ExecutionStepType.RETURN),
             ),
             model_usages=(
                 model_usage(calculated_cost=Decimal("0.0011")),
@@ -681,6 +811,17 @@ def test_completed_run_can_record_measured_contract_failure() -> None:
     )
 
     result = completed_run(
+        execution_plan=strong_direct_execution_plan(),
+        steps=(
+            strong_direct_model_step(0),
+            evaluation_step(1, failed_evaluation, role=ModelRole.STRONG),
+            strong_direct_role_step(
+                2,
+                ExecutionStepType.RETURN,
+                contract_met=False,
+            ),
+        ),
+        model_usages=(model_usage(model_role=ModelRole.STRONG),),
         evaluations=(failed_evaluation,),
         final_evaluation=failed_evaluation,
         contract_met=False,
@@ -689,41 +830,420 @@ def test_completed_run_can_record_measured_contract_failure() -> None:
     assert result.contract_met is False
 
 
-def test_completed_semantic_cache_run_has_no_model_usage() -> None:
-    """Represent accepted cache reuse with compatible evaluation evidence."""
+def completed_semantic_cache_run() -> RunResult:
+    """Build accepted cache reuse with compatible evaluation evidence."""
+    request_binding = cache_request_binding()
+    source_evaluation = EvaluationResult(
+        evaluator_type="source-deterministic",
+        evaluator_valid=True,
+        score=0.93,
+        threshold=0.80,
+        mandatory_checks_passed=True,
+        passed=True,
+        reasons=("Source contract passed",),
+        metadata={"source_run_id": "run-source-1"},
+    )
+    candidate = CacheCandidate(
+        source_run_id="run-source-1",
+        output_text="Cached final answer",
+        request_binding=request_binding,
+        similarity=0.97,
+        prior_evaluation=source_evaluation,
+        contract_compatible=True,
+        safe_to_reuse=True,
+    )
+    assessment = CacheCandidateAssessment.from_candidate(candidate)
     cache_plan = ExecutionPlan(
         cache_policy=CachePolicy.USE_CACHED_RESULT,
         context_policy=ContextPolicy.NOT_APPLICABLE,
         verification_required=False,
         optimization_mode=OptimizationMode.COST,
+        quality_profile=QualityProfile.HIGH,
         reason_codes=(
             PlannerReasonCode.OPTIMIZATION_MODE_COST,
             PlannerReasonCode.CACHE_HIGH_CONFIDENCE_MATCH,
         ),
-        human_readable_name="Semantic Cache Hit",
+        human_readable_name="Cached Result",
         decision_evidence=decision_evidence(
             base_model_policy=None,
             final_model_policy=None,
             cache_candidate_assessed=True,
         ),
+        cache_candidate=candidate,
+        cache_candidate_assessment=assessment,
+        request_binding=request_binding,
+    )
+    cache_evidence = SemanticCacheEvidence(
+        outcome=SemanticCacheOutcome.REUSED,
+        lookup_latency_ms=4,
+        planner_reason_code=PlannerReasonCode.CACHE_HIGH_CONFIDENCE_MATCH,
+        source_run_id=candidate.source_run_id,
+        similarity=candidate.similarity,
+        prior_evaluation=source_evaluation,
+        candidate_assessment=assessment,
     )
 
     result = completed_run(
         execution_plan=cache_plan,
+        request_profile=request_profile().model_copy(update={"cache_eligible": True}),
+        request_binding=request_binding,
         steps=(
-            successful_step(0, ExecutionStepType.SEMANTIC_CACHE),
-            successful_step(1, ExecutionStepType.RETURN),
+            ExecutionStep(
+                sequence=0,
+                step_type=ExecutionStepType.SEMANTIC_CACHE,
+                status=ExecutionStatus.SUCCEEDED,
+                latency_ms=4,
+                event_codes=(
+                    ExecutionEventCode.CACHE_RESULT_REUSED,
+                    ExecutionEventCode.QUALITY_CONTRACT_MET,
+                ),
+                semantic_cache=cache_evidence,
+            ),
+            successful_step(1, ExecutionStepType.RETURN).model_copy(
+                update={
+                    "facts": {
+                        "contract_met": True,
+                        "source_run_id": candidate.source_run_id,
+                    }
+                }
+            ),
         ),
+        semantic_cache=cache_evidence,
         model_usages=(),
+        evaluations=(),
+        final_evaluation=None,
+        final_output=candidate.output_text,
+        contract_met=True,
     )
+    return result
+
+
+def test_completed_semantic_cache_run_has_no_model_usage() -> None:
+    """Represent accepted cache reuse with compatible evaluation evidence."""
+    result = completed_semantic_cache_run()
+    candidate = result.execution_plan.cache_candidate
+    assert candidate is not None
+    source_evaluation = candidate.prior_evaluation
 
     assert result.execution_plan.cache_policy is CachePolicy.USE_CACHED_RESULT
     assert result.model_usages == ()
+    assert result.evaluations == ()
+    assert result.final_evaluation is None
+    assert result.semantic_cache is not None
+    assert result.semantic_cache.prior_evaluation == source_evaluation
+    assert result.semantic_cache.prior_evaluation.threshold == 0.80
     assert result.total_input_tokens == 0
     assert result.total_output_tokens == 0
     assert result.total_tokens == 0
     assert result.total_calculated_cost is None
     assert result.total_cost_provenance is None
+
+
+def test_run_rejects_removed_miss_evidence_and_cache_step() -> None:
+    """Require lookup evidence for every enabled cache-eligible model run."""
+    miss = SemanticCacheEvidence(
+        outcome=SemanticCacheOutcome.MISS,
+        lookup_latency_ms=4,
+        planner_reason_code=PlannerReasonCode.CACHE_CANDIDATE_NOT_SUPPLIED,
+    )
+    plan = execution_plan().model_copy(
+        update={
+            "reason_codes": (
+                PlannerReasonCode.CACHE_CANDIDATE_NOT_SUPPLIED,
+                PlannerReasonCode.OPTIMIZATION_MODE_COST,
+                PlannerReasonCode.SMALL_FIRST_SELECTED,
+            )
+        }
+    )
+    result = completed_run(
+        execution_plan=plan,
+        request_profile=request_profile().model_copy(update={"cache_eligible": True}),
+        semantic_cache=miss,
+        steps=(
+            ExecutionStep(
+                sequence=0,
+                step_type=ExecutionStepType.SEMANTIC_CACHE,
+                status=ExecutionStatus.SUCCEEDED,
+                latency_ms=4,
+                event_codes=(ExecutionEventCode.CACHE_MISS,),
+                semantic_cache=miss,
+            ),
+            successful_step(1, ExecutionStepType.MODEL_CALL),
+            successful_step(2, ExecutionStepType.QUALITY_EVALUATION),
+            successful_step(3, ExecutionStepType.RETURN),
+        ),
+    )
+    forged = result.model_dump(mode="json", exclude_computed_fields=True)
+    forged["semantic_cache"] = None
+    forged["steps"] = forged["steps"][1:]
+    for sequence, step in enumerate(forged["steps"]):
+        step["sequence"] = sequence
+
+    with pytest.raises(ValidationError, match="cache outcome evidence"):
+        RunResult.model_validate(forged)
+
+
+def test_run_rejects_cache_miss_without_model_call() -> None:
+    """Require normal small-first model execution after a cache miss."""
+    miss = SemanticCacheEvidence(
+        outcome=SemanticCacheOutcome.MISS,
+        lookup_latency_ms=4,
+        planner_reason_code=PlannerReasonCode.CACHE_CANDIDATE_NOT_SUPPLIED,
+    )
+    plan = execution_plan().model_copy(
+        update={
+            "reason_codes": (
+                PlannerReasonCode.CACHE_CANDIDATE_NOT_SUPPLIED,
+                PlannerReasonCode.OPTIMIZATION_MODE_COST,
+                PlannerReasonCode.SMALL_FIRST_SELECTED,
+            )
+        }
+    )
+    result = completed_run(
+        request_profile=request_profile().model_copy(update={"cache_eligible": True}),
+        execution_plan=plan,
+        semantic_cache=miss,
+        steps=(
+            ExecutionStep(
+                sequence=0,
+                step_type=ExecutionStepType.SEMANTIC_CACHE,
+                status=ExecutionStatus.SUCCEEDED,
+                latency_ms=4,
+                event_codes=(ExecutionEventCode.CACHE_MISS,),
+                semantic_cache=miss,
+            ),
+            successful_step(1, ExecutionStepType.MODEL_CALL),
+            successful_step(2, ExecutionStepType.QUALITY_EVALUATION),
+            successful_step(3, ExecutionStepType.RETURN),
+        ),
+    )
+    forged = result.model_dump(mode="json", exclude_computed_fields=True)
+    forged["steps"] = [forged["steps"][0], *forged["steps"][2:]]
+    forged["model_usages"] = []
+    for sequence, step in enumerate(forged["steps"]):
+        step["sequence"] = sequence
+
+    with pytest.raises(ValidationError, match="small-first"):
+        RunResult.model_validate(forged)
+
+
+def test_run_rejects_cache_events_outside_cache_step() -> None:
+    """Keep cache outcome events exclusive to the leading cache step."""
+    hit = completed_semantic_cache_run().model_dump(
+        mode="json",
+        exclude_computed_fields=True,
+    )
+    hit["steps"][1]["event_codes"] = [ExecutionEventCode.CACHE_MISS]
+
+    with pytest.raises(ValidationError, match="cache event codes"):
+        RunResult.model_validate(hit)
+
+    miss = SemanticCacheEvidence(
+        outcome=SemanticCacheOutcome.MISS,
+        lookup_latency_ms=4,
+        planner_reason_code=PlannerReasonCode.CACHE_CANDIDATE_NOT_SUPPLIED,
+    )
+    plan = execution_plan().model_copy(
+        update={
+            "reason_codes": (
+                PlannerReasonCode.CACHE_CANDIDATE_NOT_SUPPLIED,
+                PlannerReasonCode.OPTIMIZATION_MODE_COST,
+                PlannerReasonCode.SMALL_FIRST_SELECTED,
+            )
+        }
+    )
+    miss_result = completed_run(
+        request_profile=request_profile().model_copy(update={"cache_eligible": True}),
+        execution_plan=plan,
+        semantic_cache=miss,
+        steps=(
+            ExecutionStep(
+                sequence=0,
+                step_type=ExecutionStepType.SEMANTIC_CACHE,
+                status=ExecutionStatus.SUCCEEDED,
+                latency_ms=4,
+                event_codes=(ExecutionEventCode.CACHE_MISS,),
+                semantic_cache=miss,
+            ),
+            successful_step(1, ExecutionStepType.MODEL_CALL),
+            successful_step(2, ExecutionStepType.QUALITY_EVALUATION),
+            successful_step(3, ExecutionStepType.RETURN),
+        ),
+    ).model_dump(mode="json", exclude_computed_fields=True)
+    miss_result["steps"][1]["event_codes"] = [ExecutionEventCode.CACHE_RESULT_REUSED]
+
+    with pytest.raises(ValidationError, match="cache event codes"):
+        RunResult.model_validate(miss_result)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (
+            {
+                "request_profile": request_profile().model_copy(
+                    update={"cache_eligible": False}
+                )
+            },
+            "eligib",
+        ),
+        (
+            {
+                "steps": (
+                    ExecutionStep(
+                        sequence=0,
+                        step_type=ExecutionStepType.SEMANTIC_CACHE,
+                        status=ExecutionStatus.SUCCEEDED,
+                        latency_ms=4,
+                        event_codes=(
+                            ExecutionEventCode.CACHE_RESULT_REUSED,
+                            ExecutionEventCode.QUALITY_CONTRACT_MET,
+                        ),
+                        semantic_cache=SemanticCacheEvidence(
+                            outcome=SemanticCacheOutcome.REUSED,
+                            lookup_latency_ms=4,
+                            planner_reason_code=(
+                                PlannerReasonCode.CACHE_HIGH_CONFIDENCE_MATCH
+                            ),
+                            source_run_id="run-source-1",
+                            similarity=0.97,
+                            prior_evaluation=EvaluationResult(
+                                evaluator_type="source-deterministic",
+                                evaluator_valid=True,
+                                score=0.93,
+                                threshold=0.80,
+                                mandatory_checks_passed=True,
+                                passed=True,
+                                reasons=("Source contract passed",),
+                            ),
+                        ),
+                    ),
+                    unsuccessful_step(
+                        1,
+                        ExecutionStepType.RETURN,
+                        ExecutionStatus.FAILED,
+                    ),
+                )
+            },
+            "cache step",
+        ),
+    ],
+)
+def test_cache_hit_rejects_forged_terminal_or_profile_facts(
+    mutation: dict[str, object],
+    message: str,
+) -> None:
+    """Reject cache hits with ineligible profiles or unsuccessful returns."""
+    request_binding = cache_request_binding()
+    source_evaluation = EvaluationResult(
+        evaluator_type="source-deterministic",
+        evaluator_valid=True,
+        score=0.93,
+        threshold=0.80,
+        mandatory_checks_passed=True,
+        passed=True,
+        reasons=("Source contract passed",),
+    )
+    candidate = CacheCandidate(
+        source_run_id="run-source-1",
+        output_text="Cached final answer",
+        request_binding=request_binding,
+        similarity=0.97,
+        prior_evaluation=source_evaluation,
+        contract_compatible=True,
+        safe_to_reuse=True,
+    )
+    assessment = CacheCandidateAssessment.from_candidate(candidate)
+    cache_evidence = SemanticCacheEvidence(
+        outcome=SemanticCacheOutcome.REUSED,
+        lookup_latency_ms=4,
+        planner_reason_code=PlannerReasonCode.CACHE_HIGH_CONFIDENCE_MATCH,
+        source_run_id=candidate.source_run_id,
+        similarity=candidate.similarity,
+        prior_evaluation=source_evaluation,
+        candidate_assessment=assessment,
+    )
+    plan = ExecutionPlan(
+        cache_policy=CachePolicy.USE_CACHED_RESULT,
+        context_policy=ContextPolicy.NOT_APPLICABLE,
+        verification_required=False,
+        optimization_mode=OptimizationMode.COST,
+        quality_profile=QualityProfile.HIGH,
+        reason_codes=(
+            PlannerReasonCode.OPTIMIZATION_MODE_COST,
+            PlannerReasonCode.CACHE_HIGH_CONFIDENCE_MATCH,
+        ),
+        human_readable_name="Cached Result",
+        decision_evidence=decision_evidence(
+            base_model_policy=None,
+            final_model_policy=None,
+            cache_candidate_assessed=True,
+        ),
+        cache_candidate=candidate,
+        cache_candidate_assessment=assessment,
+        request_binding=request_binding,
+    )
+    values: dict[str, object] = {
+        "execution_plan": plan,
+        "request_profile": request_profile().model_copy(
+            update={"cache_eligible": True}
+        ),
+        "request_binding": request_binding,
+        "semantic_cache": cache_evidence,
+        "steps": (
+            ExecutionStep(
+                sequence=0,
+                step_type=ExecutionStepType.SEMANTIC_CACHE,
+                status=ExecutionStatus.SUCCEEDED,
+                latency_ms=4,
+                event_codes=(
+                    ExecutionEventCode.CACHE_RESULT_REUSED,
+                    ExecutionEventCode.QUALITY_CONTRACT_MET,
+                ),
+                semantic_cache=cache_evidence,
+            ),
+            successful_step(1, ExecutionStepType.RETURN),
+        ),
+        "model_usages": (),
+        "evaluations": (),
+        "final_evaluation": None,
+        "final_output": candidate.output_text,
+        "contract_met": True,
+    }
+    values.update(mutation)
+
+    with pytest.raises(ValidationError, match=message):
+        completed_run(**values)
+
+
+def test_model_run_rejects_cache_evidence_with_different_planner_reason() -> None:
+    """Prevent transported runtime evidence from contradicting Planner V1."""
+    cache_evidence = SemanticCacheEvidence(
+        outcome=SemanticCacheOutcome.MISS,
+        lookup_latency_ms=2,
+        planner_reason_code=PlannerReasonCode.CACHE_CANDIDATE_NOT_SUPPLIED,
+    )
+
+    with pytest.raises(ValidationError, match="reason must appear"):
+        completed_run(
+            request_profile=request_profile().model_copy(
+                update={"cache_eligible": True}
+            ),
+            semantic_cache=cache_evidence,
+            steps=(
+                ExecutionStep(
+                    sequence=0,
+                    step_type=ExecutionStepType.SEMANTIC_CACHE,
+                    status=ExecutionStatus.SUCCEEDED,
+                    latency_ms=2,
+                    event_codes=(ExecutionEventCode.CACHE_MISS,),
+                    semantic_cache=cache_evidence,
+                ),
+                successful_step(1, ExecutionStepType.MODEL_CALL),
+                successful_step(2, ExecutionStepType.QUALITY_EVALUATION),
+                successful_step(3, ExecutionStepType.RETURN),
+            ),
+        )
 
 
 @pytest.mark.parametrize("status", [RunStatus.FAILED, RunStatus.TIMED_OUT])
@@ -789,11 +1309,11 @@ def test_escalated_run_accepts_bidirectionally_consistent_trace() -> None:
     result = completed_run(
         steps=(
             successful_step(0, ExecutionStepType.MODEL_CALL),
-            successful_step(1, ExecutionStepType.QUALITY_EVALUATION),
+            evaluation_step(1, first_evaluation),
             successful_step(2, ExecutionStepType.ESCALATION),
-            successful_step(3, ExecutionStepType.MODEL_CALL),
-            successful_step(4, ExecutionStepType.QUALITY_EVALUATION),
-            successful_step(5, ExecutionStepType.RETURN),
+            strong_direct_model_step(3, request_id="provider-request-2"),
+            evaluation_step(4, final_evaluation, role=ModelRole.STRONG),
+            strong_direct_role_step(5, ExecutionStepType.RETURN),
         ),
         model_usages=(
             model_usage(),
@@ -808,6 +1328,264 @@ def test_escalated_run_accepts_bidirectionally_consistent_trace() -> None:
     )
 
     assert result.escalated is True
+
+
+def test_run_rejects_non_contiguous_step_sequences() -> None:
+    """Require executor-emitted zero-based contiguous trace sequences."""
+    with pytest.raises(ValidationError, match="contiguous"):
+        completed_run(
+            steps=(
+                successful_step(10, ExecutionStepType.MODEL_CALL),
+                successful_step(20, ExecutionStepType.QUALITY_EVALUATION),
+                successful_step(30, ExecutionStepType.RETURN),
+            )
+        )
+
+
+def test_small_first_run_rejects_strong_only_execution() -> None:
+    """Require a small-first trace and usage history to begin with SMALL."""
+    with pytest.raises(ValidationError, match="SMALL"):
+        completed_run(
+            steps=(
+                strong_direct_model_step(0),
+                strong_direct_role_step(1, ExecutionStepType.QUALITY_EVALUATION),
+                strong_direct_role_step(2, ExecutionStepType.RETURN),
+            ),
+            model_usages=(model_usage(model_role=ModelRole.STRONG),),
+        )
+
+
+def test_interrupted_small_first_run_rejects_strong_only_execution() -> None:
+    """Apply SMALL-first causality even when execution is interrupted."""
+    with pytest.raises(ValidationError, match="SMALL"):
+        completed_run(
+            status=RunStatus.FAILED,
+            steps=(strong_direct_model_step(0, ExecutionStatus.FAILED),),
+            model_usages=(),
+            evaluations=(),
+            final_evaluation=None,
+            final_output=None,
+            contract_met=None,
+            error="Strong provider failed",
+        )
+
+
+def test_nested_run_evidence_model_copy_revalidates_updates() -> None:
+    """Reject invalid nested evidence created through Pydantic model_copy."""
+    with pytest.raises(ValidationError):
+        PricingProvenance(
+            catalog_version="test-v1",
+            currency="TEST",
+        ).model_copy(update={"currency": ""})
+
+
+def test_run_model_copy_revalidates_constructed_nested_plan() -> None:
+    """Reject unchecked nested plan state supplied to parent model_copy."""
+    plan = execution_plan()
+    plan_values = {
+        field_name: getattr(plan, field_name) for field_name in type(plan).model_fields
+    }
+    plan_values["human_readable_name"] = ""
+    invalid_plan = ExecutionPlan.model_construct(**plan_values)
+
+    with pytest.raises(ValidationError, match="human_readable_name"):
+        completed_run().model_copy(update={"execution_plan": invalid_plan})
+
+
+def test_completed_run_rejects_failed_terminal_return() -> None:
+    """Require a completed model trace to end in a successful return."""
+    with pytest.raises(ValidationError, match="terminal return"):
+        completed_run(
+            steps=(
+                successful_step(0, ExecutionStepType.MODEL_CALL),
+                successful_step(1, ExecutionStepType.QUALITY_EVALUATION),
+                unsuccessful_step(
+                    2,
+                    ExecutionStepType.RETURN,
+                    ExecutionStatus.FAILED,
+                ),
+            )
+        )
+
+
+def test_interrupted_run_rejects_successful_terminal_return() -> None:
+    """Prevent interrupted runs from claiming a successful return."""
+    with pytest.raises(ValidationError, match="completed run"):
+        interrupted_run(
+            status=RunStatus.FAILED,
+            steps=(
+                successful_step(0, ExecutionStepType.MODEL_CALL),
+                successful_step(1, ExecutionStepType.QUALITY_EVALUATION),
+                successful_step(2, ExecutionStepType.RETURN),
+            ),
+            model_usages=(model_usage(),),
+            evaluations=(passing_evaluation(),),
+        )
+
+
+def test_completed_run_rejects_contradictory_return_contract_fact() -> None:
+    """Bind terminal return facts to final quality evidence."""
+    terminal = successful_step(2, ExecutionStepType.RETURN).model_copy(
+        update={
+            "facts": {
+                "model_role": ModelRole.SMALL.value,
+                "contract_met": False,
+            }
+        }
+    )
+
+    with pytest.raises(ValidationError, match="return facts"):
+        completed_run(
+            steps=(
+                successful_step(0, ExecutionStepType.MODEL_CALL),
+                successful_step(1, ExecutionStepType.QUALITY_EVALUATION),
+                terminal,
+            )
+        )
+
+
+def test_run_rejects_plan_optimization_mode_mismatch() -> None:
+    """Bind persisted plans to the run Quality Contract mode."""
+    with pytest.raises(ValidationError, match="Optimization Mode"):
+        completed_run(
+            quality_contract=quality_contract().model_copy(
+                update={"optimization_mode": OptimizationMode.QUALITY}
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("run_status", "step_status"),
+    [
+        (RunStatus.FAILED, ExecutionStatus.TIMED_OUT),
+        (RunStatus.TIMED_OUT, ExecutionStatus.FAILED),
+        (RunStatus.FAILED, ExecutionStatus.SKIPPED),
+    ],
+)
+def test_interrupted_run_rejects_terminal_status_mismatch(
+    run_status: RunStatus,
+    step_status: ExecutionStatus,
+) -> None:
+    """Bind the final interrupted step status to the top-level run status."""
+    step = (
+        successful_step(0, ExecutionStepType.MODEL_CALL).model_copy(
+            update={"status": ExecutionStatus.SKIPPED}
+        )
+        if step_status is ExecutionStatus.SKIPPED
+        else unsuccessful_step(0, ExecutionStepType.MODEL_CALL, step_status)
+    )
+
+    with pytest.raises(ValidationError, match="run status"):
+        interrupted_run(status=run_status, steps=(step,))
+
+
+def test_run_rejects_evaluation_step_facts_that_contradict_evidence() -> None:
+    """Bind successful evaluation trace facts and events to recorded evidence."""
+    forged = successful_step(1, ExecutionStepType.QUALITY_EVALUATION).model_copy(
+        update={
+            "event_codes": (ExecutionEventCode.FINAL_QUALITY_CONTRACT_NOT_MET,),
+            "facts": {
+                "model_role": ModelRole.SMALL.value,
+                "evaluator_type": "forged",
+                "evaluator_valid": True,
+                "score": 0.0,
+                "threshold": 0.90,
+                "passed": False,
+            },
+        }
+    )
+
+    with pytest.raises(ValidationError, match="evaluation step"):
+        completed_run(
+            steps=(
+                successful_step(0, ExecutionStepType.MODEL_CALL),
+                forged,
+                successful_step(2, ExecutionStepType.RETURN),
+            )
+        )
+
+
+def test_run_rejects_evaluation_after_failed_model_call() -> None:
+    """Do not evaluate or return a candidate that no model call produced."""
+    with pytest.raises(ValidationError, match="requires a successful model call"):
+        completed_run(
+            steps=(
+                unsuccessful_step(
+                    0,
+                    ExecutionStepType.MODEL_CALL,
+                    ExecutionStatus.FAILED,
+                ),
+                successful_step(1, ExecutionStepType.QUALITY_EVALUATION),
+                successful_step(2, ExecutionStepType.RETURN),
+            )
+        )
+
+
+def test_small_first_run_rejects_escalation_before_small_evaluation() -> None:
+    """Require escalation only after one unsuccessful SMALL evaluation."""
+    first_evaluation = passing_evaluation().model_copy(
+        update={"score": 0.80, "passed": False}
+    )
+    with pytest.raises(ValidationError, match="escalation"):
+        completed_run(
+            steps=(
+                successful_step(0, ExecutionStepType.ESCALATION),
+                successful_step(1, ExecutionStepType.MODEL_CALL),
+                successful_step(2, ExecutionStepType.QUALITY_EVALUATION),
+                successful_step(3, ExecutionStepType.MODEL_CALL),
+                successful_step(4, ExecutionStepType.QUALITY_EVALUATION),
+                successful_step(5, ExecutionStepType.RETURN),
+            ),
+            model_usages=(
+                model_usage(),
+                model_usage(request_id="provider-request-2"),
+            ),
+            evaluations=(first_evaluation, passing_evaluation()),
+            escalated=True,
+        )
+
+
+def test_cache_hit_rejects_request_profile_rebinding() -> None:
+    """Keep cache-hit request identity bound to profile facts in the result."""
+    forged = completed_semantic_cache_run().model_dump(
+        mode="json",
+        exclude_computed_fields=True,
+    )
+    forged["request_profile"]["task_type"] = TaskType.GENERAL_REASONING
+    forged["request_profile"]["complexity"] = Complexity.HIGH
+
+    with pytest.raises(ValidationError, match="request binding"):
+        RunResult.model_validate(forged)
+
+
+def test_cache_hit_rejects_contradictory_cache_reason() -> None:
+    """Allow only the accepted-match cache reason on a reuse plan."""
+    result = completed_semantic_cache_run()
+    with pytest.raises(ValidationError, match="cache reason"):
+        result.execution_plan.model_copy(
+            update={
+                "reason_codes": (
+                    *result.execution_plan.reason_codes,
+                    PlannerReasonCode.CACHE_REUSE_UNSAFE,
+                )
+            }
+        )
+
+
+def test_cache_hit_rejects_forged_return_evidence() -> None:
+    """Bind the terminal return facts and events to accepted cache reuse."""
+    forged = completed_semantic_cache_run().model_dump(
+        mode="json",
+        exclude_computed_fields=True,
+    )
+    forged["steps"][1]["facts"] = {
+        "contract_met": False,
+        "source_run_id": "forged-source",
+    }
+    forged["steps"][1]["event_codes"] = [ExecutionEventCode.QUALITY_THRESHOLD_NOT_MET]
+
+    with pytest.raises(ValidationError, match="cache return"):
+        RunResult.model_validate(forged)
 
 
 def test_strong_direct_run_rejects_multiple_model_attempts() -> None:
@@ -1144,7 +1922,7 @@ def test_run_rejects_final_evaluation_not_last_in_trace() -> None:
 
 def test_run_rejects_unordered_or_duplicate_execution_steps() -> None:
     """Require a deterministic actual execution trace."""
-    with pytest.raises(ValidationError, match="unique and ascending"):
+    with pytest.raises(ValidationError, match="contiguous"):
         completed_run(
             steps=(
                 successful_step(1, ExecutionStepType.MODEL_CALL),
@@ -1243,13 +2021,13 @@ def test_incomplete_attempt_measurements_do_not_fabricate_totals() -> None:
         status=RunStatus.FAILED,
         steps=(
             successful_step(0, ExecutionStepType.MODEL_CALL),
-            successful_step(1, ExecutionStepType.QUALITY_EVALUATION),
+            evaluation_step(1, small_evaluation),
             successful_step(2, ExecutionStepType.ESCALATION),
             unsuccessful_step(
                 3,
                 ExecutionStepType.MODEL_CALL,
                 ExecutionStatus.FAILED,
-            ),
+            ).model_copy(update={"facts": {"model_role": ModelRole.STRONG.value}}),
         ),
         model_usages=(
             model_usage(
@@ -1273,20 +2051,19 @@ def test_incomplete_attempt_measurements_do_not_fabricate_totals() -> None:
     assert result.total_cost_provenance is None
 
 
-def test_skipped_model_call_does_not_require_usage() -> None:
-    """Do not fabricate usage for a model call that was never attempted."""
-    result = interrupted_run(
-        status=RunStatus.FAILED,
-        steps=(
-            unsuccessful_step(
-                0,
-                ExecutionStepType.MODEL_CALL,
-                ExecutionStatus.SKIPPED,
+def test_skipped_model_call_cannot_terminate_interrupted_run() -> None:
+    """Reject a skipped operation as the claimed cause of run interruption."""
+    with pytest.raises(ValidationError, match="run status"):
+        interrupted_run(
+            status=RunStatus.FAILED,
+            steps=(
+                unsuccessful_step(
+                    0,
+                    ExecutionStepType.MODEL_CALL,
+                    ExecutionStatus.SKIPPED,
+                ),
             ),
-        ),
-    )
-
-    assert result.model_usages == ()
+        )
 
 
 def test_run_rejects_more_usage_than_non_skipped_model_calls() -> None:
@@ -1320,31 +2097,34 @@ def test_unsuccessful_evaluation_allows_unavailable_result(
     result = interrupted_run(
         status=run_status,
         steps=(
+            successful_step(0, ExecutionStepType.MODEL_CALL),
             unsuccessful_step(
-                0,
+                1,
                 ExecutionStepType.QUALITY_EVALUATION,
                 step_status,
             ),
         ),
+        model_usages=(model_usage(),),
     )
 
     assert result.evaluations == ()
 
 
-def test_skipped_evaluation_does_not_require_result() -> None:
-    """Do not fabricate evidence for an evaluation that was never attempted."""
-    result = interrupted_run(
-        status=RunStatus.FAILED,
-        steps=(
-            unsuccessful_step(
-                0,
-                ExecutionStepType.QUALITY_EVALUATION,
-                ExecutionStatus.SKIPPED,
+def test_skipped_evaluation_cannot_terminate_interrupted_run() -> None:
+    """Reject a skipped evaluation as the claimed cause of interruption."""
+    with pytest.raises(ValidationError, match="run status"):
+        interrupted_run(
+            status=RunStatus.FAILED,
+            steps=(
+                successful_step(0, ExecutionStepType.MODEL_CALL),
+                unsuccessful_step(
+                    1,
+                    ExecutionStepType.QUALITY_EVALUATION,
+                    ExecutionStatus.SKIPPED,
+                ),
             ),
-        ),
-    )
-
-    assert result.evaluations == ()
+            model_usages=(model_usage(),),
+        )
 
 
 def test_run_rejects_more_results_than_non_skipped_evaluations() -> None:

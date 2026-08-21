@@ -2,34 +2,31 @@
 
 from typing import Annotated, Protocol, runtime_checkable
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
+from pydantic import Field, model_validator
 
 from optima.domain.evaluation import EvaluationResult
 from optima.domain.quality_contract import QualityContract, QualityScore
+from optima.immutable import ImmutableJsonObject, ImmutableModel
 
 NonEmptyString = Annotated[str, Field(strict=True, min_length=1)]
 NonNegativeCount = Annotated[int, Field(strict=True, ge=0)]
 
 
-class DeterministicCheckResult(BaseModel):
+class DeterministicCheckResult(ImmutableModel):
     """Measured outcome of one mandatory deterministic check."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
 
     check_id: NonEmptyString
     passed: Annotated[bool, Field(strict=True)]
 
 
-class EvaluationEvidence(BaseModel):
+class EvaluationEvidence(ImmutableModel):
     """Explicit measured facts consumed by deterministic evaluation."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
 
     evaluator_type: NonEmptyString
     evaluator_valid: Annotated[bool, Field(strict=True)]
     score: QualityScore
     mandatory_checks: tuple[DeterministicCheckResult, ...] = ()
-    metadata: dict[str, JsonValue] = Field(default_factory=dict)
+    metadata: ImmutableJsonObject = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_unique_check_ids(self) -> "EvaluationEvidence":
@@ -40,10 +37,8 @@ class EvaluationEvidence(BaseModel):
         return self
 
 
-class EvaluationRequest(BaseModel):
+class EvaluationRequest(ImmutableModel):
     """Input for evaluating one candidate output against a Quality Contract."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
 
     run_id: NonEmptyString
     input_text: NonEmptyString
@@ -51,7 +46,7 @@ class EvaluationRequest(BaseModel):
     context: NonEmptyString | None = None
     reference_output: NonEmptyString | None = None
     criteria: tuple[NonEmptyString, ...] = ()
-    metadata: dict[str, JsonValue] = Field(default_factory=dict)
+    metadata: ImmutableJsonObject = Field(default_factory=dict)
 
 
 @runtime_checkable
@@ -62,10 +57,8 @@ class DeterministicMeasurement(Protocol):
         """Inspect a complete evaluation request and return measured facts."""
 
 
-class EvaluatorCall(BaseModel):
+class EvaluatorCall(ImmutableModel):
     """Recorded evaluator invocation for deterministic test assertions."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
 
     sequence: NonNegativeCount
     request: EvaluationRequest

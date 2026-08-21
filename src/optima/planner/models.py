@@ -3,9 +3,9 @@
 from enum import StrEnum
 from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import Field, model_validator
 
-from optima.domain.evaluation import EvaluationResult
+from optima.domain.cache import CacheCandidate as CacheCandidate
 from optima.domain.execution import (
     CachePolicy,
     ContextPolicy,
@@ -16,7 +16,9 @@ from optima.domain.execution import (
     PlannerReasonCode,
 )
 from optima.domain.quality_contract import QualityContract, QualityScore
+from optima.domain.request_binding import RequestBinding
 from optima.domain.request_profile import RequestProfile
+from optima.immutable import ImmutableModel
 
 StrictBoolean = Annotated[bool, Field(strict=True)]
 NonEmptyString = Annotated[str, Field(strict=True, min_length=1)]
@@ -25,10 +27,8 @@ PositiveCount = Annotated[int, Field(strict=True, gt=0)]
 Rate = Annotated[float, Field(strict=True, ge=0.0, le=1.0, allow_inf_nan=False)]
 
 
-class ModuleConfiguration(BaseModel):
+class ModuleConfiguration(ImmutableModel):
     """Optional optimizer-module states supplied to Planner V1."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
 
     semantic_cache_enabled: StrictBoolean
     context_reduction_enabled: StrictBoolean
@@ -36,10 +36,8 @@ class ModuleConfiguration(BaseModel):
     foundry_router_comparator_enabled: StrictBoolean
 
 
-class PlannerThresholds(BaseModel):
+class PlannerThresholds(ImmutableModel):
     """Typed configurable thresholds used by deterministic policies."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
 
     cache_similarity_threshold: Rate = 0.95
     context_reduction_consider_tokens: PositiveCount = 4_000
@@ -61,54 +59,35 @@ class PlannerThresholds(BaseModel):
         return self
 
 
-class CacheCandidate(BaseModel):
-    """Pre-resolved semantic-cache metadata assessed by the planner."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    source_run_id: NonEmptyString
-    similarity: Rate
-    prior_evaluation: EvaluationResult
-    contract_compatible: StrictBoolean
-    safe_to_reuse: StrictBoolean
-
-
-class ContextReducerCapability(BaseModel):
+class ContextReducerCapability(ImmutableModel):
     """Configured reducer availability and task-specific safety facts."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
 
     available: StrictBoolean
     task_safe: StrictBoolean
     approved_for_critical_high_risk: StrictBoolean
 
 
-class HistoricalPolicyStatistics(BaseModel):
+class HistoricalPolicyStatistics(ImmutableModel):
     """Comparable aggregate evidence supplied without storage concerns."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
 
     comparable_sample_count: NonNegativeCount
     small_pass_without_escalation_rate: Rate
     average_final_quality: QualityScore
 
 
-class PlannerCapabilities(BaseModel):
+class PlannerCapabilities(ImmutableModel):
     """Conceptual execution capabilities available to satisfy a plan."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
 
     small_model_configured: StrictBoolean = True
     strong_model_configured: StrictBoolean = True
     evaluator_configured: StrictBoolean = True
 
 
-class PlannerInput(BaseModel):
+class PlannerInput(ImmutableModel):
     """Complete validated input to deterministic Planner V1 selection."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
     request_profile: RequestProfile
+    request_binding: RequestBinding
     quality_contract: QualityContract
     modules: ModuleConfiguration
     thresholds: PlannerThresholds = Field(default_factory=PlannerThresholds)
@@ -117,39 +96,41 @@ class PlannerInput(BaseModel):
     cache_candidate: CacheCandidate | None = None
     historical_statistics: HistoricalPolicyStatistics | None = None
 
+    @model_validator(mode="after")
+    def validate_request_binding(self) -> "PlannerInput":
+        """Bind planner profile identity to the canonical request digest."""
+        if (
+            self.request_binding.task_type is not self.request_profile.task_type
+            or self.request_binding.complexity is not self.request_profile.complexity
+        ):
+            raise ValueError("request binding must match the planner request profile")
+        return self
 
-class CacheDecision(BaseModel):
+
+class CacheDecision(ImmutableModel):
     """Pure semantic-cache policy output."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
 
     policy: CachePolicy
     candidate_assessed: StrictBoolean
     reason_code: PlannerReasonCode
 
 
-class ContextDecision(BaseModel):
+class ContextDecision(ImmutableModel):
     """Pure context policy output."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
 
     policy: ContextPolicy
     reason_codes: tuple[PlannerReasonCode, ...]
 
 
-class ModelDecision(BaseModel):
+class ModelDecision(ImmutableModel):
     """Pure base model policy output."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
 
     policy: ModelPolicy
     reason_codes: tuple[PlannerReasonCode, ...]
 
 
-class HistoricalDecision(BaseModel):
+class HistoricalDecision(ImmutableModel):
     """Bounded historical-policy output."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
 
     final_policy: ModelPolicy
     reason_codes: tuple[PlannerReasonCode, ...]
@@ -164,10 +145,8 @@ class PlanningFailureCode(StrEnum):
     INITIAL_MODEL_NOT_CONFIGURED = "INITIAL_MODEL_NOT_CONFIGURED"
 
 
-class PlanningFailure(BaseModel):
+class PlanningFailure(ImmutableModel):
     """Typed failure returned instead of a knowingly invalid plan."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
 
     code: PlanningFailureCode
     message: NonEmptyString

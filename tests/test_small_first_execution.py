@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
+from pydantic import ValidationError
 
 from optima.context import (
     ContextPreservationEvidence,
@@ -14,6 +15,7 @@ from optima.context import (
     RegexTokenCounter,
 )
 from optima.cost import CostCalculator, PriceCatalog, PriceCatalogEntry
+from optima.domain.evaluation import EvaluationResult
 from optima.domain.execution import (
     ContextReductionOutcome,
     ContextSource,
@@ -29,6 +31,7 @@ from optima.domain.quality_contract import (
     QualityProfile,
     RiskTier,
 )
+from optima.domain.request_binding import RequestBinding, build_request_binding
 from optima.domain.request_profile import Complexity, RequestProfile, TaskType
 from optima.domain.run import PricingProvenance, RunStatus
 from optima.evaluation import (
@@ -102,6 +105,31 @@ class RaisingEvaluator:
         raise self._error
 
 
+class ConstructedEvaluator:
+    """Evaluator that returns unchecked structurally invalid evidence."""
+
+    async def evaluate(
+        self,
+        request: EvaluationRequest,
+        quality_contract: QualityContract,
+    ) -> EvaluationResult:
+        valid = EvaluationResult(
+            evaluator_type="constructed",
+            evaluator_valid=True,
+            score=1.0,
+            threshold=quality_contract.minimum_quality_score,
+            mandatory_checks_passed=True,
+            passed=True,
+            reasons=("Accepted",),
+        )
+        values = {
+            field_name: getattr(valid, field_name)
+            for field_name in type(valid).model_fields
+        }
+        values["reasons"] = ()
+        return EvaluationResult.model_construct(**values)
+
+
 def profile() -> RequestProfile:
     """Build a complete profile that deterministically selects small-first."""
     return RequestProfile(
@@ -124,11 +152,34 @@ def contract() -> QualityContract:
     )
 
 
+def reduction_context() -> str:
+    """Return the original context shared by reduction request fixtures."""
+    return (
+        "Priya Nair owns incident INC-204.\n"
+        "INC-204 affected 37 requests.\n"
+        "Unrelated social update for the wider team."
+    )
+
+
+def planner_request_binding(*, context: str = "Incident context") -> RequestBinding:
+    """Build the exact current binding supplied to Planner V1."""
+    return build_request_binding(
+        input_text="Summarize the incident",
+        context=context,
+        reference_output="Expected summary",
+        criteria=("Preserve the outcome",),
+        metadata={"scenario": "slice-5"},
+        task_type=TaskType.SUMMARIZATION,
+        complexity=Complexity.LOW,
+    )
+
+
 def plan() -> ExecutionPlan:
     """Build the shared plan through authoritative Planner V1."""
     result = select_plan(
         PlannerInput(
             request_profile=profile(),
+            request_binding=planner_request_binding(),
             quality_contract=contract(),
             modules=ModuleConfiguration(
                 semantic_cache_enabled=False,
@@ -155,6 +206,7 @@ def reduction_plan() -> ExecutionPlan:
     result = select_plan(
         PlannerInput(
             request_profile=reduction_profile,
+            request_binding=planner_request_binding(context=reduction_context()),
             quality_contract=contract(),
             modules=ModuleConfiguration(
                 semantic_cache_enabled=False,
@@ -189,13 +241,37 @@ def execution_request() -> ExecutionRequest:
     )
 
 
+def test_execution_request_rejects_plan_rebound_to_request_or_contract() -> None:
+    """Keep planner routing bound to current request and contract facts."""
+    request = execution_request()
+
+    with pytest.raises(ValidationError, match="request binding"):
+        request.model_copy(
+            update={
+                "request_profile": request.request_profile.model_copy(
+                    update={
+                        "task_type": TaskType.GENERAL_REASONING,
+                        "complexity": Complexity.HIGH,
+                    }
+                )
+            }
+        )
+    with pytest.raises(ValidationError, match="Quality Contract"):
+        request.model_copy(
+            update={
+                "quality_contract": request.quality_contract.model_copy(
+                    update={
+                        "quality_profile": QualityProfile.CRITICAL,
+                        "minimum_quality_score": 0.95,
+                    }
+                )
+            }
+        )
+
+
 def reduction_request() -> ExecutionRequest:
     """Build executor input whose authoritative plan selects reduction."""
-    original_context = (
-        "Priya Nair owns incident INC-204.\n"
-        "INC-204 affected 37 requests.\n"
-        "Unrelated social update for the wider team."
-    )
+    original_context = reduction_context()
     reduction_profile = profile().model_copy(
         update={"input_tokens": 4_000, "has_large_context": True}
     )
@@ -489,8 +565,14 @@ def test_reducer_output_contract_violation_falls_back_to_original(
     request = reduction_request()
     assert request.context is not None
     invalid_output = request.context if invalid_context is None else invalid_context
-    malicious = measured_reduction_result().model_copy(
-        update={"reduced_context": invalid_output}
+    measured = measured_reduction_result()
+    forged_values = {
+        field_name: getattr(measured, field_name)
+        for field_name in type(measured).model_fields
+    }
+    forged_values["reduced_context"] = invalid_output
+    malicious = ContextReductionResult.model_construct(
+        **forged_values,
     )
     reducer = FakeContextReducer((malicious,))
     executor, small, _ = build_executor(
@@ -770,6 +852,19 @@ def test_invalid_small_evidence_escalates_but_invalid_final_evidence_fails_close
     assert result.escalated is True
     assert len(small.calls) == 1  # type: ignore[attr-defined]
     assert len(strong.calls) == 1  # type: ignore[attr-defined]
+
+
+def test_structurally_invalid_evaluator_result_fails_closed() -> None:
+    """Normalize evaluator values inside the evaluation failure boundary."""
+    executor, _, _ = build_executor(evaluator=ConstructedEvaluator())
+
+    result = asyncio.run(executor.execute(execution_request()))
+
+    assert result.status is RunStatus.FAILED
+    assert result.steps[-1].step_type is ExecutionStepType.QUALITY_EVALUATION
+    assert result.steps[-1].status is ExecutionStatus.FAILED
+    assert result.final_output is None
+    assert result.contract_met is None
 
 
 @pytest.mark.parametrize(

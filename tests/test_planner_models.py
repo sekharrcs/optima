@@ -104,3 +104,9 @@ def test_core_evidence_is_frozen_and_forbids_extra_fields() -> None:
         PlannerDecisionEvidence.model_validate(
             {**evidence.model_dump(), "provider": "not-allowed"}
         )
+
+
+def test_nested_planner_evidence_model_copy_revalidates_updates() -> None:
+    """Reject invalid nested module evidence created through model_copy."""
+    with pytest.raises(ValidationError):
+        module_states().model_copy(update={"context_reduction_enabled": "not-a-bool"})

@@ -5,10 +5,14 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from optima.api.app import create_app
 from optima.api.dependencies import ExecutionDependencies
+from optima.api.models import RunRequest
+from optima.cache import FakeSemanticCache, SemanticCache, SemanticCacheLookupRequest
 from optima.config import AppSettings
 from optima.context import (
     ContextPreservationEvidence,
@@ -19,7 +23,16 @@ from optima.context import (
 )
 from optima.context.safety import DeterministicExtractiveSafetyPolicy
 from optima.cost import CostCalculator, PriceCatalog, PriceCatalogEntry
-from optima.domain.execution import ExecutionEventCode, ModelRole, PlannerReasonCode
+from optima.domain.cache import CacheCandidate
+from optima.domain.evaluation import EvaluationResult
+from optima.domain.execution import (
+    ExecutionEventCode,
+    ModelRole,
+    PlannerReasonCode,
+    SemanticCacheOutcome,
+)
+from optima.domain.request_binding import RequestBinding, build_request_binding
+from optima.domain.run import RunResult
 from optima.evaluation import EvaluationEvidence, FakeEvaluator
 from optima.providers import (
     FakeProviderResponse,
@@ -40,6 +53,28 @@ class IncrementingClock:
         value = self._value
         self._value += 0.001
         return value
+
+
+class UncheckedSemanticCache:
+    """Adapter that returns its configured value without normalization."""
+
+    def __init__(self, candidate: CacheCandidate) -> None:
+        self._candidate = candidate
+
+    async def lookup(
+        self,
+        request: SemanticCacheLookupRequest,
+    ) -> CacheCandidate | None:
+        return self._candidate
+
+
+class SubstitutingCacheCandidate(CacheCandidate):
+    """Provider value that attempts output substitution during detachment."""
+
+    def detached_copy(self) -> CacheCandidate:
+        values = self.model_dump(mode="python")
+        values["output_text"] = "substituted output"
+        return CacheCandidate.model_validate(values)
 
 
 class RaisingSmallProvider:
@@ -80,6 +115,20 @@ def request_payload(**updates: object) -> dict[str, object]:
     return values
 
 
+def cache_eligible_profile(**updates: object) -> dict[str, object]:
+    """Build the default API profile with semantic-cache lookup enabled."""
+    values: dict[str, object] = {
+        "task_type": "SUMMARIZATION",
+        "complexity": "LOW",
+        "input_tokens": 100,
+        "risk_tier": "LOW",
+        "cache_eligible": True,
+        "has_large_context": False,
+    }
+    values.update(updates)
+    return values
+
+
 def evidence(score: float) -> EvaluationEvidence:
     """Build evaluator-owned fake evidence."""
     return EvaluationEvidence(
@@ -87,6 +136,68 @@ def evidence(score: float) -> EvaluationEvidence:
         evaluator_valid=True,
         score=score,
         metadata={"source": "api-test"},
+    )
+
+
+def request_binding(
+    source_payload: dict[str, object] | None = None,
+) -> RequestBinding:
+    """Derive a complete binding from one API source request fixture."""
+    request = RunRequest.model_validate(source_payload or request_payload())
+    return build_request_binding(
+        input_text=request.input_text,
+        context=request.context,
+        reference_output=request.reference_output,
+        criteria=request.criteria,
+        metadata=request.metadata,
+        task_type=request.request_profile.task_type,
+        complexity=request.request_profile.complexity,
+    )
+
+
+def cache_candidate(
+    *,
+    source_payload: dict[str, object] | None = None,
+    **updates: object,
+) -> CacheCandidate:
+    """Build one resolved result whose source threshold differs truthfully."""
+    values: dict[str, object] = {
+        "source_run_id": "run-source-cache-1",
+        "output_text": "exact cached output",
+        "request_binding": request_binding(source_payload),
+        "similarity": 0.97,
+        "prior_evaluation": EvaluationResult(
+            evaluator_type="source-deterministic",
+            evaluator_valid=True,
+            score=0.95,
+            threshold=0.80,
+            mandatory_checks_passed=True,
+            passed=True,
+            reasons=("Source contract passed",),
+            metadata={"source_run_id": "run-source-cache-1"},
+        ),
+        "contract_compatible": True,
+        "safe_to_reuse": True,
+    }
+    values.update(updates)
+    return CacheCandidate.model_validate(values)
+
+
+def with_semantic_cache(
+    configured: ExecutionDependencies,
+    cache: SemanticCache | None,
+    *,
+    context_reduction_enabled: bool = False,
+) -> ExecutionDependencies:
+    """Enable semantic cache while preserving fresh application dependencies."""
+    return replace(
+        configured,
+        settings=AppSettings(
+            semantic_cache_enabled=True,
+            context_reduction_enabled=context_reduction_enabled,
+            historical_policy_enabled=False,
+        ),
+        semantic_cache=cache,
     )
 
 
@@ -896,3 +1007,387 @@ def test_separate_apps_do_not_share_mutable_fake_state() -> None:
     assert second_response.status_code == 200
     assert len(first_small.calls) == 1
     assert len(second_small.calls) == 1
+
+
+def test_disabled_semantic_cache_bypasses_dependency_completely() -> None:
+    """Do not call a configured cache when the typed module flag is disabled."""
+    configured, small, _, _ = dependencies(0.93)
+    cache = FakeSemanticCache((cache_candidate(),))
+    configured = replace(configured, semantic_cache=cache)
+
+    response = TestClient(create_app(execution_dependencies=configured)).post(
+        "/api/v1/runs",
+        json=request_payload(request_profile=cache_eligible_profile()),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["semantic_cache"]["outcome"] == "DISABLED_BYPASSED"
+    assert body["semantic_cache"]["lookup_latency_ms"] == 0
+    assert (
+        PlannerReasonCode.SEMANTIC_CACHE_DISABLED
+        in (body["execution_plan"]["reason_codes"])
+    )
+    assert all(step["step_type"] != "SEMANTIC_CACHE" for step in body["steps"])
+    assert cache.calls == ()
+    assert len(small.calls) == 1
+
+
+def test_cache_hit_returns_exact_bound_output_and_preserves_source_evidence() -> None:
+    """Reuse one accepted match without model, reducer, or current evaluator calls."""
+    original_context = "Incident ARC-9 resolved.\nIncident ARC-9 resolved."
+    configured, small, strong, evaluator = dependencies(0.93)
+    source_payload = request_payload(
+        context=original_context,
+        request_profile={
+            "task_type": "SUMMARIZATION",
+            "complexity": "LOW",
+            "input_tokens": 4_000,
+            "risk_tier": "LOW",
+            "cache_eligible": True,
+            "has_large_context": True,
+        },
+    )
+    cache = FakeSemanticCache((cache_candidate(source_payload=source_payload),))
+    reducer = FakeContextReducer((reduction_result(original_context),))
+    counter = RecordingTokenCounter(RegexTokenCounter())
+    configured = replace(
+        with_semantic_cache(configured, cache, context_reduction_enabled=True),
+        context_reducer=reducer,
+        token_counter=counter,
+        context_reducer_safety_policy=DeterministicExtractiveSafetyPolicy(),
+    )
+
+    response = TestClient(create_app(execution_dependencies=configured)).post(
+        "/api/v1/runs",
+        json=source_payload,
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["execution_plan"]["human_readable_name"] == "Cached Result"
+    assert body["final_output"] == "exact cached output"
+    assert body["contract_met"] is True
+    assert body["semantic_cache"]["outcome"] == SemanticCacheOutcome.REUSED
+    assert body["semantic_cache"]["source_run_id"] == "run-source-cache-1"
+    assert body["semantic_cache"]["similarity"] == 0.97
+    assert body["semantic_cache"]["prior_evaluation"] == (
+        cache_candidate().prior_evaluation.model_dump(mode="json")
+    )
+    assert body["semantic_cache"]["prior_evaluation"]["threshold"] == 0.80
+    assert body["semantic_cache"]["prior_evaluation"]["metadata"] == {
+        "source_run_id": "run-source-cache-1"
+    }
+    assert body["evaluations"] == []
+    assert body["final_evaluation"] is None
+    assert body["model_usages"] == []
+    assert body["escalated"] is False
+    assert body["total_input_tokens"] == 0
+    assert body["total_output_tokens"] == 0
+    assert body["total_tokens"] == 0
+    assert body["total_calculated_cost"] is None
+    assert [step["step_type"] for step in body["steps"]] == [
+        "SEMANTIC_CACHE",
+        "RETURN",
+    ]
+    assert body["steps"][0]["semantic_cache"] == body["semantic_cache"]
+    assert body["latency_ms"] >= body["semantic_cache"]["lookup_latency_ms"]
+    assert len(cache.calls) == 1
+    assert small.calls == ()
+    assert strong.calls == ()
+    assert evaluator.calls == ()
+    assert reducer.calls == ()
+    assert counter.calls == ()
+
+
+@pytest.mark.parametrize(
+    "request_update",
+    [
+        {"input_text": "Explain the incident"},
+        {"context": "Different incident context"},
+        {"reference_output": "Incompatible reference"},
+        {"criteria": []},
+        {"criteria": ["Preserve the outcome", "The answer must be JSON."]},
+        {"criteria": ["Use JSON", "Preserve the outcome"]},
+        {"metadata": {"scenario": "different-audience"}},
+    ],
+)
+def test_cache_candidate_for_different_complete_request_is_rejected(
+    request_update: dict[str, object],
+) -> None:
+    """Reject a candidate assessed for any materially different request fact."""
+    configured, small, strong, evaluator = dependencies(0.93)
+    cache = FakeSemanticCache((cache_candidate(),))
+    configured = with_semantic_cache(configured, cache)
+
+    response = TestClient(create_app(execution_dependencies=configured)).post(
+        "/api/v1/runs",
+        json=request_payload(
+            request_profile=cache_eligible_profile(),
+            **request_update,
+        ),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["semantic_cache"]["outcome"] == SemanticCacheOutcome.MATCH_REJECTED
+    assert body["semantic_cache"]["planner_reason_code"] == (
+        PlannerReasonCode.CACHE_REQUEST_BINDING_MISMATCH
+    )
+    assert body["final_output"] != "exact cached output"
+    assert len(cache.calls) == 1
+    assert len(small.calls) == 1
+    assert strong.calls == ()
+    assert len(evaluator.calls) == 1
+
+
+def test_cache_miss_preserves_small_first_execution() -> None:
+    """Continue through the unchanged small-first path after a truthful miss."""
+    configured, small, strong, evaluator = dependencies(0.93)
+    cache = FakeSemanticCache((None,))
+    configured = with_semantic_cache(configured, cache)
+
+    response = TestClient(create_app(execution_dependencies=configured)).post(
+        "/api/v1/runs",
+        json=request_payload(request_profile=cache_eligible_profile()),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["semantic_cache"]["outcome"] == SemanticCacheOutcome.MISS
+    assert body["semantic_cache"]["source_run_id"] is None
+    assert body["execution_plan"]["model_policy"] == "SMALL_FIRST_WITH_FALLBACK"
+    assert body["steps"][0]["event_codes"] == [ExecutionEventCode.CACHE_MISS]
+    assert len(cache.calls) == 1
+    assert len(small.calls) == 1
+    assert strong.calls == ()
+    assert len(evaluator.calls) == 1
+
+
+def test_cache_miss_preserves_strong_direct_execution() -> None:
+    """Continue through the unchanged strong-direct path after a truthful miss."""
+    configured, small, strong, evaluator = dependencies(0.93)
+    cache = FakeSemanticCache((None,))
+    configured = with_semantic_cache(configured, cache)
+
+    response = TestClient(create_app(execution_dependencies=configured)).post(
+        "/api/v1/runs",
+        json=request_payload(
+            request_profile={
+                "task_type": "GENERAL_REASONING",
+                "complexity": "HIGH",
+                "input_tokens": 100,
+                "risk_tier": "LOW",
+                "cache_eligible": True,
+                "has_large_context": False,
+            }
+        ),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["semantic_cache"]["outcome"] == SemanticCacheOutcome.MISS
+    assert body["execution_plan"]["model_policy"] == "STRONG_DIRECT"
+    assert small.calls == ()
+    assert len(strong.calls) == 1
+    assert len(evaluator.calls) == 1
+
+
+def test_cache_miss_still_executes_selected_context_reduction() -> None:
+    """Run the selected reducer after the leading successful cache lookup miss."""
+    original_context = "Incident ARC-9 resolved.\nIncident ARC-9 resolved."
+    configured, small, _, _ = dependencies(0.93)
+    cache = FakeSemanticCache((None,))
+    reducer = FakeContextReducer((reduction_result(original_context),))
+    configured = replace(
+        with_semantic_cache(configured, cache, context_reduction_enabled=True),
+        context_reducer=reducer,
+        token_counter=RegexTokenCounter(),
+        context_reducer_safety_policy=DeterministicExtractiveSafetyPolicy(),
+    )
+
+    response = TestClient(create_app(execution_dependencies=configured)).post(
+        "/api/v1/runs",
+        json=request_payload(
+            context=original_context,
+            request_profile={
+                "task_type": "SUMMARIZATION",
+                "complexity": "LOW",
+                "input_tokens": 4_000,
+                "risk_tier": "LOW",
+                "cache_eligible": True,
+                "has_large_context": True,
+            },
+        ),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [step["step_type"] for step in body["steps"][:2]] == [
+        "SEMANTIC_CACHE",
+        "CONTEXT_REDUCTION",
+    ]
+    assert body["execution_plan"]["context_policy"] == "REDUCE"
+    assert len(reducer.calls) == 1
+    assert len(small.calls) == 1
+
+
+def test_rejected_cache_match_preserves_source_facts_and_planner_reason() -> None:
+    """Keep candidate evidence while Planner V1 continues normal execution."""
+    configured, small, _, evaluator = dependencies(0.93)
+    rejected = cache_candidate(similarity=0.94)
+    cache = FakeSemanticCache((rejected,))
+    configured = with_semantic_cache(configured, cache)
+
+    response = TestClient(create_app(execution_dependencies=configured)).post(
+        "/api/v1/runs",
+        json=request_payload(request_profile=cache_eligible_profile()),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["semantic_cache"]["outcome"] == "MATCH_REJECTED"
+    assert body["semantic_cache"]["source_run_id"] == rejected.source_run_id
+    assert body["semantic_cache"]["similarity"] == 0.94
+    assert body["semantic_cache"]["planner_reason_code"] == (
+        PlannerReasonCode.CACHE_SIMILARITY_BELOW_THRESHOLD
+    )
+    assert body["execution_plan"]["cache_candidate"] is None
+    assert len(small.calls) == 1
+    assert len(evaluator.calls) == 1
+
+    body["semantic_cache"]["source_run_id"] = "forged-source"
+    body["semantic_cache"]["similarity"] = 0.01
+    body["steps"][0]["semantic_cache"] = body["semantic_cache"]
+    for computed_field in (
+        "total_input_tokens",
+        "total_output_tokens",
+        "total_tokens",
+        "total_calculated_cost",
+        "total_cost_provenance",
+    ):
+        body.pop(computed_field)
+    with pytest.raises(ValidationError, match="candidate assessment"):
+        RunResult.model_validate(body)
+
+
+def test_invalid_cache_provider_value_fails_closed_to_model_execution() -> None:
+    """Normalize cache-adapter values before they cross the lookup boundary."""
+    configured, small, _, evaluator = dependencies(0.93)
+    supplied = cache_candidate()
+    evaluation_values = {
+        field_name: getattr(supplied.prior_evaluation, field_name)
+        for field_name in type(supplied.prior_evaluation).model_fields
+    }
+    evaluation_values["reasons"] = ()
+    invalid_evaluation = EvaluationResult.model_construct(**evaluation_values)
+    candidate_values = {
+        field_name: getattr(supplied, field_name)
+        for field_name in type(supplied).model_fields
+    }
+    candidate_values["prior_evaluation"] = invalid_evaluation
+    invalid_candidate = CacheCandidate.model_construct(**candidate_values)
+    configured = with_semantic_cache(
+        configured,
+        UncheckedSemanticCache(invalid_candidate),
+    )
+
+    response = TestClient(create_app(execution_dependencies=configured)).post(
+        "/api/v1/runs",
+        json=request_payload(request_profile=cache_eligible_profile()),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["semantic_cache"]["outcome"] == "LOOKUP_FAILED"
+    assert body["semantic_cache"]["source_run_id"] is None
+    assert len(small.calls) == 1
+    assert len(evaluator.calls) == 1
+
+
+def test_fake_cache_does_not_invoke_candidate_controlled_detachment() -> None:
+    """Return the configured cache value rather than a subclass substitution."""
+    configured, small, strong, evaluator = dependencies(0.93)
+    supplied = SubstitutingCacheCandidate.model_validate(
+        cache_candidate().model_dump(mode="python")
+    )
+    configured = with_semantic_cache(
+        configured,
+        FakeSemanticCache((supplied,)),
+    )
+
+    response = TestClient(create_app(execution_dependencies=configured)).post(
+        "/api/v1/runs",
+        json=request_payload(request_profile=cache_eligible_profile()),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["semantic_cache"]["outcome"] == "REUSED"
+    assert body["final_output"] == "exact cached output"
+    assert len(small.calls) == 0
+    assert len(strong.calls) == 0
+    assert len(evaluator.calls) == 0
+
+
+@pytest.mark.parametrize(
+    ("error", "outcome", "status_value", "event"),
+    [
+        (
+            RuntimeError("cache unavailable"),
+            SemanticCacheOutcome.LOOKUP_FAILED,
+            "FAILED",
+            ExecutionEventCode.CACHE_LOOKUP_FAILED,
+        ),
+        (
+            TimeoutError("cache timed out"),
+            SemanticCacheOutcome.LOOKUP_TIMED_OUT,
+            "TIMED_OUT",
+            ExecutionEventCode.CACHE_LOOKUP_TIMED_OUT,
+        ),
+    ],
+)
+def test_cache_operational_failure_falls_back_without_claiming_miss(
+    error: Exception,
+    outcome: SemanticCacheOutcome,
+    status_value: str,
+    event: ExecutionEventCode,
+) -> None:
+    """Record optional-cache failure distinctly and complete normal execution."""
+    configured, small, _, evaluator = dependencies(0.93)
+    cache = FakeSemanticCache((error,))
+    configured = with_semantic_cache(configured, cache)
+
+    response = TestClient(create_app(execution_dependencies=configured)).post(
+        "/api/v1/runs",
+        json=request_payload(request_profile=cache_eligible_profile()),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "COMPLETED"
+    assert body["semantic_cache"]["outcome"] == outcome
+    assert body["steps"][0]["status"] == status_value
+    assert body["steps"][0]["event_codes"] == [event]
+    assert body["semantic_cache"]["source_run_id"] is None
+    assert body["semantic_cache"]["similarity"] is None
+    assert body["semantic_cache"]["error"] == f"Semantic cache {type(error).__name__}"
+    assert len(small.calls) == 1
+    assert len(evaluator.calls) == 1
+
+
+def test_enabled_semantic_cache_without_dependency_fails_before_models() -> None:
+    """Expose missing enabled composition as a structural API failure."""
+    configured, small, strong, evaluator = dependencies(0.93)
+    configured = with_semantic_cache(configured, None)
+
+    response = TestClient(create_app(execution_dependencies=configured)).post(
+        "/api/v1/runs",
+        json=request_payload(request_profile=cache_eligible_profile()),
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "SEMANTIC_CACHE_NOT_CONFIGURED"
+    assert small.calls == ()
+    assert strong.calls == ()
+    assert evaluator.calls == ()

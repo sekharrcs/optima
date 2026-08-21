@@ -1,5 +1,6 @@
 """Public domain contracts for OPTIMA planning and execution."""
 
+from optima.domain.cache import CacheCandidate, CacheCandidateAssessment
 from optima.domain.evaluation import EvaluationResult
 from optima.domain.execution import (
     CachePolicy,
@@ -19,6 +20,11 @@ from optima.domain.execution import (
     PlannerDecisionEvidence,
     PlannerModuleStates,
     PlannerReasonCode,
+    SemanticCacheEvidence,
+    SemanticCacheOutcome,
+    SemanticCacheOutcomeContract,
+    semantic_cache_outcome_contract,
+    validate_semantic_cache_binding,
 )
 from optima.domain.quality_contract import (
     OptimizationMode,
@@ -28,10 +34,13 @@ from optima.domain.quality_contract import (
     RiskTier,
     build_quality_contract,
 )
+from optima.domain.request_binding import RequestBinding, build_request_binding
 from optima.domain.request_profile import Complexity, RequestProfile, TaskType
 from optima.domain.run import ModelUsage, RunResult, RunStatus
 
 __all__ = [
+    "CacheCandidate",
+    "CacheCandidateAssessment",
     "CachePolicy",
     "Complexity",
     "ContextPolicy",
@@ -56,10 +65,17 @@ __all__ = [
     "QualityContract",
     "QualityProfile",
     "QualityThresholds",
+    "RequestBinding",
     "RequestProfile",
     "RiskTier",
     "RunResult",
     "RunStatus",
+    "SemanticCacheEvidence",
+    "SemanticCacheOutcome",
+    "SemanticCacheOutcomeContract",
     "TaskType",
+    "build_request_binding",
     "build_quality_contract",
+    "semantic_cache_outcome_contract",
+    "validate_semantic_cache_binding",
 ]
