@@ -192,7 +192,12 @@ def passing_evaluation() -> EvaluationResult:
     )
 
 
-def successful_step(sequence: int, step_type: ExecutionStepType) -> ExecutionStep:
+def successful_step(
+    sequence: int,
+    step_type: ExecutionStepType,
+    *,
+    request_id: str | None = "provider-request-1",
+) -> ExecutionStep:
     """Build one successful execution trace step."""
     facts: dict[str, JsonValue]
     event_codes: tuple[ExecutionEventCode, ...]
@@ -211,7 +216,7 @@ def successful_step(sequence: int, step_type: ExecutionStepType) -> ExecutionSte
                 "model_role": ModelRole.SMALL.value,
                 "provider": "foundry",
                 "deployment": "small-deployment",
-                "request_id": "provider-request-1",
+                "request_id": request_id,
             }
             event_codes = ()
         elif step_type is ExecutionStepType.QUALITY_EVALUATION:
@@ -365,11 +370,12 @@ def strong_direct_role_step(
 
 def model_usage(
     *,
-    request_id: str = "provider-request-1",
+    request_id: str | None = "provider-request-1",
     run_id: str = "run-1",
     model_role: ModelRole = ModelRole.SMALL,
-    input_tokens: int = 100,
-    output_tokens: int = 20,
+    input_tokens: int | None = 100,
+    output_tokens: int | None = 20,
+    provider_total_tokens: int | None = None,
     calculated_cost: Decimal | None = None,
     pricing_provenance: PricingProvenance | None = None,
 ) -> ModelUsage:
@@ -388,6 +394,7 @@ def model_usage(
         model_role=model_role,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
+        provider_total_tokens=provider_total_tokens,
         latency_ms=125,
         calculated_cost=calculated_cost,
         pricing_provenance=authoritative_provenance,
@@ -490,6 +497,24 @@ def test_model_usage_allows_unavailable_cost_without_placeholder_zero() -> None:
 
     assert usage.calculated_cost is None
     assert usage.pricing_provenance is None
+    assert usage.cached_tokens is None
+
+
+def test_model_usage_preserves_unavailable_tokens_and_provider_total() -> None:
+    """Keep absent token categories unavailable without discarding a reported total."""
+    usage = ModelUsage(
+        request_id="provider-request-1",
+        run_id="run-1",
+        provider="foundry",
+        deployment="small-deployment",
+        model_role=ModelRole.SMALL,
+        provider_total_tokens=37,
+        latency_ms=125,
+    )
+
+    assert usage.input_tokens is None
+    assert usage.output_tokens is None
+    assert usage.provider_total_tokens == 37
     assert usage.cached_tokens is None
 
 
@@ -649,6 +674,68 @@ def test_run_aggregates_one_complete_model_call() -> None:
         catalog_version="test-v1",
         currency="TEST",
     )
+
+
+def test_run_prefers_each_provider_reported_total_without_losing_categories() -> None:
+    """Use a provider total consistent with categories as the exact call total."""
+    result = completed_run(
+        model_usages=(
+            model_usage(
+                input_tokens=101,
+                output_tokens=19,
+                provider_total_tokens=120,
+            ),
+        )
+    )
+
+    assert result.total_input_tokens == 101
+    assert result.total_output_tokens == 19
+    assert result.total_tokens == 120
+
+
+def test_model_usage_rejects_total_inconsistent_with_reported_categories() -> None:
+    """Reject a provider total that contradicts both reported token categories."""
+    with pytest.raises(
+        ValidationError,
+        match="provider_total_tokens must equal input_tokens plus output_tokens",
+    ):
+        model_usage(input_tokens=101, output_tokens=19, provider_total_tokens=125)
+
+
+def test_run_keeps_missing_token_categories_and_total_unavailable() -> None:
+    """Do not turn a missing provider measurement into a zero or partial total."""
+    result = completed_run(
+        model_usages=(model_usage(input_tokens=None, output_tokens=19),)
+    )
+
+    assert result.total_input_tokens is None
+    assert result.total_output_tokens == 19
+    assert result.total_tokens is None
+    assert result.total_calculated_cost is None
+
+
+def test_model_usage_allows_absent_request_correlation_id() -> None:
+    """Keep the request-correlation id unavailable instead of fabricating one."""
+    usage = model_usage(request_id=None)
+
+    assert usage.request_id is None
+    assert usage.model_dump(mode="json")["request_id"] is None
+
+
+def test_run_binds_model_call_without_request_correlation_id() -> None:
+    """Bind a model-call step and serialization to usage with no request id."""
+    result = completed_run(
+        steps=(
+            successful_step(0, ExecutionStepType.MODEL_CALL, request_id=None),
+            successful_step(1, ExecutionStepType.QUALITY_EVALUATION),
+            successful_step(2, ExecutionStepType.RETURN),
+        ),
+        model_usages=(model_usage(request_id=None),),
+    )
+
+    assert result.model_usages[0].request_id is None
+    assert result.steps[0].facts["request_id"] is None
+    assert result.model_dump(mode="json")["model_usages"][0]["request_id"] is None
 
 
 def test_run_aggregates_escalated_calls_in_execution_order() -> None:

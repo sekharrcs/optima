@@ -120,12 +120,40 @@ Acceptance:
 - cache failures and timeouts fall back to unchanged model execution
 - the local exact-match demo proves integration only; Redis remains Slice 10
 
-## Slice 10 - Azure adapters
+## Corrective Slice 10A - Foundry and APIM model provider
+
 Implement:
-- Foundry/APIM model provider
-- Cosmos run-history adapter
-- Redis semantic cache adapter
-- App Insights tracing
+
+- Azure OpenAI v1 chat-completion adapter behind the existing provider contract
+- configured `SMALL` and `STRONG` deployment mapping
+- explicit API-key, Azure CLI, and managed-identity authentication
+- provider output, request identity, latency, and optional usage mapping
+
+Acceptance:
+
+- each logical provider call performs one outbound request with no implicit retry
+- missing provider usage remains unavailable rather than becoming zero
+- provider-reported total and cached token facts remain unchanged
+- planner, evaluator, escalation, and cost ownership remain unchanged
+- default API, local demo, and unit tests require no Azure credentials or paid calls
+
+## Slice 10B - Cosmos run-history adapter
+
+Implement:
+
+- Cosmos DB persistence for OPTIMA run history
+
+## Slice 10C - Redis semantic-cache adapter
+
+Implement:
+
+- Azure Managed Redis implementation of the existing semantic-cache contract
+
+## Slice 10D - Application Insights tracing
+
+Implement:
+
+- Application Insights tracing for planner, execution, evaluation, and outcome evidence
 
 ## Slice 11 - Azure infrastructure and deployment
 Implement:

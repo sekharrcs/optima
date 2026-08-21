@@ -55,13 +55,14 @@ class PricingProvenance(ImmutableModel):
 class ModelUsage(ImmutableModel):
     """Measured facts for one provider model call."""
 
-    request_id: NonEmptyString
+    request_id: NonEmptyString | None = None
     run_id: NonEmptyString
     provider: NonEmptyString
     deployment: NonEmptyString
     model_role: ModelRole
-    input_tokens: NonNegativeCount
-    output_tokens: NonNegativeCount
+    input_tokens: NonNegativeCount | None = None
+    output_tokens: NonNegativeCount | None = None
+    provider_total_tokens: NonNegativeCount | None = None
     cached_tokens: NonNegativeCount | None = None
     latency_ms: NonNegativeCount
     calculated_cost: NonNegativeDecimal | None = None
@@ -69,9 +70,23 @@ class ModelUsage(ImmutableModel):
 
     @model_validator(mode="after")
     def validate_usage_measurements(self) -> "ModelUsage":
-        """Validate cached input and the authoritative cost/provenance pair."""
-        if self.cached_tokens is not None and self.cached_tokens > self.input_tokens:
+        """Validate cached input, token-total consistency, and cost/provenance pair."""
+        if (
+            self.cached_tokens is not None
+            and self.input_tokens is not None
+            and self.cached_tokens > self.input_tokens
+        ):
             raise ValueError("cached_tokens must not exceed input_tokens")
+        if (
+            self.input_tokens is not None
+            and self.output_tokens is not None
+            and self.provider_total_tokens is not None
+            and self.provider_total_tokens != self.input_tokens + self.output_tokens
+        ):
+            raise ValueError(
+                "provider_total_tokens must equal input_tokens plus output_tokens "
+                "when all three measurements are reported"
+            )
         if (self.calculated_cost is None) is not (self.pricing_provenance is None):
             raise ValueError(
                 "calculated_cost and pricing_provenance must be provided together"
@@ -106,28 +121,39 @@ class RunResult(ImmutableModel):
     def total_input_tokens(self) -> int | None:
         """Return exact input tokens only when every attempted call has usage."""
         usages = self._complete_model_usages()
-        if usages is None:
+        if usages is None or any(usage.input_tokens is None for usage in usages):
             return None
-        return sum(usage.input_tokens for usage in usages)
+        return sum(
+            usage.input_tokens for usage in usages if usage.input_tokens is not None
+        )
 
     @computed_field  # type: ignore[prop-decorator]
     @property
     def total_output_tokens(self) -> int | None:
         """Return exact output tokens only when every attempted call has usage."""
         usages = self._complete_model_usages()
-        if usages is None:
+        if usages is None or any(usage.output_tokens is None for usage in usages):
             return None
-        return sum(usage.output_tokens for usage in usages)
+        return sum(
+            usage.output_tokens for usage in usages if usage.output_tokens is not None
+        )
 
     @computed_field  # type: ignore[prop-decorator]
     @property
     def total_tokens(self) -> int | None:
-        """Return exact combined tokens without double-counting cached tokens."""
-        input_tokens = self.total_input_tokens
-        output_tokens = self.total_output_tokens
-        if input_tokens is None or output_tokens is None:
+        """Return reported or exactly derivable totals for every attempted call."""
+        usages = self._complete_model_usages()
+        if usages is None:
             return None
-        return input_tokens + output_tokens
+        total = 0
+        for usage in usages:
+            if usage.provider_total_tokens is not None:
+                total += usage.provider_total_tokens
+            elif usage.input_tokens is not None and usage.output_tokens is not None:
+                total += usage.input_tokens + usage.output_tokens
+            else:
+                return None
+        return total
 
     @computed_field  # type: ignore[prop-decorator]
     @property

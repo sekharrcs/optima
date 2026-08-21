@@ -192,6 +192,14 @@ def test_calculator_requires_cached_measurement_for_distinct_cached_rate() -> No
     assert calculator.calculate(model_usage(cached_tokens=None)) is None
 
 
+@pytest.mark.parametrize("missing_field", ["input_tokens", "output_tokens"])
+def test_calculator_requires_both_token_categories(missing_field: str) -> None:
+    """Keep cost unavailable when the provider omits a priced token category."""
+    calculator = CostCalculator(price_catalog(price_entry()))
+
+    assert calculator.calculate(model_usage(**{missing_field: None})) is None
+
+
 def test_calculator_accepts_explicit_zero_cached_tokens() -> None:
     """Distinguish a measured zero cached subset from missing measurement."""
     calculator = CostCalculator(price_catalog(price_entry()))

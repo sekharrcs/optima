@@ -13,10 +13,24 @@ from optima.providers.fakes import (
     build_fake_small_provider,
     build_fake_strong_provider,
 )
+from optima.providers.foundry import (
+    FOUNDRY_PROVIDER_NAME,
+    ApiKeyAuthentication,
+    EntraTokenAuthentication,
+    FoundryAuthentication,
+    FoundryModelProvider,
+    FoundryProviderError,
+)
 
 __all__ = [
     "FakeModelProvider",
     "FakeProviderResponse",
+    "FOUNDRY_PROVIDER_NAME",
+    "ApiKeyAuthentication",
+    "EntraTokenAuthentication",
+    "FoundryAuthentication",
+    "FoundryModelProvider",
+    "FoundryProviderError",
     "ModelProvider",
     "ModelProviderCall",
     "ModelProviderRequest",

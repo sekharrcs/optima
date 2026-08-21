@@ -20,7 +20,7 @@ class CostCalculator:
             provider=usage.provider,
             deployment=usage.deployment,
         )
-        if entry is None:
+        if entry is None or usage.input_tokens is None or usage.output_tokens is None:
             return None
 
         cached_rate = entry.cached_input_rate_per_million_tokens
