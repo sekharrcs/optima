@@ -19,7 +19,13 @@ from optima.comparison import (
     ComparableRun,
     ComparisonArm,
 )
-from optima.domain.execution import ExecutionStatus, ModelRole, PlannerReasonCode
+from optima.domain.execution import (
+    ExecutionStatus,
+    ExecutionStep,
+    ExecutionStepType,
+    ModelRole,
+    PlannerReasonCode,
+)
 from optima.domain.quality_contract import OptimizationMode, QualityProfile
 from optima.domain.request_profile import Complexity
 from optima.domain.run import PricingProvenance, RunResult, RunStatus
@@ -41,6 +47,7 @@ from ui.presentation import (
     decision_view,
     format_cost,
     outcome_label,
+    reason_explanations,
     semantic_cache_view,
     trace_rows,
 )
@@ -157,7 +164,7 @@ def interrupted_model_call_result(step_status: ExecutionStatus) -> RunResult:
                     "status": step_status,
                     "latency_ms": 0,
                     "event_codes": [],
-                    "facts": {},
+                    "facts": {"model_role": "SMALL"},
                     "error": (
                         None
                         if step_status is ExecutionStatus.SKIPPED
@@ -181,6 +188,17 @@ def interrupted_model_call_result(step_status: ExecutionStatus) -> RunResult:
 def test_reason_explanations_cover_every_planner_code() -> None:
     """Require deterministic text whenever Planner V1 adds or returns a code."""
     assert set(REASON_EXPLANATIONS) == set(PlannerReasonCode)
+
+
+def test_binding_mismatch_reason_has_deterministic_explanation() -> None:
+    """Explain a complete-request cache mismatch without raising a key error."""
+    explanations = reason_explanations(
+        (PlannerReasonCode.CACHE_REQUEST_BINDING_MISMATCH,)
+    )
+
+    assert explanations == (
+        "The cache candidate was assessed for a different complete request.",
+    )
 
 
 def test_decision_and_trace_preserve_backend_order_and_non_escalation() -> None:
@@ -380,7 +398,13 @@ def test_attempted_model_call_count_uses_non_skipped_trace_steps() -> None:
     successful = execute_result()
     failed = interrupted_model_call_result(ExecutionStatus.FAILED)
     timed_out = interrupted_model_call_result(ExecutionStatus.TIMED_OUT)
-    skipped = interrupted_model_call_result(ExecutionStatus.SKIPPED)
+    skipped = ExecutionStep(
+        sequence=0,
+        step_type=ExecutionStepType.MODEL_CALL,
+        status=ExecutionStatus.SKIPPED,
+        latency_ms=0,
+        facts={"model_role": ModelRole.SMALL.value},
+    )
     escalated = execute_result(quality_profile=QualityProfile.CRITICAL)
 
     assert len(successful.model_usages) == 1
@@ -389,7 +413,7 @@ def test_attempted_model_call_count_uses_non_skipped_trace_steps() -> None:
     assert attempted_model_call_count(failed.steps) == 1
     assert timed_out.model_usages == ()
     assert attempted_model_call_count(timed_out.steps) == 1
-    assert attempted_model_call_count(skipped.steps) == 0
+    assert attempted_model_call_count((skipped,)) == 0
     assert attempted_model_call_count(escalated.steps) == 2
 
 
@@ -451,6 +475,13 @@ def test_compatible_measured_baseline_is_aggregated() -> None:
     for index, usage in enumerate(baseline_payload["model_usages"]):
         usage["run_id"] = "run-compatible-baseline"
         usage["request_id"] = f"baseline-request-{index + 1}"
+    model_steps = [
+        step
+        for step in baseline_payload["steps"]
+        if step["step_type"] == ExecutionStepType.MODEL_CALL
+    ]
+    for index, step in enumerate(model_steps):
+        step["facts"]["request_id"] = f"baseline-request-{index + 1}"
     baseline = RunResult.model_validate(baseline_payload)
     identity = BenchmarkCaseIdentity(
         benchmark_case_id="case-compatible-1",

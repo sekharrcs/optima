@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
-from pydantic import ValidationError
+from pydantic import JsonValue, ValidationError
 
 from optima.comparison import (
     BaselineComparisonRequest,
@@ -18,6 +18,7 @@ from optima.domain.evaluation import EvaluationResult
 from optima.domain.execution import (
     CachePolicy,
     ContextPolicy,
+    ExecutionEventCode,
     ExecutionPlan,
     ExecutionStatus,
     ExecutionStep,
@@ -35,8 +36,10 @@ from optima.domain.quality_contract import (
     RiskTier,
     build_quality_contract,
 )
+from optima.domain.request_binding import RequestBinding, build_request_binding
 from optima.domain.request_profile import Complexity, RequestProfile, TaskType
 from optima.domain.run import ModelUsage, PricingProvenance, RunResult, RunStatus
+from optima.planner.policies import effective_risk_tier
 
 
 def quality_contract(
@@ -65,8 +68,33 @@ def request_profile(**updates: object) -> RequestProfile:
     return RequestProfile.model_validate(values)
 
 
-def execution_plan() -> ExecutionPlan:
+def request_binding(profile: RequestProfile | None = None) -> RequestBinding:
+    """Build the shared comparison request identity."""
+    bound_profile = profile or request_profile()
+    return build_request_binding(
+        input_text="Analyze the benchmark logs",
+        context=None,
+        reference_output=None,
+        criteria=(),
+        metadata={},
+        task_type=bound_profile.task_type,
+        complexity=bound_profile.complexity,
+    )
+
+
+def execution_plan(
+    *,
+    contract: QualityContract | None = None,
+    profile: RequestProfile | None = None,
+) -> ExecutionPlan:
     """Build a valid small-first plan for measured test runs."""
+    bound_contract = contract or quality_contract()
+    bound_profile = profile or request_profile()
+    mode_reason = {
+        OptimizationMode.COST: PlannerReasonCode.OPTIMIZATION_MODE_COST,
+        OptimizationMode.BALANCED: PlannerReasonCode.OPTIMIZATION_MODE_BALANCED,
+        OptimizationMode.QUALITY: PlannerReasonCode.OPTIMIZATION_MODE_QUALITY,
+    }[bound_contract.optimization_mode]
     return ExecutionPlan(
         cache_policy=CachePolicy.SKIP,
         context_policy=ContextPolicy.KEEP_ORIGINAL,
@@ -74,16 +102,20 @@ def execution_plan() -> ExecutionPlan:
         initial_model_role=ModelRole.SMALL,
         verification_required=True,
         escalation_model_role=ModelRole.STRONG,
-        optimization_mode=OptimizationMode.COST,
+        optimization_mode=bound_contract.optimization_mode,
+        quality_profile=bound_contract.quality_profile,
         reason_codes=(
-            PlannerReasonCode.OPTIMIZATION_MODE_COST,
+            mode_reason,
             PlannerReasonCode.SMALL_FIRST_SELECTED,
         ),
         human_readable_name="Small -> Verify -> Escalate if needed",
         decision_evidence=PlannerDecisionEvidence(
-            profile_risk_tier=RiskTier.MEDIUM,
-            contract_risk_tier=RiskTier.MEDIUM,
-            effective_risk_tier=RiskTier.MEDIUM,
+            profile_risk_tier=bound_profile.risk_tier,
+            contract_risk_tier=bound_contract.risk_tier,
+            effective_risk_tier=effective_risk_tier(
+                bound_profile.risk_tier,
+                bound_contract.risk_tier,
+            ),
             module_states=PlannerModuleStates(
                 semantic_cache_enabled=False,
                 context_reduction_enabled=False,
@@ -94,6 +126,7 @@ def execution_plan() -> ExecutionPlan:
             base_model_policy=ModelPolicy.SMALL_FIRST_WITH_FALLBACK,
             final_model_policy=ModelPolicy.SMALL_FIRST_WITH_FALLBACK,
         ),
+        request_binding=request_binding(bound_profile),
     )
 
 
@@ -121,15 +154,78 @@ def step(
     step_type: ExecutionStepType,
     *,
     status: ExecutionStatus = ExecutionStatus.SUCCEEDED,
+    model_role: ModelRole = ModelRole.SMALL,
+    contract_met: bool = True,
+    error: str = "Execution interrupted",
+    request_id: str = "provider-request-1",
+    evaluation_result: EvaluationResult | None = None,
 ) -> ExecutionStep:
     """Build one execution trace fact."""
+    facts: dict[str, JsonValue]
+    event_codes: tuple[ExecutionEventCode, ...]
+    if step_type is ExecutionStepType.ESCALATION:
+        facts = {
+            "from_model_role": ModelRole.SMALL.value,
+            "to_model_role": ModelRole.STRONG.value,
+        }
+        event_codes = (
+            ExecutionEventCode.ESCALATION_REQUIRED,
+            ExecutionEventCode.ESCALATED_TO_STRONG,
+        )
+    else:
+        event_codes = ()
+        if step_type is ExecutionStepType.MODEL_CALL:
+            facts = {
+                "model_role": model_role.value,
+                "provider": "foundry",
+                "deployment": f"{model_role.value.lower()}-deployment",
+                "request_id": request_id,
+            }
+        elif step_type is ExecutionStepType.QUALITY_EVALUATION:
+            if evaluation_result is None:
+                raise ValueError("successful evaluation steps require evidence")
+            facts = {
+                "model_role": model_role.value,
+                "evaluator_type": evaluation_result.evaluator_type,
+                "evaluator_valid": evaluation_result.evaluator_valid,
+                "score": evaluation_result.score,
+                "threshold": evaluation_result.threshold,
+                "passed": evaluation_result.passed,
+            }
+            if evaluation_result.passed:
+                event_codes = (ExecutionEventCode.QUALITY_CONTRACT_MET,)
+            else:
+                event_codes = ()
+                if (
+                    evaluation_result.evaluator_valid
+                    and evaluation_result.score < evaluation_result.threshold
+                ):
+                    event_codes += (ExecutionEventCode.QUALITY_THRESHOLD_NOT_MET,)
+                if model_role is ModelRole.STRONG and evaluation_result.evaluator_valid:
+                    event_codes += (ExecutionEventCode.FINAL_QUALITY_CONTRACT_NOT_MET,)
+        elif (
+            step_type is ExecutionStepType.RETURN
+            and status is ExecutionStatus.SUCCEEDED
+        ):
+            facts = {
+                "model_role": model_role.value,
+                "contract_met": contract_met,
+            }
+        elif step_type in {
+            ExecutionStepType.RETURN,
+        }:
+            facts = {"model_role": model_role.value}
+        else:
+            facts = {}
     return ExecutionStep(
         sequence=sequence,
         step_type=step_type,
         status=status,
         latency_ms=0,
+        event_codes=event_codes,
+        facts=facts,
         error=(
-            "Execution interrupted"
+            error
             if status in {ExecutionStatus.FAILED, ExecutionStatus.TIMED_OUT}
             else None
         ),
@@ -178,6 +274,8 @@ def completed_run(
     currency: str = "USD",
 ) -> RunResult:
     """Build a complete measured run with one or two model calls."""
+    bound_contract = contract or quality_contract()
+    bound_profile = profile or request_profile()
     final_evaluation = evaluation(
         score=score,
         evaluator_type=evaluator_type,
@@ -196,9 +294,17 @@ def completed_run(
     )
     if model_calls == 1:
         steps = (
-            step(0, ExecutionStepType.MODEL_CALL),
-            step(1, ExecutionStepType.QUALITY_EVALUATION),
-            step(2, ExecutionStepType.RETURN),
+            step(
+                0,
+                ExecutionStepType.MODEL_CALL,
+                request_id=f"{run_id}-request-1",
+            ),
+            step(
+                1,
+                ExecutionStepType.QUALITY_EVALUATION,
+                evaluation_result=final_evaluation,
+            ),
+            step(2, ExecutionStepType.RETURN, contract_met=contract_met),
         )
         usages = (
             usage(
@@ -221,12 +327,35 @@ def completed_run(
             first_cost = cost / 2
             second_cost = cost - first_cost
         steps = (
-            step(0, ExecutionStepType.MODEL_CALL),
-            step(1, ExecutionStepType.QUALITY_EVALUATION),
+            step(
+                0,
+                ExecutionStepType.MODEL_CALL,
+                request_id=f"{run_id}-request-1",
+            ),
+            step(
+                1,
+                ExecutionStepType.QUALITY_EVALUATION,
+                evaluation_result=first_evaluation,
+            ),
             step(2, ExecutionStepType.ESCALATION),
-            step(3, ExecutionStepType.MODEL_CALL),
-            step(4, ExecutionStepType.QUALITY_EVALUATION),
-            step(5, ExecutionStepType.RETURN),
+            step(
+                3,
+                ExecutionStepType.MODEL_CALL,
+                model_role=ModelRole.STRONG,
+                request_id=f"{run_id}-request-2",
+            ),
+            step(
+                4,
+                ExecutionStepType.QUALITY_EVALUATION,
+                model_role=ModelRole.STRONG,
+                evaluation_result=final_evaluation,
+            ),
+            step(
+                5,
+                ExecutionStepType.RETURN,
+                model_role=ModelRole.STRONG,
+                contract_met=contract_met,
+            ),
         )
         usages = (
             usage(
@@ -255,9 +384,13 @@ def completed_run(
         correlation_id=f"{run_id}-correlation",
         created_at=datetime(2026, 8, 20, 12, 0, tzinfo=UTC),
         status=RunStatus.COMPLETED,
-        quality_contract=contract or quality_contract(),
-        request_profile=profile or request_profile(),
-        execution_plan=execution_plan(),
+        quality_contract=bound_contract,
+        request_profile=bound_profile,
+        request_binding=request_binding(bound_profile),
+        execution_plan=execution_plan(
+            contract=bound_contract,
+            profile=bound_profile,
+        ),
         steps=steps,
         model_usages=usages,
         evaluations=evaluations,
@@ -284,10 +417,25 @@ def invalid_evaluation_run(*, run_id: str, evaluator_type: str) -> RunResult:
         status=RunStatus.FAILED,
         quality_contract=quality_contract(),
         request_profile=request_profile(),
+        request_binding=request_binding(),
         execution_plan=execution_plan(),
         steps=(
-            step(0, ExecutionStepType.MODEL_CALL),
-            step(1, ExecutionStepType.QUALITY_EVALUATION),
+            step(
+                0,
+                ExecutionStepType.MODEL_CALL,
+                request_id=f"{run_id}-request-1",
+            ),
+            step(
+                1,
+                ExecutionStepType.QUALITY_EVALUATION,
+                evaluation_result=final_evaluation,
+            ),
+            step(
+                2,
+                ExecutionStepType.RETURN,
+                status=ExecutionStatus.FAILED,
+                error="Evaluator evidence invalid",
+            ),
         ),
         model_usages=(
             usage(
@@ -321,6 +469,7 @@ def incomplete_run(*, run_id: str) -> RunResult:
         status=RunStatus.FAILED,
         quality_contract=quality_contract(),
         request_profile=request_profile(),
+        request_binding=request_binding(),
         execution_plan=execution_plan(),
         steps=(
             step(
@@ -614,7 +763,12 @@ def test_baseline_pass_and_optima_fail_remain_visible() -> None:
     result = BaselineComparisonService().compare(
         comparison_request(
             completed_run(run_id="baseline", score=0.95, contract_met=True),
-            completed_run(run_id="optima", score=0.85, contract_met=False),
+            completed_run(
+                run_id="optima",
+                score=0.85,
+                contract_met=False,
+                model_calls=2,
+            ),
         )
     )
 

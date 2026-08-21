@@ -3,7 +3,9 @@
 from enum import StrEnum
 from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import Field, model_validator
+
+from optima.immutable import ImmutableModel
 
 QualityScore = Annotated[
     float,
@@ -36,10 +38,8 @@ class RiskTier(StrEnum):
     HIGH = "HIGH"
 
 
-class QualityThresholds(BaseModel):
+class QualityThresholds(ImmutableModel):
     """Configurable minimum score for each Quality Profile."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
 
     standard: QualityScore = 0.80
     high: QualityScore = 0.90
@@ -63,10 +63,8 @@ class QualityThresholds(BaseModel):
         }[profile]
 
 
-class QualityContract(BaseModel):
+class QualityContract(ImmutableModel):
     """Explicit quality constraints and optimization preference for a request."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
 
     quality_profile: QualityProfile
     minimum_quality_score: QualityScore

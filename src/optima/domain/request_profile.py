@@ -3,9 +3,10 @@
 from enum import StrEnum
 from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import Field
 
 from optima.domain.quality_contract import RiskTier
+from optima.immutable import ImmutableModel
 
 TokenCount = Annotated[int, Field(strict=True, ge=0)]
 
@@ -31,10 +32,8 @@ class Complexity(StrEnum):
     HIGH = "HIGH"
 
 
-class RequestProfile(BaseModel):
+class RequestProfile(ImmutableModel):
     """Descriptive request facts provided to the planner."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
 
     task_type: TaskType
     complexity: Complexity

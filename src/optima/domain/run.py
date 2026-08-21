@@ -5,7 +5,7 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
+from pydantic import Field, computed_field, model_validator
 
 from optima.domain.evaluation import EvaluationResult
 from optima.domain.execution import (
@@ -22,9 +22,12 @@ from optima.domain.execution import (
     ModelRole,
     SemanticCacheEvidence,
     SemanticCacheOutcome,
+    validate_semantic_cache_binding,
 )
 from optima.domain.quality_contract import QualityContract
+from optima.domain.request_binding import RequestBinding
 from optima.domain.request_profile import RequestProfile
+from optima.immutable import ImmutableModel
 
 NonEmptyString = Annotated[str, Field(strict=True, min_length=1)]
 NonNegativeCount = Annotated[int, Field(strict=True, ge=0)]
@@ -42,19 +45,15 @@ class RunStatus(StrEnum):
     TIMED_OUT = "TIMED_OUT"
 
 
-class PricingProvenance(BaseModel):
+class PricingProvenance(ImmutableModel):
     """Catalog identity governing one authoritative calculated cost."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
 
     catalog_version: NonEmptyString
     currency: NonEmptyString
 
 
-class ModelUsage(BaseModel):
+class ModelUsage(ImmutableModel):
     """Measured facts for one provider model call."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
 
     request_id: NonEmptyString
     run_id: NonEmptyString
@@ -80,10 +79,8 @@ class ModelUsage(BaseModel):
         return self
 
 
-class RunResult(BaseModel):
+class RunResult(ImmutableModel):
     """Final result and actual decision trace for one OPTIMA run."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
 
     run_id: NonEmptyString
     correlation_id: NonEmptyString
@@ -91,6 +88,7 @@ class RunResult(BaseModel):
     status: RunStatus
     quality_contract: QualityContract
     request_profile: RequestProfile
+    request_binding: RequestBinding
     execution_plan: ExecutionPlan
     semantic_cache: SemanticCacheEvidence | None = None
     steps: Annotated[tuple[ExecutionStep, ...], Field(min_length=1)]
@@ -168,9 +166,52 @@ class RunResult(BaseModel):
         if self.created_at.utcoffset() is None:
             raise ValueError("created_at must be timezone-aware")
 
+        if self.request_binding is not None and (
+            self.request_binding.task_type is not self.request_profile.task_type
+            or self.request_binding.complexity is not self.request_profile.complexity
+        ):
+            raise ValueError("request binding must match request profile facts")
+        if self.execution_plan.request_binding != self.request_binding:
+            raise ValueError("execution plan request binding must match the run result")
+        if (
+            self.execution_plan.quality_profile
+            is not self.quality_contract.quality_profile
+        ):
+            raise ValueError("execution plan must match the run Quality Contract")
+        if (
+            self.execution_plan.optimization_mode
+            is not self.quality_contract.optimization_mode
+        ):
+            raise ValueError("execution plan must match the run Optimization Mode")
+        if (
+            self.execution_plan.decision_evidence.profile_risk_tier
+            is not self.request_profile.risk_tier
+            or self.execution_plan.decision_evidence.contract_risk_tier
+            is not self.quality_contract.risk_tier
+        ):
+            raise ValueError("execution plan risk evidence must match current facts")
+
         sequences = [step.sequence for step in self.steps]
-        if sequences != sorted(sequences) or len(sequences) != len(set(sequences)):
-            raise ValueError("execution-step sequences must be unique and ascending")
+        if sequences != list(range(len(self.steps))):
+            raise ValueError(
+                "execution-step sequences must be zero-based and contiguous"
+            )
+
+        cache_event_codes = {
+            ExecutionEventCode.CACHE_RESULT_REUSED,
+            ExecutionEventCode.CACHE_MISS,
+            ExecutionEventCode.CACHE_MATCH_REJECTED,
+            ExecutionEventCode.CACHE_LOOKUP_FAILED,
+            ExecutionEventCode.CACHE_LOOKUP_TIMED_OUT,
+        }
+        if any(
+            step.step_type is not ExecutionStepType.SEMANTIC_CACHE
+            and cache_event_codes.intersection(step.event_codes)
+            for step in self.steps
+        ):
+            raise ValueError(
+                "cache event codes are allowed only on semantic-cache steps"
+            )
 
         has_escalation_step = any(
             step.step_type is ExecutionStepType.ESCALATION for step in self.steps
@@ -224,6 +265,17 @@ class RunResult(BaseModel):
         attempted_model_calls = sum(
             step.status is not ExecutionStatus.SKIPPED for step in model_call_steps
         )
+        if (
+            self.status is RunStatus.COMPLETED
+            and self.execution_plan.model_policy
+            is ModelPolicy.SMALL_FIRST_WITH_FALLBACK
+        ):
+            expected_model_attempts = 1 + int(has_escalation_step)
+            if attempted_model_calls != expected_model_attempts:
+                raise ValueError(
+                    "small-first runs require one initial model-call attempt and "
+                    "one additional attempt after escalation"
+                )
         if self.execution_plan.model_policy is ModelPolicy.STRONG_DIRECT:
             if attempted_model_calls != 1:
                 raise ValueError(
@@ -345,6 +397,19 @@ class RunResult(BaseModel):
             ):
                 raise ValueError("final evaluation threshold must match the contract")
 
+        self._validate_model_trace()
+        self._validate_successful_step_evidence()
+
+        if self.status is not RunStatus.COMPLETED:
+            expected_step_status = {
+                RunStatus.FAILED: ExecutionStatus.FAILED,
+                RunStatus.TIMED_OUT: ExecutionStatus.TIMED_OUT,
+            }[self.status]
+            if not self.steps or self.steps[-1].status is not expected_step_status:
+                raise ValueError(
+                    "interrupted run status must match the final execution step"
+                )
+
         measured_contract_met = self._measured_contract_met(is_cache_hit=is_cache_hit)
         if self.contract_met is not measured_contract_met:
             raise ValueError(
@@ -364,6 +429,226 @@ class RunResult(BaseModel):
             )
         return self
 
+    def _validate_successful_step_evidence(self) -> None:
+        """Bind successful model and evaluation steps to recorded evidence."""
+        model_steps = tuple(
+            step
+            for step in self.steps
+            if step.step_type is ExecutionStepType.MODEL_CALL
+            and step.status is ExecutionStatus.SUCCEEDED
+        )
+        if len(self.model_usages) < len(model_steps):
+            raise ValueError("successful model steps require model usage evidence")
+        for step, usage in zip(model_steps, self.model_usages, strict=False):
+            if step.facts != {
+                "model_role": usage.model_role.value,
+                "provider": usage.provider,
+                "deployment": usage.deployment,
+                "request_id": usage.request_id,
+            }:
+                raise ValueError(
+                    "model-call step facts must match model usage evidence"
+                )
+
+        evaluation_steps = tuple(
+            step
+            for step in self.steps
+            if step.step_type is ExecutionStepType.QUALITY_EVALUATION
+            and step.status is ExecutionStatus.SUCCEEDED
+        )
+        if len(evaluation_steps) != len(self.evaluations):
+            raise ValueError(
+                "successful evaluation steps must match evaluation evidence"
+            )
+        for step, evaluation in zip(
+            evaluation_steps,
+            self.evaluations,
+            strict=True,
+        ):
+            role = step.facts.get("model_role")
+            expected_events: tuple[ExecutionEventCode, ...] = ()
+            if evaluation.passed:
+                expected_events = (ExecutionEventCode.QUALITY_CONTRACT_MET,)
+            else:
+                if evaluation.evaluator_valid and (
+                    evaluation.score < evaluation.threshold
+                ):
+                    expected_events += (ExecutionEventCode.QUALITY_THRESHOLD_NOT_MET,)
+                if role == ModelRole.STRONG.value and evaluation.evaluator_valid:
+                    expected_events += (
+                        ExecutionEventCode.FINAL_QUALITY_CONTRACT_NOT_MET,
+                    )
+            if step.event_codes != expected_events or step.facts != {
+                "model_role": role,
+                "evaluator_type": evaluation.evaluator_type,
+                "evaluator_valid": evaluation.evaluator_valid,
+                "score": evaluation.score,
+                "threshold": evaluation.threshold,
+                "passed": evaluation.passed,
+            }:
+                raise ValueError(
+                    "evaluation step facts and events must match evaluation evidence"
+                )
+
+    def _validate_model_trace(self) -> None:
+        """Require the exact causal model/evaluation grammar emitted by V1."""
+        policy = self.execution_plan.model_policy
+        if policy is None:
+            return
+
+        prefix_length = 0
+        if self.steps[0].step_type is ExecutionStepType.SEMANTIC_CACHE:
+            prefix_length += 1
+        if (
+            prefix_length < len(self.steps)
+            and self.steps[prefix_length].step_type
+            is ExecutionStepType.CONTEXT_REDUCTION
+        ):
+            prefix_length += 1
+        trace = self.steps[prefix_length:]
+        if not trace or trace[0].step_type is not ExecutionStepType.MODEL_CALL:
+            if trace and trace[0].step_type is ExecutionStepType.ESCALATION:
+                raise ValueError("escalation cannot precede the initial model call")
+            raise ValueError("model execution must begin with a model call")
+
+        if policy is ModelPolicy.STRONG_DIRECT:
+            self._validate_candidate_attempt(trace, ModelRole.STRONG)
+            if any(
+                usage.model_role is not ModelRole.STRONG for usage in self.model_usages
+            ):
+                raise ValueError("strong-direct usage must identify STRONG")
+            return
+
+        escalation_indexes = [
+            index
+            for index, step in enumerate(trace)
+            if step.step_type is ExecutionStepType.ESCALATION
+        ]
+        expected_usage_roles: tuple[ModelRole, ...]
+        if self.escalated:
+            if escalation_indexes != [2]:
+                raise ValueError(
+                    "small-first escalation must follow the SMALL evaluation exactly"
+                )
+            small_attempt = trace[:2]
+            if len(small_attempt) != 2:
+                raise ValueError("escalation requires one complete SMALL attempt")
+            self._validate_candidate_attempt(
+                small_attempt,
+                ModelRole.SMALL,
+                terminal_required=False,
+            )
+            if not self.evaluations or self.evaluations[0].passed:
+                raise ValueError("escalation requires an unsuccessful SMALL evaluation")
+            self._validate_escalation_step(trace[2])
+            self._validate_candidate_attempt(trace[3:], ModelRole.STRONG)
+            expected_usage_roles = (ModelRole.SMALL, ModelRole.STRONG)
+        else:
+            if escalation_indexes:
+                raise ValueError("non-escalated small-first traces cannot escalate")
+            self._validate_candidate_attempt(trace, ModelRole.SMALL)
+            if (
+                self.status is RunStatus.COMPLETED
+                and self.evaluations
+                and not self.evaluations[0].passed
+            ):
+                raise ValueError(
+                    "unsuccessful SMALL evaluation requires STRONG escalation"
+                )
+            expected_usage_roles = (ModelRole.SMALL,)
+
+        if any(
+            usage.model_role is not expected_usage_roles[index]
+            for index, usage in enumerate(self.model_usages)
+            if index < len(expected_usage_roles)
+        ) or len(self.model_usages) > len(expected_usage_roles):
+            raise ValueError("small-first model usage must follow SMALL then STRONG")
+
+    def _validate_candidate_attempt(
+        self,
+        trace: tuple[ExecutionStep, ...],
+        role: ModelRole,
+        *,
+        terminal_required: bool = True,
+    ) -> None:
+        """Validate one causally ordered model, evaluation, and return attempt."""
+        if not trace or trace[0].step_type is not ExecutionStepType.MODEL_CALL:
+            raise ValueError(f"{role.value} attempt must begin with a model call")
+        model_step = trace[0]
+        if model_step.facts.get("model_role") != role.value:
+            raise ValueError(f"model-call facts must identify {role.value}")
+        if model_step.status is not ExecutionStatus.SUCCEEDED:
+            if len(trace) != 1:
+                raise ValueError("evaluation requires a successful model call")
+            return
+        if (
+            len(trace) < 2
+            or trace[1].step_type is not ExecutionStepType.QUALITY_EVALUATION
+        ):
+            raise ValueError("successful model calls require immediate evaluation")
+        evaluation_step = trace[1]
+        if evaluation_step.facts.get("model_role") != role.value:
+            raise ValueError(f"evaluation facts must identify {role.value}")
+        if not terminal_required:
+            if (
+                len(trace) != 2
+                or evaluation_step.status is not ExecutionStatus.SUCCEEDED
+            ):
+                raise ValueError("escalation requires one successful SMALL evaluation")
+            return
+        if evaluation_step.status is not ExecutionStatus.SUCCEEDED:
+            if len(trace) != 2:
+                raise ValueError("return requires a successful evaluation")
+            return
+        if len(trace) != 3 or trace[2].step_type is not ExecutionStepType.RETURN:
+            raise ValueError("successful evaluation requires one terminal return")
+        terminal = trace[2]
+        if terminal.status is ExecutionStatus.FAILED:
+            if (
+                self.status is not RunStatus.FAILED
+                or self.final_evaluation is None
+                or self.final_evaluation.evaluator_valid
+                or terminal.event_codes
+                or terminal.facts != {"model_role": role.value}
+                or terminal.error != self.error
+            ):
+                raise ValueError(
+                    "failed terminal return requires invalid final evaluation evidence"
+                )
+            return
+        if terminal.status is not ExecutionStatus.SUCCEEDED or terminal.event_codes:
+            raise ValueError("terminal return must have a valid terminal status")
+        if self.status is not RunStatus.COMPLETED:
+            raise ValueError("terminal return requires a completed run")
+        if self.final_evaluation is None:
+            raise ValueError("terminal return requires final evaluation evidence")
+        expected_facts = {
+            "model_role": role.value,
+            "contract_met": self.final_evaluation.passed,
+        }
+        if terminal.facts != expected_facts:
+            raise ValueError("return facts must match final evaluation evidence")
+
+    @staticmethod
+    def _validate_escalation_step(step: ExecutionStep) -> None:
+        """Validate the exact transition emitted between SMALL and STRONG."""
+        if (
+            step.status is not ExecutionStatus.SUCCEEDED
+            or step.event_codes
+            != (
+                ExecutionEventCode.ESCALATION_REQUIRED,
+                ExecutionEventCode.ESCALATED_TO_STRONG,
+            )
+            or step.facts
+            != {
+                "from_model_role": ModelRole.SMALL.value,
+                "to_model_role": ModelRole.STRONG.value,
+            }
+        ):
+            raise ValueError(
+                "escalation evidence must match SMALL-to-STRONG transition"
+            )
+
     def _measured_contract_met(self, *, is_cache_hit: bool) -> bool | None:
         """Derive compliance from current evaluation or accepted source evidence."""
         cache_steps = tuple(
@@ -371,8 +656,24 @@ class RunResult(BaseModel):
             for step in self.steps
             if step.step_type is ExecutionStepType.SEMANTIC_CACHE
         )
-        if self.semantic_cache is not None:
-            self._validate_cache_outcome_binding(self.semantic_cache)
+        cache_contract = validate_semantic_cache_binding(
+            plan=self.execution_plan,
+            cache_eligible=self.request_profile.cache_eligible,
+            evidence=self.semantic_cache,
+            run_id=self.run_id,
+            minimum_quality_score=self.quality_contract.minimum_quality_score,
+            request_binding=self.request_binding,
+        )
+        if cache_contract is None:
+            if cache_steps:
+                raise ValueError("cache steps require top-level cache evidence")
+        elif cache_contract.step_status is None:
+            if cache_steps:
+                raise ValueError("cache bypass cannot record a lookup step")
+        elif len(cache_steps) != 1 or cache_steps[0] is not self.steps[0]:
+            raise ValueError("attempted lookup requires one leading cache step")
+        elif cache_steps[0].semantic_cache != self.semantic_cache:
+            raise ValueError("cache step must match top-level cache evidence")
         if is_cache_hit:
             candidate = self.execution_plan.cache_candidate
             evidence = self.semantic_cache
@@ -386,15 +687,28 @@ class RunResult(BaseModel):
                 raise ValueError("cache runs require bound candidate and evidence")
             if evidence.outcome is not SemanticCacheOutcome.REUSED:
                 raise ValueError("cache runs require a reused outcome")
-            if len(cache_steps) != 1 or cache_steps[0] is not self.steps[0]:
-                raise ValueError("cache runs require one leading cache step")
-            if cache_steps[0].semantic_cache != evidence:
-                raise ValueError("cache step must match top-level cache evidence")
             if (
                 len(self.steps) != 2
                 or self.steps[1].step_type is not ExecutionStepType.RETURN
             ):
                 raise ValueError("cache runs require exactly cache and return steps")
+            if self.steps[1].status is not ExecutionStatus.SUCCEEDED:
+                raise ValueError("cache runs require a successful return step")
+            expected_return_facts = {
+                "contract_met": True,
+                "source_run_id": candidate.source_run_id,
+            }
+            if (
+                self.steps[1].event_codes
+                or self.steps[1].facts != expected_return_facts
+            ):
+                raise ValueError("cache return evidence must match the bound candidate")
+            if (
+                self.status is not RunStatus.COMPLETED
+                or self.contract_met is not True
+                or self.escalated
+            ):
+                raise ValueError("cache runs require completed terminal facts")
             if any(step.step_type in forbidden_steps for step in self.steps):
                 raise ValueError("cache reuse cannot record model-path execution")
             if (
@@ -405,65 +719,15 @@ class RunResult(BaseModel):
                 raise ValueError("cache reuse cannot claim current execution evidence")
             if self.final_output != candidate.output_text:
                 raise ValueError("cache output must match the bound candidate")
-            if self.run_id == candidate.source_run_id:
-                raise ValueError("cache source run must differ from current run")
-            source = candidate.prior_evaluation
-            accepted = (
-                evidence.source_run_id == candidate.source_run_id
-                and evidence.similarity == candidate.similarity
-                and evidence.prior_evaluation == source
-                and candidate.similarity
-                >= self.execution_plan.decision_evidence.cache_similarity_threshold
-                and source.evaluator_valid
-                and source.passed
-                and source.mandatory_checks_passed
-                and source.score >= self.quality_contract.minimum_quality_score
-                and candidate.contract_compatible
-                and candidate.safe_to_reuse
-            )
-            if not accepted:
-                raise ValueError("cache result lacks valid accepted source evidence")
+            if evidence.lookup_latency_ms > self.latency_ms:
+                raise ValueError("cache lookup latency cannot exceed total latency")
             return True
-        if self.semantic_cache is not None:
-            if self.semantic_cache.outcome is SemanticCacheOutcome.REUSED:
-                raise ValueError("model runs cannot claim a reused cache result")
-            attempted = self.semantic_cache.outcome not in {
-                SemanticCacheOutcome.DISABLED_BYPASSED,
-                SemanticCacheOutcome.INELIGIBLE_BYPASSED,
-            }
-            if attempted:
-                if len(cache_steps) != 1 or cache_steps[0] is not self.steps[0]:
-                    raise ValueError("attempted lookup requires one leading cache step")
-                if cache_steps[0].semantic_cache != self.semantic_cache:
-                    raise ValueError("cache step must match top-level cache evidence")
-            elif cache_steps:
-                raise ValueError("cache bypass cannot record a lookup step")
-        elif cache_steps:
-            raise ValueError("cache steps require top-level cache evidence")
         return (
             self.final_evaluation.passed
             if self.final_evaluation is not None
             and self.final_evaluation.evaluator_valid
             else None
         )
-
-    def _validate_cache_outcome_binding(
-        self,
-        evidence: SemanticCacheEvidence,
-    ) -> None:
-        """Keep transported cache facts aligned with the selected plan."""
-        plan = self.execution_plan
-        if evidence.planner_reason_code not in plan.reason_codes:
-            raise ValueError("cache evidence reason must appear in the selected plan")
-        disabled = evidence.outcome is SemanticCacheOutcome.DISABLED_BYPASSED
-        if disabled is plan.decision_evidence.module_states.semantic_cache_enabled:
-            raise ValueError("cache outcome must match the planned module state")
-        assessed = evidence.outcome in {
-            SemanticCacheOutcome.MATCH_REJECTED,
-            SemanticCacheOutcome.REUSED,
-        }
-        if assessed is not plan.decision_evidence.cache_candidate_assessed:
-            raise ValueError("cache outcome must match candidate-assessed evidence")
 
     def _complete_model_usages(self) -> tuple[ModelUsage, ...] | None:
         """Return usage only when every attempted model call has measurements."""

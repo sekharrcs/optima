@@ -52,6 +52,12 @@ def reduction_result() -> ContextReductionResult:
     )
 
 
+def test_context_evidence_model_copy_revalidates_updates() -> None:
+    """Reject invalid nested context evidence created through model_copy."""
+    with pytest.raises(ValidationError, match="source segments"):
+        preservation_evidence().model_copy(update={"retained_segment_indexes": (0, 3)})
+
+
 def fixture_cases() -> list[dict[str, Any]]:
     """Load deterministic preservation benchmark cases as structured data."""
     loaded = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))

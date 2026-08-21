@@ -186,6 +186,30 @@ def test_api_client_transports_exact_local_cache_hit_evidence() -> None:
     assert result.total_calculated_cost is None
 
 
+def test_local_cache_exact_match_includes_complete_request_key() -> None:
+    """Treat changed evaluation criteria as a local exact-match cache miss."""
+    payload = ExecuteInputs(
+        input_text=DEMO_CACHE_INPUT,
+        context=DEMO_CACHE_CONTEXT,
+        cache_eligible=True,
+    ).to_run_request()
+    payload.criteria = ("The answer must be JSON.",)
+
+    response = TestClient(demo_app).post(
+        "/api/v1/runs", json=payload.model_dump(mode="json", exclude_none=True)
+    )
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(response.status_code, json=response.json())
+    )
+    result = OptimaApiClient(transport=transport).execute(payload)
+
+    assert response.status_code == 200
+    assert result.execution_plan.human_readable_name != "Cached Result"
+    assert result.semantic_cache is not None
+    assert result.semantic_cache.outcome is SemanticCacheOutcome.MISS
+    assert result.final_output != DEMO_CACHE_OUTPUT
+
+
 def test_api_client_transports_local_cache_miss_before_model_fallback() -> None:
     """Parse truthful miss evidence followed by actual model execution facts."""
     payload = ExecuteInputs(

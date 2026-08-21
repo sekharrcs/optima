@@ -1,6 +1,7 @@
 """Composition and invariant tests for deterministic Planner V1."""
 
 import pytest
+from pydantic import ValidationError
 
 from optima.domain.evaluation import EvaluationResult
 from optima.domain.execution import (
@@ -17,6 +18,7 @@ from optima.domain.quality_contract import (
     QualityProfile,
     RiskTier,
 )
+from optima.domain.request_binding import RequestBinding, build_request_binding
 from optima.domain.request_profile import Complexity, RequestProfile, TaskType
 from optima.planner import (
     CacheCandidate,
@@ -83,11 +85,29 @@ def accepted_evaluation() -> EvaluationResult:
     )
 
 
+def request_binding(
+    *,
+    task_type: TaskType = TaskType.SUMMARIZATION,
+    complexity: Complexity = Complexity.LOW,
+) -> RequestBinding:
+    """Build the complete current binding shared by planner fixtures."""
+    return build_request_binding(
+        input_text="Summarize incident ARC-9",
+        context="Incident ARC-9 is resolved.",
+        reference_output=None,
+        criteria=(),
+        metadata={},
+        task_type=task_type,
+        complexity=complexity,
+    )
+
+
 def cache_candidate(**updates: object) -> CacheCandidate:
     """Build a safe high-confidence cache candidate."""
     values: dict[str, object] = {
         "source_run_id": "run-1",
         "output_text": "cached output",
+        "request_binding": request_binding(),
         "similarity": 0.95,
         "prior_evaluation": accepted_evaluation(),
         "contract_compatible": True,
@@ -97,10 +117,20 @@ def cache_candidate(**updates: object) -> CacheCandidate:
     return CacheCandidate.model_validate(values)
 
 
+class SubstitutingCacheCandidate(CacheCandidate):
+    """Provider value that attempts to substitute output during detachment."""
+
+    def detached_copy(self) -> CacheCandidate:
+        values = self.model_dump(mode="python")
+        values["output_text"] = "substituted output"
+        return CacheCandidate.model_validate(values)
+
+
 def planner_input(**updates: object) -> PlannerInput:
     """Build complete default planner input without a cache hit or history."""
     values: dict[str, object] = {
         "request_profile": request_profile(),
+        "request_binding": request_binding(),
         "quality_contract": quality_contract(),
         "modules": modules(),
         "reducer_capability": ContextReducerCapability(
@@ -135,7 +165,85 @@ def test_safe_cache_hit_short_circuits_model_and_context_planning() -> None:
     assert plan.cache_candidate.prior_evaluation is not (
         supplied_candidate.prior_evaluation
     )
+    assert plan.request_binding == request_binding()
+    assert plan.request_binding is not supplied_candidate.request_binding
     assert plan.decision_evidence.cache_similarity_threshold == 0.95
+
+
+def test_planner_normalizes_provider_candidate_before_detachment() -> None:
+    """Prevent cache-provider subclasses from substituting accepted output."""
+    supplied = SubstitutingCacheCandidate.model_validate(
+        cache_candidate().model_dump(mode="python")
+    )
+
+    plan = require_plan(select_plan(planner_input(cache_candidate=supplied)))
+
+    assert plan.cache_candidate is not None
+    assert type(plan.cache_candidate) is CacheCandidate
+    assert plan.cache_candidate.output_text == "cached output"
+
+
+def test_planner_input_revalidates_constructed_candidate_evidence() -> None:
+    """Reject unchecked nested evaluator evidence at the provider boundary."""
+    accepted = accepted_evaluation()
+    evaluation_values = {
+        field_name: getattr(accepted, field_name)
+        for field_name in type(accepted).model_fields
+    }
+    evaluation_values["reasons"] = ()
+    invalid_evaluation = EvaluationResult.model_construct(**evaluation_values)
+    supplied = cache_candidate()
+    candidate_values = {
+        field_name: getattr(supplied, field_name)
+        for field_name in type(supplied).model_fields
+    }
+    candidate_values["prior_evaluation"] = invalid_evaluation
+    constructed = CacheCandidate.model_construct(**candidate_values)
+
+    with pytest.raises(ValidationError, match="reasons"):
+        planner_input(cache_candidate=constructed)
+
+
+def test_planner_detaches_constructed_candidate_metadata_alias() -> None:
+    """Prevent provider-owned nested metadata from mutating plan evidence."""
+    mutable_metadata: dict[str, object] = {"nested": []}
+    accepted = accepted_evaluation()
+    evaluation_values = {
+        field_name: getattr(accepted, field_name)
+        for field_name in type(accepted).model_fields
+    }
+    evaluation_values["metadata"] = mutable_metadata
+    constructed_evaluation = EvaluationResult.model_construct(**evaluation_values)
+    supplied = cache_candidate()
+    candidate_values = {
+        field_name: getattr(supplied, field_name)
+        for field_name in type(supplied).model_fields
+    }
+    candidate_values["prior_evaluation"] = constructed_evaluation
+    constructed_candidate = CacheCandidate.model_construct(**candidate_values)
+
+    plan = require_plan(
+        select_plan(planner_input(cache_candidate=constructed_candidate))
+    )
+    nested = mutable_metadata["nested"]
+    assert isinstance(nested, list)
+    nested.append("tampered")
+
+    assert plan.cache_candidate_assessment is not None
+    assert plan.cache_candidate_assessment.prior_evaluation.metadata == {"nested": []}
+
+
+def test_planner_input_rejects_profile_binding_mismatch() -> None:
+    """Bind planner profile identity to task and complexity in the request digest."""
+    with pytest.raises(ValidationError, match="request binding"):
+        planner_input(
+            request_profile=request_profile().model_copy(
+                update={
+                    "task_type": TaskType.GENERAL_REASONING,
+                    "complexity": Complexity.HIGH,
+                }
+            )
+        )
 
 
 def test_cache_plan_preserves_configured_similarity_threshold() -> None:
@@ -172,6 +280,7 @@ def test_rejected_cache_candidate_continues_normal_planning(
 
     assert plan.cache_policy is CachePolicy.SKIP
     assert plan.cache_candidate is None
+    assert plan.request_binding == request_binding()
     assert plan.model_policy is ModelPolicy.SMALL_FIRST_WITH_FALLBACK
     assert reason in plan.reason_codes
     assert plan.decision_evidence.cache_candidate_assessed is True
@@ -249,6 +358,7 @@ def test_poor_history_adjustment_reasons_describe_final_strong_plan(
         select_plan(
             planner_input(
                 request_profile=request_profile(complexity=complexity),
+                request_binding=request_binding(complexity=complexity),
                 quality_contract=quality_contract(
                     quality_profile=quality_profile,
                     optimization_mode=mode,
@@ -308,6 +418,7 @@ def test_base_strong_direct_selection_reasons_remain_unchanged() -> None:
         select_plan(
             planner_input(
                 request_profile=request_profile(complexity=Complexity.HIGH),
+                request_binding=request_binding(complexity=Complexity.HIGH),
             )
         )
     )
@@ -329,6 +440,7 @@ def test_high_complexity_remains_strong_after_history(
         select_plan(
             planner_input(
                 request_profile=request_profile(complexity=Complexity.HIGH),
+                request_binding=request_binding(complexity=Complexity.HIGH),
                 quality_contract=quality_contract(
                     quality_profile=quality_profile,
                     optimization_mode=mode,
@@ -373,6 +485,7 @@ def test_every_base_small_first_case_has_verified_strong_fallback(
         select_plan(
             planner_input(
                 request_profile=request_profile(complexity=complexity),
+                request_binding=request_binding(complexity=complexity),
                 quality_contract=quality_contract(
                     quality_profile=quality_profile,
                     optimization_mode=mode,

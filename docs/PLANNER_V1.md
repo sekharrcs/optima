@@ -201,6 +201,7 @@ Only evaluate cache if:
 - a cache candidate exists
 
 Select cache only when all are true:
+- candidate request binding equals the current request binding
 - candidate similarity >= configured similarity threshold
 - cached result previously passed a valid evaluator
 - cached quality score >= current contract threshold
@@ -214,6 +215,7 @@ if (
     modules.semantic_cache_enabled
     and profile.cache_eligible
     and cache_candidate is not None
+    and cache_candidate.request_binding == current_request_binding
     and cache_candidate.similarity >= config.cache_similarity_threshold
     and cache_candidate.quality_score >= contract.minimum_quality_score
     and cache_candidate.contract_compatible
@@ -230,6 +232,7 @@ Cache rejection reason codes, evaluated in this precedence order, are:
 - `SEMANTIC_CACHE_DISABLED`
 - `CACHE_REQUEST_NOT_ELIGIBLE`
 - `CACHE_CANDIDATE_NOT_SUPPLIED`
+- `CACHE_REQUEST_BINDING_MISMATCH`
 - `CACHE_SIMILARITY_BELOW_THRESHOLD`
 - `CACHE_PRIOR_EVALUATOR_INVALID`
 - `CACHE_PRIOR_EVALUATION_FAILED`
@@ -239,6 +242,16 @@ Cache rejection reason codes, evaluated in this precedence order, are:
 
 A rejected candidate continues through context and model planning. Similarity
 and quality comparisons are inclusive at their configured thresholds.
+
+`CACHE_REQUEST_BINDING_MISMATCH` is evaluated before similarity and every
+quality, compatibility, or safety gate because the remaining candidate facts
+belong to a different request. The binding uses versioned canonical JSON over
+the exact input text, original context, reference output, ordered and
+duplicate-preserving criteria, caller metadata, task type, and complexity.
+Object keys are sorted recursively, arrays retain order, nulls are retained,
+strings are not normalized, and non-finite numbers are rejected. Planner V1
+compares the typed SHA-256 binding; the cache adapter does not make the final
+reuse decision.
 
 Optimization Mode does not override cache safety or contract compatibility.
 
@@ -497,6 +510,8 @@ ExecutionPlan
 - verification_required
 - escalation_model_role (optional)
 - optimization_mode
+- quality_profile
+- request_binding
 - reason_codes[]
 - human_readable_name
 - expected_quality (optional estimate)
@@ -508,6 +523,8 @@ Decision evidence contains the profile, contract, and effective risk tiers;
 module states; whether a cache candidate was assessed; historical statistics
 used for an adjustment or confidence decision; and base/final model policies.
 Core evidence is immutable and typed rather than stored in an arbitrary map.
+Every model and cache plan snapshots the complete request binding and selected
+Quality Profile so execution and run validation can reject plan rebinding.
 
 For `SMALL_FIRST_WITH_FALLBACK`:
 

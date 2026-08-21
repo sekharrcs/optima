@@ -17,6 +17,7 @@ from optima.domain.execution import (
     SemanticCacheOutcome,
 )
 from optima.domain.quality_contract import build_quality_contract
+from optima.domain.request_binding import build_request_binding
 from optima.domain.run import RunResult
 from optima.execution import (
     ContextReductionDependencyError,
@@ -57,6 +58,15 @@ def build_runs_router(
             max_latency_ms=run_request.max_latency_ms,
             thresholds=dependencies.settings.quality_thresholds(),
         )
+        request_binding = build_request_binding(
+            input_text=run_request.input_text,
+            context=run_request.context,
+            reference_output=run_request.reference_output,
+            criteria=run_request.criteria,
+            metadata=run_request.metadata,
+            task_type=run_request.request_profile.task_type,
+            complexity=run_request.request_profile.complexity,
+        )
         run_id = dependencies.run_id_factory()
         correlation_id = dependencies.correlation_id_factory()
         clock = dependencies.monotonic_clock or SystemMonotonicClock()
@@ -80,15 +90,23 @@ def build_runs_router(
         else:
             lookup_started_at = clock.now()
             try:
-                cache_candidate = await dependencies.semantic_cache.lookup(
+                resolved_candidate = await dependencies.semantic_cache.lookup(
                     SemanticCacheLookupRequest(
                         run_id=run_id,
                         input_text=run_request.input_text,
                         context=run_request.context,
+                        reference_output=run_request.reference_output,
+                        criteria=run_request.criteria,
                         quality_contract=quality_contract,
                         request_profile=run_request.request_profile,
                         metadata=run_request.metadata,
+                        request_binding=request_binding,
                     )
+                )
+                cache_candidate = (
+                    CacheCandidate.model_validate(resolved_candidate)
+                    if resolved_candidate is not None
+                    else None
                 )
                 cache_outcome = (
                     SemanticCacheOutcome.MISS
@@ -126,6 +144,7 @@ def build_runs_router(
         planner_result = select_plan(
             PlannerInput(
                 request_profile=run_request.request_profile,
+                request_binding=request_binding,
                 quality_contract=quality_contract,
                 modules=dependencies.settings.module_configuration(),
                 thresholds=dependencies.settings.planner_thresholds(),
@@ -167,6 +186,7 @@ def build_runs_router(
                 if cache_candidate is not None
                 else None
             ),
+            candidate_assessment=execution_plan.cache_candidate_assessment,
             error=cache_error,
         )
 
@@ -228,6 +248,7 @@ def _cache_reason(execution_plan: ExecutionPlan) -> PlannerReasonCode:
         PlannerReasonCode.SEMANTIC_CACHE_DISABLED,
         PlannerReasonCode.CACHE_REQUEST_NOT_ELIGIBLE,
         PlannerReasonCode.CACHE_CANDIDATE_NOT_SUPPLIED,
+        PlannerReasonCode.CACHE_REQUEST_BINDING_MISMATCH,
         PlannerReasonCode.CACHE_SIMILARITY_BELOW_THRESHOLD,
         PlannerReasonCode.CACHE_PRIOR_EVALUATOR_INVALID,
         PlannerReasonCode.CACHE_PRIOR_EVALUATION_FAILED,

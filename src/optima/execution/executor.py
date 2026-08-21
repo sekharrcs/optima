@@ -25,8 +25,9 @@ from optima.domain.execution import (
     ModelPolicy,
     ModelRole,
     SemanticCacheEvidence,
-    SemanticCacheOutcome,
+    semantic_cache_outcome_contract,
 )
+from optima.domain.request_binding import RequestBinding, build_request_binding
 from optima.domain.run import ModelUsage, RunResult, RunStatus
 from optima.evaluation import EvaluationRequest, QualityEvaluator
 from optima.execution.contracts import (
@@ -578,6 +579,7 @@ class PlanExecutor:
                 ),
                 request.quality_contract,
             )
+            result = EvaluationResult.model_validate(result)
             if result.threshold != request.quality_contract.minimum_quality_score:
                 raise ValueError(
                     "evaluation threshold does not match the Quality Contract"
@@ -666,41 +668,18 @@ class PlanExecutor:
         steps: list[ExecutionStep],
     ) -> None:
         """Record only actual lookup attempts, never disabled or ineligible bypasses."""
-        if evidence is None or evidence.outcome in {
-            SemanticCacheOutcome.DISABLED_BYPASSED,
-            SemanticCacheOutcome.INELIGIBLE_BYPASSED,
-        }:
+        if evidence is None:
             return
-        status = {
-            SemanticCacheOutcome.MISS: ExecutionStatus.SUCCEEDED,
-            SemanticCacheOutcome.MATCH_REJECTED: ExecutionStatus.SUCCEEDED,
-            SemanticCacheOutcome.REUSED: ExecutionStatus.SUCCEEDED,
-            SemanticCacheOutcome.LOOKUP_FAILED: ExecutionStatus.FAILED,
-            SemanticCacheOutcome.LOOKUP_TIMED_OUT: ExecutionStatus.TIMED_OUT,
-        }[evidence.outcome]
-        event = {
-            SemanticCacheOutcome.MISS: ExecutionEventCode.CACHE_MISS,
-            SemanticCacheOutcome.MATCH_REJECTED: (
-                ExecutionEventCode.CACHE_MATCH_REJECTED
-            ),
-            SemanticCacheOutcome.REUSED: ExecutionEventCode.CACHE_RESULT_REUSED,
-            SemanticCacheOutcome.LOOKUP_FAILED: (
-                ExecutionEventCode.CACHE_LOOKUP_FAILED
-            ),
-            SemanticCacheOutcome.LOOKUP_TIMED_OUT: (
-                ExecutionEventCode.CACHE_LOOKUP_TIMED_OUT
-            ),
-        }[evidence.outcome]
-        events: tuple[ExecutionEventCode, ...] = (event,)
-        if evidence.outcome is SemanticCacheOutcome.REUSED:
-            events += (ExecutionEventCode.QUALITY_CONTRACT_MET,)
+        contract = semantic_cache_outcome_contract(evidence.outcome)
+        if contract.step_status is None:
+            return
         steps.append(
             ExecutionStep(
                 sequence=len(steps),
                 step_type=ExecutionStepType.SEMANTIC_CACHE,
-                status=status,
+                status=contract.step_status,
                 latency_ms=evidence.lookup_latency_ms,
-                event_codes=events,
+                event_codes=contract.step_event_codes,
                 semantic_cache=evidence,
                 error=evidence.error,
             )
@@ -737,6 +716,7 @@ class PlanExecutor:
             status=RunStatus.COMPLETED,
             quality_contract=request.quality_contract,
             request_profile=request.request_profile,
+            request_binding=self._request_binding(request),
             execution_plan=request.execution_plan,
             semantic_cache=request.semantic_cache,
             steps=tuple(steps),
@@ -808,6 +788,7 @@ class PlanExecutor:
             status=RunStatus.COMPLETED,
             quality_contract=request.quality_contract,
             request_profile=request.request_profile,
+            request_binding=self._request_binding(request),
             execution_plan=request.execution_plan,
             semantic_cache=request.semantic_cache,
             steps=tuple(steps),
@@ -840,6 +821,7 @@ class PlanExecutor:
             status=status,
             quality_contract=request.quality_contract,
             request_profile=request.request_profile,
+            request_binding=self._request_binding(request),
             execution_plan=request.execution_plan,
             semantic_cache=request.semantic_cache,
             steps=tuple(steps),
@@ -853,6 +835,19 @@ class PlanExecutor:
             ),
             latency_ms=self._elapsed_ms(started_at),
             error=error,
+        )
+
+    @staticmethod
+    def _request_binding(request: ExecutionRequest) -> RequestBinding:
+        """Derive the current binding independently from executor request facts."""
+        return build_request_binding(
+            input_text=request.input_text,
+            context=request.context,
+            reference_output=request.reference_output,
+            criteria=request.criteria,
+            metadata=request.metadata,
+            task_type=request.request_profile.task_type,
+            complexity=request.request_profile.complexity,
         )
 
     def _elapsed_ms(self, started_at: float) -> int:

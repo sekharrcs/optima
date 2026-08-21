@@ -30,6 +30,7 @@ from optima.domain.quality_contract import (
     QualityProfile,
     RiskTier,
 )
+from optima.domain.request_binding import RequestBinding, build_request_binding
 from optima.domain.request_profile import Complexity, RequestProfile, TaskType
 from optima.domain.run import PricingProvenance, RunStatus
 from optima.evaluation import EvaluationEvidence, EvaluationRequest, FakeEvaluator
@@ -121,11 +122,36 @@ def quality_contract() -> QualityContract:
     )
 
 
+def reduction_context() -> str:
+    """Return the original context shared by reduction request fixtures."""
+    return (
+        "Priya Nair owns incident INC-204.\n"
+        "INC-204 affected 37 requests.\n"
+        "Unrelated social update for the wider team."
+    )
+
+
+def planner_request_binding(
+    *, context: str = "Original architecture context"
+) -> RequestBinding:
+    """Build the exact current binding supplied to Planner V1."""
+    return build_request_binding(
+        input_text="Assess the architecture tradeoffs",
+        context=context,
+        reference_output=None,
+        criteria=(),
+        metadata={},
+        task_type=TaskType.GENERAL_REASONING,
+        complexity=Complexity.HIGH,
+    )
+
+
 def strong_direct_plan() -> ExecutionPlan:
     """Build the authoritative Planner V1 strong-direct plan."""
     result = select_plan(
         PlannerInput(
             request_profile=request_profile(),
+            request_binding=planner_request_binding(),
             quality_contract=quality_contract(),
             modules=ModuleConfiguration(
                 semantic_cache_enabled=False,
@@ -153,6 +179,7 @@ def reduction_plan() -> ExecutionPlan:
     result = select_plan(
         PlannerInput(
             request_profile=reduction_profile,
+            request_binding=planner_request_binding(context=reduction_context()),
             quality_contract=quality_contract(),
             modules=ModuleConfiguration(
                 semantic_cache_enabled=False,
@@ -187,11 +214,7 @@ def execution_request() -> ExecutionRequest:
 
 def reduction_request() -> ExecutionRequest:
     """Build a direct request whose authoritative plan selects reduction."""
-    original_context = (
-        "Priya Nair owns incident INC-204.\n"
-        "INC-204 affected 37 requests.\n"
-        "Unrelated social update for the wider team."
-    )
+    original_context = reduction_context()
     reduction_profile = request_profile().model_copy(
         update={"input_tokens": 4_000, "has_large_context": True}
     )

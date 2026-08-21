@@ -108,6 +108,17 @@ def evidence(**updates: object) -> EvaluationEvidence:
     return EvaluationEvidence.model_validate(values)
 
 
+def test_evaluation_evidence_revalidates_constructed_mandatory_checks() -> None:
+    """Reject unchecked mandatory-check values before threshold evaluation."""
+    constructed = DeterministicCheckResult.model_construct(
+        check_id="must-pass",
+        passed="false",
+    )
+
+    with pytest.raises(ValidationError, match="passed"):
+        evidence(mandatory_checks=(constructed,))
+
+
 def evaluation_request(**updates: object) -> EvaluationRequest:
     """Build one provider-independent evaluator request."""
     values: dict[str, object] = {

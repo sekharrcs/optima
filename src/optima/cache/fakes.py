@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 from optima.cache.contracts import SemanticCacheLookupRequest
 from optima.domain.cache import CacheCandidate
+from optima.domain.request_binding import RequestBinding
 
 
 class FakeSemanticCache:
@@ -33,16 +34,19 @@ class FakeSemanticCache:
         outcome = next(self._outcomes)
         if isinstance(outcome, Exception):
             raise outcome
-        return outcome.detached_copy() if outcome is not None else None
+        return CacheCandidate.model_validate(outcome) if outcome is not None else None
 
 
 @dataclass(frozen=True)
 class InMemoryCacheEntry:
     """One exact request key mapped to a resolved semantic-cache candidate."""
 
-    input_text: str
-    context: str | None
+    request_binding: RequestBinding
     candidate: CacheCandidate
+
+    def __post_init__(self) -> None:
+        if self.request_binding != self.candidate.request_binding:
+            raise ValueError("cache entry binding must match its candidate")
 
 
 class InMemorySemanticCache:
@@ -66,9 +70,6 @@ class InMemorySemanticCache:
             SemanticCacheLookupRequest.model_validate(request.model_dump(mode="python"))
         )
         for entry in self._entries:
-            if (
-                entry.input_text == request.input_text
-                and entry.context == request.context
-            ):
-                return entry.candidate.detached_copy()
+            if entry.request_binding == request.request_binding:
+                return CacheCandidate.model_validate(entry.candidate)
         return None

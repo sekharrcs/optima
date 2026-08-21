@@ -14,6 +14,7 @@ from optima.domain.quality_contract import (
     QualityProfile,
     RiskTier,
 )
+from optima.domain.request_binding import RequestBinding
 from optima.domain.request_profile import Complexity, RequestProfile
 from optima.planner.models import (
     CacheCandidate,
@@ -59,6 +60,7 @@ def evaluate_cache_policy(
     *,
     enabled: bool,
     profile: RequestProfile,
+    request_binding: RequestBinding,
     candidate: CacheCandidate | None,
     contract: QualityContract,
     thresholds: PlannerThresholds,
@@ -84,7 +86,9 @@ def evaluate_cache_policy(
         )
 
     reason: PlannerReasonCode | None = None
-    if candidate.similarity < thresholds.cache_similarity_threshold:
+    if candidate.request_binding != request_binding:
+        reason = PlannerReasonCode.CACHE_REQUEST_BINDING_MISMATCH
+    elif candidate.similarity < thresholds.cache_similarity_threshold:
         reason = PlannerReasonCode.CACHE_SIMILARITY_BELOW_THRESHOLD
     elif not candidate.prior_evaluation.evaluator_valid:
         reason = PlannerReasonCode.CACHE_PRIOR_EVALUATOR_INVALID

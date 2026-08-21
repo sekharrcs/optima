@@ -100,6 +100,9 @@ REASON_EXPLANATIONS: dict[PlannerReasonCode, str] = {
     PRC.CACHE_CANDIDATE_NOT_SUPPLIED: (
         "No semantic-cache candidate was supplied to Planner V1."
     ),
+    PRC.CACHE_REQUEST_BINDING_MISMATCH: (
+        "The cache candidate was assessed for a different complete request."
+    ),
     PRC.CACHE_SIMILARITY_BELOW_THRESHOLD: (
         "The cache candidate similarity was below the configured threshold."
     ),

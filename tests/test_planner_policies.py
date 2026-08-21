@@ -18,6 +18,7 @@ from optima.domain.quality_contract import (
     QualityProfile,
     RiskTier,
 )
+from optima.domain.request_binding import RequestBinding, build_request_binding
 from optima.domain.request_profile import Complexity, RequestProfile, TaskType
 from optima.planner.models import (
     CacheCandidate,
@@ -215,11 +216,25 @@ def evaluation(**updates: object) -> EvaluationResult:
     return EvaluationResult.model_validate(values)
 
 
+def request_binding(*, input_text: str = "Summarize incident ARC-9") -> RequestBinding:
+    """Build the current complete binding used by cache policy tests."""
+    return build_request_binding(
+        input_text=input_text,
+        context="Incident ARC-9 is resolved.",
+        reference_output=None,
+        criteria=(),
+        metadata={},
+        task_type=TaskType.SUMMARIZATION,
+        complexity=Complexity.LOW,
+    )
+
+
 def candidate(**updates: object) -> CacheCandidate:
     """Build a safe cache candidate with optional overrides."""
     values: dict[str, object] = {
         "source_run_id": "run-1",
         "output_text": "cached output",
+        "request_binding": request_binding(),
         "similarity": 0.95,
         "prior_evaluation": evaluation(),
         "contract_compatible": True,
@@ -337,6 +352,7 @@ def test_cache_rejection_taxonomy(
     decision = evaluate_cache_policy(
         enabled=enabled,
         profile=profile(cache_eligible=cache_eligible),
+        request_binding=request_binding(),
         candidate=candidate_value,
         contract=contract(threshold=0.90),
         thresholds=PlannerThresholds(),
@@ -357,6 +373,7 @@ def test_cache_accepts_inclusive_similarity_and_quality_thresholds(
     decision = evaluate_cache_policy(
         enabled=True,
         profile=profile(),
+        request_binding=request_binding(),
         candidate=candidate(
             similarity=similarity,
             prior_evaluation=evaluation(score=quality, threshold=0.80),
@@ -367,6 +384,73 @@ def test_cache_accepts_inclusive_similarity_and_quality_thresholds(
 
     assert decision.policy is CachePolicy.USE_CACHED_RESULT
     assert decision.reason_code is PlannerReasonCode.CACHE_HIGH_CONFIDENCE_MATCH
+
+
+def test_cache_accepts_candidate_with_exact_request_binding() -> None:
+    """Accept a candidate only when its source binding equals the current request."""
+    current_binding = request_binding()
+
+    decision = evaluate_cache_policy(
+        enabled=True,
+        profile=profile(),
+        request_binding=current_binding,
+        candidate=candidate(request_binding=current_binding),
+        contract=contract(),
+        thresholds=PlannerThresholds(),
+    )
+
+    assert decision.policy is CachePolicy.USE_CACHED_RESULT
+    assert decision.reason_code is PlannerReasonCode.CACHE_HIGH_CONFIDENCE_MATCH
+
+
+def test_cache_rejects_candidate_with_different_request_binding() -> None:
+    """Reject source evidence produced for a different complete request."""
+    decision = evaluate_cache_policy(
+        enabled=True,
+        profile=profile(),
+        request_binding=request_binding(input_text="Different current request"),
+        candidate=candidate(),
+        contract=contract(),
+        thresholds=PlannerThresholds(),
+    )
+
+    assert decision.policy is CachePolicy.SKIP
+    assert decision.candidate_assessed is True
+    assert decision.reason_code is PlannerReasonCode.CACHE_REQUEST_BINDING_MISMATCH
+
+
+@pytest.mark.parametrize(
+    "candidate_updates",
+    [
+        {"similarity": 0.01},
+        {
+            "prior_evaluation": evaluation(
+                evaluator_valid=False,
+                passed=False,
+            )
+        },
+        {"prior_evaluation": evaluation(score=0.79, passed=False)},
+        {"prior_evaluation": evaluation(score=0.79, threshold=0.70)},
+        {"contract_compatible": False},
+        {"safe_to_reuse": False},
+    ],
+)
+def test_cache_binding_mismatch_precedes_every_later_candidate_defect(
+    candidate_updates: dict[str, object],
+) -> None:
+    """Stop at source binding mismatch before assessing unrelated evidence."""
+    decision = evaluate_cache_policy(
+        enabled=True,
+        profile=profile(),
+        request_binding=request_binding(input_text="Different current request"),
+        candidate=candidate(**candidate_updates),
+        contract=contract(),
+        thresholds=PlannerThresholds(),
+    )
+
+    assert decision.policy is CachePolicy.SKIP
+    assert decision.candidate_assessed is True
+    assert decision.reason_code is PlannerReasonCode.CACHE_REQUEST_BINDING_MISMATCH
 
 
 @pytest.mark.parametrize(

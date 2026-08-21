@@ -2,24 +2,23 @@
 
 from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
+from pydantic import Field, model_validator
 
 from optima.domain.execution import (
-    CachePolicy,
     ExecutionPlan,
     SemanticCacheEvidence,
-    SemanticCacheOutcome,
+    validate_semantic_cache_binding,
 )
 from optima.domain.quality_contract import QualityContract
+from optima.domain.request_binding import build_request_binding
 from optima.domain.request_profile import RequestProfile
+from optima.immutable import ImmutableJsonObject, ImmutableModel
 
 NonEmptyString = Annotated[str, Field(strict=True, min_length=1)]
 
 
-class ExecutionRequest(BaseModel):
+class ExecutionRequest(ImmutableModel):
     """Complete immutable facts needed to execute one selected plan."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
 
     run_id: NonEmptyString
     correlation_id: NonEmptyString
@@ -27,7 +26,7 @@ class ExecutionRequest(BaseModel):
     context: NonEmptyString | None = None
     reference_output: NonEmptyString | None = None
     criteria: tuple[NonEmptyString, ...] = ()
-    metadata: dict[str, JsonValue] = Field(default_factory=dict)
+    metadata: ImmutableJsonObject = Field(default_factory=dict)
     quality_contract: QualityContract
     request_profile: RequestProfile
     execution_plan: ExecutionPlan
@@ -39,65 +38,37 @@ class ExecutionRequest(BaseModel):
         plan = self.execution_plan
         if plan.optimization_mode is not self.quality_contract.optimization_mode:
             raise ValueError("plan optimization mode must match the current contract")
-        if self.semantic_cache is not None and (
-            self.semantic_cache.planner_reason_code not in plan.reason_codes
+        current_binding = build_request_binding(
+            input_text=self.input_text,
+            context=self.context,
+            reference_output=self.reference_output,
+            criteria=self.criteria,
+            metadata=self.metadata,
+            task_type=self.request_profile.task_type,
+            complexity=self.request_profile.complexity,
+        )
+        if plan.request_binding != current_binding:
+            raise ValueError(
+                "execution plan request binding must match current request"
+            )
+        if plan.quality_profile is not self.quality_contract.quality_profile:
+            raise ValueError("execution plan must match the current Quality Contract")
+        if (
+            plan.decision_evidence.profile_risk_tier
+            is not self.request_profile.risk_tier
+            or plan.decision_evidence.contract_risk_tier
+            is not self.quality_contract.risk_tier
         ):
-            raise ValueError("cache evidence reason must appear in the selected plan")
-        if self.semantic_cache is not None:
-            self._validate_cache_outcome_binding(self.semantic_cache)
-        if plan.cache_policy is CachePolicy.USE_CACHED_RESULT:
-            candidate = plan.cache_candidate
-            evidence = self.semantic_cache
-            if candidate is None or evidence is None:
-                raise ValueError("cache reuse requires bound candidate and evidence")
-            if evidence.outcome is not SemanticCacheOutcome.REUSED:
-                raise ValueError("cache plan requires a reused runtime outcome")
-            if not self.request_profile.cache_eligible:
-                raise ValueError("cache reuse requires an eligible request profile")
-            if not plan.decision_evidence.module_states.semantic_cache_enabled:
-                raise ValueError("cache reuse requires the module to be enabled")
-            if self.run_id == candidate.source_run_id:
-                raise ValueError("current run cannot be its own cache source")
-            if (
-                evidence.source_run_id != candidate.source_run_id
-                or evidence.similarity != candidate.similarity
-                or evidence.prior_evaluation != candidate.prior_evaluation
-            ):
-                raise ValueError("cache evidence must match the bound candidate")
-            source = candidate.prior_evaluation
-            if not (
-                source.evaluator_valid
-                and source.passed
-                and source.mandatory_checks_passed
-                and candidate.similarity
-                >= plan.decision_evidence.cache_similarity_threshold
-                and source.score >= self.quality_contract.minimum_quality_score
-                and candidate.contract_compatible
-                and candidate.safe_to_reuse
-            ):
-                raise ValueError("bound cache candidate does not satisfy reuse gates")
-            return self
-        if self.semantic_cache is not None and (
-            self.semantic_cache.outcome is SemanticCacheOutcome.REUSED
-        ):
-            raise ValueError("model plans cannot claim cache reuse")
+            raise ValueError("execution plan risk evidence must match current facts")
+        validate_semantic_cache_binding(
+            plan=plan,
+            cache_eligible=self.request_profile.cache_eligible,
+            evidence=self.semantic_cache,
+            run_id=self.run_id,
+            minimum_quality_score=self.quality_contract.minimum_quality_score,
+            request_binding=current_binding,
+        )
         return self
-
-    def _validate_cache_outcome_binding(
-        self,
-        evidence: SemanticCacheEvidence,
-    ) -> None:
-        """Align runtime outcome with the planner's module and assessment facts."""
-        plan_evidence = self.execution_plan.decision_evidence
-        disabled = evidence.outcome is SemanticCacheOutcome.DISABLED_BYPASSED
-        if disabled is plan_evidence.module_states.semantic_cache_enabled:
-            raise ValueError("cache outcome must match the planned module state")
-        assessed = evidence.outcome in {
-            SemanticCacheOutcome.MATCH_REJECTED,
-            SemanticCacheOutcome.REUSED,
-        }
-        if assessed is not plan_evidence.cache_candidate_assessed:
-            raise ValueError("cache outcome must match candidate-assessed evidence")
 
 
 class UnsupportedExecutionPlanError(ValueError):

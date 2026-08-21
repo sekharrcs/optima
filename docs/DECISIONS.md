@@ -144,12 +144,25 @@ Status: Accepted
 
 The application performs at most one provider-independent semantic-cache lookup
 before Planner V1. A resolved value contains the exact cached output and its
-source-run, similarity, prior-evaluation, contract-compatibility, and reuse-safety
-evidence. The cache abstraction retrieves evidence but makes no reuse decision.
+source-run, complete request binding, similarity, prior-evaluation,
+contract-compatibility, and reuse-safety evidence. The cache abstraction
+retrieves evidence but makes no reuse decision.
 
 Planner V1 applies all cache gates. An accepted plan carries a detached snapshot
 of the exact resolved value, and the executor consumes that snapshot without a
 second lookup. This prevents time-of-check/time-of-use substitution.
+
+The versioned request binding uses deterministic canonical JSON over input text,
+original context, reference output, ordered criteria, caller metadata, task
+type, and complexity. Planner V1 rejects a binding mismatch before candidate
+similarity or quality gates. The binding exposes task type and complexity but no
+raw request content. The execution request recomputes the digest, and the run
+result verifies profile identity plus equality across planner and runtime
+snapshots. Every assessed candidate also produces a detached assessment without
+the cached output, including its binding, source identity, similarity, prior
+evaluation, compatibility, and safety facts. Semantic-cache outcome requirements
+and model trace ordering are centralized so contradictory evidence, event sets,
+execution steps, or terminal cache results fail at domain boundaries.
 
 Source evaluation evidence remains unchanged and is exposed separately from
 current-run evaluations. Cache failures and timeouts fall back to normal model
