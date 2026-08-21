@@ -172,15 +172,17 @@ def _normalize_base_url(base_url: str) -> str:
     normalized = base_url.rstrip("/")
     parsed = urlparse(normalized)
     if (
-        parsed.scheme not in {"http", "https"}
+        parsed.scheme != "https"
         or not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
         or parsed.params
         or parsed.query
         or parsed.fragment
         or parsed.path.rstrip("/").endswith("/openai/v1") is False
     ):
         raise ValueError(
-            "Foundry base URL must be an absolute HTTP(S) /openai/v1 API root"
+            "Foundry base URL must be an absolute HTTPS /openai/v1 API root"
         )
     return normalized
 

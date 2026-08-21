@@ -367,10 +367,12 @@ def test_foundry_provider_implements_existing_protocol() -> None:
 @pytest.mark.parametrize(
     "base_url",
     [
+        "http://gateway.example/openai/v1",
         "https://gateway.example",
         "https://gateway.example/openai",
         "https://gateway.example/OPENAI/V1",
         "https://gateway.example/openai/v1/chat/completions",
+        "https://user:password@gateway.example/openai/v1",
     ],
 )
 def test_provider_rejects_base_url_outside_v1_api_root(base_url: str) -> None:
@@ -452,6 +454,11 @@ def test_api_key_composition_creates_no_azure_credential(
     [
         (
             FoundryAuthMode.AZURE_CLI,
+            {"foundry_token_scope": "api://optima-apim/.default"},
+            None,
+        ),
+        (
+            FoundryAuthMode.MANAGED_IDENTITY,
             {"foundry_token_scope": "api://optima-apim/.default"},
             None,
         ),

@@ -45,15 +45,17 @@ class FoundryProviderConfiguration(ImmutableModel):
         """Require one complete authentication mode without silent fallback."""
         parsed = urlparse(self.base_url)
         if (
-            parsed.scheme not in {"http", "https"}
+            parsed.scheme != "https"
             or not parsed.netloc
+            or parsed.username is not None
+            or parsed.password is not None
             or parsed.params
             or parsed.query
             or parsed.fragment
             or parsed.path.rstrip("/").endswith("/openai/v1") is False
         ):
             raise ValueError(
-                "Foundry base URL must be an absolute HTTP(S) /openai/v1 API root"
+                "Foundry base URL must be an absolute HTTPS /openai/v1 API root"
             )
 
         if self.auth_mode is FoundryAuthMode.API_KEY:

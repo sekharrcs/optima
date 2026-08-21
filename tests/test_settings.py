@@ -323,6 +323,20 @@ def test_settings_read_foundry_api_key_without_exposing_it(
             "foundry_api_key": "key",
         },
         {
+            "foundry_base_url": "http://gateway.example/openai/v1",
+            "foundry_small_deployment": "small",
+            "foundry_strong_deployment": "strong",
+            "foundry_auth_mode": "API_KEY",
+            "foundry_api_key": "key",
+        },
+        {
+            "foundry_base_url": "https://user:password@gateway.example/openai/v1",
+            "foundry_small_deployment": "small",
+            "foundry_strong_deployment": "strong",
+            "foundry_auth_mode": "API_KEY",
+            "foundry_api_key": "key",
+        },
+        {
             "foundry_base_url": "https://gateway.example/not-the-v1-root",
             "foundry_small_deployment": "small",
             "foundry_strong_deployment": "strong",
