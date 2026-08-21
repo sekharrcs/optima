@@ -250,16 +250,19 @@ def _parse_response(
     if not isinstance(output_text, str) or not output_text.strip():
         raise _invalid_response()
 
-    request_id = body.get("id")
-    if not isinstance(request_id, str) or not request_id:
-        request_id = next(
-            (
-                value
-                for header in ("x-request-id", "apim-request-id", "x-ms-request-id")
-                if (value := response.headers.get(header))
-            ),
-            None,
-        )
+    # Prefer the provider request-correlation id; the completion id is a last resort.
+    request_id = next(
+        (
+            value
+            for header in ("apim-request-id", "x-ms-request-id", "x-request-id")
+            if (value := response.headers.get(header))
+        ),
+        None,
+    )
+    if request_id is None:
+        completion_id = body.get("id")
+        if isinstance(completion_id, str) and completion_id:
+            request_id = completion_id
     if request_id is None:
         raise _invalid_response()
 
@@ -276,6 +279,13 @@ def _parse_usage(
     prompt_tokens = _optional_count(usage, "prompt_tokens")
     completion_tokens = _optional_count(usage, "completion_tokens")
     total_tokens = _optional_count(usage, "total_tokens")
+    if (
+        prompt_tokens is not None
+        and completion_tokens is not None
+        and total_tokens is not None
+        and total_tokens != prompt_tokens + completion_tokens
+    ):
+        raise _invalid_response()
 
     details = usage.get("prompt_tokens_details")
     if details is None:
@@ -283,6 +293,12 @@ def _parse_usage(
     elif isinstance(details, dict):
         cached_tokens = _optional_count(details, "cached_tokens")
     else:
+        raise _invalid_response()
+    if (
+        cached_tokens is not None
+        and prompt_tokens is not None
+        and cached_tokens > prompt_tokens
+    ):
         raise _invalid_response()
     return prompt_tokens, completion_tokens, total_tokens, cached_tokens
 

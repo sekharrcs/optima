@@ -136,6 +136,11 @@ $env:OPTIMA_FOUNDRY_AUTH_MODE="API_KEY"
 $env:OPTIMA_FOUNDRY_API_KEY="<api-key>"
 ```
 
+`API_KEY` mode sends the value as the Azure OpenAI `api-key` header. Use it with a
+direct Foundry endpoint or an APIM policy that accepts that header. APIM
+subscription keys (`Ocp-Apim-Subscription-Key`) and caller bearer tokens to APIM
+are out of Slice 10A scope.
+
 For local passwordless development, sign in with Azure CLI and configure the
 scope accepted by the APIM inbound policy. A direct Foundry endpoint commonly
 uses `https://ai.azure.com/.default`; an APIM-protected API can require its own

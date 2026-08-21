@@ -217,6 +217,21 @@ def test_response_header_supplies_request_id_when_body_omits_it() -> None:
     assert result.usage.request_id == "apim-request-7"
 
 
+def test_request_id_prefers_request_header_over_completion_id() -> None:
+    """Record the provider request-correlation id, not the chat-completion id."""
+    result = asyncio.run(
+        generate_with_transport(
+            lambda request: httpx.Response(
+                200,
+                headers={"apim-request-id": "apim-request-9"},
+                json=successful_response(),
+            )
+        )
+    )
+
+    assert result.usage.request_id == "apim-request-9"
+
+
 @pytest.mark.parametrize(
     "response",
     [
@@ -229,6 +244,39 @@ def test_response_header_supplies_request_id_when_body_omits_it() -> None:
             ),
         ),
         httpx.Response(200, json=successful_response(id=None)),
+        httpx.Response(
+            200,
+            json=successful_response(
+                usage={
+                    "prompt_tokens": 17,
+                    "completion_tokens": 5,
+                    "total_tokens": 99,
+                }
+            ),
+        ),
+        httpx.Response(
+            200,
+            json=successful_response(
+                usage={"prompt_tokens": True, "completion_tokens": 5}
+            ),
+        ),
+        httpx.Response(
+            200,
+            json=successful_response(
+                usage={
+                    "prompt_tokens": 5,
+                    "completion_tokens": 5,
+                    "total_tokens": 10,
+                    "prompt_tokens_details": {"cached_tokens": 9},
+                }
+            ),
+        ),
+        httpx.Response(
+            200,
+            json=successful_response(
+                choices=[{"message": {"role": "assistant", "content": "   "}}]
+            ),
+        ),
     ],
 )
 def test_provider_rejects_malformed_success_responses(
@@ -247,6 +295,8 @@ def test_provider_rejects_malformed_success_responses(
         (400, "REQUEST_REJECTED"),
         (401, "AUTHENTICATION_FAILED"),
         (403, "AUTHENTICATION_FAILED"),
+        (408, "REQUEST_REJECTED"),
+        (409, "REQUEST_REJECTED"),
         (429, "THROTTLED"),
         (500, "SERVICE_UNAVAILABLE"),
         (503, "SERVICE_UNAVAILABLE"),

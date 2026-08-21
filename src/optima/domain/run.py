@@ -70,13 +70,23 @@ class ModelUsage(ImmutableModel):
 
     @model_validator(mode="after")
     def validate_usage_measurements(self) -> "ModelUsage":
-        """Validate cached input and the authoritative cost/provenance pair."""
+        """Validate cached input, token-total consistency, and cost/provenance pair."""
         if (
             self.cached_tokens is not None
             and self.input_tokens is not None
             and self.cached_tokens > self.input_tokens
         ):
             raise ValueError("cached_tokens must not exceed input_tokens")
+        if (
+            self.input_tokens is not None
+            and self.output_tokens is not None
+            and self.provider_total_tokens is not None
+            and self.provider_total_tokens != self.input_tokens + self.output_tokens
+        ):
+            raise ValueError(
+                "provider_total_tokens must equal input_tokens plus output_tokens "
+                "when all three measurements are reported"
+            )
         if (self.calculated_cost is None) is not (self.pricing_provenance is None):
             raise ValueError(
                 "calculated_cost and pricing_provenance must be provided together"

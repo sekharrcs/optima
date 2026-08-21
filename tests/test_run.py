@@ -672,20 +672,29 @@ def test_run_aggregates_one_complete_model_call() -> None:
 
 
 def test_run_prefers_each_provider_reported_total_without_losing_categories() -> None:
-    """Use a provider total as the exact call total while retaining category facts."""
+    """Use a provider total consistent with categories as the exact call total."""
     result = completed_run(
         model_usages=(
             model_usage(
                 input_tokens=101,
                 output_tokens=19,
-                provider_total_tokens=125,
+                provider_total_tokens=120,
             ),
         )
     )
 
     assert result.total_input_tokens == 101
     assert result.total_output_tokens == 19
-    assert result.total_tokens == 125
+    assert result.total_tokens == 120
+
+
+def test_model_usage_rejects_total_inconsistent_with_reported_categories() -> None:
+    """Reject a provider total that contradicts both reported token categories."""
+    with pytest.raises(
+        ValidationError,
+        match="provider_total_tokens must equal input_tokens plus output_tokens",
+    ):
+        model_usage(input_tokens=101, output_tokens=19, provider_total_tokens=125)
 
 
 def test_run_keeps_missing_token_categories_and_total_unavailable() -> None:
