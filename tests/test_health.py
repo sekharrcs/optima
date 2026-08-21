@@ -20,4 +20,8 @@ def test_application_exposes_only_versioned_health_and_run_routes() -> None:
     application = create_app()
     application_routes = set(application.openapi()["paths"])
 
-    assert application_routes == {"/api/v1/health", "/api/v1/runs"}
+    assert application_routes == {
+        "/api/v1/health",
+        "/api/v1/runs",
+        "/api/v1/runs/{run_id}",
+    }

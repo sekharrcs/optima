@@ -180,6 +180,56 @@ structural configuration error before model execution. The local in-memory
 implementation is deterministic test and demo infrastructure only; the Redis
 adapter remains Slice 10.
 
+### Run-history persistence boundary
+
+Run history is a provider-independent asynchronous contract that saves one
+terminal `RunResult`, retrieves one run by opaque `run_id`, and lists a bounded
+newest-first sequence. The application persists only after the executor returns
+a fully validated terminal result. Persistence does not participate in planning,
+model execution, evaluation, escalation, semantic caching, or cost calculation.
+An absent store preserves local execution behavior, while history reads return a
+structured unavailable response.
+
+Completed run evidence is immutable. The first write uses create semantics. A
+duplicate ID is idempotent only when a point read validates to the same complete
+`RunResult`; different evidence is a typed conflict and is never replaced.
+Every point and list read validates the authoritative payload through the current
+strict domain model. Unsupported schema versions, malformed payloads, and
+metadata contradictions fail closed.
+
+Cosmos schema version 1 contains only:
+
+* `id`, equal to `RunResult.run_id`
+* `schema_version`
+* canonical UTC `created_at` ordering metadata
+* `run_result_json`, the authoritative `RunResult.model_dump_json()` payload
+
+The container partition-key path is `/id`. Opaque run IDs provide high
+cardinality and permit point reads with the exact item ID and partition key.
+Recent-history listing is therefore a bounded cross-partition query ordered by
+`created_at DESC, id ASC`; the container needs the matching composite index.
+This is an intentional MVP tradeoff for direct lookup integrity over cheap
+global history scans.
+
+The authoritative result is stored as a JSON string because Cosmos JSON numbers
+use binary64 and cannot preserve arbitrary exact Decimal cost evidence. Query
+metadata is derived from that validated payload and checked against it on read.
+The adapter measures the complete compact UTF-8 JSON document and rejects items
+over Cosmos DB's 2-MB item limit rather than truncating evidence.
+
+The Cosmos adapter translates SDK exceptions into sanitized not-found,
+conflict, invalid-document, authentication, timeout, throttling, oversized-item,
+and service-unavailable errors. An API persistence failure states that execution
+completed but history persistence failed and exposes only safe run and
+correlation identifiers.
+
+Cosmos configuration explicitly selects account key, Azure CLI credential, or
+managed identity. `DefaultAzureCredential` and implicit credential fallback are
+not used. One closeable resource owner holds the application-lifetime async
+Cosmos client and any selected async Azure Identity credential. Slice 11 retains
+responsibility for production FastAPI lifespan wiring, Cosmos provisioning,
+indexing policy, and role assignments.
+
 ### Provider abstraction
 Hides Microsoft Foundry/APIM request details from planner and execution-policy logic.
 Maps conceptual model roles such as `SMALL` and `STRONG` to configured deployments.

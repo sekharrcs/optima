@@ -25,6 +25,7 @@ from optima.providers import (
     ModelProvider,
     MonotonicClock,
 )
+from optima.storage import RunHistoryStore
 
 
 def new_run_id() -> str:
@@ -46,6 +47,7 @@ class ExecutionDependencies:
     strong_provider: ModelProvider
     evaluator: QualityEvaluator
     cost_calculator: CostCalculator
+    run_history_store: RunHistoryStore | None = None
     semantic_cache: SemanticCache | None = None
     context_reducer: ContextReducer | None = None
     token_counter: TokenCounter | None = None
