@@ -4,6 +4,7 @@ import asyncio
 from datetime import UTC, datetime
 from decimal import Decimal
 
+import httpx
 import pytest
 
 from optima.context import (
@@ -32,7 +33,7 @@ from optima.domain.quality_contract import (
 )
 from optima.domain.request_binding import RequestBinding, build_request_binding
 from optima.domain.request_profile import Complexity, RequestProfile, TaskType
-from optima.domain.run import PricingProvenance, RunStatus
+from optima.domain.run import PricingProvenance, RunResult, RunStatus
 from optima.evaluation import EvaluationEvidence, EvaluationRequest, FakeEvaluator
 from optima.execution import (
     ContextReductionDependencyError,
@@ -47,7 +48,9 @@ from optima.planner import (
     select_plan,
 )
 from optima.providers import (
+    ApiKeyAuthentication,
     FakeProviderResponse,
+    FoundryModelProvider,
     ModelProviderRequest,
     ModelProviderResult,
     build_fake_small_provider,
@@ -486,6 +489,57 @@ def test_strong_provider_operational_failure_does_not_fabricate_evidence(
     assert len(provider.calls) == 1
     assert len(small.calls) == 0  # type: ignore[attr-defined]
     assert len(evaluator.calls) == 0
+
+
+@pytest.mark.parametrize("status_code", [408, 504])
+def test_strong_direct_provider_timeout_status_times_out_run(status_code: int) -> None:
+    """Map a Foundry timeout status to a TIMED_OUT run without fabricated evidence."""
+    request_count = 0
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        request_count += 1
+        return httpx.Response(status_code)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handle))
+    provider = FoundryModelProvider(
+        base_url="https://gateway.example/openai/v1",
+        deployment_name="strong-deployment",
+        model_role=ModelRole.STRONG,
+        authentication=ApiKeyAuthentication("fake-api-key"),
+        client=client,
+        clock=IncrementingClock(),
+    )
+    evaluator = FakeEvaluator(responses=(evaluation_evidence(0.95),))
+    executor, small, _, _ = build_executor(
+        evaluator=evaluator,
+        strong_provider=provider,
+    )
+
+    async def run() -> RunResult:
+        try:
+            return await executor.execute(execution_request())
+        finally:
+            await client.aclose()
+
+    result = asyncio.run(run())
+
+    assert request_count == 1
+    assert result.status is RunStatus.TIMED_OUT
+    assert result.steps[-1].status is ExecutionStatus.TIMED_OUT
+    assert result.final_output is None
+    assert result.contract_met is None
+    assert result.model_usages == ()
+    assert result.evaluations == ()
+    assert result.final_evaluation is None
+    assert len(evaluator.calls) == 0
+    assert len(small.calls) == 0  # type: ignore[attr-defined]
+    attempted_model_calls = sum(
+        step.step_type is ExecutionStepType.MODEL_CALL
+        and step.status is not ExecutionStatus.SKIPPED
+        for step in result.steps
+    )
+    assert attempted_model_calls == 1
 
 
 @pytest.mark.parametrize(

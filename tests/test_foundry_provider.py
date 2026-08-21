@@ -127,7 +127,11 @@ def test_provider_maps_role_deployment_request_and_full_usage(
 
     def handle(request: httpx.Request) -> httpx.Response:
         captured.append(request)
-        return httpx.Response(200, json=successful_response())
+        return httpx.Response(
+            200,
+            headers={"apim-request-id": "apim-request-1"},
+            json=successful_response(),
+        )
 
     result = asyncio.run(
         generate_with_transport(
@@ -152,7 +156,7 @@ def test_provider_maps_role_deployment_request_and_full_usage(
     assert result.output_text == "Result"
     assert result.usage.model_role is role
     assert result.usage.deployment == deployment
-    assert result.usage.request_id == "chatcmpl-provider-1"
+    assert result.usage.request_id == "apim-request-1"
     assert result.usage.input_tokens == 17
     assert result.usage.output_tokens == 5
     assert result.usage.provider_total_tokens == 22
@@ -232,6 +236,59 @@ def test_request_id_prefers_request_header_over_completion_id() -> None:
     assert result.usage.request_id == "apim-request-9"
 
 
+def test_request_id_absent_when_only_completion_id_present() -> None:
+    """Never substitute the chat-completion id for a missing request id."""
+    result = asyncio.run(
+        generate_with_transport(
+            lambda request: httpx.Response(200, json=successful_response())
+        )
+    )
+
+    assert result.usage.request_id is None
+
+
+def test_request_id_absent_when_no_identifier_present() -> None:
+    """Keep the request-correlation id unavailable when the gateway omits it."""
+    result = asyncio.run(
+        generate_with_transport(
+            lambda request: httpx.Response(200, json=successful_response(id=None))
+        )
+    )
+
+    assert result.usage.request_id is None
+
+
+@pytest.mark.parametrize(
+    ("headers", "expected"),
+    [
+        (
+            {
+                "apim-request-id": "apim-1",
+                "x-ms-request-id": "ms-1",
+                "x-request-id": "req-1",
+            },
+            "apim-1",
+        ),
+        ({"x-ms-request-id": "ms-1", "x-request-id": "req-1"}, "ms-1"),
+        ({"x-request-id": "req-1"}, "req-1"),
+    ],
+)
+def test_request_id_header_precedence(
+    headers: dict[str, str],
+    expected: str,
+) -> None:
+    """Resolve request identity by gateway header precedence."""
+    result = asyncio.run(
+        generate_with_transport(
+            lambda request: httpx.Response(
+                200, headers=headers, json=successful_response(id=None)
+            )
+        )
+    )
+
+    assert result.usage.request_id == expected
+
+
 @pytest.mark.parametrize(
     "response",
     [
@@ -243,7 +300,6 @@ def test_request_id_prefers_request_header_over_completion_id() -> None:
                 usage={"prompt_tokens": -1, "completion_tokens": 1}
             ),
         ),
-        httpx.Response(200, json=successful_response(id=None)),
         httpx.Response(
             200,
             json=successful_response(
@@ -295,7 +351,6 @@ def test_provider_rejects_malformed_success_responses(
         (400, "REQUEST_REJECTED"),
         (401, "AUTHENTICATION_FAILED"),
         (403, "AUTHENTICATION_FAILED"),
-        (408, "REQUEST_REJECTED"),
         (409, "REQUEST_REJECTED"),
         (429, "THROTTLED"),
         (500, "SERVICE_UNAVAILABLE"),
@@ -346,6 +401,22 @@ def test_provider_maps_transport_failures(
 
     with pytest.raises(expected_exception):
         asyncio.run(generate_with_transport(fail))
+
+
+@pytest.mark.parametrize("status_code", [408, 504])
+def test_provider_maps_timeout_statuses_to_timeout_error(status_code: int) -> None:
+    """Route server and gateway timeout statuses to the executor timeout path."""
+    request_count = 0
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        request_count += 1
+        return httpx.Response(status_code, json={"error": {"message": "timeout"}})
+
+    with pytest.raises(TimeoutError):
+        asyncio.run(generate_with_transport(handle))
+
+    assert request_count == 1
 
 
 def test_entra_failure_stops_before_model_transport() -> None:

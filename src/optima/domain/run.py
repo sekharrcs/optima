@@ -55,7 +55,7 @@ class PricingProvenance(ImmutableModel):
 class ModelUsage(ImmutableModel):
     """Measured facts for one provider model call."""
 
-    request_id: NonEmptyString
+    request_id: NonEmptyString | None = None
     run_id: NonEmptyString
     provider: NonEmptyString
     deployment: NonEmptyString

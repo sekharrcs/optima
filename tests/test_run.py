@@ -192,7 +192,12 @@ def passing_evaluation() -> EvaluationResult:
     )
 
 
-def successful_step(sequence: int, step_type: ExecutionStepType) -> ExecutionStep:
+def successful_step(
+    sequence: int,
+    step_type: ExecutionStepType,
+    *,
+    request_id: str | None = "provider-request-1",
+) -> ExecutionStep:
     """Build one successful execution trace step."""
     facts: dict[str, JsonValue]
     event_codes: tuple[ExecutionEventCode, ...]
@@ -211,7 +216,7 @@ def successful_step(sequence: int, step_type: ExecutionStepType) -> ExecutionSte
                 "model_role": ModelRole.SMALL.value,
                 "provider": "foundry",
                 "deployment": "small-deployment",
-                "request_id": "provider-request-1",
+                "request_id": request_id,
             }
             event_codes = ()
         elif step_type is ExecutionStepType.QUALITY_EVALUATION:
@@ -365,7 +370,7 @@ def strong_direct_role_step(
 
 def model_usage(
     *,
-    request_id: str = "provider-request-1",
+    request_id: str | None = "provider-request-1",
     run_id: str = "run-1",
     model_role: ModelRole = ModelRole.SMALL,
     input_tokens: int | None = 100,
@@ -707,6 +712,30 @@ def test_run_keeps_missing_token_categories_and_total_unavailable() -> None:
     assert result.total_output_tokens == 19
     assert result.total_tokens is None
     assert result.total_calculated_cost is None
+
+
+def test_model_usage_allows_absent_request_correlation_id() -> None:
+    """Keep the request-correlation id unavailable instead of fabricating one."""
+    usage = model_usage(request_id=None)
+
+    assert usage.request_id is None
+    assert usage.model_dump(mode="json")["request_id"] is None
+
+
+def test_run_binds_model_call_without_request_correlation_id() -> None:
+    """Bind a model-call step and serialization to usage with no request id."""
+    result = completed_run(
+        steps=(
+            successful_step(0, ExecutionStepType.MODEL_CALL, request_id=None),
+            successful_step(1, ExecutionStepType.QUALITY_EVALUATION),
+            successful_step(2, ExecutionStepType.RETURN),
+        ),
+        model_usages=(model_usage(request_id=None),),
+    )
+
+    assert result.model_usages[0].request_id is None
+    assert result.steps[0].facts["request_id"] is None
+    assert result.model_dump(mode="json")["model_usages"][0]["request_id"] is None
 
 
 def test_run_aggregates_escalated_calls_in_execution_order() -> None:

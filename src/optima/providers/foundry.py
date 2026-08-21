@@ -144,6 +144,8 @@ class FoundryModelProvider(ModelProvider):
             ) from error
 
         if response.is_error:
+            if response.status_code in (408, 504):
+                raise TimeoutError("Foundry model request timed out.")
             raise _status_error(response)
 
         latency_ms = max(0, int(round((clock_now() - started_at) * 1000)))
@@ -229,7 +231,7 @@ def _retry_after_ms(headers: httpx.Headers) -> int | None:
 
 def _parse_response(
     response: httpx.Response,
-) -> tuple[str, str, tuple[int | None, int | None, int | None, int | None]]:
+) -> tuple[str, str | None, tuple[int | None, int | None, int | None, int | None]]:
     try:
         body = response.json()
     except ValueError as error:
@@ -250,7 +252,7 @@ def _parse_response(
     if not isinstance(output_text, str) or not output_text.strip():
         raise _invalid_response()
 
-    # Prefer the provider request-correlation id; the completion id is a last resort.
+    # The request-correlation id is optional; a completion id is not a request id.
     request_id = next(
         (
             value
@@ -259,12 +261,6 @@ def _parse_response(
         ),
         None,
     )
-    if request_id is None:
-        completion_id = body.get("id")
-        if isinstance(completion_id, str) and completion_id:
-            request_id = completion_id
-    if request_id is None:
-        raise _invalid_response()
 
     return output_text, request_id, _parse_usage(body.get("usage"))
 
