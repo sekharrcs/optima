@@ -201,21 +201,24 @@ Cosmos schema version 1 contains only:
 
 * `id`, equal to `RunResult.run_id`
 * `schema_version`
-* canonical UTC `created_at` ordering metadata
+* canonical UTC `created_at` metadata, validated against the payload
+* `sort_key`, one descending recent-history ordering key
 * `run_result_json`, the authoritative `RunResult.model_dump_json()` payload
 
 The container partition-key path is `/id`. Opaque run IDs provide high
 cardinality and permit point reads with the exact item ID and partition key.
 Recent-history listing is therefore a bounded cross-partition query ordered by
-`created_at DESC, id ASC`; the container needs the matching composite index.
+the single descending `sort_key` property (canonical `created_at` plus
+`run_id`), so it runs on the default container index without a composite index.
 This is an intentional MVP tradeoff for direct lookup integrity over cheap
 global history scans.
 
 The authoritative result is stored as a JSON string because Cosmos JSON numbers
 use binary64 and cannot preserve arbitrary exact Decimal cost evidence. Query
 metadata is derived from that validated payload and checked against it on read.
-The adapter measures the complete compact UTF-8 JSON document and rejects items
-over Cosmos DB's 2-MB item limit rather than truncating evidence.
+The adapter runs a conservative UTF-8 JSON size pre-check and rejects oversized
+evidence before writing, while Cosmos DB's server-side 2-MB limit (surfaced as a
+mapped 413) stays the authoritative backstop rather than truncating evidence.
 
 The Cosmos adapter translates SDK exceptions into sanitized not-found,
 conflict, invalid-document, authentication, timeout, throttling, oversized-item,

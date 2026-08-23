@@ -36,12 +36,17 @@ class InMemoryRunHistoryStore:
         return self._load(payload)
 
     async def list_recent(self, limit: int) -> tuple[RunResult, ...]:
-        """List at most ``limit`` results by timestamp then stable run ID."""
+        """List at most ``limit`` newest-first results, breaking ties by run ID.
+
+        Ties resolve on descending run ID to match the Cosmos ``sort_key`` order.
+        """
         if not 1 <= limit <= MAX_RUN_HISTORY_LIST_LIMIT:
             raise ValueError("run-history limit must be between 1 and 100")
         results = [self._load(payload) for payload in self._payloads.values()]
-        results.sort(key=lambda result: result.run_id)
-        results.sort(key=lambda result: result.created_at, reverse=True)
+        results.sort(
+            key=lambda result: (result.created_at, result.run_id),
+            reverse=True,
+        )
         return tuple(results[:limit])
 
     @staticmethod

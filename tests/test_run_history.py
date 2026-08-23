@@ -15,6 +15,7 @@ from azure.core.exceptions import (
     ServiceResponseError,
 )
 from azure.cosmos.exceptions import (
+    CosmosClientTimeoutError,
     CosmosHttpResponseError,
     CosmosResourceExistsError,
     CosmosResourceNotFoundError,
@@ -43,6 +44,7 @@ from optima.storage import (
     RunHistoryTimeoutError,
     build_cosmos_run_history_resources,
 )
+from optima.storage.cosmos import RECENT_RUNS_QUERY
 
 
 class AsyncItems:
@@ -246,7 +248,7 @@ def test_in_memory_save_get_round_trip_preserves_exact_evidence() -> None:
 
 
 def test_in_memory_listing_is_bounded_newest_first_with_run_id_ties() -> None:
-    """Use deterministic ascending run IDs when timestamps are equal."""
+    """Use deterministic descending run IDs when timestamps are equal."""
     newest = completed_run("run-c", created_at=datetime(2026, 8, 21, tzinfo=UTC))
     tied_first = completed_run("run-a", created_at=datetime(2026, 8, 20, tzinfo=UTC))
     tied_second = completed_run("run-b", created_at=datetime(2026, 8, 20, tzinfo=UTC))
@@ -256,7 +258,7 @@ def test_in_memory_listing_is_bounded_newest_first_with_run_id_ties() -> None:
 
     recent = asyncio.run(store.list_recent(2))
 
-    assert [result.run_id for result in recent] == ["run-c", "run-a"]
+    assert [result.run_id for result in recent] == ["run-c", "run-b"]
 
 
 @pytest.mark.parametrize("limit", [0, 101])
@@ -299,6 +301,7 @@ def test_cosmos_document_shape_identity_and_exact_decimal_payload() -> None:
         "id",
         "schema_version",
         "created_at",
+        "sort_key",
         "run_result_json",
     }
     assert document["id"] == result.run_id
@@ -364,12 +367,80 @@ def test_cosmos_recent_query_is_parameterized_bounded_and_ordered() -> None:
             "query": (
                 "SELECT TOP @limit c.id, c.schema_version, c.created_at, "
                 "c.run_result_json FROM c "
-                "ORDER BY c.created_at DESC, c.id ASC"
+                "ORDER BY c.sort_key DESC"
             ),
             "parameters": [{"name": "@limit", "value": 2}],
             "max_item_count": 2,
         }
     ]
+
+
+def test_cosmos_recent_query_orders_by_single_indexed_property() -> None:
+    """Keep recent-history ordering runnable on a default `/id` container index."""
+    order_by = RECENT_RUNS_QUERY.split("ORDER BY", 1)[1]
+    assert order_by.count(",") == 0
+    assert "c.sort_key" in order_by
+
+
+def test_cosmos_sort_key_orders_newest_first_with_descending_run_id_ties() -> None:
+    """Sort one descending key like Cosmos, matching the in-memory fake order."""
+    newest = document_for(
+        completed_run("run-a", created_at=datetime(2026, 8, 21, tzinfo=UTC))
+    )
+    tie_high = document_for(
+        completed_run("run-z", created_at=datetime(2026, 8, 20, tzinfo=UTC))
+    )
+    tie_low = document_for(
+        completed_run("run-a2", created_at=datetime(2026, 8, 20, tzinfo=UTC))
+    )
+
+    ordered = sorted(
+        (tie_low, tie_high, newest),
+        key=lambda document: document["sort_key"],
+        reverse=True,
+    )
+
+    assert [document["id"] for document in ordered] == ["run-a", "run-z", "run-a2"]
+
+
+def test_cosmos_list_recent_bounds_results_even_when_query_overreturns() -> None:
+    """Bound the adapter result so a page size is never treated as a total limit."""
+    runs = [completed_run(f"run-{index}") for index in range(3)]
+    container = FakeContainer()
+    container.query_documents = [document_for(run) for run in runs]
+
+    results = asyncio.run(CosmosRunHistoryStore(container).list_recent(2))
+
+    assert results == tuple(runs[:2])
+
+
+def test_cosmos_create_timeout_maps_to_timeout_and_is_attempted_once() -> None:
+    """Report an ambiguous create timeout without retrying the non-idempotent write."""
+    result = completed_run()
+    container = FakeContainer()
+    container.create_error = CosmosClientTimeoutError()  # type: ignore[no-untyped-call]
+
+    with pytest.raises(RunHistoryTimeoutError):
+        asyncio.run(CosmosRunHistoryStore(container).save(result))
+
+    assert len(container.create_calls) == 1
+
+
+def test_cosmos_conflict_reconcile_fails_closed_on_corrupted_existing() -> None:
+    """Never accept malformed existing evidence as an identical duplicate."""
+    result = completed_run()
+    corrupted = document_for(result)
+    corrupted["run_result_json"] = "not-json"
+    container = FakeContainer()
+    container.create_error = CosmosResourceExistsError(  # type: ignore[no-untyped-call]
+        status_code=409,
+        message="conflict",
+    )
+    container.read_document = corrupted
+    store = CosmosRunHistoryStore(container)
+
+    with pytest.raises(RunHistoryInvalidDocumentError):
+        asyncio.run(store.save(result))
 
 
 @pytest.mark.parametrize(

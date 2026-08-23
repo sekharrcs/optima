@@ -179,16 +179,18 @@ ID succeeds only when the existing versioned document validates to the same
 complete result; otherwise the adapter raises a conflict.
 
 Schema version 1 uses `id == RunResult.run_id`, `/id` as the partition-key path,
-canonical UTC `created_at` metadata, and the authoritative
-`RunResult.model_dump_json()` representation stored as a string. The string
+canonical UTC `created_at` metadata, a descending `sort_key` ordering property,
+and the authoritative `RunResult.model_dump_json()` representation stored as a
+string. The string
 preserves exact Decimal costs that Cosmos binary64 JSON numbers cannot represent
 reliably. Every read validates the strict current model and rejects identity or
 timestamp metadata that contradicts the payload.
 
 The `/id` partition key provides high cardinality and efficient point reads by
 opaque run ID. Its accepted tradeoff is that bounded recent-history listing is a
-cross-partition query. Deterministic ordering uses `created_at DESC, id ASC` and
-requires a matching composite index.
+cross-partition query. Deterministic newest-first ordering uses one descending
+`sort_key` property (canonical `created_at` plus `run_id`), so it runs on the
+default container index without a composite index.
 
 Cosmos authentication is explicit: account key, Azure CLI credential, or
 managed identity. There is no implicit credential chain. One closeable resource

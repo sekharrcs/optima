@@ -220,10 +220,10 @@ $env:OPTIMA_COSMOS_AUTH_MODE="MANAGED_IDENTITY"
 $env:OPTIMA_COSMOS_MANAGED_IDENTITY_CLIENT_ID="<user-assigned-client-id>"
 ```
 
-The Cosmos container must use `/id` as its partition-key path. It also needs a
-composite index for descending `created_at` followed by ascending `id` to serve
-the deterministic recent-history query. Infrastructure creation and role
-assignment remain Slice 11.
+The Cosmos container must use `/id` as its partition-key path. The deterministic
+recent-history query orders by one descending `sort_key` property, so the
+default container index serves it without a composite index. Infrastructure
+creation and role assignment remain Slice 11.
 
 `build_cosmos_run_history_resources(AppSettings())` creates one asynchronous
 Cosmos client and only the selected credential. Inject its `store` into

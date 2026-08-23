@@ -42,7 +42,7 @@ COSMOS_ITEM_MAX_BYTES = 2 * 1024 * 1024
 RECENT_RUNS_QUERY = (
     "SELECT TOP @limit c.id, c.schema_version, c.created_at, "
     "c.run_result_json FROM c "
-    "ORDER BY c.created_at DESC, c.id ASC"
+    "ORDER BY c.sort_key DESC"
 )
 
 
@@ -223,8 +223,14 @@ def _build_document(result: RunResult) -> dict[str, Any]:
         "id": result.run_id,
         "schema_version": COSMOS_RUN_HISTORY_SCHEMA_VERSION,
         "created_at": _canonical_utc(result.created_at),
+        "sort_key": _recent_sort_key(result),
         "run_result_json": result.model_dump_json(exclude_computed_fields=True),
     }
+
+
+def _recent_sort_key(result: RunResult) -> str:
+    """Encode one descending recent-history key so ORDER BY needs no composite index."""
+    return f"{_canonical_utc(result.created_at)}|{result.run_id}"
 
 
 def _decode_document(
@@ -257,7 +263,11 @@ def _canonical_utc(value: datetime) -> str:
 
 
 def _document_size_bytes(document: Mapping[str, Any]) -> int:
-    """Measure the complete compact SDK-compatible UTF-8 JSON representation."""
+    """Estimate the UTF-8 JSON item as a conservative pre-write guard.
+
+    Cosmos DB enforces its 2-MB item limit on server-side serialization that
+    also includes system fields, so a mapped 413 stays the authoritative backstop.
+    """
     return len(
         json.dumps(
             document,
