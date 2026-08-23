@@ -172,6 +172,87 @@ transient service failures. Retry policy requires separate execution evidence
 and is not part of Slice 10A. Evaluation, escalation, and authoritative cost
 calculation remain in their existing OPTIMA components.
 
+## Cosmos DB run-history configuration
+
+Slice 10B adds a provider-independent run-history contract with deterministic
+in-memory and Azure Cosmos DB for NoSQL implementations. A configured API saves
+the exact terminal `RunResult` after execution and exposes validated history at:
+
+* `GET /api/v1/runs/{run_id}`
+* `GET /api/v1/runs?limit=<1-100>`
+
+The default API and demo remain cloud-free and do not configure persistent run
+history. History reads return a structured `503` until a store is injected.
+The current Streamlit history remains session-local; migrating it to these API
+routes is outside Slice 10B.
+
+Configure the account and bounded operational settings:
+
+```powershell
+$env:OPTIMA_COSMOS_ENDPOINT="https://<account>.documents.azure.com:443/"
+$env:OPTIMA_COSMOS_DATABASE_NAME="<database-name>"
+$env:OPTIMA_COSMOS_CONTAINER_NAME="<container-name>"
+$env:OPTIMA_COSMOS_HISTORY_LIST_LIMIT="50"
+$env:OPTIMA_COSMOS_TIMEOUT_SECONDS="10"
+$env:OPTIMA_COSMOS_RETRY_TOTAL="3"
+```
+
+Choose exactly one authentication mode. Account-key mode is intended for local
+or manual operation, and the key must remain in untracked secret configuration:
+
+```powershell
+$env:OPTIMA_COSMOS_AUTH_MODE="ACCOUNT_KEY"
+$env:OPTIMA_COSMOS_ACCOUNT_KEY="<account-key>"
+```
+
+Azure CLI mode uses only the identity selected by `az login`:
+
+```powershell
+az login
+$env:OPTIMA_COSMOS_AUTH_MODE="AZURE_CLI"
+```
+
+Managed-identity mode uses the system-assigned identity unless a user-assigned
+client ID is present:
+
+```powershell
+$env:OPTIMA_COSMOS_AUTH_MODE="MANAGED_IDENTITY"
+$env:OPTIMA_COSMOS_MANAGED_IDENTITY_CLIENT_ID="<user-assigned-client-id>"
+```
+
+The Cosmos container must use `/id` as its partition-key path. The deterministic
+recent-history query orders by one descending `sort_key` property, so the
+default container index serves it without a composite index. Infrastructure
+creation and role assignment remain Slice 11.
+
+`build_cosmos_run_history_resources(AppSettings())` creates one asynchronous
+Cosmos client and only the selected credential. Inject its `store` into
+`ExecutionDependencies`, retain the returned resources for the application
+lifetime, and call `CosmosRunHistoryResources.aclose()` during shutdown. Full
+production lifespan composition remains Slice 11.
+
+Persisted evidence uses create-only writes. A duplicate run ID succeeds only
+when a point read validates to the same complete `RunResult`; different evidence
+is a conflict and is never overwritten. The version 1 document stores exact
+`RunResult.model_dump_json()` output as a string so Decimal costs round-trip
+without Cosmos binary64 loss. Every read revalidates the strict current domain
+model and cross-checks ID, timestamp, and sort-key metadata. Items larger than
+Cosmos DB's 2-MB UTF-8 JSON limit fail before write without truncation.
+
+Execution and run-history persistence cannot be atomic because external model
+execution precedes storage. `POST /api/v1/runs` returns the authoritative
+completed `RunResult` once constructed and reports persistence as a best-effort
+side effect through response headers: `X-OPTIMA-Run-History` is `PERSISTED`,
+`FAILED`, or `NOT_CONFIGURED`, and `X-OPTIMA-Run-History-Error` carries one
+sanitized `RunHistoryErrorCode` only on failure. A failed save is not evidence
+that model execution failed, so callers should not resubmit a completed run;
+those needing durable history inspect the header instead. Application Insights in
+Slice 10D and lifecycle and infrastructure in Slice 11 do not replace this
+contract.
+
+No live Cosmos account is exercised by the default test suite. The adapter's
+SDK calls, error mapping, and lifecycle are validated with offline fakes.
+
 On Windows ARM64, use an x64 Python 3.12 interpreter for Streamlit because its
 Pandas and PyArrow dependencies may not have Windows ARM64 wheels in the
 configured package feed.

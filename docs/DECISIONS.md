@@ -168,3 +168,37 @@ Source evaluation evidence remains unchanged and is exposed separately from
 current-run evaluations. Cache failures and timeouts fall back to normal model
 execution with typed runtime evidence. Redis persistence, cache writes,
 invalidation, embeddings, and cloud adapters remain Slice 10 or later.
+
+## ADR-019: Cosmos run history uses immutable versioned payloads
+
+Status: Accepted
+
+Completed `RunResult` values are immutable execution evidence. The Cosmos
+adapter uses create-only writes and never unconditional upsert. A duplicate run
+ID succeeds only when the existing versioned document validates to the same
+complete result; otherwise the adapter raises a conflict.
+
+Schema version 1 uses `id == RunResult.run_id`, `/id` as the partition-key path,
+canonical UTC `created_at` metadata, a descending `sort_key` ordering property,
+and the authoritative `RunResult.model_dump_json()` representation stored as a
+string. The string
+preserves exact Decimal costs that Cosmos binary64 JSON numbers cannot represent
+reliably. Every read validates the strict current model and rejects identity,
+timestamp, or sort-key metadata that contradicts the payload.
+
+The `/id` partition key provides high cardinality and efficient point reads by
+opaque run ID. Its accepted tradeoff is that bounded recent-history listing is a
+cross-partition query. Deterministic newest-first ordering uses one descending
+`sort_key` property (canonical `created_at` plus `run_id`), so it runs on the
+default container index without a composite index.
+
+Execution and persistence cannot be atomic because external model execution
+precedes storage. `POST /api/v1/runs` returns the authoritative completed result
+once constructed and reports persistence as a best-effort side effect through the
+`X-OPTIMA-Run-History` and `X-OPTIMA-Run-History-Error` response headers rather
+than converting a completed paid execution into a retryable HTTP failure.
+
+Cosmos authentication is explicit: account key, Azure CLI credential, or
+managed identity. There is no implicit credential chain. One closeable resource
+owner retains the async client and any owned credential for the application
+lifetime. Production lifespan wiring and Cosmos infrastructure remain Slice 11.

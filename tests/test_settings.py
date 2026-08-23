@@ -37,6 +37,15 @@ def isolate_settings_sources(
         "OPTIMA_FOUNDRY_TOKEN_SCOPE",
         "OPTIMA_FOUNDRY_MANAGED_IDENTITY_CLIENT_ID",
         "OPTIMA_FOUNDRY_TIMEOUT_SECONDS",
+        "OPTIMA_COSMOS_ENDPOINT",
+        "OPTIMA_COSMOS_DATABASE_NAME",
+        "OPTIMA_COSMOS_CONTAINER_NAME",
+        "OPTIMA_COSMOS_AUTH_MODE",
+        "OPTIMA_COSMOS_ACCOUNT_KEY",
+        "OPTIMA_COSMOS_MANAGED_IDENTITY_CLIENT_ID",
+        "OPTIMA_COSMOS_HISTORY_LIST_LIMIT",
+        "OPTIMA_COSMOS_TIMEOUT_SECONDS",
+        "OPTIMA_COSMOS_RETRY_TOTAL",
     ):
         monkeypatch.delenv(variable, raising=False)
 
@@ -120,6 +129,15 @@ def test_settings_accept_explicit_injection() -> None:
         "foundry_token_scope": None,
         "foundry_managed_identity_client_id": None,
         "foundry_timeout_seconds": 30.0,
+        "cosmos_endpoint": None,
+        "cosmos_database_name": None,
+        "cosmos_container_name": None,
+        "cosmos_auth_mode": None,
+        "cosmos_account_key": None,
+        "cosmos_managed_identity_client_id": None,
+        "cosmos_history_list_limit": 50,
+        "cosmos_timeout_seconds": 10.0,
+        "cosmos_retry_total": 3,
     }
 
 
@@ -309,6 +327,21 @@ def test_settings_read_foundry_api_key_without_exposing_it(
     assert configuration.api_key is not None
     assert configuration.api_key.get_secret_value() == "configured-secret"
     assert "configured-secret" not in repr(settings)
+
+
+def test_settings_read_cosmos_numeric_environment_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Coerce documented numeric environment strings within explicit bounds."""
+    monkeypatch.setenv("OPTIMA_COSMOS_HISTORY_LIST_LIMIT", "25")
+    monkeypatch.setenv("OPTIMA_COSMOS_TIMEOUT_SECONDS", "12.5")
+    monkeypatch.setenv("OPTIMA_COSMOS_RETRY_TOTAL", "4")
+
+    settings = AppSettings()
+
+    assert settings.cosmos_history_list_limit == 25
+    assert settings.cosmos_timeout_seconds == 12.5
+    assert settings.cosmos_retry_total == 4
 
 
 @pytest.mark.parametrize(

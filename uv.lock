@@ -147,6 +147,19 @@ wheels = [
 ]
 
 [[package]]
+name = "azure-cosmos"
+version = "4.16.3"
+source = { registry = "https://packagefeedproxy.microsoft.io/pypi/simple" }
+dependencies = [
+    { name = "azure-core" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://ms-feed-12.pkgs.visualstudio.com/80ca31fc-64d9-45fa-acb1-85ac9c6202b2/_packaging/00cb4235-4c66-4418-be20-d052995979fb/pypi/download/azure-cosmos/4.16.3/azure_cosmos-4.16.3.tar.gz", hash = "sha256:da0a4d9957de7b3f018b2ebb728b7e0494623d4db58639eb92ccd140eddc12d3" }
+wheels = [
+    { url = "https://ms-feed-12.pkgs.visualstudio.com/80ca31fc-64d9-45fa-acb1-85ac9c6202b2/_packaging/00cb4235-4c66-4418-be20-d052995979fb/pypi/download/azure-cosmos/4.16.3/azure_cosmos-4.16.3-py3-none-any.whl", hash = "sha256:666fa5d40227bc233d0e49d8e6342998603a8ef57780d1986af1b23b6d08e987" },
+]
+
+[[package]]
 name = "azure-identity"
 version = "1.25.3"
 source = { registry = "https://packagefeedproxy.microsoft.io/pypi/simple" }
@@ -941,6 +954,7 @@ name = "optima"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "azure-cosmos" },
     { name = "azure-identity" },
     { name = "fastapi" },
     { name = "httpx" },
@@ -959,6 +973,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "azure-cosmos", specifier = ">=4.16.3" },
     { name = "azure-identity", specifier = ">=1.25.3" },
     { name = "fastapi", specifier = ">=0.141.1" },
     { name = "httpx", specifier = ">=0.28.1" },
