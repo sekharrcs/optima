@@ -202,7 +202,7 @@ Cosmos schema version 1 contains only:
 * `id`, equal to `RunResult.run_id`
 * `schema_version`
 * canonical UTC `created_at` metadata, validated against the payload
-* `sort_key`, one descending recent-history ordering key
+* `sort_key`, a descending recent-history ordering key checked against the payload
 * `run_result_json`, the authoritative `RunResult.model_dump_json()` payload
 
 The container partition-key path is `/id`. Opaque run IDs provide high
@@ -222,9 +222,16 @@ mapped 413) stays the authoritative backstop rather than truncating evidence.
 
 The Cosmos adapter translates SDK exceptions into sanitized not-found,
 conflict, invalid-document, authentication, timeout, throttling, oversized-item,
-and service-unavailable errors. An API persistence failure states that execution
-completed but history persistence failed and exposes only safe run and
-correlation identifiers.
+and service-unavailable errors. Execution and persistence cannot be atomic
+because external model execution precedes storage. `POST /api/v1/runs` therefore
+returns the authoritative completed `RunResult` once constructed and reports
+run-history persistence as a separate best-effort side effect through response
+headers: `X-OPTIMA-Run-History` is `PERSISTED`, `FAILED`, or `NOT_CONFIGURED`,
+and `X-OPTIMA-Run-History-Error` carries one sanitized `RunHistoryErrorCode` only
+on failure. A failed save is not evidence that execution failed, so callers
+requiring durable history inspect the header instead of resubmitting a completed
+run. Application Insights in Slice 10D and lifecycle and infrastructure in Slice
+11 do not replace this API contract.
 
 Cosmos configuration explicitly selects account key, Azure CLI credential, or
 managed identity. `DefaultAzureCredential` and implicit credential fallback are

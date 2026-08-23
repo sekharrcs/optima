@@ -236,8 +236,19 @@ when a point read validates to the same complete `RunResult`; different evidence
 is a conflict and is never overwritten. The version 1 document stores exact
 `RunResult.model_dump_json()` output as a string so Decimal costs round-trip
 without Cosmos binary64 loss. Every read revalidates the strict current domain
-model and cross-checks ID and timestamp metadata. Items larger than Cosmos DB's
-2-MB UTF-8 JSON limit fail before write without truncation.
+model and cross-checks ID, timestamp, and sort-key metadata. Items larger than
+Cosmos DB's 2-MB UTF-8 JSON limit fail before write without truncation.
+
+Execution and run-history persistence cannot be atomic because external model
+execution precedes storage. `POST /api/v1/runs` returns the authoritative
+completed `RunResult` once constructed and reports persistence as a best-effort
+side effect through response headers: `X-OPTIMA-Run-History` is `PERSISTED`,
+`FAILED`, or `NOT_CONFIGURED`, and `X-OPTIMA-Run-History-Error` carries one
+sanitized `RunHistoryErrorCode` only on failure. A failed save is not evidence
+that model execution failed, so callers should not resubmit a completed run;
+those needing durable history inspect the header instead. Application Insights in
+Slice 10D and lifecycle and infrastructure in Slice 11 do not replace this
+contract.
 
 No live Cosmos account is exercised by the default test suite. The adapter's
 SDK calls, error mapping, and lifecycle are validated with offline fakes.

@@ -41,7 +41,7 @@ COSMOS_RUN_HISTORY_SCHEMA_VERSION = 1
 COSMOS_ITEM_MAX_BYTES = 2 * 1024 * 1024
 RECENT_RUNS_QUERY = (
     "SELECT TOP @limit c.id, c.schema_version, c.created_at, "
-    "c.run_result_json FROM c "
+    "c.sort_key, c.run_result_json FROM c "
     "ORDER BY c.sort_key DESC"
 )
 
@@ -81,6 +81,7 @@ class _RunHistoryDocument(BaseModel):
     id: StrictStr
     schema_version: StrictInt
     created_at: StrictStr
+    sort_key: StrictStr
     run_result_json: StrictStr
 
 
@@ -250,6 +251,8 @@ def _decode_document(
             raise ValueError("point-read identity contradicts requested run")
         if document.created_at != _canonical_utc(result.created_at):
             raise ValueError("ordering metadata contradicts payload")
+        if document.sort_key != _recent_sort_key(result):
+            raise ValueError("sort metadata contradicts payload")
         return result
     except (ValidationError, ValueError, TypeError) as error:
         raise RunHistoryInvalidDocumentError from error

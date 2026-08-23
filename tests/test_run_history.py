@@ -22,7 +22,13 @@ from azure.cosmos.exceptions import (
 )
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
-from test_runs_api import RaisingSmallProvider, dependencies, request_payload
+from test_runs_api import (
+    RaisingSmallProvider,
+    cache_eligible_profile,
+    dependencies,
+    request_payload,
+    with_semantic_cache,
+)
 
 from optima.api.app import create_app
 from optima.config import AppSettings, CosmosAuthMode
@@ -124,6 +130,24 @@ class FailingRunHistoryStore:
 
     async def list_recent(self, limit: int) -> tuple[RunResult, ...]:
         raise RunHistoryInvalidDocumentError
+
+
+class SaveErrorRunHistoryStore:
+    """Raise one configured save error while counting persistence attempts."""
+
+    def __init__(self, error: Exception) -> None:
+        self._error = error
+        self.save_calls = 0
+
+    async def save(self, result: RunResult) -> None:
+        self.save_calls += 1
+        raise self._error
+
+    async def get(self, run_id: str) -> RunResult:
+        raise RunHistoryNotFoundError
+
+    async def list_recent(self, limit: int) -> tuple[RunResult, ...]:
+        return ()
 
 
 class TimeoutSmallProvider:
@@ -366,7 +390,7 @@ def test_cosmos_recent_query_is_parameterized_bounded_and_ordered() -> None:
             "args": (),
             "query": (
                 "SELECT TOP @limit c.id, c.schema_version, c.created_at, "
-                "c.run_result_json FROM c "
+                "c.sort_key, c.run_result_json FROM c "
                 "ORDER BY c.sort_key DESC"
             ),
             "parameters": [{"name": "@limit", "value": 2}],
@@ -431,6 +455,72 @@ def test_cosmos_conflict_reconcile_fails_closed_on_corrupted_existing() -> None:
     result = completed_run()
     corrupted = document_for(result)
     corrupted["run_result_json"] = "not-json"
+    container = FakeContainer()
+    container.create_error = CosmosResourceExistsError(  # type: ignore[no-untyped-call]
+        status_code=409,
+        message="conflict",
+    )
+    container.read_document = corrupted
+    store = CosmosRunHistoryStore(container)
+
+    with pytest.raises(RunHistoryInvalidDocumentError):
+        asyncio.run(store.save(result))
+
+
+def test_cosmos_read_accepts_valid_sort_key() -> None:
+    """Return evidence when the persisted sort key reproduces the payload."""
+    result = completed_run()
+    container = FakeContainer()
+    container.read_document = document_for(result)
+
+    restored = asyncio.run(CosmosRunHistoryStore(container).get(result.run_id))
+
+    assert restored == result
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda document: document.pop("sort_key"),
+        lambda document: document.update(sort_key=1234),
+        lambda document: document.update(
+            sort_key=document["sort_key"].split("|", 1)[0] + "|run-tampered"
+        ),
+        lambda document: document.update(
+            sort_key="2000-01-01T00:00:00.000000Z|" + document["id"]
+        ),
+    ],
+    ids=["missing", "non-string", "run-id-corrupted", "timestamp-corrupted"],
+)
+def test_cosmos_point_read_rejects_invalid_sort_key(mutate: Any) -> None:
+    """Fail closed when query-driving sort metadata cannot be reproduced."""
+    result = completed_run()
+    document = document_for(result)
+    mutate(document)
+    container = FakeContainer()
+    container.read_document = document
+
+    with pytest.raises(RunHistoryInvalidDocumentError):
+        asyncio.run(CosmosRunHistoryStore(container).get(result.run_id))
+
+
+def test_cosmos_list_rejects_contradictory_sort_key() -> None:
+    """Reject list evidence whose sort key disagrees with the authoritative payload."""
+    result = completed_run()
+    document = document_for(result)
+    document.update(sort_key="2000-01-01T00:00:00.000000Z|" + document["id"])
+    container = FakeContainer()
+    container.query_documents = [document]
+
+    with pytest.raises(RunHistoryInvalidDocumentError):
+        asyncio.run(CosmosRunHistoryStore(container).list_recent(5))
+
+
+def test_cosmos_reconcile_rejects_existing_corrupted_sort_key() -> None:
+    """Never accept a duplicate whose existing sort metadata is corrupted."""
+    result = completed_run()
+    corrupted = document_for(result)
+    corrupted.update(sort_key="2000-01-01T00:00:00.000000Z|" + corrupted["id"])
     container = FakeContainer()
     container.create_error = CosmosResourceExistsError(  # type: ignore[no-untyped-call]
         status_code=409,
@@ -768,6 +858,8 @@ def test_api_persists_completed_result_once_without_changing_execution() -> None
     )
 
     assert response.status_code == 200
+    assert response.headers["X-OPTIMA-Run-History"] == "PERSISTED"
+    assert "X-OPTIMA-Run-History-Error" not in response.headers
     assert len(store.save_calls) == 1
     persisted = asyncio.run(store.get("run-api-1"))
     assert response.json() == persisted.model_dump(mode="json")
@@ -803,6 +895,7 @@ def test_api_persists_truthful_terminal_failures(
 
     assert response.status_code == 200
     assert response.json()["status"] == expected_status
+    assert response.headers["X-OPTIMA-Run-History"] == "PERSISTED"
     assert len(store.save_calls) == 1
     persisted = asyncio.run(store.get("run-api-1"))
     assert persisted.status.value == expected_status
@@ -810,12 +903,122 @@ def test_api_persists_truthful_terminal_failures(
     assert persisted.contract_met is None
 
 
-def test_api_distinguishes_completed_execution_from_persistence_failure() -> None:
-    """Return safe identifiers and never relabel persistence as model failure."""
+def test_api_returns_completed_result_when_persistence_unavailable() -> None:
+    """Return the exact completed result with a sanitized FAILED persistence header."""
     configured, small, strong, evaluator = dependencies(0.93)
+    store = SaveErrorRunHistoryStore(RunHistoryServiceUnavailableError())
+    configured = replace(configured, run_history_store=store)
+
+    response = TestClient(create_app(execution_dependencies=configured)).post(
+        "/api/v1/runs",
+        json=request_payload(),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["run_id"] == "run-api-1"
+    assert body["status"] == "COMPLETED"
+    assert "persistence_error" not in body
+    assert response.headers["X-OPTIMA-Run-History"] == "FAILED"
+    assert (
+        response.headers["X-OPTIMA-Run-History-Error"]
+        == "RUN_HISTORY_SERVICE_UNAVAILABLE"
+    )
+    assert store.save_calls == 1
+    assert len(small.calls) == 1
+    assert len(strong.calls) == 0
+    assert len(evaluator.calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_code"),
+    [
+        (RunHistoryTimeoutError(), "RUN_HISTORY_TIMED_OUT"),
+        (RunHistoryThrottledError(), "RUN_HISTORY_THROTTLED"),
+        (RunHistoryAuthenticationError(), "RUN_HISTORY_AUTHENTICATION_FAILED"),
+        (RunHistoryConflictError(), "RUN_HISTORY_CONFLICT"),
+        (RunHistoryInvalidDocumentError(), "RUN_HISTORY_INVALID_DOCUMENT"),
+        (RunHistoryDocumentTooLargeError(), "RUN_HISTORY_DOCUMENT_TOO_LARGE"),
+    ],
+)
+def test_api_reports_sanitized_persistence_error_headers(
+    error: Exception,
+    expected_code: str,
+) -> None:
+    """Surface each sanitized persistence error code without failing the response."""
+    configured, small, _, evaluator = dependencies(0.93)
+    store = SaveErrorRunHistoryStore(error)
+    configured = replace(configured, run_history_store=store)
+
+    response = TestClient(create_app(execution_dependencies=configured)).post(
+        "/api/v1/runs",
+        json=request_payload(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["run_id"] == "run-api-1"
+    assert response.headers["X-OPTIMA-Run-History"] == "FAILED"
+    assert response.headers["X-OPTIMA-Run-History-Error"] == expected_code
+    assert store.save_calls == 1
+    assert len(small.calls) == 1
+    assert len(evaluator.calls) == 1
+
+
+def test_api_maps_unexpected_persistence_exception_without_leaking_detail() -> None:
+    """Convert an unexpected adapter error to a safe service-unavailable code."""
+    configured, small, _, _ = dependencies(0.93)
+    store = SaveErrorRunHistoryStore(RuntimeError("sensitive adapter detail"))
+    configured = replace(configured, run_history_store=store)
+
+    response = TestClient(create_app(execution_dependencies=configured)).post(
+        "/api/v1/runs",
+        json=request_payload(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["run_id"] == "run-api-1"
+    assert response.headers["X-OPTIMA-Run-History"] == "FAILED"
+    assert (
+        response.headers["X-OPTIMA-Run-History-Error"]
+        == "RUN_HISTORY_SERVICE_UNAVAILABLE"
+    )
+    assert "sensitive adapter detail" not in str(dict(response.headers))
+    assert store.save_calls == 1
+
+
+def test_api_reports_not_configured_persistence_header() -> None:
+    """Report NOT_CONFIGURED and still return the completed result cloud-free."""
+    configured, _, _, _ = dependencies(0.93)
+
+    response = TestClient(create_app(execution_dependencies=configured)).post(
+        "/api/v1/runs",
+        json=request_payload(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["run_id"] == "run-api-1"
+    assert response.headers["X-OPTIMA-Run-History"] == "NOT_CONFIGURED"
+    assert "X-OPTIMA-Run-History-Error" not in response.headers
+
+
+@pytest.mark.parametrize(
+    ("provider", "expected_status"),
+    [
+        (RaisingSmallProvider(), "FAILED"),
+        (TimeoutSmallProvider(), "TIMED_OUT"),
+    ],
+)
+def test_api_returns_terminal_failure_result_even_when_persistence_fails(
+    provider: Any,
+    expected_status: str,
+) -> None:
+    """Return the unchanged terminal result with a FAILED persistence header."""
+    configured, _, _, _ = dependencies(0.93)
+    store = SaveErrorRunHistoryStore(RunHistoryServiceUnavailableError())
     configured = replace(
         configured,
-        run_history_store=FailingRunHistoryStore(),
+        small_provider=provider,
+        run_history_store=store,
     )
 
     response = TestClient(create_app(execution_dependencies=configured)).post(
@@ -823,21 +1026,35 @@ def test_api_distinguishes_completed_execution_from_persistence_failure() -> Non
         json=request_payload(),
     )
 
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == expected_status
+    assert body["final_output"] is None
+    assert body["contract_met"] is None
+    assert response.headers["X-OPTIMA-Run-History"] == "FAILED"
+    assert store.save_calls == 1
+
+
+def test_api_skips_persistence_when_execution_fails_before_result() -> None:
+    """Do not save or report persistence when execution fails before a result."""
+    configured, small, _, evaluator = dependencies(0.93)
+    store = RecordingRunHistoryStore()
+    configured = replace(
+        with_semantic_cache(configured, None),
+        run_history_store=store,
+    )
+
+    response = TestClient(create_app(execution_dependencies=configured)).post(
+        "/api/v1/runs",
+        json=request_payload(request_profile=cache_eligible_profile()),
+    )
+
     assert response.status_code == 503
-    assert response.json() == {
-        "detail": {
-            "code": "RUN_COMPLETED_PERSISTENCE_FAILED",
-            "message": "Execution completed but run-history persistence failed",
-            "facts": {
-                "run_id": "run-api-1",
-                "correlation_id": "correlation-api-1",
-                "persistence_error": "RUN_HISTORY_SERVICE_UNAVAILABLE",
-            },
-        }
-    }
-    assert len(small.calls) == 1
-    assert len(strong.calls) == 0
-    assert len(evaluator.calls) == 1
+    assert response.json()["detail"]["code"] == "SEMANTIC_CACHE_NOT_CONFIGURED"
+    assert store.save_calls == []
+    assert "X-OPTIMA-Run-History" not in response.headers
+    assert small.calls == ()
+    assert evaluator.calls == ()
 
 
 def test_api_history_point_read_list_and_missing_behavior() -> None:

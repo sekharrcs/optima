@@ -2,7 +2,7 @@
 
 from typing import Annotated, Never
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, HTTPException, Query, Response, status
 
 from optima.api.dependencies import ExecutionDependencies
 from optima.api.models import ApiError, RunRequest
@@ -35,11 +35,16 @@ from optima.planner import (
 )
 from optima.storage import (
     RunHistoryError,
+    RunHistoryErrorCode,
     RunHistoryInvalidDocumentError,
     RunHistoryNotFoundError,
+    RunHistoryStore,
 )
 
 HistoryLimit = Annotated[int | None, Query(ge=1, le=100)]
+
+RUN_HISTORY_OUTCOME_HEADER = "X-OPTIMA-Run-History"
+RUN_HISTORY_ERROR_HEADER = "X-OPTIMA-Run-History-Error"
 
 
 def build_runs_router(
@@ -49,7 +54,7 @@ def build_runs_router(
     router = APIRouter()
 
     @router.post("/runs", response_model=RunResult)
-    async def execute_run(run_request: RunRequest) -> RunResult:
+    async def execute_run(run_request: RunRequest, response: Response) -> RunResult:
         """Plan and execute one supported Planner V1 OPTIMA run."""
         if dependencies is None:
             _raise_api_error(
@@ -246,16 +251,9 @@ def build_runs_router(
                 facts={"context_policy": execution_plan.context_policy.value},
             )
 
-        if dependencies.run_history_store is not None:
-            try:
-                await dependencies.run_history_store.save(result)
-            except RunHistoryError as error:
-                _raise_completed_persistence_error(result, error.code.value)
-            except Exception:
-                _raise_completed_persistence_error(
-                    result,
-                    "RUN_HISTORY_SERVICE_UNAVAILABLE",
-                )
+        await _record_run_history_persistence(
+            response, dependencies.run_history_store, result
+        )
         return result
 
     @router.get("/runs/{run_id}", response_model=RunResult)
@@ -349,18 +347,27 @@ def _require_execution_plan(
     return planner_result
 
 
-def _raise_completed_persistence_error(result: RunResult, error_code: str) -> Never:
-    """Report post-execution persistence failure without changing run evidence."""
-    _raise_api_error(
-        status.HTTP_503_SERVICE_UNAVAILABLE,
-        code="RUN_COMPLETED_PERSISTENCE_FAILED",
-        message="Execution completed but run-history persistence failed",
-        facts={
-            "run_id": result.run_id,
-            "correlation_id": result.correlation_id,
-            "persistence_error": error_code,
-        },
-    )
+async def _record_run_history_persistence(
+    response: Response,
+    store: RunHistoryStore | None,
+    result: RunResult,
+) -> None:
+    """Report best-effort persistence via headers without altering the result."""
+    if store is None:
+        response.headers[RUN_HISTORY_OUTCOME_HEADER] = "NOT_CONFIGURED"
+        return
+    error_code: str | None = None
+    try:
+        await store.save(result)
+    except RunHistoryError as error:
+        error_code = error.code.value
+    except Exception:
+        error_code = RunHistoryErrorCode.SERVICE_UNAVAILABLE.value
+    if error_code is None:
+        response.headers[RUN_HISTORY_OUTCOME_HEADER] = "PERSISTED"
+        return
+    response.headers[RUN_HISTORY_OUTCOME_HEADER] = "FAILED"
+    response.headers[RUN_HISTORY_ERROR_HEADER] = error_code
 
 
 def _raise_history_not_configured() -> Never:

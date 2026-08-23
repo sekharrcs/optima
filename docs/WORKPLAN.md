@@ -163,8 +163,9 @@ Acceptance:
 	exclusive, with no default credential chain
 - one application-lifetime async client and any owned credential are explicitly
 	closeable
-- completed, failed, and timed-out terminal results persist exactly once after
-	execution; persistence failure remains distinct from model-execution failure
+- completed, failed, and timed-out terminal results are returned once and persist
+	exactly once as a best-effort side effect; a persistence failure is reported by
+	response header and never converts a completed execution into an HTTP failure
 - history reads return structured `404`, `503`, or fail-closed invalid-document
 	responses as appropriate
 - default tests use deterministic fakes without Azure credentials, network

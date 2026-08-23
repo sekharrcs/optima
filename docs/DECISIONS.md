@@ -183,14 +183,20 @@ canonical UTC `created_at` metadata, a descending `sort_key` ordering property,
 and the authoritative `RunResult.model_dump_json()` representation stored as a
 string. The string
 preserves exact Decimal costs that Cosmos binary64 JSON numbers cannot represent
-reliably. Every read validates the strict current model and rejects identity or
-timestamp metadata that contradicts the payload.
+reliably. Every read validates the strict current model and rejects identity,
+timestamp, or sort-key metadata that contradicts the payload.
 
 The `/id` partition key provides high cardinality and efficient point reads by
 opaque run ID. Its accepted tradeoff is that bounded recent-history listing is a
 cross-partition query. Deterministic newest-first ordering uses one descending
 `sort_key` property (canonical `created_at` plus `run_id`), so it runs on the
 default container index without a composite index.
+
+Execution and persistence cannot be atomic because external model execution
+precedes storage. `POST /api/v1/runs` returns the authoritative completed result
+once constructed and reports persistence as a best-effort side effect through the
+`X-OPTIMA-Run-History` and `X-OPTIMA-Run-History-Error` response headers rather
+than converting a completed paid execution into a retryable HTTP failure.
 
 Cosmos authentication is explicit: account key, Azure CLI credential, or
 managed identity. There is no implicit credential chain. One closeable resource
