@@ -76,7 +76,7 @@ OpenTelemetry providers and exporters.
 - `ruff format --check .`: 116 files formatted
 - `ruff check .`: passed
 - `mypy src tests`: 98 source files passed
-- focused settings and observability tests: 87 passed
+- focused settings and observability tests: 90 passed
 - full `pytest`: 1,006 passed
 - `git diff --check`: passed
 - secret-pattern scan: zero added-content matches

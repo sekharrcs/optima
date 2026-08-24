@@ -23,7 +23,7 @@ description: Draft pull request summary for OPTIMA Corrective Slice 10D
 - `ruff format --check .`: 116 files formatted
 - `ruff check .`: passed
 - `mypy src tests`: 98 source files passed
-- focused settings and observability tests: 87 passed
+- focused settings and observability tests: 90 passed
 - full `pytest`: 1,006 passed with one existing FastAPI TestClient deprecation
   warning
 - `git diff --check`: passed
