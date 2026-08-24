@@ -19,7 +19,7 @@ from optima.cache.contracts import (
     SemanticCacheLookupTimeout,
 )
 from optima.domain.cache import CacheCandidate
-from optima.domain.embedding import EmbeddingProfile, EmbeddingUsage
+from optima.domain.embedding import EmbeddingAttempt, EmbeddingProfile, EmbeddingUsage
 from optima.domain.evaluation import EvaluationResult
 from optima.domain.request_binding import RequestBinding
 
@@ -49,9 +49,9 @@ class RedisSearchClient(Protocol):
 class RedisSemanticCacheInvalidResponseError(SemanticCacheLookupError):
     """Report malformed or contradictory Redis cache evidence safely."""
 
-    def __init__(self, embedding_usage: EmbeddingUsage | None = None) -> None:
+    def __init__(self, embedding_attempt: EmbeddingAttempt | None = None) -> None:
         super().__init__(
-            embedding_usage,
+            embedding_attempt,
             message="Redis semantic-cache response is invalid",
         )
 
@@ -84,7 +84,7 @@ class RedisSemanticCache:
     ) -> SemanticCacheLookupResult:
         """Run one bounded KNN lookup and return evidence without applying policy."""
         normalized_request = SemanticCacheLookupRequest.model_validate(request)
-        embedding_usage: EmbeddingUsage | None = None
+        embedding_attempt: EmbeddingAttempt | None = None
         try:
             async with asyncio.timeout(self._timeout_seconds):
                 started = perf_counter()
@@ -96,9 +96,14 @@ class RedisSemanticCache:
                     embedding_result,
                     latency_ms=_elapsed_ms(perf_counter(), started),
                 )
+                embedding_attempt = EmbeddingAttempt(
+                    invoked=True,
+                    outbound_attempted=True,
+                    usage=embedding_usage,
+                )
                 if embedding_result.profile != self._embedding_profile:
                     raise SemanticCacheLookupError(
-                        embedding_usage,
+                        embedding_attempt,
                         message="embedding profile does not match configured profile",
                     )
                 query_vector = _encode_float32_vector(
@@ -128,18 +133,42 @@ class RedisSemanticCache:
         except SemanticCacheLookupError:
             raise
         except TimeoutError as error:
-            raise SemanticCacheLookupTimeout(embedding_usage) from error
+            raise SemanticCacheLookupTimeout(
+                _attempt_after_error(embedding_attempt, error)
+            ) from error
         except Exception as error:
-            raise SemanticCacheLookupError(embedding_usage) from error
+            raise SemanticCacheLookupError(
+                _attempt_after_error(embedding_attempt, error)
+            ) from error
         candidate = _decode_search_response(
             response,
             self._embedding_profile,
-            embedding_usage,
+            embedding_attempt,
         )
         return SemanticCacheLookupResult(
             candidate=candidate,
-            embedding_usage=embedding_usage,
+            embedding_attempt=embedding_attempt,
         )
+
+
+def _attempt_after_error(
+    existing: EmbeddingAttempt | None,
+    error: BaseException,
+) -> EmbeddingAttempt | None:
+    """Return the embedding attempt to attach to a failed or timed-out lookup.
+
+    A measured attempt is preserved verbatim. Otherwise the embedding never
+    returned usage, so the attempt is recorded as possibly-paid unless the
+    provider proved the failure happened before any outbound request.
+    """
+    if existing is not None:
+        return existing
+    outbound_attempted = bool(getattr(error, "outbound_attempted", True))
+    return EmbeddingAttempt(
+        invoked=True,
+        outbound_attempted=outbound_attempted,
+        usage=None,
+    )
 
 
 def _build_embedding_usage(
@@ -216,23 +245,23 @@ def _encode_float32_vector(
 def _decode_search_response(
     response: object,
     profile: EmbeddingProfile,
-    embedding_usage: EmbeddingUsage | None,
+    embedding_attempt: EmbeddingAttempt | None,
 ) -> CacheCandidate | None:
     """Decode the exact RESP2 FT.SEARCH shape and fail closed on corruption."""
     if not isinstance(response, list) or not response:
-        raise RedisSemanticCacheInvalidResponseError(embedding_usage)
+        raise RedisSemanticCacheInvalidResponseError(embedding_attempt)
     total = response[0]
     if type(total) is not int or total < 0:
-        raise RedisSemanticCacheInvalidResponseError(embedding_usage)
+        raise RedisSemanticCacheInvalidResponseError(embedding_attempt)
     if total == 0:
         if response != [0]:
-            raise RedisSemanticCacheInvalidResponseError(embedding_usage)
+            raise RedisSemanticCacheInvalidResponseError(embedding_attempt)
         return None
     if total != 1 or len(response) != 3 or not isinstance(response[2], list):
-        raise RedisSemanticCacheInvalidResponseError(embedding_usage)
-    fields = _decode_field_pairs(response[2], embedding_usage)
+        raise RedisSemanticCacheInvalidResponseError(embedding_attempt)
+    fields = _decode_field_pairs(response[2], embedding_attempt)
     if set(fields) != set(_RETURN_FIELDS):
-        raise RedisSemanticCacheInvalidResponseError(embedding_usage)
+        raise RedisSemanticCacheInvalidResponseError(embedding_attempt)
     try:
         if _decode_text(fields["schema_version"]) != str(REDIS_CACHE_SCHEMA_VERSION):
             raise ValueError("unsupported schema version")
@@ -262,24 +291,24 @@ def _decode_search_response(
         TypeError,
         ValidationError,
     ) as error:
-        raise RedisSemanticCacheInvalidResponseError(embedding_usage) from error
+        raise RedisSemanticCacheInvalidResponseError(embedding_attempt) from error
 
 
 def _decode_field_pairs(
     raw_fields: list[object],
-    embedding_usage: EmbeddingUsage | None,
+    embedding_attempt: EmbeddingAttempt | None,
 ) -> dict[str, object]:
     """Build unique UTF-8 field pairs from one Redis hash result."""
     if len(raw_fields) % 2 != 0:
-        raise RedisSemanticCacheInvalidResponseError(embedding_usage)
+        raise RedisSemanticCacheInvalidResponseError(embedding_attempt)
     fields: dict[str, object] = {}
     for index in range(0, len(raw_fields), 2):
         try:
             name = _decode_text(raw_fields[index])
         except (UnicodeDecodeError, TypeError) as error:
-            raise RedisSemanticCacheInvalidResponseError(embedding_usage) from error
+            raise RedisSemanticCacheInvalidResponseError(embedding_attempt) from error
         if name in fields:
-            raise RedisSemanticCacheInvalidResponseError(embedding_usage)
+            raise RedisSemanticCacheInvalidResponseError(embedding_attempt)
         fields[name] = raw_fields[index + 1]
     return fields
 

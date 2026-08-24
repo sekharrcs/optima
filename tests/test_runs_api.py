@@ -29,7 +29,7 @@ from optima.context import (
 from optima.context.safety import DeterministicExtractiveSafetyPolicy
 from optima.cost import CostCalculator, PriceCatalog, PriceCatalogEntry
 from optima.domain.cache import CacheCandidate
-from optima.domain.embedding import EmbeddingUsage
+from optima.domain.embedding import EmbeddingAttempt, EmbeddingUsage
 from optima.domain.evaluation import EvaluationResult
 from optima.domain.execution import (
     ExecutionEventCode,
@@ -73,7 +73,7 @@ class UncheckedSemanticCache:
     ) -> SemanticCacheLookupResult:
         return SemanticCacheLookupResult.model_construct(
             candidate=self._candidate,
-            embedding_usage=None,
+            embedding_attempt=None,
         )
 
 
@@ -1328,7 +1328,14 @@ def test_run_endpoint_cache_hit_reports_priced_embedding_usage() -> None:
         latency_ms=1,
     )
     cache = FakeSemanticCache(
-        (SemanticCacheLookupResult(candidate=candidate, embedding_usage=usage),)
+        (
+            SemanticCacheLookupResult(
+                candidate=candidate,
+                embedding_attempt=EmbeddingAttempt(
+                    invoked=True, outbound_attempted=True, usage=usage
+                ),
+            ),
+        )
     )
     calculator = CostCalculator(
         PriceCatalog(
@@ -1357,7 +1364,8 @@ def test_run_endpoint_cache_hit_reports_priced_embedding_usage() -> None:
     assert response.status_code == 200
     body = response.json()
     assert body["semantic_cache"]["outcome"] == "REUSED"
-    embedding = body["semantic_cache"]["embedding_usage"]
+    embedding = body["semantic_cache"]["embedding_attempt"]["usage"]
+    assert body["semantic_cache"]["embedding_attempt"]["outbound_attempted"] is True
     assert embedding["input_tokens"] == 8
     assert Decimal(embedding["calculated_cost"]) == Decimal("0.0008")
     assert body["model_usages"] == []

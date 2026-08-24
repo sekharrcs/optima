@@ -128,7 +128,7 @@ def test_in_memory_cache_returns_exact_detached_match_and_truthful_miss() -> Non
     assert hit.candidate is not None
     assert hit.candidate.prior_evaluation.threshold == 0.80
     assert hit.candidate.prior_evaluation.metadata == {"source_run": "run-source-1"}
-    assert hit.embedding_usage is None
+    assert hit.embedding_attempt is None
     assert miss.candidate is None
     assert [call.input_text for call in cache.calls] == [
         "Summarize incident ARC-9",

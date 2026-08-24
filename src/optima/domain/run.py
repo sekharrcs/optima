@@ -7,7 +7,7 @@ from typing import Annotated
 
 from pydantic import Field, computed_field, model_validator
 
-from optima.domain.embedding import EmbeddingUsage
+from optima.domain.embedding import EmbeddingAttempt, EmbeddingUsage
 from optima.domain.evaluation import EvaluationResult
 from optima.domain.execution import (
     CachePolicy,
@@ -111,16 +111,34 @@ class RunResult(ImmutableModel):
     latency_ms: NonNegativeCount
     error: NonEmptyString | None = None
 
-    def _embedding_usage(self) -> EmbeddingUsage | None:
-        """Return the embedding usage consumed while resolving the cache lookup."""
+    def _embedding_attempt(self) -> EmbeddingAttempt | None:
+        """Return the embedding attempt evidence recorded for the cache lookup."""
         if self.semantic_cache is None:
             return None
-        return self.semantic_cache.embedding_usage
+        return self.semantic_cache.embedding_attempt
+
+    def _embedding_usage(self) -> EmbeddingUsage | None:
+        """Return the embedding usage consumed while resolving the cache lookup."""
+        attempt = self._embedding_attempt()
+        if attempt is None:
+            return None
+        return attempt.usage
+
+    def _embedding_consumption_indeterminate(self) -> bool:
+        """Return whether a possibly paid embedding left consumption unmeasured."""
+        attempt = self._embedding_attempt()
+        return attempt is not None and attempt.consumption_indeterminate
 
     @computed_field  # type: ignore[prop-decorator]
     @property
     def total_input_tokens(self) -> int | None:
-        """Return exact input tokens only when every consumed call reports them."""
+        """Return exact input tokens only when every consumed call reports them.
+
+        An embedding attempt that reached the provider without returning measured
+        usage makes the input-token total indeterminate rather than model-only.
+        """
+        if self._embedding_consumption_indeterminate():
+            return None
         usages = self._complete_model_usages()
         if usages is None or any(usage.input_tokens is None for usage in usages):
             return None
@@ -137,7 +155,12 @@ class RunResult(ImmutableModel):
     @computed_field  # type: ignore[prop-decorator]
     @property
     def total_output_tokens(self) -> int | None:
-        """Return exact output tokens; embedding requests emit no output tokens."""
+        """Return exact output tokens; embedding requests emit no output tokens.
+
+        Output totals stay exact even when an embedding attempt is indeterminate:
+        embeddings never produce output tokens, so an unmeasured embedding cannot
+        change this total.
+        """
         usages = self._complete_model_usages()
         if usages is None or any(usage.output_tokens is None for usage in usages):
             return None
@@ -148,7 +171,13 @@ class RunResult(ImmutableModel):
     @computed_field  # type: ignore[prop-decorator]
     @property
     def total_tokens(self) -> int | None:
-        """Return complete run tokens including any embedding-lookup consumption."""
+        """Return complete run tokens including any embedding-lookup consumption.
+
+        An embedding attempt that reached the provider without returning measured
+        usage makes the combined total indeterminate rather than model-only.
+        """
+        if self._embedding_consumption_indeterminate():
+            return None
         usages = self._complete_model_usages()
         if usages is None:
             return None
@@ -170,7 +199,13 @@ class RunResult(ImmutableModel):
     @computed_field  # type: ignore[prop-decorator]
     @property
     def total_calculated_cost(self) -> Decimal | None:
-        """Sum exact Decimal costs across model and embedding consumption."""
+        """Sum exact Decimal costs across model and embedding consumption.
+
+        An embedding attempt that reached the provider without returning measured
+        usage makes the run cost indeterminate rather than model-only.
+        """
+        if self._embedding_consumption_indeterminate():
+            return None
         usages = self._complete_model_usages()
         if usages is None:
             return None
@@ -303,11 +338,7 @@ class RunResult(ImmutableModel):
             for usage in self.model_usages
             if usage.pricing_provenance is not None
         }
-        embedding_usage = (
-            self.semantic_cache.embedding_usage
-            if self.semantic_cache is not None
-            else None
-        )
+        embedding_usage = self._embedding_usage()
         if embedding_usage is not None and embedding_usage.run_id != self.run_id:
             raise ValueError("embedding usage must belong to this run")
         if (

@@ -160,6 +160,11 @@ def test_settings_accept_explicit_injection() -> None:
         "redis_managed_identity_client_id": None,
         "redis_timeout_seconds": 1.0,
         "redis_max_connections": 10,
+        "redis_token_renewal_attempts": 3,
+        "redis_token_retry_backoff_seconds": 0.5,
+        "redis_token_retry_backoff_cap_seconds": 5.0,
+        "redis_token_acquisition_timeout_seconds": 10.0,
+        "redis_token_expiry_safety_margin_seconds": 5.0,
     }
 
 

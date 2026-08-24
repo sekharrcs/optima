@@ -9,7 +9,9 @@ from optima.cache.azure_redis import (
     build_redis_semantic_cache_resources,
 )
 from optima.cache.contracts import (
+    EmbeddingProviderError,
     EmbeddingProviderResult,
+    EmbeddingProviderTimeout,
     SemanticCache,
     SemanticCacheEmbeddingProvider,
     SemanticCacheLookupError,
@@ -33,7 +35,9 @@ __all__ = [
     "AZURE_MANAGED_REDIS_SCOPE",
     "AzureRedisCredentialProvider",
     "AzureRedisToken",
+    "EmbeddingProviderError",
     "EmbeddingProviderResult",
+    "EmbeddingProviderTimeout",
     "FakeSemanticCache",
     "InMemoryCacheEntry",
     "InMemorySemanticCache",

@@ -281,3 +281,55 @@ whitespace, and other non-hostname input before any network activity. The custom
 `azure-identity` streaming credential provider is retained over `redis-entraid`
 to keep explicit `AzureCliCredential` and `ManagedIdentityCredential` support and
 object-ID `AUTH` username handling under OPTIMA's own typed control.
+
+The truthfulness, provider-identity, semantic-input, and renewal guarantees
+described above are made precise and enforced by ADR-022; where the two ADRs
+overlap, ADR-022 is authoritative.
+
+## ADR-022: Truthful embedding attempts, verified identity, and safe renewal
+
+Status: Accepted
+
+A paid embedding request can leave the caller unable to observe what it
+consumed: the request may reach the provider and be billed, yet fail before
+returning measured usage. Recording "no usage" in that case understates
+consumption. Slice 10C therefore replaces the raw `EmbeddingUsage` carried on
+cache evidence with a typed `EmbeddingAttempt` that records whether the provider
+was invoked, whether an outbound request may have been attempted, and the
+measured usage when available. The embedding provider signals
+`outbound_attempted=False` only when a failure provably occurred before any
+outbound request (for example, authentication acquisition); every failure at or
+after the outbound call is reported as possibly billed. When an attempt was
+possibly billed but returned no measured usage, `RunResult` reports
+`total_input_tokens`, `total_tokens`, and cost as unavailable rather than
+model-only. Output-token totals stay exact because embeddings never produce
+output tokens, and a proven pre-outbound failure keeps model-only totals intact.
+
+Two embedding models can return same-dimension vectors from incompatible spaces,
+so a vector is bound to a profile only when the provider identity is verified.
+The provider requires the embeddings response `model` to be present and equal to
+the configured profile model; a missing, blank, non-string, or mismatched value
+is rejected as an invalid response, and no profile is ever attached to an
+unverified vector. Because embeddings consume input only, reported
+`total_tokens` must equal `prompt_tokens` whenever both are present; a
+disagreement is rejected.
+
+Semantic similarity is defined over a versioned input policy
+(`semantic-input-v1`) whose version is part of the embedding-profile identity.
+A single pure builder produces the embedding input as canonical JSON over the
+generation request (input text and optional context) rather than delimiter
+concatenation, avoiding injection ambiguity; reference output and evaluation
+criteria are excluded because they are evaluation identity captured by the
+authoritative `RequestBinding` that Planner V1 checks. Any external
+cache-population tooling must use the same builder to remain comparable.
+
+Background Microsoft Entra token renewal bounds each token acquisition with an
+explicit timeout, classifies failures so only transient transport, throttling,
+and transient server statuses are retried while authentication and authorization
+failures stop immediately, refuses to sleep a retry that would cross a safe
+margin before the current token expires, retries reauthentication of the pool
+within the same bounds, and publishes a renewed token only after the pool has
+accepted it. All renewal bounds (attempts, backoff, cap, acquisition timeout,
+and expiry safety margin) are configurable within strict limits. This section
+supersedes any earlier claim that these behaviors held before Slice 10C's
+round-three correction.

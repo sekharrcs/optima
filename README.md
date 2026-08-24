@@ -296,9 +296,10 @@ the injected provider to declare that exact profile, filters retrieval by it,
 and rejects any stored record whose profile differs — so vectors from a
 different model or dimension are never compared as if they were compatible.
 Composition also fails fast when the provider profile and the Redis index
-profile disagree. The injected embedding provider receives the request input
-text to derive the query vector, so that boundary must satisfy the deployment's
-privacy requirements.
+profile disagree. The injected embedding provider receives a versioned,
+canonical semantic-input payload derived from the request input text and
+optional context to produce the query vector, so that boundary must satisfy the
+deployment's privacy requirements.
 
 Configure the endpoint, existing index, embedding profile, and bounded client
 settings:
@@ -343,9 +344,11 @@ $env:OPTIMA_REDIS_MANAGED_IDENTITY_CLIENT_ID="<user-assigned-client-id>"
 creates one application-lifetime client and only the selected credential. Inject
 its `cache` into `ExecutionDependencies`, retain the returned resources, and call
 `RedisSemanticCacheResources.aclose()` during application shutdown. The resource
-owner renews Microsoft Entra tokens with bounded retries, backoff, and jitter —
-a single transient token or reauthentication failure does not permanently
-disable renewal — and stops renewal before closing Redis and Azure Identity. The
+owner renews Microsoft Entra tokens with a bounded acquisition timeout and
+bounded retries that apply only to transient failures — authentication and
+authorization errors stop renewal immediately, retries never cross a safe margin
+before token expiry, and a renewed token is published only after the pool
+accepts it — and stops renewal before closing Redis and Azure Identity. The
 default API and deterministic demo do not call this builder or probe Azure
 credentials.
 
@@ -355,17 +358,22 @@ embedding provider from the Slice 10A Foundry base URL and authentication mode
 never a fallback) plus the Redis embedding profile. It calls one Azure OpenAI v1
 `/embeddings` request per lookup with no retry, strictly validates the response
 (exactly one embedding at the expected index, exact dimension, finite non-boolean
-values, and non-fabricated usage), and never leaks the endpoint, token, prompt,
-or response body. A deterministic `FakeEmbeddingProvider` serves offline tests.
-Production FastAPI lifespan ownership of these resources remains Slice 11.
+values, a `model` that matches the configured profile, `total_tokens` equal to
+`prompt_tokens`, and non-fabricated usage), and never leaks the endpoint, token,
+prompt, or response body. A deterministic `FakeEmbeddingProvider` serves offline
+tests. Production FastAPI lifespan ownership of these resources remains Slice 11.
 
 A cache lookup against a paid embeddings deployment consumes input tokens and
-cost even when it produces a hit. The lookup therefore returns a dedicated
-`EmbeddingUsage`, priced through the same authoritative cost catalog as model
-calls, and `RunResult.total_input_tokens`, `total_tokens`, and
-`total_calculated_cost` include that consumption. A cache hit is never reported
-as free when an embedding request was made; totals return `None` rather than
-fabricate a value when embedding tokens or pricing are unavailable.
+cost even when it produces a hit, and a failed request may already have been
+billed. The lookup therefore carries a typed `EmbeddingAttempt` — recording
+whether the provider was invoked, whether an outbound request may have been
+attempted, and any measured usage priced through the same authoritative cost
+catalog as model calls. `RunResult.total_input_tokens`, `total_tokens`, and
+`total_calculated_cost` include measured embedding consumption and become `None`
+when an attempt was possibly billed but returned no usage; a failure proven to
+occur before any outbound request leaves model-only totals intact. Output-token
+totals stay exact because embeddings produce no output tokens. A cache hit is
+never reported as free when an embedding request was made.
 
 This project deliberately implements the streaming credential provider directly
 on `azure-identity` rather than adopting `redis-entraid`. The direct

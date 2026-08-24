@@ -27,6 +27,10 @@ BoundedTimeoutSeconds = Annotated[
     float,
     Field(gt=0, le=120, allow_inf_nan=False),
 ]
+BoundedSafetyMarginSeconds = Annotated[
+    float,
+    Field(ge=0, le=120, allow_inf_nan=False),
+]
 NonEmptyString = Annotated[str, Field(strict=True, min_length=1)]
 
 
@@ -68,6 +72,11 @@ class RedisSemanticCacheConfiguration(ImmutableModel):
     managed_identity_client_id: NonEmptyString | None = None
     timeout_seconds: BoundedTimeoutSeconds = 1.0
     max_connections: BoundedRedisConnections = 10
+    token_renewal_attempts: BoundedRetryCount = 3
+    token_retry_backoff_seconds: BoundedTimeoutSeconds = 0.5
+    token_retry_backoff_cap_seconds: BoundedTimeoutSeconds = 5.0
+    token_acquisition_timeout_seconds: BoundedTimeoutSeconds = 10.0
+    token_expiry_safety_margin_seconds: BoundedSafetyMarginSeconds = 5.0
 
     def embedding_profile(self) -> EmbeddingProfile:
         """Build the versioned embedding profile bound to this cache index."""
@@ -278,6 +287,11 @@ class AppSettings(BaseSettings):
     redis_managed_identity_client_id: str | None = None
     redis_timeout_seconds: BoundedTimeoutSeconds = 1.0
     redis_max_connections: BoundedRedisConnections = 10
+    redis_token_renewal_attempts: BoundedRetryCount = 3
+    redis_token_retry_backoff_seconds: BoundedTimeoutSeconds = 0.5
+    redis_token_retry_backoff_cap_seconds: BoundedTimeoutSeconds = 5.0
+    redis_token_acquisition_timeout_seconds: BoundedTimeoutSeconds = 10.0
+    redis_token_expiry_safety_margin_seconds: BoundedSafetyMarginSeconds = 5.0
 
     @model_validator(mode="after")
     def validate_quality_threshold_order(self) -> "AppSettings":
@@ -429,4 +443,15 @@ class AppSettings(BaseSettings):
             managed_identity_client_id=self.redis_managed_identity_client_id,
             timeout_seconds=self.redis_timeout_seconds,
             max_connections=self.redis_max_connections,
+            token_renewal_attempts=self.redis_token_renewal_attempts,
+            token_retry_backoff_seconds=self.redis_token_retry_backoff_seconds,
+            token_retry_backoff_cap_seconds=(
+                self.redis_token_retry_backoff_cap_seconds
+            ),
+            token_acquisition_timeout_seconds=(
+                self.redis_token_acquisition_timeout_seconds
+            ),
+            token_expiry_safety_margin_seconds=(
+                self.redis_token_expiry_safety_margin_seconds
+            ),
         )

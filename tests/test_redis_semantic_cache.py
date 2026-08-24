@@ -4,13 +4,14 @@ import asyncio
 import struct
 import sys
 import types
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from time import time
 from typing import Any
 
 import pytest
 from azure.core.credentials import AccessToken
+from azure.core.exceptions import ClientAuthenticationError, ServiceRequestError
 from test_semantic_cache import candidate, lookup_request, request_binding
 
 from optima.cache import (
@@ -209,8 +210,10 @@ def test_redis_lookup_runs_one_bounded_knn_query_and_decodes_candidate() -> None
     result = asyncio.run(cache.lookup(lookup_request()))
 
     assert result.candidate == resolved
-    assert result.embedding_usage is not None
-    assert result.embedding_usage.input_tokens == 11
+    assert result.embedding_attempt is not None
+    assert result.embedding_attempt.outbound_attempted is True
+    assert result.embedding_attempt.usage is not None
+    assert result.embedding_attempt.usage.input_tokens == 11
     assert len(embeddings.calls) == 1
     assert len(redis.calls) == 1
     command = redis.calls[0]
@@ -288,7 +291,8 @@ def test_redis_lookup_returns_truthful_miss() -> None:
 
     result = asyncio.run(cache.lookup(lookup_request()))
     assert result.candidate is None
-    assert result.embedding_usage is not None
+    assert result.embedding_attempt is not None
+    assert result.embedding_attempt.usage is not None
     assert len(redis.calls) == 1
 
 
@@ -389,8 +393,9 @@ def test_redis_lookup_propagates_client_failure_without_fabricating_hit() -> Non
         asyncio.run(cache.lookup(lookup_request()))
     assert redis.calls == 1
     assert len(embeddings.calls) == 1
-    assert excinfo.value.embedding_usage is not None
-    assert excinfo.value.embedding_usage.input_tokens == 11
+    assert excinfo.value.embedding_attempt is not None
+    assert excinfo.value.embedding_attempt.usage is not None
+    assert excinfo.value.embedding_attempt.usage.input_tokens == 11
 
 
 def redis_settings(auth_mode: RedisAuthMode, **updates: object) -> AppSettings:
@@ -750,7 +755,8 @@ def test_redis_lookup_records_embedding_usage_on_hit() -> None:
 
     assert result.candidate is not None
     assert result.candidate.source_run_id == resolved.source_run_id
-    usage = result.embedding_usage
+    assert result.embedding_attempt is not None
+    usage = result.embedding_attempt.usage
     assert usage is not None
     assert usage.run_id == "run-current-1"
     assert usage.provider == "fake-embed"
@@ -774,7 +780,8 @@ def test_redis_lookup_rejects_provider_profile_mismatch() -> None:
     with pytest.raises(SemanticCacheLookupError, match="profile") as excinfo:
         asyncio.run(cache.lookup(lookup_request()))
     assert redis.calls == []
-    assert excinfo.value.embedding_usage is not None
+    assert excinfo.value.embedding_attempt is not None
+    assert excinfo.value.embedding_attempt.usage is not None
 
 
 def test_redis_composition_rejects_mismatched_embedding_profile() -> None:
@@ -817,6 +824,9 @@ def _flaky_token_credential(
     *,
     park: asyncio.Event | None = None,
     park_from: int | None = None,
+    error_factory: "Callable[[], Exception]" = lambda: ServiceRequestError(
+        "transient token failure"
+    ),
 ) -> "FakeAzureCredential":
     class FlakyAzureCredential(FakeAzureCredential):
         async def get_token(self, *scopes: str, **kwargs: object) -> AccessToken:
@@ -825,7 +835,7 @@ def _flaky_token_credential(
             if park is not None and park_from is not None and call >= park_from:
                 await park.wait()
             if call in failing_calls:
-                raise RuntimeError("transient token failure")
+                raise error_factory()
             return AccessToken("secret-token", int(time()) + 3600)
 
     return FlakyAzureCredential()
@@ -870,6 +880,46 @@ def test_token_renewal_retries_transient_failure_then_succeeds() -> None:
     assert credential.close_calls == 1
 
 
+def test_token_renewal_stops_immediately_on_non_transient_error() -> None:
+    """A non-transient authentication failure must stop renewal without retry."""
+    credential = _flaky_token_credential(
+        {2, 3, 4, 5, 6},
+        error_factory=lambda: ClientAuthenticationError("bad credential"),
+    )
+    errors: list[Exception] = []
+
+    async def fake_sleep(delay: float) -> None:
+        return None
+
+    provider = AzureRedisCredentialProvider(
+        lambda: credential,
+        "object-id",
+        max_renewal_attempts=3,
+        sleep=fake_sleep,
+        jitter=lambda base: 0.0,
+    )
+
+    async def on_error(error: Exception) -> None:
+        errors.append(error)
+
+    async def exercise() -> None:
+        provider.on_error(on_error)
+        await provider.get_credentials_async()
+        for _ in range(500):
+            if not provider.is_streaming():
+                break
+            await asyncio.sleep(0)
+        assert provider.is_streaming() is False
+        await provider.aclose()
+
+    asyncio.run(exercise())
+
+    assert len(errors) == 1
+    assert isinstance(errors[0], ClientAuthenticationError)
+    # Only the initial success plus one non-transient failure; no retries.
+    assert len(credential.get_token_calls) == 2
+
+
 def test_token_renewal_stops_after_exhausting_bounded_attempts() -> None:
     """Give up renewal after the configured bounded attempts are exhausted."""
     credential = _flaky_token_credential({2, 3, 4, 5, 6})
@@ -905,10 +955,10 @@ def test_token_renewal_stops_after_exhausting_bounded_attempts() -> None:
     assert len(credential.get_token_calls) == 4
 
 
-def test_token_renewal_survives_reauthentication_callback_failure() -> None:
-    """A transient reauthentication failure must not stop token renewal."""
+def test_token_renewal_retries_reauthentication_then_delivers() -> None:
+    """A transient reauthentication failure is retried until the pool accepts."""
     park = asyncio.Event()
-    credential = _flaky_token_credential(set(), park=park, park_from=4)
+    credential = _flaky_token_credential(set(), park=park, park_from=3)
     delivered: list[AzureRedisToken] = []
     errors: list[Exception] = []
     reauth_calls = {"count": 0}
@@ -946,5 +996,7 @@ def test_token_renewal_survives_reauthentication_callback_failure() -> None:
 
     asyncio.run(exercise())
 
+    # The token is published only after the pool accepts it on retry.
+    assert reauth_calls["count"] == 2
     assert len(delivered) == 1
-    assert len(errors) >= 1
+    assert errors == []

@@ -10,6 +10,12 @@ from datetime import UTC, datetime
 from typing import Protocol, cast
 
 from azure.core.credentials import AccessToken
+from azure.core.exceptions import (
+    ClientAuthenticationError,
+    HttpResponseError,
+    ServiceRequestError,
+    ServiceResponseError,
+)
 from azure.identity.aio import AzureCliCredential, ManagedIdentityCredential
 
 from optima.cache.contracts import SemanticCacheEmbeddingProvider
@@ -26,9 +32,31 @@ DEFAULT_TOKEN_RENEWAL_ATTEMPTS = 3
 MAX_TOKEN_RENEWAL_ATTEMPTS = 10
 DEFAULT_TOKEN_RETRY_BACKOFF_SECONDS = 0.5
 DEFAULT_TOKEN_RETRY_BACKOFF_CAP_SECONDS = 5.0
+DEFAULT_TOKEN_ACQUISITION_TIMEOUT_SECONDS = 10.0
+DEFAULT_TOKEN_EXPIRY_SAFETY_MARGIN_SECONDS = 5.0
+
+# HTTP statuses from Azure Identity that represent transient, retryable failures.
+_TRANSIENT_TOKEN_HTTP_STATUS = frozenset({408, 429, 500, 502, 503, 504})
 
 SleepCallable = Callable[[float], Awaitable[None]]
 JitterCallable = Callable[[float], float]
+
+
+def _is_transient_token_error(error: BaseException) -> bool:
+    """Return whether a token-acquisition failure should be retried.
+
+    Authentication and authorization failures are permanent even though
+    ``ClientAuthenticationError`` subclasses ``HttpResponseError``, so they are
+    classified first. Only transport faults, throttling, and transient server
+    statuses are treated as retryable.
+    """
+    if isinstance(error, ClientAuthenticationError):
+        return False
+    if isinstance(error, ServiceRequestError | ServiceResponseError):
+        return True
+    if isinstance(error, HttpResponseError):
+        return error.status_code in _TRANSIENT_TOKEN_HTTP_STATUS
+    return isinstance(error, TimeoutError | ConnectionError)
 
 
 def _default_token_jitter(base_seconds: float) -> float:
@@ -114,6 +142,12 @@ class AzureRedisCredentialProvider:
         max_renewal_attempts: int = DEFAULT_TOKEN_RENEWAL_ATTEMPTS,
         retry_backoff_seconds: float = DEFAULT_TOKEN_RETRY_BACKOFF_SECONDS,
         retry_backoff_cap_seconds: float = DEFAULT_TOKEN_RETRY_BACKOFF_CAP_SECONDS,
+        acquisition_timeout_seconds: float = (
+            DEFAULT_TOKEN_ACQUISITION_TIMEOUT_SECONDS
+        ),
+        expiry_safety_margin_seconds: float = (
+            DEFAULT_TOKEN_EXPIRY_SAFETY_MARGIN_SECONDS
+        ),
         sleep: SleepCallable = asyncio.sleep,
         jitter: JitterCallable = _default_token_jitter,
     ) -> None:
@@ -124,6 +158,10 @@ class AzureRedisCredentialProvider:
             )
         if retry_backoff_seconds <= 0 or retry_backoff_cap_seconds <= 0:
             raise ValueError("token retry backoff seconds must be positive")
+        if acquisition_timeout_seconds <= 0:
+            raise ValueError("token acquisition timeout must be positive")
+        if expiry_safety_margin_seconds < 0:
+            raise ValueError("token expiry safety margin must not be negative")
         self._credential_factory = credential_factory
         self._credential: _AsyncAzureCredential | None = None
         self._object_id = object_id
@@ -131,6 +169,8 @@ class AzureRedisCredentialProvider:
         self._max_renewal_attempts = max_renewal_attempts
         self._retry_backoff_seconds = retry_backoff_seconds
         self._retry_backoff_cap_seconds = retry_backoff_cap_seconds
+        self._acquisition_timeout_seconds = acquisition_timeout_seconds
+        self._expiry_safety_margin_seconds = expiry_safety_margin_seconds
         self._sleep = sleep
         self._jitter = jitter
         self._token: AzureRedisToken | None = None
@@ -188,7 +228,10 @@ class AzureRedisCredentialProvider:
         if credential is None:
             credential = self._credential_factory()
             self._credential = credential
-        access_token = await credential.get_token(self._scope)
+        # Bound acquisition so a hung credential endpoint cannot stall renewal
+        # indefinitely; a timeout is transient and eligible for retry.
+        async with asyncio.timeout(self._acquisition_timeout_seconds):
+            access_token = await credential.get_token(self._scope)
         return _build_redis_token(
             access_token,
             object_id=self._object_id,
@@ -210,8 +253,12 @@ class AzureRedisCredentialProvider:
             renewed = await self._renew_with_retries()
             if renewed is None:
                 return
+            # Publish the renewed token only after the pool has accepted it, so a
+            # failed reauthentication never advertises an undelivered token.
+            delivered = await self._deliver_renewed_token(renewed)
+            if not delivered:
+                return
             self._token = renewed
-            await self._deliver_renewed_token(renewed)
 
     async def _renew_with_retries(self) -> "AzureRedisToken | None":
         attempt = 0
@@ -224,13 +271,19 @@ class AzureRedisCredentialProvider:
                 attempt += 1
                 current = self._token
                 if (
-                    attempt >= self._max_renewal_attempts
+                    not _is_transient_token_error(error)
+                    or attempt >= self._max_renewal_attempts
                     or current is None
                     or current.is_expired()
                 ):
                     await self._report_error(error)
                     return None
-                await self._sleep(self._retry_delay(attempt))
+                delay = self._retry_delay(attempt)
+                if not self._safe_to_delay(current, delay):
+                    # Retrying would outlast the current token; stop before a gap.
+                    await self._report_error(error)
+                    return None
+                await self._sleep(delay)
                 continue
             if renewed.is_expired():
                 await self._report_error(
@@ -240,16 +293,34 @@ class AzureRedisCredentialProvider:
             return renewed
         return None
 
-    async def _deliver_renewed_token(self, renewed: "AzureRedisToken") -> None:
+    async def _deliver_renewed_token(self, renewed: "AzureRedisToken") -> bool:
+        """Reauthenticate the pool with bounded retries; report on final failure."""
         if self._on_next is None:
-            return
-        try:
-            await _maybe_await(self._on_next(renewed))
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:
-            # A reauthentication failure is transient; keep renewing tokens.
-            await self._report_error(error)
+            return True
+        attempt = 0
+        while not self._closed:
+            try:
+                await _maybe_await(self._on_next(renewed))
+                return True
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                attempt += 1
+                delay = self._retry_delay(attempt)
+                if (
+                    attempt >= self._max_renewal_attempts
+                    or renewed.is_expired()
+                    or not self._safe_to_delay(renewed, delay)
+                ):
+                    await self._report_error(error)
+                    return False
+                await self._sleep(delay)
+        return False
+
+    def _safe_to_delay(self, token: "AzureRedisToken", delay_seconds: float) -> bool:
+        """Return whether one delay keeps a safety margin before token expiry."""
+        remaining_seconds = token.ttl() / 1000 - self._expiry_safety_margin_seconds
+        return delay_seconds <= remaining_seconds
 
     def _retry_delay(self, attempt: int) -> float:
         exponential = self._retry_backoff_seconds * (1 << (attempt - 1))
@@ -321,6 +392,15 @@ def build_redis_semantic_cache_resources(
         credential_provider = AzureRedisCredentialProvider(
             credential_factory,
             configuration.object_id,
+            max_renewal_attempts=configuration.token_renewal_attempts,
+            retry_backoff_seconds=configuration.token_retry_backoff_seconds,
+            retry_backoff_cap_seconds=configuration.token_retry_backoff_cap_seconds,
+            acquisition_timeout_seconds=(
+                configuration.token_acquisition_timeout_seconds
+            ),
+            expiry_safety_margin_seconds=(
+                configuration.token_expiry_safety_margin_seconds
+            ),
         )
 
     client = _create_redis_client(

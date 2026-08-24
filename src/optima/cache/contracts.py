@@ -6,7 +6,7 @@ from typing import Annotated, Protocol, runtime_checkable
 from pydantic import Field, field_validator, model_validator
 
 from optima.domain.cache import CacheCandidate
-from optima.domain.embedding import EmbeddingProfile, EmbeddingUsage
+from optima.domain.embedding import EmbeddingAttempt, EmbeddingProfile
 from optima.domain.quality_contract import QualityContract
 from optima.domain.request_binding import RequestBinding, build_request_binding
 from optima.domain.request_profile import RequestProfile
@@ -91,31 +91,63 @@ class EmbeddingProviderResult(ImmutableModel):
 
 
 class SemanticCacheLookupResult(ImmutableModel):
-    """One resolved candidate and the embedding usage the lookup consumed."""
+    """One resolved candidate and the embedding attempt the lookup made."""
 
     candidate: CacheCandidate | None = None
-    embedding_usage: EmbeddingUsage | None = None
+    embedding_attempt: EmbeddingAttempt | None = None
 
 
 class SemanticCacheLookupError(Exception):
-    """A cache lookup failure that may carry already-consumed embedding usage."""
+    """A cache lookup failure that may carry an already-made embedding attempt."""
 
     def __init__(
         self,
-        embedding_usage: EmbeddingUsage | None = None,
+        embedding_attempt: EmbeddingAttempt | None = None,
         *,
         message: str = "semantic-cache lookup failed",
     ) -> None:
         super().__init__(message)
-        self.embedding_usage = embedding_usage
+        self.embedding_attempt = embedding_attempt
 
 
 class SemanticCacheLookupTimeout(TimeoutError):
-    """A cache lookup timeout that may carry already-consumed embedding usage."""
+    """A cache lookup timeout that may carry an already-made embedding attempt."""
 
-    def __init__(self, embedding_usage: EmbeddingUsage | None = None) -> None:
+    def __init__(self, embedding_attempt: EmbeddingAttempt | None = None) -> None:
         super().__init__("semantic-cache lookup timed out")
-        self.embedding_usage = embedding_usage
+        self.embedding_attempt = embedding_attempt
+
+
+class EmbeddingProviderError(Exception):
+    """An embedding-provider failure recording whether a request went outbound.
+
+    ``outbound_attempted`` is the paid-consumption safety signal: ``False`` means
+    the failure provably happened before any outbound provider request, so no
+    consumption is possible; ``True`` means the request may have reached the paid
+    provider even though no usage was measured.
+    """
+
+    def __init__(
+        self,
+        message: str = "embedding provider request failed",
+        *,
+        outbound_attempted: bool,
+    ) -> None:
+        super().__init__(message)
+        self.outbound_attempted = outbound_attempted
+
+
+class EmbeddingProviderTimeout(TimeoutError):
+    """An embedding-provider timeout; a timed-out request may have gone outbound."""
+
+    def __init__(
+        self,
+        message: str = "embedding provider request timed out",
+        *,
+        outbound_attempted: bool = True,
+    ) -> None:
+        super().__init__(message)
+        self.outbound_attempted = outbound_attempted
 
 
 @runtime_checkable

@@ -1,6 +1,7 @@
 """Offline tests for the Foundry/APIM embedding provider."""
 
 import asyncio
+import json
 from collections.abc import Callable
 
 import httpx
@@ -9,13 +10,17 @@ from azure.core.credentials import AccessToken, TokenCredential
 from test_semantic_cache import lookup_request
 
 from optima.api.dependencies import build_foundry_embedding_provider
-from optima.cache import EmbeddingProviderResult
+from optima.cache import (
+    EmbeddingProviderError,
+    EmbeddingProviderResult,
+    EmbeddingProviderTimeout,
+)
 from optima.config import AppSettings, FoundryAuthMode, RedisAuthMode
-from optima.domain.embedding import EmbeddingProfile
+from optima.domain.embedding import EmbeddingProfile, build_semantic_input
 from optima.providers import (
     ApiKeyAuthentication,
+    EntraTokenAuthentication,
     FoundryEmbeddingProvider,
-    FoundryProviderError,
 )
 
 BASE_URL = "https://example-resource.openai.azure.com/openai/v1"
@@ -94,8 +99,12 @@ def test_embedding_provider_returns_vector_profile_and_usage() -> None:
     assert result.input_tokens == 7
     assert len(requests) == 1
     assert requests[0].url.path.endswith("/openai/v1/embeddings")
-    assert b'"model":"optima-embed"' in requests[0].content
-    assert b'"input":"Summarize incident ARC-9"' in requests[0].content
+    sent = json.loads(requests[0].content)
+    assert sent["model"] == "optima-embed"
+    assert sent["input"] == build_semantic_input(
+        input_text=lookup_request().input_text,
+        context=lookup_request().context,
+    )
 
 
 def test_embedding_provider_reports_missing_usage_without_fabrication() -> None:
@@ -138,7 +147,7 @@ def test_embedding_provider_rejects_malformed_responses(
     payload.update(body)
     provider = make_provider(lambda request: httpx.Response(200, json=payload))
 
-    with pytest.raises(FoundryProviderError, match="INVALID_RESPONSE|invalid"):
+    with pytest.raises(EmbeddingProviderError, match="invalid"):
         asyncio.run(_embed(provider))
 
 
@@ -157,7 +166,7 @@ def test_embedding_provider_rejects_non_finite_vector_values(token: str) -> None
             headers={"content-type": "application/json"},
         )
     )
-    with pytest.raises(FoundryProviderError):
+    with pytest.raises(EmbeddingProviderError):
         asyncio.run(_embed(provider))
 
 
@@ -187,9 +196,153 @@ def test_embedding_provider_maps_server_error_without_leakage() -> None:
     provider = make_provider(
         lambda request: httpx.Response(500, json={"secret": "leak"})
     )
-    with pytest.raises(FoundryProviderError) as excinfo:
+    with pytest.raises(EmbeddingProviderError) as excinfo:
         asyncio.run(_embed(provider))
     assert "leak" not in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "model_value",
+    ["different-model", "", "   ", None, 7],
+)
+def test_embedding_provider_rejects_unverified_response_model(
+    model_value: object,
+) -> None:
+    """Never attach the profile when the response model is missing or mismatched."""
+    provider = make_provider(
+        lambda request: httpx.Response(200, json=embeddings_response(model=model_value))
+    )
+    with pytest.raises(EmbeddingProviderError, match="invalid"):
+        asyncio.run(_embed(provider))
+
+
+def test_embedding_provider_rejects_inconsistent_total_tokens() -> None:
+    """Reject usage whose total_tokens disagrees with prompt_tokens."""
+    provider = make_provider(
+        lambda request: httpx.Response(
+            200,
+            json=embeddings_response(usage={"prompt_tokens": 7, "total_tokens": 9}),
+        )
+    )
+    with pytest.raises(EmbeddingProviderError, match="invalid"):
+        asyncio.run(_embed(provider))
+
+
+def test_embedding_provider_accepts_consistent_total_tokens() -> None:
+    """Accept usage whose total_tokens equals prompt_tokens for embeddings."""
+    provider = make_provider(
+        lambda request: httpx.Response(
+            200,
+            json=embeddings_response(usage={"prompt_tokens": 5, "total_tokens": 5}),
+        )
+    )
+    result = asyncio.run(_embed(provider))
+    assert result.input_tokens == 5
+
+
+@pytest.mark.parametrize(
+    "handler",
+    [
+        lambda request: httpx.Response(500, json={"x": 1}),
+        lambda request: httpx.Response(200, json={"data": []}),
+    ],
+)
+def test_embedding_provider_reports_outbound_attempt_on_provider_failure(
+    handler: Handler,
+) -> None:
+    """A failure after the request left records a possibly-billed attempt."""
+    provider = make_provider(handler)
+    with pytest.raises(EmbeddingProviderError) as excinfo:
+        asyncio.run(_embed(provider))
+    assert excinfo.value.outbound_attempted is True
+
+
+def test_embedding_provider_transport_failure_reports_outbound_attempt() -> None:
+    """A transport error may still have reached the provider."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("boom", request=request)
+
+    provider = make_provider(handler)
+    with pytest.raises(EmbeddingProviderError) as excinfo:
+        asyncio.run(_embed(provider))
+    assert excinfo.value.outbound_attempted is True
+
+
+def test_embedding_provider_timeout_reports_outbound_attempt() -> None:
+    """A timed-out embedding request may already have been billed."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("slow", request=request)
+
+    provider = make_provider(handler)
+    with pytest.raises(EmbeddingProviderTimeout) as excinfo:
+        asyncio.run(_embed(provider))
+    assert excinfo.value.outbound_attempted is True
+
+
+def test_embedding_provider_auth_failure_is_pre_outbound() -> None:
+    """An authentication failure proves no outbound provider request occurred."""
+
+    class _FailingCredential(TokenCredential):
+        def get_token(self, *scopes: str, **kwargs: object) -> AccessToken:
+            raise RuntimeError("no credential")
+
+    called = {"transport": False}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        called["transport"] = True
+        return httpx.Response(200, json=embeddings_response())
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = FoundryEmbeddingProvider(
+        base_url=BASE_URL,
+        profile=embedding_profile(),
+        authentication=EntraTokenAuthentication(
+            _FailingCredential(), "https://scope/.default"
+        ),
+        client=client,
+    )
+
+    async def run() -> EmbeddingProviderError:
+        try:
+            with pytest.raises(EmbeddingProviderError) as excinfo:
+                await provider.embed(lookup_request())
+            return excinfo.value
+        finally:
+            await client.aclose()
+
+    error = asyncio.run(run())
+    assert error.outbound_attempted is False
+    assert called["transport"] is False
+
+
+@pytest.mark.parametrize(
+    "bad_url",
+    [
+        "https://example.openai.azure.com/openai/v1\nHost: evil",
+        "https://example.openai.azure.com/openai/v1 ",
+        "https://example.openai.azure.com/openai/v1\t",
+        "https://example.openai.azure.com/openai/v1\x00",
+    ],
+)
+def test_embedding_provider_rejects_unsafe_base_url_before_io(bad_url: str) -> None:
+    """Reject control characters and whitespace before any network or auth use."""
+
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+        raise AssertionError("transport must not run for an invalid base URL")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        with pytest.raises(ValueError):
+            FoundryEmbeddingProvider(
+                base_url=bad_url,
+                profile=embedding_profile(),
+                authentication=ApiKeyAuthentication("fake-key"),
+                client=client,
+            )
+    finally:
+        asyncio.run(client.aclose())
 
 
 class FakeTokenCredential(TokenCredential):

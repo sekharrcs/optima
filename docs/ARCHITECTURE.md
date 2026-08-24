@@ -212,18 +212,26 @@ user-assigned managed identity. `DefaultAzureCredential` and implicit credential
 fallback are not used. The client uses TLS with hostname verification on Azure
 Managed Redis port `10000`, RESP2 raw responses, bounded connections and
 timeouts, and zero Redis command retries. Background Microsoft Entra token
-renewal uses bounded attempts, backoff, and jitter, so one transient token or
-reauthentication failure does not permanently disable renewal; one resource
-owner stops renewal before closing the Redis client and selected Azure
-credential.
+renewal bounds each token acquisition with a timeout, retries only transient
+failures (stopping immediately on authentication or authorization errors),
+never sleeps a retry past a safe margin before the current token expires,
+retries pool reauthentication within the same bounds, and publishes a renewed
+token only after the pool accepts it, so one transient failure does not
+permanently disable renewal; one resource owner stops renewal before closing the
+Redis client and selected Azure credential.
 
 The production embedding provider is a Foundry/APIM Azure OpenAI v1 `/embeddings`
 adapter that reuses the Slice 10A authentication modes, issues one non-retried
-request per lookup, strictly validates the response, and preserves optional
-provider usage. Because a lookup against a paid embeddings deployment consumes
-tokens and cost even on a hit, the lookup returns a dedicated `EmbeddingUsage`
-priced through the authoritative cost catalog, and `RunResult` token and cost
-totals include that consumption so a cache hit is never reported as free.
+request per lookup, and strictly validates the response, including verifying that
+the response `model` matches the configured profile and that reported
+`total_tokens` equals `prompt_tokens`. The embedding input is a versioned,
+canonical semantic-input payload built from the generation request. Because a
+lookup against a paid embeddings deployment consumes tokens and cost even on a
+hit, the lookup carries a typed `EmbeddingAttempt` (priced through the
+authoritative cost catalog) that distinguishes measured usage from a
+possibly-billed attempt with no usage; `RunResult` includes measured embedding
+consumption and reports input/token/cost totals as unavailable when an attempt
+was possibly billed but unmeasured, so a cache hit is never reported as free.
 Production index provisioning, role assignment, cache population, and FastAPI
 lifespan ownership of the Redis and embedding resources remain Slice 11
 responsibilities.

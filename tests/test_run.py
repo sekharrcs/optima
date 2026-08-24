@@ -8,7 +8,7 @@ from pydantic import JsonValue, ValidationError
 
 from optima.context import ContextPreservationEvidence
 from optima.domain.cache import CacheCandidate, CacheCandidateAssessment
-from optima.domain.embedding import EmbeddingUsage
+from optima.domain.embedding import EmbeddingAttempt, EmbeddingUsage
 from optima.domain.evaluation import EvaluationResult
 from optima.domain.execution import (
     CachePolicy,
@@ -920,7 +920,7 @@ def test_completed_run_can_record_measured_contract_failure() -> None:
 
 def completed_semantic_cache_run(
     *,
-    embedding_usage: EmbeddingUsage | None = None,
+    embedding_attempt: EmbeddingAttempt | None = None,
 ) -> RunResult:
     """Build accepted cache reuse with compatible evaluation evidence."""
     request_binding = cache_request_binding()
@@ -972,7 +972,7 @@ def completed_semantic_cache_run(
         similarity=candidate.similarity,
         prior_evaluation=source_evaluation,
         candidate_assessment=assessment,
-        embedding_usage=embedding_usage,
+        embedding_attempt=embedding_attempt,
     )
 
     result = completed_run(
@@ -1045,7 +1045,11 @@ def test_cache_hit_totals_include_priced_embedding_usage() -> None:
         pricing_provenance=provenance,
     )
 
-    result = completed_semantic_cache_run(embedding_usage=usage)
+    result = completed_semantic_cache_run(
+        embedding_attempt=EmbeddingAttempt(
+            invoked=True, outbound_attempted=True, usage=usage
+        )
+    )
 
     assert result.total_input_tokens == 12
     assert result.total_output_tokens == 0
@@ -1065,7 +1069,11 @@ def test_cache_hit_without_embedding_cost_reports_incomplete_cost() -> None:
         latency_ms=3,
     )
 
-    result = completed_semantic_cache_run(embedding_usage=usage)
+    result = completed_semantic_cache_run(
+        embedding_attempt=EmbeddingAttempt(
+            invoked=True, outbound_attempted=True, usage=usage
+        )
+    )
 
     assert result.total_tokens == 12
     assert result.total_calculated_cost is None
@@ -1082,10 +1090,45 @@ def test_cache_hit_without_embedding_tokens_reports_unknown_tokens() -> None:
         latency_ms=3,
     )
 
-    result = completed_semantic_cache_run(embedding_usage=usage)
+    result = completed_semantic_cache_run(
+        embedding_attempt=EmbeddingAttempt(
+            invoked=True, outbound_attempted=True, usage=usage
+        )
+    )
 
     assert result.total_input_tokens is None
     assert result.total_tokens is None
+
+
+def test_indeterminate_embedding_attempt_makes_input_and_cost_unknown() -> None:
+    """A possibly-billed embedding with no measured usage voids input totals."""
+    result = completed_semantic_cache_run(
+        embedding_attempt=EmbeddingAttempt(
+            invoked=True, outbound_attempted=True, usage=None
+        )
+    )
+
+    # Output tokens stay exact because embeddings never produce output tokens.
+    assert result.total_output_tokens == 0
+    assert result.total_input_tokens is None
+    assert result.total_tokens is None
+    assert result.total_calculated_cost is None
+    assert result.total_cost_provenance is None
+
+
+def test_pre_outbound_embedding_failure_keeps_totals_model_only() -> None:
+    """An embedding that never went outbound leaves model-only totals intact."""
+    result = completed_semantic_cache_run(
+        embedding_attempt=EmbeddingAttempt(
+            invoked=True, outbound_attempted=False, usage=None
+        )
+    )
+
+    assert result.total_input_tokens == 0
+    assert result.total_output_tokens == 0
+    assert result.total_tokens == 0
+    assert result.total_calculated_cost is None
+    assert result.total_cost_provenance is None
 
 
 def test_run_rejects_removed_miss_evidence_and_cache_step() -> None:
