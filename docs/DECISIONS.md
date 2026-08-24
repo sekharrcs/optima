@@ -202,3 +202,147 @@ Cosmos authentication is explicit: account key, Azure CLI credential, or
 managed identity. There is no implicit credential chain. One closeable resource
 owner retains the async client and any owned credential for the application
 lifetime. Production lifespan wiring and Cosmos infrastructure remain Slice 11.
+
+## ADR-020: Redis retrieves candidate evidence and Planner V1 decides reuse
+
+Status: Accepted
+
+The Azure Managed Redis semantic-cache adapter performs one read-only vector
+lookup before Planner V1. It returns at most one complete `CacheCandidate` and
+does not apply similarity thresholds, Quality Contract thresholds, exact request
+binding, contract compatibility, or reuse safety. Planner V1 remains the single
+authority for all reuse gates, and the executor consumes the planner-bound
+snapshot without another Redis lookup.
+
+Schema version 1 uses a HASH index with task-type and complexity TAG fields and
+one `FLAT`, `FLOAT32`, `COSINE` vector field. Stored JSON payloads contain the
+complete request binding and prior evaluation. The adapter validates exact
+dimensions, finite nonzero vectors, canonical booleans, supported schema
+version, bounded cosine distance, and complete immutable domain evidence.
+Malformed evidence fails closed into the existing typed lookup-failure path.
+
+Azure Managed Redis uses TLS with hostname verification on port `10000`, RESP2
+raw responses, bounded timeouts and connection count, and zero command retries.
+Authentication is explicitly one of access key, Azure CLI, or managed identity.
+Microsoft Entra modes use the configured identity object ID as the Redis AUTH
+username and request tokens only for `https://redis.azure.com/.default`.
+`DefaultAzureCredential` and credential fallback are prohibited.
+
+One application-lifetime resource owner controls the Redis client, background
+token renewal, and selected Azure Identity credential. Renewal is cancelled
+before transport and credential shutdown. Cache write-back, invalidation,
+population, infrastructure provisioning, role assignment, and production
+lifespan wiring remain outside Slice 10C.
+
+## ADR-021: Enforce embedding-profile identity, embedding cost, and renewal resilience
+
+Status: Accepted
+
+Different embedding models can produce vectors of identical dimension in
+incompatible vector spaces, so dimension equality alone is not truthful evidence
+of comparability. Slice 10C therefore binds every stored and queried vector to a
+strict, versioned embedding profile (`embedding-profile-v1`) whose identity is a
+SHA-256 hash of the embedding model, deployment, and dimension. The identity is
+an injection-safe RediSearch tag: model and deployment tokens are validated
+against a restricted character set. The Redis adapter requires the injected
+provider to declare the configured profile, filters `FT.SEARCH` by schema
+version and embedding profile before KNN, and rejects any stored record whose
+profile differs. Composition fails fast when the provider and index profiles
+disagree. The source `RequestBinding` is still returned unchanged and Planner V1
+remains the sole reuse authority.
+
+The smallest production embedding provider is a Foundry/APIM Azure OpenAI v1
+`/embeddings` adapter that reuses the Slice 10A authentication modes (API key,
+Azure CLI, or managed identity, with no `DefaultAzureCredential` and no
+fallback), issues exactly one non-retried HTTPS request per lookup, and strictly
+validates the response: exactly one embedding at the expected index, exact
+dimension, finite non-boolean values, and non-fabricated usage. Errors expose no
+endpoint, token, prompt, or response body. A deterministic fake provider serves
+offline tests. Production FastAPI lifespan ownership remains Slice 11.
+
+Because a lookup against a paid embeddings deployment consumes tokens and cost
+even on a hit, the lookup returns a dedicated `EmbeddingUsage` (never forced into
+a model role). It is priced through the same authoritative catalog as model
+calls; central pricing stays authoritative and provider-reported monetary cost is
+not accepted. `RunResult` token and cost totals include embedding consumption, so
+a cache hit is never reported as free, and totals return unavailable rather than
+fabricate a value when embedding tokens or pricing are missing. Embedding usage
+is carried through hit, miss, binding-mismatch fallback, and Redis-failure paths;
+a genuine embedding failure records no usage.
+
+Background Microsoft Entra token renewal uses bounded attempts with bounded
+backoff and jitter (both configurable within strict limits). A transient token
+acquisition or reauthentication failure no longer permanently disables renewal;
+renewal stops only when the bound is exhausted, the owner is closing, the failure
+is non-transient, or continued use would pass the safe expiry boundary. Renewal
+never retries a Redis search or an embedding request and never knowingly uses an
+expired token. Endpoint validation additionally rejects control characters,
+whitespace, and other non-hostname input before any network activity. The custom
+`azure-identity` streaming credential provider is retained over `redis-entraid`
+to keep explicit `AzureCliCredential` and `ManagedIdentityCredential` support and
+object-ID `AUTH` username handling under OPTIMA's own typed control.
+
+The truthfulness, provider-identity, semantic-input, and renewal guarantees
+described above are made precise and enforced by ADR-022; where the two ADRs
+overlap, ADR-022 is authoritative.
+
+## ADR-022: Truthful embedding attempts, verified identity, and safe renewal
+
+Status: Accepted
+
+A paid embedding request can leave the caller unable to observe what it
+consumed: the request may reach the provider and be billed, yet fail before
+returning measured usage. Recording "no usage" in that case understates
+consumption. Slice 10C therefore replaces the raw `EmbeddingUsage` carried on
+cache evidence with a typed `EmbeddingAttempt` that records whether the provider
+was invoked, whether an outbound request may have been attempted, and the
+measured usage when available. The embedding provider signals
+`outbound_attempted=False` only when a failure provably occurred before any
+outbound request (for example, authentication acquisition); every failure at or
+after the outbound call is reported as possibly billed. When an attempt was
+possibly billed but returned no measured usage, `RunResult` reports
+`total_input_tokens`, `total_tokens`, and cost as unavailable rather than
+model-only. Output-token totals stay exact because embeddings never produce
+output tokens, and a proven pre-outbound failure keeps model-only totals intact.
+
+Two embedding models can return same-dimension vectors from incompatible spaces,
+so a vector is bound to a profile only when the provider identity is verified.
+The provider requires the embeddings response `model` to be present and equal to
+the configured profile model; a missing, blank, non-string, or mismatched value
+is rejected as an invalid response, and no profile is ever attached to an
+unverified vector. Because embeddings consume input only, reported
+`total_tokens` must equal `prompt_tokens` whenever both are present; a
+disagreement is rejected.
+
+Semantic similarity is defined over a versioned input policy
+(`semantic-input-v1`) whose version is part of the embedding-profile identity.
+A single pure builder produces the embedding input as canonical JSON over the
+generation request (input text and optional context) rather than delimiter
+concatenation, avoiding injection ambiguity; reference output and evaluation
+criteria are excluded because they are evaluation identity captured by the
+authoritative `RequestBinding` that Planner V1 checks. Any external
+cache-population tooling must use the same builder to remain comparable.
+
+Background Microsoft Entra token renewal bounds each token acquisition with an
+explicit timeout, classifies failures so only transient transport, throttling,
+and transient server statuses are retried while authentication and authorization
+failures stop immediately, and publishes a renewed token only after the pool has
+accepted it. A renewal step is scheduled and retried against a conservative safe
+deadline: the whole next-attempt budget — the actual jittered delay plus the
+operation's bounded timeout plus a pre-expiry safety margin — must fit before the
+relevant token expires, so a retry can never begin yet block past the deadline in
+acquisition or reauthentication. The pre-expiry margin defaults to 180 seconds,
+matching Microsoft's guidance to send a renewed `AUTH` token at least three
+minutes before expiry, and reauthentication retries are measured against the
+current (still-serving) token rather than the renewed token, because live
+connections depend on the current token until reauthentication succeeds. The
+first refresh is scheduled at the sooner of a proactive refresh ratio or the last
+moment that still reserves one full acquisition, one full reauthentication, and
+the margin; a short-lived token whose ratio point would already breach that
+reserve is refreshed immediately. Cancellation is preserved during sleeps,
+acquisition, and reauthentication; renewal never retries a Redis search or an
+embedding request, never knowingly uses an expired token, and never exposes token
+or SDK error text. All renewal bounds (attempts, backoff, cap, acquisition
+timeout, reauthentication timeout, and expiry safety margin) are configurable
+within strict limits. This section supersedes any earlier claim that these
+behaviors held before Slice 10C's round-three and round-four corrections.

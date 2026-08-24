@@ -177,8 +177,67 @@ A healthy miss, rejected match, lookup failure, or timeout continues through the
 existing context and model path. Typed runtime evidence distinguishes those
 outcomes. An enabled application without a semantic-cache dependency fails as a
 structural configuration error before model execution. The local in-memory
-implementation is deterministic test and demo infrastructure only; the Redis
-adapter remains Slice 10.
+implementation remains deterministic test and demo infrastructure only.
+
+The Slice 10C Azure Managed Redis adapter is read-only. The injected embedding
+provider returns a vector bound to a strict, versioned embedding profile
+(`embedding-profile-v1`, hashing the embedding model, deployment, and dimension).
+The adapter validates and encodes the vector as a finite, nonzero, little-endian
+`FLOAT32` buffer, requires the returned provider profile to equal the configured
+profile, and sends one bounded `KNN 1` COSINE query against a pre-provisioned
+HASH index filtered by schema version, task type, complexity, and embedding
+profile. It derives the candidate similarity from Redis vector distance, rejects
+any record whose stored embedding profile differs, and strictly reconstructs the
+complete `CacheCandidate`; it does not apply any Planner V1 reuse gate. The
+source `RequestBinding` is returned unchanged.
+
+Redis schema version 1 contains:
+
+* `schema_version`
+* TAG fields `embedding_profile`, `task_type`, and `complexity`
+* the `embedding` VECTOR field, configured as `FLAT`, `FLOAT32`, and `COSINE`
+* `source_run_id` and `output_text`
+* complete `request_binding_json` and `prior_evaluation_json` payloads
+* canonical `contract_compatible` and `safe_to_reuse` booleans
+
+Malformed, unsupported, non-finite, incomplete, or contradictory Redis evidence
+fails the lookup boundary. The existing API maps timeout and failure to typed
+runtime evidence before normal model execution. There is no lookup retry, cache
+write-back, invalidation, or second execution-time lookup.
+
+Azure Managed Redis configuration explicitly selects access key, Azure CLI, or
+managed identity. Microsoft Entra modes carry a separately configured identity
+object ID as the Redis AUTH username; a client ID is used only to select a
+user-assigned managed identity. `DefaultAzureCredential` and implicit credential
+fallback are not used. The client uses TLS with hostname verification on Azure
+Managed Redis port `10000`, RESP2 raw responses, bounded connections and
+timeouts, and zero Redis command retries. Background Microsoft Entra token
+renewal bounds each token acquisition with a timeout, retries only transient
+failures (stopping immediately on authentication or authorization errors), and
+schedules and retries every step against a conservative safe deadline so the
+whole next-attempt budget — actual delay plus the operation timeout plus a
+pre-expiry margin that defaults to Microsoft's recommended three minutes — fits
+before expiry; reauthentication retries are measured against the current
+still-serving token, and a renewed token is published only after the pool accepts
+it, so one transient failure does not permanently disable renewal. One resource
+owner stops renewal before closing the Redis client and selected Azure
+credential.
+
+The production embedding provider is a Foundry/APIM Azure OpenAI v1 `/embeddings`
+adapter that reuses the Slice 10A authentication modes, issues one non-retried
+request per lookup, and strictly validates the response, including verifying that
+the response `model` matches the configured profile and that reported
+`total_tokens` equals `prompt_tokens`. The embedding input is a versioned,
+canonical semantic-input payload built from the generation request. Because a
+lookup against a paid embeddings deployment consumes tokens and cost even on a
+hit, the lookup carries a typed `EmbeddingAttempt` (priced through the
+authoritative cost catalog) that distinguishes measured usage from a
+possibly-billed attempt with no usage; `RunResult` includes measured embedding
+consumption and reports input/token/cost totals as unavailable when an attempt
+was possibly billed but unmeasured, so a cache hit is never reported as free.
+Production index provisioning, role assignment, cache population, and FastAPI
+lifespan ownership of the Redis and embedding resources remain Slice 11
+responsibilities.
 
 ### Run-history persistence boundary
 

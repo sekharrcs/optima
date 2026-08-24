@@ -1,6 +1,7 @@
 """Microsoft Foundry and APIM model-provider adapter."""
 
 import asyncio
+import math
 from collections.abc import Mapping
 from typing import Protocol
 from urllib.parse import urlparse
@@ -8,6 +9,13 @@ from urllib.parse import urlparse
 import httpx
 from azure.core.credentials import TokenCredential
 
+from optima.cache.contracts import (
+    EmbeddingProviderError,
+    EmbeddingProviderResult,
+    EmbeddingProviderTimeout,
+    SemanticCacheLookupRequest,
+)
+from optima.domain.embedding import EmbeddingProfile, build_semantic_input
 from optima.domain.execution import ModelRole
 from optima.domain.run import ModelUsage
 from optima.providers.contracts import (
@@ -170,7 +178,195 @@ class FoundryModelProvider(ModelProvider):
         return ModelProviderResult(output_text=output_text, usage=usage)
 
 
+class FoundryEmbeddingProvider:
+    """Call one Azure OpenAI v1 embeddings deployment for cache lookups."""
+
+    provider_name: str
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        profile: EmbeddingProfile,
+        authentication: FoundryAuthentication,
+        client: httpx.AsyncClient,
+        provider_name: str = FOUNDRY_PROVIDER_NAME,
+    ) -> None:
+        self._base_url = _normalize_base_url(base_url)
+        if not provider_name:
+            raise ValueError("provider_name must not be empty")
+        self._profile = profile
+        self.provider_name = provider_name
+        self._authentication = authentication
+        self._client = client
+
+    @property
+    def profile(self) -> EmbeddingProfile:
+        """Return the embedding profile this provider produces."""
+        return self._profile
+
+    async def embed(
+        self,
+        request: SemanticCacheLookupRequest,
+    ) -> EmbeddingProviderResult:
+        """Execute one non-retried embedding request and map measured facts."""
+        try:
+            headers = await self._authentication.headers()
+        except FoundryProviderError as error:
+            # Authentication is acquired before any outbound embedding request, so
+            # a failure here proves no paid provider request was attempted.
+            raise EmbeddingProviderError(
+                "Foundry embedding authentication failed.",
+                outbound_attempted=False,
+            ) from error
+
+        # From this point an outbound request may reach the paid provider, so every
+        # failure is reported as a possibly-billed attempt.
+        try:
+            response = await self._client.post(
+                f"{self._base_url}/embeddings",
+                headers=headers,
+                json={
+                    "model": self._profile.deployment,
+                    "input": build_semantic_input(
+                        input_text=request.input_text,
+                        context=request.context,
+                    ),
+                },
+            )
+        except httpx.TimeoutException as error:
+            raise EmbeddingProviderTimeout(
+                "Foundry embedding request timed out.",
+            ) from error
+        except httpx.TransportError as error:
+            raise EmbeddingProviderError(
+                "Foundry embedding transport failed.",
+                outbound_attempted=True,
+            ) from error
+
+        if response.is_error:
+            if response.status_code in (408, 504):
+                raise EmbeddingProviderTimeout("Foundry embedding request timed out.")
+            raise _embedding_status_error(response)
+
+        vector, request_id, input_tokens = _parse_embedding_response(
+            response,
+            expected_dimension=self._profile.dimension,
+            expected_model=self._profile.model,
+        )
+        return EmbeddingProviderResult(
+            vector=vector,
+            profile=self._profile,
+            provider=self.provider_name,
+            request_id=request_id,
+            input_tokens=input_tokens,
+        )
+
+
+def _parse_embedding_response(
+    response: httpx.Response,
+    *,
+    expected_dimension: int,
+    expected_model: str,
+) -> tuple[tuple[float, ...], str | None, int | None]:
+    try:
+        body = response.json()
+    except ValueError as error:
+        raise _invalid_embedding_response() from error
+    if not isinstance(body, dict):
+        raise _invalid_embedding_response()
+
+    # Fail closed unless the provider identity in the response matches the profile
+    # the vector will be persisted under; never attach an unverified profile.
+    model = body.get("model")
+    if not isinstance(model, str) or not model.strip() or model != expected_model:
+        raise _invalid_embedding_response()
+
+    data = body.get("data")
+    if not isinstance(data, list) or len(data) != 1:
+        raise _invalid_embedding_response()
+    element = data[0]
+    if not isinstance(element, dict):
+        raise _invalid_embedding_response()
+    index = element.get("index")
+    if type(index) is not int or index != 0:
+        raise _invalid_embedding_response()
+    raw_vector = element.get("embedding")
+    if not isinstance(raw_vector, list) or len(raw_vector) != expected_dimension:
+        raise _invalid_embedding_response()
+    vector: list[float] = []
+    for value in raw_vector:
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            raise _invalid_embedding_response()
+        number = float(value)
+        if not math.isfinite(number):
+            raise _invalid_embedding_response()
+        vector.append(number)
+
+    # The request-correlation id is optional; an embedding id is not a request id.
+    request_id = next(
+        (
+            value
+            for header in ("apim-request-id", "x-ms-request-id", "x-request-id")
+            if (value := response.headers.get(header))
+        ),
+        None,
+    )
+    return tuple(vector), request_id, _parse_embedding_input_tokens(body.get("usage"))
+
+
+def _parse_embedding_input_tokens(usage: object) -> int | None:
+    if usage is None:
+        return None
+    if not isinstance(usage, dict):
+        raise _invalid_embedding_response()
+    prompt_tokens = _embedding_usage_count(usage.get("prompt_tokens"))
+    total_tokens = _embedding_usage_count(usage.get("total_tokens"))
+    # Embeddings consume input only, so an OpenAI-compatible response must report
+    # total_tokens equal to prompt_tokens whenever both are present.
+    if (
+        prompt_tokens is not None
+        and total_tokens is not None
+        and total_tokens != prompt_tokens
+    ):
+        raise _invalid_embedding_response()
+    if prompt_tokens is None:
+        return None
+    return prompt_tokens
+
+
+def _embedding_usage_count(value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or type(value) is not int or value < 0:
+        raise _invalid_embedding_response()
+    return value
+
+
+def _embedding_status_error(response: httpx.Response) -> EmbeddingProviderError:
+    return EmbeddingProviderError(
+        "Foundry rejected the embedding request.",
+        outbound_attempted=True,
+    )
+
+
+def _invalid_embedding_response() -> "EmbeddingProviderError":
+    return EmbeddingProviderError(
+        "Foundry returned an invalid embedding response.",
+        outbound_attempted=True,
+    )
+
+
 def _normalize_base_url(base_url: str) -> str:
+    # Reject control characters and whitespace before parsing so a crafted
+    # endpoint cannot smuggle newlines into request lines or hide an authority.
+    if any(
+        character.isspace() or _is_forbidden_url_control(character)
+        for character in base_url
+    ):
+        raise ValueError(
+            "Foundry base URL must not contain control characters or whitespace"
+        )
     normalized = base_url.rstrip("/")
     parsed = urlparse(normalized)
     if (
@@ -187,6 +383,12 @@ def _normalize_base_url(base_url: str) -> str:
             "Foundry base URL must be an absolute HTTPS /openai/v1 API root"
         )
     return normalized
+
+
+def _is_forbidden_url_control(character: str) -> bool:
+    """Return whether a character is a C0/C1 control or DEL code point."""
+    code_point = ord(character)
+    return code_point < 0x20 or 0x7F <= code_point <= 0x9F
 
 
 def _messages(request: ModelProviderRequest) -> list[dict[str, str]]:

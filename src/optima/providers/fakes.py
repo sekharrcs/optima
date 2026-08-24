@@ -1,10 +1,16 @@
 """Deterministic fake model providers for local tests and development."""
 
+import hashlib
 from decimal import Decimal
 from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from optima.cache.contracts import (
+    EmbeddingProviderResult,
+    SemanticCacheLookupRequest,
+)
+from optima.domain.embedding import EmbeddingProfile
 from optima.domain.execution import ModelRole
 from optima.domain.run import ModelUsage, PricingProvenance
 from optima.providers.contracts import (
@@ -149,3 +155,63 @@ def build_fake_strong_provider(
         responses=responses,
         clock=clock,
     )
+
+
+class FakeEmbeddingProvider:
+    """Deterministic embedding provider for offline tests and local demos."""
+
+    provider_name: str
+
+    def __init__(
+        self,
+        *,
+        profile: EmbeddingProfile,
+        provider_name: str = "fake-embedding",
+        input_tokens: int | None = None,
+        request_id: str | None = None,
+    ) -> None:
+        self._profile = profile
+        self.provider_name = provider_name
+        self._input_tokens = input_tokens
+        self._request_id = request_id
+        self._calls: list[SemanticCacheLookupRequest] = []
+
+    @property
+    def profile(self) -> EmbeddingProfile:
+        """Return the embedding profile this provider produces."""
+        return self._profile
+
+    @property
+    def calls(self) -> tuple[SemanticCacheLookupRequest, ...]:
+        """Return immutable snapshots of embedded requests received so far."""
+        return tuple(self._calls)
+
+    async def embed(
+        self,
+        request: SemanticCacheLookupRequest,
+    ) -> EmbeddingProviderResult:
+        """Return a deterministic finite non-zero vector for the request text."""
+        self._calls.append(request)
+        return EmbeddingProviderResult(
+            vector=_deterministic_vector(request.input_text, self._profile.dimension),
+            profile=self._profile,
+            provider=self.provider_name,
+            request_id=self._request_id,
+            input_tokens=self._input_tokens,
+        )
+
+
+def _deterministic_vector(text: str, dimension: int) -> tuple[float, ...]:
+    """Derive one stable finite non-zero vector from the input text."""
+    values: list[float] = []
+    counter = 0
+    while len(values) < dimension:
+        digest = hashlib.sha256(f"{counter}:{text}".encode()).digest()
+        for byte in digest:
+            values.append(byte / 255.0 * 2.0 - 1.0)
+            if len(values) == dimension:
+                break
+        counter += 1
+    if not any(values):
+        values[0] = 1.0
+    return tuple(values)

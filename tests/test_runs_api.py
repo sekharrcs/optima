@@ -12,7 +12,12 @@ from pydantic import ValidationError
 from optima.api.app import create_app
 from optima.api.dependencies import ExecutionDependencies
 from optima.api.models import RunRequest
-from optima.cache import FakeSemanticCache, SemanticCache, SemanticCacheLookupRequest
+from optima.cache import (
+    FakeSemanticCache,
+    SemanticCache,
+    SemanticCacheLookupRequest,
+    SemanticCacheLookupResult,
+)
 from optima.config import AppSettings
 from optima.context import (
     ContextPreservationEvidence,
@@ -24,6 +29,7 @@ from optima.context import (
 from optima.context.safety import DeterministicExtractiveSafetyPolicy
 from optima.cost import CostCalculator, PriceCatalog, PriceCatalogEntry
 from optima.domain.cache import CacheCandidate
+from optima.domain.embedding import EmbeddingAttempt, EmbeddingUsage
 from optima.domain.evaluation import EvaluationResult
 from optima.domain.execution import (
     ExecutionEventCode,
@@ -64,8 +70,11 @@ class UncheckedSemanticCache:
     async def lookup(
         self,
         request: SemanticCacheLookupRequest,
-    ) -> CacheCandidate | None:
-        return self._candidate
+    ) -> SemanticCacheLookupResult:
+        return SemanticCacheLookupResult.model_construct(
+            candidate=self._candidate,
+            embedding_attempt=None,
+        )
 
 
 class SubstitutingCacheCandidate(CacheCandidate):
@@ -1303,6 +1312,67 @@ def test_invalid_cache_provider_value_fails_closed_to_model_execution() -> None:
     assert body["semantic_cache"]["source_run_id"] is None
     assert len(small.calls) == 1
     assert len(evaluator.calls) == 1
+
+
+def test_run_endpoint_cache_hit_reports_priced_embedding_usage() -> None:
+    """A cache hit must report the paid embedding tokens and cost truthfully."""
+    configured, small, _, evaluator = dependencies(0.93)
+    payload = request_payload(request_profile=cache_eligible_profile())
+    candidate = cache_candidate(source_payload=payload)
+    usage = EmbeddingUsage(
+        run_id="run-api-1",
+        provider="fake-embed",
+        deployment="optima-embed",
+        embedding_profile="profile-hash",
+        input_tokens=8,
+        latency_ms=1,
+    )
+    cache = FakeSemanticCache(
+        (
+            SemanticCacheLookupResult(
+                candidate=candidate,
+                embedding_attempt=EmbeddingAttempt(
+                    invoked=True, outbound_attempted=True, usage=usage
+                ),
+            ),
+        )
+    )
+    calculator = CostCalculator(
+        PriceCatalog(
+            version="api-test-v1",
+            currency="TEST",
+            entries=(
+                PriceCatalogEntry(
+                    provider="fake-embed",
+                    deployment="optima-embed",
+                    input_rate_per_million_tokens=Decimal("100"),
+                    output_rate_per_million_tokens=Decimal("0"),
+                ),
+            ),
+        )
+    )
+    configured = replace(
+        with_semantic_cache(configured, cache),
+        cost_calculator=calculator,
+    )
+
+    response = TestClient(create_app(execution_dependencies=configured)).post(
+        "/api/v1/runs",
+        json=payload,
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["semantic_cache"]["outcome"] == "REUSED"
+    embedding = body["semantic_cache"]["embedding_attempt"]["usage"]
+    assert body["semantic_cache"]["embedding_attempt"]["outbound_attempted"] is True
+    assert embedding["input_tokens"] == 8
+    assert Decimal(embedding["calculated_cost"]) == Decimal("0.0008")
+    assert body["model_usages"] == []
+    assert body["total_tokens"] == 8
+    assert Decimal(body["total_calculated_cost"]) == Decimal("0.0008")
+    assert len(small.calls) == 0
+    assert len(evaluator.calls) == 0
 
 
 def test_fake_cache_does_not_invoke_candidate_controlled_detachment() -> None:

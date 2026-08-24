@@ -8,6 +8,7 @@ from optima.providers.contracts import (
     MonotonicClock,
 )
 from optima.providers.fakes import (
+    FakeEmbeddingProvider,
     FakeModelProvider,
     FakeProviderResponse,
     build_fake_small_provider,
@@ -18,17 +19,20 @@ from optima.providers.foundry import (
     ApiKeyAuthentication,
     EntraTokenAuthentication,
     FoundryAuthentication,
+    FoundryEmbeddingProvider,
     FoundryModelProvider,
     FoundryProviderError,
 )
 
 __all__ = [
+    "FakeEmbeddingProvider",
     "FakeModelProvider",
     "FakeProviderResponse",
     "FOUNDRY_PROVIDER_NAME",
     "ApiKeyAuthentication",
     "EntraTokenAuthentication",
     "FoundryAuthentication",
+    "FoundryEmbeddingProvider",
     "FoundryModelProvider",
     "FoundryProviderError",
     "ModelProvider",

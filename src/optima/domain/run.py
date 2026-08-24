@@ -7,6 +7,7 @@ from typing import Annotated
 
 from pydantic import Field, computed_field, model_validator
 
+from optima.domain.embedding import EmbeddingAttempt, EmbeddingUsage
 from optima.domain.evaluation import EvaluationResult
 from optima.domain.execution import (
     CachePolicy,
@@ -24,6 +25,7 @@ from optima.domain.execution import (
     SemanticCacheOutcome,
     validate_semantic_cache_binding,
 )
+from optima.domain.pricing import PricingProvenance as PricingProvenance
 from optima.domain.quality_contract import QualityContract
 from optima.domain.request_binding import RequestBinding
 from optima.domain.request_profile import RequestProfile
@@ -43,13 +45,6 @@ class RunStatus(StrEnum):
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     TIMED_OUT = "TIMED_OUT"
-
-
-class PricingProvenance(ImmutableModel):
-    """Catalog identity governing one authoritative calculated cost."""
-
-    catalog_version: NonEmptyString
-    currency: NonEmptyString
 
 
 class ModelUsage(ImmutableModel):
@@ -116,21 +111,56 @@ class RunResult(ImmutableModel):
     latency_ms: NonNegativeCount
     error: NonEmptyString | None = None
 
+    def _embedding_attempt(self) -> EmbeddingAttempt | None:
+        """Return the embedding attempt evidence recorded for the cache lookup."""
+        if self.semantic_cache is None:
+            return None
+        return self.semantic_cache.embedding_attempt
+
+    def _embedding_usage(self) -> EmbeddingUsage | None:
+        """Return the embedding usage consumed while resolving the cache lookup."""
+        attempt = self._embedding_attempt()
+        if attempt is None:
+            return None
+        return attempt.usage
+
+    def _embedding_consumption_indeterminate(self) -> bool:
+        """Return whether a possibly paid embedding left consumption unmeasured."""
+        attempt = self._embedding_attempt()
+        return attempt is not None and attempt.consumption_indeterminate
+
     @computed_field  # type: ignore[prop-decorator]
     @property
     def total_input_tokens(self) -> int | None:
-        """Return exact input tokens only when every attempted call has usage."""
+        """Return exact input tokens only when every consumed call reports them.
+
+        An embedding attempt that reached the provider without returning measured
+        usage makes the input-token total indeterminate rather than model-only.
+        """
+        if self._embedding_consumption_indeterminate():
+            return None
         usages = self._complete_model_usages()
         if usages is None or any(usage.input_tokens is None for usage in usages):
             return None
-        return sum(
+        total = sum(
             usage.input_tokens for usage in usages if usage.input_tokens is not None
         )
+        embedding = self._embedding_usage()
+        if embedding is None:
+            return total
+        if embedding.input_tokens is None:
+            return None
+        return total + embedding.input_tokens
 
     @computed_field  # type: ignore[prop-decorator]
     @property
     def total_output_tokens(self) -> int | None:
-        """Return exact output tokens only when every attempted call has usage."""
+        """Return exact output tokens; embedding requests emit no output tokens.
+
+        Output totals stay exact even when an embedding attempt is indeterminate:
+        embeddings never produce output tokens, so an unmeasured embedding cannot
+        change this total.
+        """
         usages = self._complete_model_usages()
         if usages is None or any(usage.output_tokens is None for usage in usages):
             return None
@@ -141,7 +171,13 @@ class RunResult(ImmutableModel):
     @computed_field  # type: ignore[prop-decorator]
     @property
     def total_tokens(self) -> int | None:
-        """Return reported or exactly derivable totals for every attempted call."""
+        """Return complete run tokens including any embedding-lookup consumption.
+
+        An embedding attempt that reached the provider without returning measured
+        usage makes the combined total indeterminate rather than model-only.
+        """
+        if self._embedding_consumption_indeterminate():
+            return None
         usages = self._complete_model_usages()
         if usages is None:
             return None
@@ -153,37 +189,64 @@ class RunResult(ImmutableModel):
                 total += usage.input_tokens + usage.output_tokens
             else:
                 return None
-        return total
+        embedding = self._embedding_usage()
+        if embedding is None:
+            return total
+        if embedding.input_tokens is None:
+            return None
+        return total + embedding.input_tokens
 
     @computed_field  # type: ignore[prop-decorator]
     @property
     def total_calculated_cost(self) -> Decimal | None:
-        """Sum exact Decimal costs only when every attempted cost is available."""
+        """Sum exact Decimal costs across model and embedding consumption.
+
+        An embedding attempt that reached the provider without returning measured
+        usage makes the run cost indeterminate rather than model-only.
+        """
+        if self._embedding_consumption_indeterminate():
+            return None
         usages = self._complete_model_usages()
-        if usages is None or not usages:
+        if usages is None:
             return None
         total = Decimal("0")
+        priced_any = False
         for usage in usages:
             if usage.calculated_cost is None:
                 return None
             total += usage.calculated_cost
+            priced_any = True
+        embedding = self._embedding_usage()
+        if embedding is not None:
+            if embedding.calculated_cost is None:
+                return None
+            total += embedding.calculated_cost
+            priced_any = True
+        if not priced_any:
+            return None
         return total
 
     @computed_field  # type: ignore[prop-decorator]
     @property
     def total_cost_provenance(self) -> PricingProvenance | None:
-        """Return provenance only for one complete compatible run total."""
+        """Return provenance only for one complete, single-provenance run total."""
+        if self.total_calculated_cost is None:
+            return None
         usages = self._complete_model_usages()
-        if usages is None or not usages:
+        if usages is None:
             return None
-        provenance = usages[0].pricing_provenance
-        if provenance is None:
-            return None
-        if any(
-            usage.calculated_cost is None or usage.pricing_provenance != provenance
-            for usage in usages
-        ):
-            return None
+        provenance: PricingProvenance | None = None
+        for usage in usages:
+            if provenance is None:
+                provenance = usage.pricing_provenance
+            elif usage.pricing_provenance != provenance:
+                return None
+        embedding = self._embedding_usage()
+        if embedding is not None:
+            if provenance is None:
+                provenance = embedding.pricing_provenance
+            elif embedding.pricing_provenance != provenance:
+                return None
         return provenance
 
     @model_validator(mode="after")
@@ -275,6 +338,19 @@ class RunResult(ImmutableModel):
             for usage in self.model_usages
             if usage.pricing_provenance is not None
         }
+        embedding_usage = self._embedding_usage()
+        if embedding_usage is not None and embedding_usage.run_id != self.run_id:
+            raise ValueError("embedding usage must belong to this run")
+        if (
+            embedding_usage is not None
+            and embedding_usage.pricing_provenance is not None
+        ):
+            cost_provenances.add(
+                (
+                    embedding_usage.pricing_provenance.catalog_version,
+                    embedding_usage.pricing_provenance.currency,
+                )
+            )
         if len(cost_provenances) > 1:
             raise ValueError(
                 "all calculated costs in one run must use compatible provenance"

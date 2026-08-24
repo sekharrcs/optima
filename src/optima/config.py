@@ -1,5 +1,6 @@
 """Typed application settings for OPTIMA capabilities and thresholds."""
 
+import re
 from enum import StrEnum
 from typing import Annotated
 from urllib.parse import urlparse
@@ -7,6 +8,7 @@ from urllib.parse import urlparse
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from optima.domain.embedding import EmbeddingProfile, EmbeddingProfileToken
 from optima.domain.quality_contract import QualityThresholds
 from optima.immutable import ImmutableModel
 from optima.planner.models import ModuleConfiguration, PlannerThresholds
@@ -19,9 +21,15 @@ PositiveInteger = Annotated[int, Field(gt=0)]
 PositiveSeconds = Annotated[float, Field(gt=0, allow_inf_nan=False)]
 BoundedHistoryLimit = Annotated[int, Field(gt=0, le=100)]
 BoundedRetryCount = Annotated[int, Field(gt=0, le=10)]
+BoundedEmbeddingDimension = Annotated[int, Field(gt=0, le=32_768)]
+BoundedRedisConnections = Annotated[int, Field(gt=0, le=100)]
 BoundedTimeoutSeconds = Annotated[
     float,
     Field(gt=0, le=120, allow_inf_nan=False),
+]
+BoundedSafetyMarginSeconds = Annotated[
+    float,
+    Field(ge=0, le=1800, allow_inf_nan=False),
 ]
 NonEmptyString = Annotated[str, Field(strict=True, min_length=1)]
 
@@ -40,6 +48,87 @@ class CosmosAuthMode(StrEnum):
     ACCOUNT_KEY = "ACCOUNT_KEY"
     AZURE_CLI = "AZURE_CLI"
     MANAGED_IDENTITY = "MANAGED_IDENTITY"
+
+
+class RedisAuthMode(StrEnum):
+    """Explicit authentication source for Azure Managed Redis."""
+
+    ACCESS_KEY = "ACCESS_KEY"
+    AZURE_CLI = "AZURE_CLI"
+    MANAGED_IDENTITY = "MANAGED_IDENTITY"
+
+
+class RedisSemanticCacheConfiguration(ImmutableModel):
+    """Complete settings for one application-lifetime Redis cache client."""
+
+    host: NonEmptyString
+    index_name: NonEmptyString
+    embedding_dimension: BoundedEmbeddingDimension
+    embedding_model: EmbeddingProfileToken
+    embedding_deployment: EmbeddingProfileToken
+    auth_mode: RedisAuthMode
+    access_key: SecretStr | None = None
+    object_id: NonEmptyString | None = None
+    managed_identity_client_id: NonEmptyString | None = None
+    timeout_seconds: BoundedTimeoutSeconds = 1.0
+    max_connections: BoundedRedisConnections = 10
+    token_renewal_attempts: BoundedRetryCount = 3
+    token_retry_backoff_seconds: BoundedTimeoutSeconds = 0.5
+    token_retry_backoff_cap_seconds: BoundedTimeoutSeconds = 5.0
+    token_acquisition_timeout_seconds: BoundedTimeoutSeconds = 10.0
+    token_reauth_timeout_seconds: BoundedTimeoutSeconds = 10.0
+    token_expiry_safety_margin_seconds: BoundedSafetyMarginSeconds = 180.0
+
+    def embedding_profile(self) -> EmbeddingProfile:
+        """Build the versioned embedding profile bound to this cache index."""
+        return EmbeddingProfile(
+            model=self.embedding_model,
+            deployment=self.embedding_deployment,
+            dimension=self.embedding_dimension,
+        )
+
+    @model_validator(mode="after")
+    def validate_configuration(self) -> "RedisSemanticCacheConfiguration":
+        """Require one Azure endpoint and exactly one explicit auth mode."""
+        if (
+            re.fullmatch(
+                r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+                r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*",
+                self.host,
+            )
+            is None
+            or ".." in self.host
+            or not self.host.endswith(".redis.azure.net")
+        ):
+            raise ValueError(
+                "Redis host must be a lowercase Azure Managed Redis hostname"
+            )
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9:._-]{0,127}", self.index_name) is None:
+            raise ValueError("Redis index name contains unsupported characters")
+
+        if self.auth_mode is RedisAuthMode.ACCESS_KEY:
+            if self.access_key is None or not self.access_key.get_secret_value():
+                raise ValueError("ACCESS_KEY mode requires redis_access_key")
+            if self.object_id is not None:
+                raise ValueError("ACCESS_KEY mode cannot configure redis_object_id")
+            if self.managed_identity_client_id is not None:
+                raise ValueError(
+                    "ACCESS_KEY mode cannot configure a managed identity client ID"
+                )
+            return self
+
+        if self.access_key is not None:
+            raise ValueError("Microsoft Entra modes cannot configure redis_access_key")
+        if self.object_id is None:
+            raise ValueError("Microsoft Entra modes require redis_object_id")
+        if (
+            self.auth_mode is RedisAuthMode.AZURE_CLI
+            and self.managed_identity_client_id is not None
+        ):
+            raise ValueError(
+                "AZURE_CLI mode cannot configure a managed identity client ID"
+            )
+        return self
 
 
 class CosmosRunHistoryConfiguration(ImmutableModel):
@@ -188,6 +277,23 @@ class AppSettings(BaseSettings):
     cosmos_history_list_limit: BoundedHistoryLimit = 50
     cosmos_timeout_seconds: BoundedTimeoutSeconds = 10.0
     cosmos_retry_total: BoundedRetryCount = 3
+    redis_host: str | None = None
+    redis_index_name: str | None = None
+    redis_embedding_dimension: int | None = None
+    redis_embedding_model: str | None = None
+    redis_embedding_deployment: str | None = None
+    redis_auth_mode: RedisAuthMode | None = None
+    redis_access_key: SecretStr | None = None
+    redis_object_id: str | None = None
+    redis_managed_identity_client_id: str | None = None
+    redis_timeout_seconds: BoundedTimeoutSeconds = 1.0
+    redis_max_connections: BoundedRedisConnections = 10
+    redis_token_renewal_attempts: BoundedRetryCount = 3
+    redis_token_retry_backoff_seconds: BoundedTimeoutSeconds = 0.5
+    redis_token_retry_backoff_cap_seconds: BoundedTimeoutSeconds = 5.0
+    redis_token_acquisition_timeout_seconds: BoundedTimeoutSeconds = 10.0
+    redis_token_reauth_timeout_seconds: BoundedTimeoutSeconds = 10.0
+    redis_token_expiry_safety_margin_seconds: BoundedSafetyMarginSeconds = 180.0
 
     @model_validator(mode="after")
     def validate_quality_threshold_order(self) -> "AppSettings":
@@ -196,6 +302,7 @@ class AppSettings(BaseSettings):
         self.planner_thresholds()
         self.foundry_provider_configuration()
         self.cosmos_run_history_configuration()
+        self.redis_semantic_cache_configuration()
         return self
 
     def quality_thresholds(self) -> QualityThresholds:
@@ -295,4 +402,59 @@ class AppSettings(BaseSettings):
             history_list_limit=self.cosmos_history_list_limit,
             timeout_seconds=self.cosmos_timeout_seconds,
             retry_total=self.cosmos_retry_total,
+        )
+
+    def redis_semantic_cache_configuration(
+        self,
+    ) -> RedisSemanticCacheConfiguration | None:
+        """Build cache settings only when Azure Managed Redis is requested."""
+        optional_values = (
+            self.redis_host,
+            self.redis_index_name,
+            self.redis_embedding_dimension,
+            self.redis_embedding_model,
+            self.redis_embedding_deployment,
+            self.redis_auth_mode,
+            self.redis_access_key,
+            self.redis_object_id,
+            self.redis_managed_identity_client_id,
+        )
+        if all(value is None for value in optional_values):
+            return None
+        if (
+            self.redis_host is None
+            or self.redis_index_name is None
+            or self.redis_embedding_dimension is None
+            or self.redis_embedding_model is None
+            or self.redis_embedding_deployment is None
+            or self.redis_auth_mode is None
+        ):
+            raise ValueError(
+                "Redis semantic cache requires host, index, embedding dimension, "
+                "embedding model, embedding deployment, and auth mode"
+            )
+        return RedisSemanticCacheConfiguration(
+            host=self.redis_host,
+            index_name=self.redis_index_name,
+            embedding_dimension=self.redis_embedding_dimension,
+            embedding_model=self.redis_embedding_model,
+            embedding_deployment=self.redis_embedding_deployment,
+            auth_mode=self.redis_auth_mode,
+            access_key=self.redis_access_key,
+            object_id=self.redis_object_id,
+            managed_identity_client_id=self.redis_managed_identity_client_id,
+            timeout_seconds=self.redis_timeout_seconds,
+            max_connections=self.redis_max_connections,
+            token_renewal_attempts=self.redis_token_renewal_attempts,
+            token_retry_backoff_seconds=self.redis_token_retry_backoff_seconds,
+            token_retry_backoff_cap_seconds=(
+                self.redis_token_retry_backoff_cap_seconds
+            ),
+            token_acquisition_timeout_seconds=(
+                self.redis_token_acquisition_timeout_seconds
+            ),
+            token_reauth_timeout_seconds=self.redis_token_reauth_timeout_seconds,
+            token_expiry_safety_margin_seconds=(
+                self.redis_token_expiry_safety_margin_seconds
+            ),
         )

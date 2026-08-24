@@ -253,6 +253,142 @@ contract.
 No live Cosmos account is exercised by the default test suite. The adapter's
 SDK calls, error mapping, and lifecycle are validated with offline fakes.
 
+## Azure Managed Redis semantic-cache configuration
+
+Slice 10C adds a read-only Azure Managed Redis implementation of the existing
+semantic-cache lookup contract. Azure Managed Redis must be provisioned with
+RediSearch, Enterprise clustering, and `NoEviction`. The adapter connects over
+TLS on port `10000`, verifies the server hostname, uses RESP2 for a stable raw
+`FT.SEARCH` response, and performs no Redis command retries.
+
+Provision a HASH index before starting the configured API. Replace the vector
+dimension with the exact output dimension of the injected embedding provider:
+
+```text
+FT.CREATE optima-cache-v1 ON HASH PREFIX 1 optima:semantic-cache: SCHEMA schema_version TAG embedding_profile TAG task_type TAG complexity TAG embedding VECTOR FLAT 6 TYPE FLOAT32 DIM <embedding-dimension> DISTANCE_METRIC COSINE
+```
+
+Each indexed hash uses schema version `1` and contains these fields:
+
+* `schema_version`, with the value `1`
+* `embedding_profile`, the SHA-256 identity of the embedding model, deployment,
+  and dimension (see below)
+* `task_type` and `complexity`, using the domain enum values
+* `embedding`, encoded as a finite, nonzero, little-endian `FLOAT32` vector
+* `source_run_id` and `output_text`
+* `request_binding_json`, containing a complete serialized `RequestBinding`
+* `prior_evaluation_json`, containing a complete serialized `EvaluationResult`
+* `contract_compatible` and `safe_to_reuse`, each encoded as `true` or `false`
+
+The adapter runs one `KNN 1` COSINE query filtered by schema version, task type,
+complexity, and embedding profile, derives similarity as
+`max(0, 1 - vector_distance)` (the cosine similarity clamped into the domain
+`[0, 1]` range, so a negative cosine similarity maps to `0`), and strictly
+validates all returned evidence. It does not compare the Planner V1 similarity
+threshold, current Quality Contract threshold, request binding, compatibility,
+or safety. Planner V1 remains authoritative for those gates. Cache population,
+invalidation, and write-back remain outside Slice 10C.
+
+Stored and query vectors are bound to a strict, versioned embedding profile
+(`embedding-profile-v1`) that hashes the embedding model, deployment, and
+dimension into an injection-safe `embedding_profile` tag. The adapter requires
+the injected provider to declare that exact profile, filters retrieval by it,
+and rejects any stored record whose profile differs — so vectors from a
+different model or dimension are never compared as if they were compatible.
+Composition also fails fast when the provider profile and the Redis index
+profile disagree. The injected embedding provider receives a versioned,
+canonical semantic-input payload derived from the request input text and
+optional context to produce the query vector, so that boundary must satisfy the
+deployment's privacy requirements.
+
+Configure the endpoint, existing index, embedding profile, and bounded client
+settings:
+
+```powershell
+$env:OPTIMA_REDIS_HOST="<name>.<region>.redis.azure.net"
+$env:OPTIMA_REDIS_INDEX_NAME="optima-cache-v1"
+$env:OPTIMA_REDIS_EMBEDDING_DIMENSION="1536"
+$env:OPTIMA_REDIS_EMBEDDING_MODEL="text-embedding-3-small"
+$env:OPTIMA_REDIS_EMBEDDING_DEPLOYMENT="<embeddings-deployment-name>"
+$env:OPTIMA_REDIS_TIMEOUT_SECONDS="1"
+$env:OPTIMA_REDIS_MAX_CONNECTIONS="10"
+```
+
+Choose exactly one authentication mode. Access-key mode keeps the key in
+untracked secret configuration:
+
+```powershell
+$env:OPTIMA_REDIS_AUTH_MODE="ACCESS_KEY"
+$env:OPTIMA_REDIS_ACCESS_KEY="<access-key>"
+```
+
+Azure CLI mode uses only the signed-in Azure CLI identity. Redis AUTH requires
+that identity's object ID, not an application or managed-identity client ID:
+
+```powershell
+az login
+$env:OPTIMA_REDIS_AUTH_MODE="AZURE_CLI"
+$env:OPTIMA_REDIS_OBJECT_ID="<signed-in-identity-object-id>"
+```
+
+Managed-identity mode also requires the identity principal's object ID. Set the
+client ID only when selecting a user-assigned identity:
+
+```powershell
+$env:OPTIMA_REDIS_AUTH_MODE="MANAGED_IDENTITY"
+$env:OPTIMA_REDIS_OBJECT_ID="<managed-identity-object-id>"
+$env:OPTIMA_REDIS_MANAGED_IDENTITY_CLIENT_ID="<user-assigned-client-id>"
+```
+
+`build_redis_semantic_cache_resources(AppSettings(), embedding_provider)`
+creates one application-lifetime client and only the selected credential. Inject
+its `cache` into `ExecutionDependencies`, retain the returned resources, and call
+`RedisSemanticCacheResources.aclose()` during application shutdown. The resource
+owner renews Microsoft Entra tokens with a bounded acquisition timeout and
+bounded retries that apply only to transient failures — authentication and
+authorization errors stop renewal immediately, every scheduled refresh and retry
+must fit its full next-attempt budget (delay plus operation timeout plus a
+pre-expiry margin defaulting to Microsoft's recommended three minutes) before the
+relevant token expires, reauthentication retries are measured against the current
+still-serving token, and a renewed token is published only after the pool accepts
+it — and stops renewal before closing Redis and Azure Identity. The default API
+and deterministic demo do not call this builder or probe Azure credentials.
+
+`build_foundry_embedding_provider(AppSettings())` composes the production
+embedding provider from the Slice 10A Foundry base URL and authentication mode
+(API key, Azure CLI, or managed identity — never `DefaultAzureCredential` and
+never a fallback) plus the Redis embedding profile. It calls one Azure OpenAI v1
+`/embeddings` request per lookup with no retry, strictly validates the response
+(exactly one embedding at the expected index, exact dimension, finite non-boolean
+values, a `model` that matches the configured profile, `total_tokens` equal to
+`prompt_tokens`, and non-fabricated usage), and never leaks the endpoint, token,
+prompt, or response body. A deterministic `FakeEmbeddingProvider` serves offline
+tests. Production FastAPI lifespan ownership of these resources remains Slice 11.
+
+A cache lookup against a paid embeddings deployment consumes input tokens and
+cost even when it produces a hit, and a failed request may already have been
+billed. The lookup therefore carries a typed `EmbeddingAttempt` — recording
+whether the provider was invoked, whether an outbound request may have been
+attempted, and any measured usage priced through the same authoritative cost
+catalog as model calls. `RunResult.total_input_tokens`, `total_tokens`, and
+`total_calculated_cost` include measured embedding consumption and become `None`
+when an attempt was possibly billed but returned no usage; a failure proven to
+occur before any outbound request leaves model-only totals intact. Output-token
+totals stay exact because embeddings produce no output tokens. A cache hit is
+never reported as free when an embedding request was made.
+
+This project deliberately implements the streaming credential provider directly
+on `azure-identity` rather than adopting `redis-entraid`. The direct
+implementation supports explicit `AzureCliCredential` and
+`ManagedIdentityCredential` modes consistent with the Foundry and Cosmos slices,
+uses the configured identity object ID as the Redis `AUTH` username, and keeps
+token acquisition, renewal bounds, and failure reporting under OPTIMA's own
+typed control without a `DefaultAzureCredential` chain.
+
+No live Redis resource is exercised by the default test suite. Lookup parsing,
+query construction, embedding-profile enforcement, authentication selection,
+token renewal, client options, and lifecycle are validated with offline fakes.
+
 On Windows ARM64, use an x64 Python 3.12 interpreter for Streamlit because its
 Pandas and PyArrow dependencies may not have Windows ARM64 wheels in the
 configured package feed.

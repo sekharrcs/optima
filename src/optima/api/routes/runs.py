@@ -8,7 +8,9 @@ from optima.api.dependencies import ExecutionDependencies
 from optima.api.models import ApiError, RunRequest
 from optima.cache import SemanticCacheLookupRequest
 from optima.context.safety import ContextReducerSafetyRequest
+from optima.cost import CostCalculator
 from optima.domain.cache import CacheCandidate
+from optima.domain.embedding import EmbeddingAttempt
 from optima.domain.execution import (
     CachePolicy,
     ExecutionPlan,
@@ -45,6 +47,31 @@ HistoryLimit = Annotated[int | None, Query(ge=1, le=100)]
 
 RUN_HISTORY_OUTCOME_HEADER = "X-OPTIMA-Run-History"
 RUN_HISTORY_ERROR_HEADER = "X-OPTIMA-Run-History-Error"
+
+
+def _extract_embedding_attempt(error: BaseException) -> EmbeddingAttempt | None:
+    """Recover the embedding attempt a cache failure carried, if any."""
+    attempt = getattr(error, "embedding_attempt", None)
+    return attempt if isinstance(attempt, EmbeddingAttempt) else None
+
+
+def _price_embedding_attempt(
+    attempt: EmbeddingAttempt | None,
+    cost_calculator: CostCalculator,
+) -> EmbeddingAttempt | None:
+    """Apply the authoritative catalog cost to any measured embedding usage."""
+    if attempt is None or attempt.usage is None:
+        return attempt
+    calculation = cost_calculator.calculate_embedding(attempt.usage)
+    if calculation is None:
+        return attempt
+    priced_usage = attempt.usage.model_copy(
+        update={
+            "calculated_cost": calculation.amount,
+            "pricing_provenance": calculation.provenance,
+        }
+    )
+    return attempt.model_copy(update={"usage": priced_usage})
 
 
 def build_runs_router(
@@ -87,6 +114,7 @@ def build_runs_router(
         cache_outcome: SemanticCacheOutcome
         cache_error: str | None = None
         cache_lookup_latency_ms = 0
+        embedding_attempt: EmbeddingAttempt | None = None
         if not dependencies.settings.semantic_cache_enabled:
             cache_outcome = SemanticCacheOutcome.DISABLED_BYPASSED
         elif dependencies.semantic_cache is None:
@@ -102,7 +130,7 @@ def build_runs_router(
         else:
             lookup_started_at = clock.now()
             try:
-                resolved_candidate = await dependencies.semantic_cache.lookup(
+                lookup_result = await dependencies.semantic_cache.lookup(
                     SemanticCacheLookupRequest(
                         run_id=run_id,
                         input_text=run_request.input_text,
@@ -116,10 +144,11 @@ def build_runs_router(
                     )
                 )
                 cache_candidate = (
-                    CacheCandidate.model_validate(resolved_candidate)
-                    if resolved_candidate is not None
+                    CacheCandidate.model_validate(lookup_result.candidate)
+                    if lookup_result.candidate is not None
                     else None
                 )
+                embedding_attempt = lookup_result.embedding_attempt
                 cache_outcome = (
                     SemanticCacheOutcome.MISS
                     if cache_candidate is None
@@ -128,10 +157,15 @@ def build_runs_router(
             except TimeoutError as error:
                 cache_outcome = SemanticCacheOutcome.LOOKUP_TIMED_OUT
                 cache_error = f"Semantic cache {type(error).__name__}"
+                embedding_attempt = _extract_embedding_attempt(error)
             except Exception as error:
                 cache_outcome = SemanticCacheOutcome.LOOKUP_FAILED
                 cache_error = f"Semantic cache {type(error).__name__}"
+                embedding_attempt = _extract_embedding_attempt(error)
             cache_lookup_latency_ms = _elapsed_ms(clock.now(), lookup_started_at)
+            embedding_attempt = _price_embedding_attempt(
+                embedding_attempt, dependencies.cost_calculator
+            )
         reducer_configured = (
             dependencies.context_reducer is not None
             and dependencies.token_counter is not None
@@ -199,6 +233,7 @@ def build_runs_router(
                 else None
             ),
             candidate_assessment=execution_plan.cache_candidate_assessment,
+            embedding_attempt=embedding_attempt,
             error=cache_error,
         )
 

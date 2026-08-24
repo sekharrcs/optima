@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from pydantic import SecretStr, ValidationError
 
-from optima.config import AppSettings, FoundryAuthMode
+from optima.config import AppSettings, FoundryAuthMode, RedisAuthMode
 
 
 @pytest.fixture(autouse=True)
@@ -46,6 +46,17 @@ def isolate_settings_sources(
         "OPTIMA_COSMOS_HISTORY_LIST_LIMIT",
         "OPTIMA_COSMOS_TIMEOUT_SECONDS",
         "OPTIMA_COSMOS_RETRY_TOTAL",
+        "OPTIMA_REDIS_HOST",
+        "OPTIMA_REDIS_INDEX_NAME",
+        "OPTIMA_REDIS_EMBEDDING_DIMENSION",
+        "OPTIMA_REDIS_EMBEDDING_MODEL",
+        "OPTIMA_REDIS_EMBEDDING_DEPLOYMENT",
+        "OPTIMA_REDIS_AUTH_MODE",
+        "OPTIMA_REDIS_ACCESS_KEY",
+        "OPTIMA_REDIS_OBJECT_ID",
+        "OPTIMA_REDIS_MANAGED_IDENTITY_CLIENT_ID",
+        "OPTIMA_REDIS_TIMEOUT_SECONDS",
+        "OPTIMA_REDIS_MAX_CONNECTIONS",
     ):
         monkeypatch.delenv(variable, raising=False)
 
@@ -138,6 +149,23 @@ def test_settings_accept_explicit_injection() -> None:
         "cosmos_history_list_limit": 50,
         "cosmos_timeout_seconds": 10.0,
         "cosmos_retry_total": 3,
+        "redis_host": None,
+        "redis_index_name": None,
+        "redis_embedding_dimension": None,
+        "redis_embedding_model": None,
+        "redis_embedding_deployment": None,
+        "redis_auth_mode": None,
+        "redis_access_key": None,
+        "redis_object_id": None,
+        "redis_managed_identity_client_id": None,
+        "redis_timeout_seconds": 1.0,
+        "redis_max_connections": 10,
+        "redis_token_renewal_attempts": 3,
+        "redis_token_retry_backoff_seconds": 0.5,
+        "redis_token_retry_backoff_cap_seconds": 5.0,
+        "redis_token_acquisition_timeout_seconds": 10.0,
+        "redis_token_reauth_timeout_seconds": 10.0,
+        "redis_token_expiry_safety_margin_seconds": 180.0,
     }
 
 
@@ -265,6 +293,135 @@ def test_settings_ignore_unrelated_dotenv_values(tmp_path: Path) -> None:
 def test_default_settings_do_not_request_foundry_composition() -> None:
     """Keep cloud composition optional for the default API and local demo."""
     assert AppSettings().foundry_provider_configuration() is None
+
+
+def test_default_settings_do_not_request_redis_composition() -> None:
+    """Keep local API and tests free from Redis credentials and connections."""
+    assert AppSettings().redis_semantic_cache_configuration() is None
+
+
+@pytest.mark.parametrize(
+    ("auth_mode", "auth_values"),
+    [
+        (RedisAuthMode.ACCESS_KEY, {"redis_access_key": "fake-key"}),
+        (RedisAuthMode.AZURE_CLI, {"redis_object_id": "cli-object-id"}),
+        (
+            RedisAuthMode.MANAGED_IDENTITY,
+            {
+                "redis_object_id": "identity-object-id",
+                "redis_managed_identity_client_id": "identity-client-id",
+            },
+        ),
+    ],
+)
+def test_settings_build_explicit_redis_authentication_modes(
+    auth_mode: RedisAuthMode,
+    auth_values: dict[str, str],
+) -> None:
+    """Build each Redis mode without selecting an implicit credential chain."""
+    values: dict[str, object] = {
+        "redis_host": "optima.eastus.redis.azure.net",
+        "redis_index_name": "optima-cache-v1",
+        "redis_embedding_dimension": 1536,
+        "redis_embedding_model": "text-embed-3",
+        "redis_embedding_deployment": "optima-embed",
+        "redis_auth_mode": auth_mode,
+    }
+    values.update(auth_values)
+
+    configuration = AppSettings.model_validate(
+        values
+    ).redis_semantic_cache_configuration()
+
+    assert configuration is not None
+    assert configuration.auth_mode is auth_mode
+    assert configuration.embedding_dimension == 1536
+    assert configuration.timeout_seconds == 1.0
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"redis_host": "optima.eastus.redis.azure.net"},
+        {
+            "redis_host": "optima.eastus.redis.azure.net",
+            "redis_index_name": "cache",
+            "redis_embedding_dimension": 1536,
+            "redis_embedding_model": "text-embed-3",
+            "redis_auth_mode": "AZURE_CLI",
+            "redis_object_id": "object-id",
+        },
+        {
+            "redis_host": "https://optima.eastus.redis.azure.net",
+            "redis_index_name": "cache",
+            "redis_embedding_dimension": 1536,
+            "redis_embedding_model": "text-embed-3",
+            "redis_embedding_deployment": "optima-embed",
+            "redis_auth_mode": "AZURE_CLI",
+            "redis_object_id": "object-id",
+        },
+        {
+            "redis_host": "optima.eastus.redis.azure.net",
+            "redis_index_name": "unsafe index",
+            "redis_embedding_dimension": 1536,
+            "redis_embedding_model": "text-embed-3",
+            "redis_embedding_deployment": "optima-embed",
+            "redis_auth_mode": "AZURE_CLI",
+            "redis_object_id": "object-id",
+        },
+        {
+            "redis_host": "optima.eastus.redis.azure.net",
+            "redis_index_name": "cache",
+            "redis_embedding_dimension": 1536,
+            "redis_embedding_model": "invalid model!",
+            "redis_embedding_deployment": "optima-embed",
+            "redis_auth_mode": "AZURE_CLI",
+            "redis_object_id": "object-id",
+        },
+        {
+            "redis_host": "optima.eastus.redis.azure.net",
+            "redis_index_name": "cache",
+            "redis_embedding_dimension": 1536,
+            "redis_embedding_model": "text-embed-3",
+            "redis_embedding_deployment": "optima-embed",
+            "redis_auth_mode": "ACCESS_KEY",
+        },
+        {
+            "redis_host": "optima.eastus.redis.azure.net",
+            "redis_index_name": "cache",
+            "redis_embedding_dimension": 1536,
+            "redis_embedding_model": "text-embed-3",
+            "redis_embedding_deployment": "optima-embed",
+            "redis_auth_mode": "AZURE_CLI",
+        },
+        {
+            "redis_host": "optima.eastus.redis.azure.net",
+            "redis_index_name": "cache",
+            "redis_embedding_dimension": 1536,
+            "redis_embedding_model": "text-embed-3",
+            "redis_embedding_deployment": "optima-embed",
+            "redis_auth_mode": "AZURE_CLI",
+            "redis_object_id": "object-id",
+            "redis_access_key": "mixed-secret",
+        },
+        {
+            "redis_host": "optima.eastus.redis.azure.net",
+            "redis_index_name": "cache",
+            "redis_embedding_dimension": 1536,
+            "redis_embedding_model": "text-embed-3",
+            "redis_embedding_deployment": "optima-embed",
+            "redis_auth_mode": "AZURE_CLI",
+            "redis_object_id": "object-id",
+            "redis_managed_identity_client_id": "forbidden-client-id",
+        },
+    ],
+)
+def test_settings_reject_incomplete_unsafe_or_mixed_redis_configuration(
+    updates: dict[str, object],
+) -> None:
+    """Fail closed for ambiguous Redis endpoints, indexes, and credentials."""
+    with pytest.raises(ValidationError):
+        AppSettings.model_validate(updates)
 
 
 @pytest.mark.parametrize(
