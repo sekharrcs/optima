@@ -177,8 +177,39 @@ A healthy miss, rejected match, lookup failure, or timeout continues through the
 existing context and model path. Typed runtime evidence distinguishes those
 outcomes. An enabled application without a semantic-cache dependency fails as a
 structural configuration error before model execution. The local in-memory
-implementation is deterministic test and demo infrastructure only; the Redis
-adapter remains Slice 10.
+implementation remains deterministic test and demo infrastructure only.
+
+The Slice 10C Azure Managed Redis adapter is read-only. One provider-independent
+embedding is validated and encoded as a finite, nonzero, little-endian `FLOAT32`
+vector. The adapter sends one bounded `KNN 1` COSINE query against a
+pre-provisioned HASH index, filtered by task type and complexity. It derives the
+candidate similarity from Redis vector distance and strictly reconstructs the
+complete `CacheCandidate`; it does not apply any Planner V1 reuse gate.
+
+Redis schema version 1 contains:
+
+* `schema_version`
+* TAG fields `task_type` and `complexity`
+* the `embedding` VECTOR field, configured as `FLAT`, `FLOAT32`, and `COSINE`
+* `source_run_id` and `output_text`
+* complete `request_binding_json` and `prior_evaluation_json` payloads
+* canonical `contract_compatible` and `safe_to_reuse` booleans
+
+Malformed, unsupported, non-finite, incomplete, or contradictory Redis evidence
+fails the lookup boundary. The existing API maps timeout and failure to typed
+runtime evidence before normal model execution. There is no lookup retry, cache
+write-back, invalidation, or second execution-time lookup.
+
+Azure Managed Redis configuration explicitly selects access key, Azure CLI, or
+managed identity. Microsoft Entra modes carry a separately configured identity
+object ID as the Redis AUTH username; a client ID is used only to select a
+user-assigned managed identity. `DefaultAzureCredential` and implicit credential
+fallback are not used. The client uses TLS with hostname verification on Azure
+Managed Redis port `10000`, RESP2 raw responses, bounded connections and
+timeouts, and zero Redis command retries. One resource owner stops background
+token renewal before closing the Redis client and selected Azure credential.
+Production index provisioning, role assignment, cache population, and FastAPI
+lifespan wiring remain Slice 11 responsibilities.
 
 ### Run-history persistence boundary
 

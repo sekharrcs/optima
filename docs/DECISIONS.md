@@ -202,3 +202,34 @@ Cosmos authentication is explicit: account key, Azure CLI credential, or
 managed identity. There is no implicit credential chain. One closeable resource
 owner retains the async client and any owned credential for the application
 lifetime. Production lifespan wiring and Cosmos infrastructure remain Slice 11.
+
+## ADR-020: Redis retrieves candidate evidence and Planner V1 decides reuse
+
+Status: Accepted
+
+The Azure Managed Redis semantic-cache adapter performs one read-only vector
+lookup before Planner V1. It returns at most one complete `CacheCandidate` and
+does not apply similarity thresholds, Quality Contract thresholds, exact request
+binding, contract compatibility, or reuse safety. Planner V1 remains the single
+authority for all reuse gates, and the executor consumes the planner-bound
+snapshot without another Redis lookup.
+
+Schema version 1 uses a HASH index with task-type and complexity TAG fields and
+one `FLAT`, `FLOAT32`, `COSINE` vector field. Stored JSON payloads contain the
+complete request binding and prior evaluation. The adapter validates exact
+dimensions, finite nonzero vectors, canonical booleans, supported schema
+version, bounded cosine distance, and complete immutable domain evidence.
+Malformed evidence fails closed into the existing typed lookup-failure path.
+
+Azure Managed Redis uses TLS with hostname verification on port `10000`, RESP2
+raw responses, bounded timeouts and connection count, and zero command retries.
+Authentication is explicitly one of access key, Azure CLI, or managed identity.
+Microsoft Entra modes use the configured identity object ID as the Redis AUTH
+username and request tokens only for `https://redis.azure.com/.default`.
+`DefaultAzureCredential` and credential fallback are prohibited.
+
+One application-lifetime resource owner controls the Redis client, background
+token renewal, and selected Azure Identity credential. Renewal is cancelled
+before transport and credential shutdown. Cache write-back, invalidation,
+population, infrastructure provisioning, role assignment, and production
+lifespan wiring remain outside Slice 10C.

@@ -253,6 +253,94 @@ contract.
 No live Cosmos account is exercised by the default test suite. The adapter's
 SDK calls, error mapping, and lifecycle are validated with offline fakes.
 
+## Azure Managed Redis semantic-cache configuration
+
+Slice 10C adds a read-only Azure Managed Redis implementation of the existing
+semantic-cache lookup contract. Azure Managed Redis must be provisioned with
+RediSearch, Enterprise clustering, and `NoEviction`. The adapter connects over
+TLS on port `10000`, verifies the server hostname, uses RESP2 for a stable raw
+`FT.SEARCH` response, and performs no Redis command retries.
+
+Provision a HASH index before starting the configured API. Replace the vector
+dimension with the exact output dimension of the injected embedding provider:
+
+```text
+FT.CREATE optima-cache-v1 ON HASH PREFIX 1 optima:semantic-cache: SCHEMA task_type TAG complexity TAG embedding VECTOR FLAT 6 TYPE FLOAT32 DIM <embedding-dimension> DISTANCE_METRIC COSINE
+```
+
+Each indexed hash uses schema version `1` and contains these fields:
+
+* `schema_version`, with the value `1`
+* `task_type` and `complexity`, using the domain enum values
+* `embedding`, encoded as a finite, nonzero, little-endian `FLOAT32` vector
+* `source_run_id` and `output_text`
+* `request_binding_json`, containing a complete serialized `RequestBinding`
+* `prior_evaluation_json`, containing a complete serialized `EvaluationResult`
+* `contract_compatible` and `safe_to_reuse`, each encoded as `true` or `false`
+
+The adapter runs one `KNN 1` COSINE query filtered by task type and complexity,
+derives similarity as `max(0, 1 - vector_distance)` (the cosine similarity
+clamped into the domain `[0, 1]` range, so a negative cosine similarity maps to
+`0`), and strictly validates all returned evidence. It does not compare the
+Planner V1 similarity threshold, current Quality Contract threshold, request
+binding, compatibility, or safety. Planner V1 remains authoritative for those
+gates. Cache population, invalidation, and write-back remain outside Slice 10C.
+
+Stored and query vectors must come from the same embedding model and deployment.
+Schema version `1` records carry no embedding-model identity, so this consistency
+is an operator responsibility; the adapter validates only the vector dimension.
+To derive the query vector, the injected embedding provider receives the
+request's semantic input (input text, optional context, criteria, and metadata),
+so that boundary must satisfy the deployment's privacy requirements.
+
+Configure the endpoint, existing index, embedding dimension, and bounded client
+settings:
+
+```powershell
+$env:OPTIMA_REDIS_HOST="<name>.<region>.redis.azure.net"
+$env:OPTIMA_REDIS_INDEX_NAME="optima-cache-v1"
+$env:OPTIMA_REDIS_EMBEDDING_DIMENSION="1536"
+$env:OPTIMA_REDIS_TIMEOUT_SECONDS="1"
+$env:OPTIMA_REDIS_MAX_CONNECTIONS="10"
+```
+
+Choose exactly one authentication mode. Access-key mode keeps the key in
+untracked secret configuration:
+
+```powershell
+$env:OPTIMA_REDIS_AUTH_MODE="ACCESS_KEY"
+$env:OPTIMA_REDIS_ACCESS_KEY="<access-key>"
+```
+
+Azure CLI mode uses only the signed-in Azure CLI identity. Redis AUTH requires
+that identity's object ID, not an application or managed-identity client ID:
+
+```powershell
+az login
+$env:OPTIMA_REDIS_AUTH_MODE="AZURE_CLI"
+$env:OPTIMA_REDIS_OBJECT_ID="<signed-in-identity-object-id>"
+```
+
+Managed-identity mode also requires the identity principal's object ID. Set the
+client ID only when selecting a user-assigned identity:
+
+```powershell
+$env:OPTIMA_REDIS_AUTH_MODE="MANAGED_IDENTITY"
+$env:OPTIMA_REDIS_OBJECT_ID="<managed-identity-object-id>"
+$env:OPTIMA_REDIS_MANAGED_IDENTITY_CLIENT_ID="<user-assigned-client-id>"
+```
+
+`build_redis_semantic_cache_resources(AppSettings(), embedding_provider)`
+creates one application-lifetime client and only the selected credential. Inject
+its `cache` into `ExecutionDependencies`, retain the returned resources, and call
+`RedisSemanticCacheResources.aclose()` during application shutdown. The resource
+owner stops token renewal before closing Redis and Azure Identity. The default
+API and deterministic demo do not call this builder or probe Azure credentials.
+
+No live Redis resource is exercised by the default test suite. Lookup parsing,
+query construction, authentication selection, token shape, client options, and
+lifecycle are validated with offline fakes.
+
 On Windows ARM64, use an x64 Python 3.12 interpreter for Streamlit because its
 Pandas and PyArrow dependencies may not have Windows ARM64 wheels in the
 configured package feed.

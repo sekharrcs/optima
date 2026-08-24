@@ -175,9 +175,23 @@ Acceptance:
 
 ## Slice 10C - Redis semantic-cache adapter
 
-Implement:
+Implemented:
 
-- Azure Managed Redis implementation of the existing semantic-cache contract
+- read-only Azure Managed Redis implementation of the existing semantic-cache
+	contract
+- one bounded pre-planning `KNN 1` lookup with strict schema and domain
+	validation
+- explicit access-key, Azure CLI, or managed-identity authentication without a
+	default credential chain
+- application-lifetime Redis, token-renewal, and Azure Identity ownership
+- offline tests for query shape, malformed evidence, Planner V1 authority,
+	authentication selection, client security settings, and cleanup
+
+Deferred to Slice 11 or a separately approved cache-population slice:
+
+- Redis provisioning, RediSearch enablement, index creation, and role assignment
+- cache writes, write-back, invalidation, and population policy
+- production FastAPI lifespan composition
 
 ## Slice 10D - Application Insights tracing
 
