@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from optima.domain.embedding import EmbeddingProfile, EmbeddingProfileToken
 from optima.domain.quality_contract import QualityThresholds
 from optima.immutable import ImmutableModel
 from optima.planner.models import ModuleConfiguration, PlannerThresholds
@@ -59,6 +60,8 @@ class RedisSemanticCacheConfiguration(ImmutableModel):
     host: NonEmptyString
     index_name: NonEmptyString
     embedding_dimension: BoundedEmbeddingDimension
+    embedding_model: EmbeddingProfileToken
+    embedding_deployment: EmbeddingProfileToken
     auth_mode: RedisAuthMode
     access_key: SecretStr | None = None
     object_id: NonEmptyString | None = None
@@ -66,14 +69,26 @@ class RedisSemanticCacheConfiguration(ImmutableModel):
     timeout_seconds: BoundedTimeoutSeconds = 1.0
     max_connections: BoundedRedisConnections = 10
 
+    def embedding_profile(self) -> EmbeddingProfile:
+        """Build the versioned embedding profile bound to this cache index."""
+        return EmbeddingProfile(
+            model=self.embedding_model,
+            deployment=self.embedding_deployment,
+            dimension=self.embedding_dimension,
+        )
+
     @model_validator(mode="after")
     def validate_configuration(self) -> "RedisSemanticCacheConfiguration":
         """Require one Azure endpoint and exactly one explicit auth mode."""
         if (
-            self.host != self.host.lower()
+            re.fullmatch(
+                r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+                r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*",
+                self.host,
+            )
+            is None
+            or ".." in self.host
             or not self.host.endswith(".redis.azure.net")
-            or any(character in self.host for character in "/:@?#")
-            or any(character.isspace() for character in self.host)
         ):
             raise ValueError(
                 "Redis host must be a lowercase Azure Managed Redis hostname"
@@ -255,6 +270,8 @@ class AppSettings(BaseSettings):
     redis_host: str | None = None
     redis_index_name: str | None = None
     redis_embedding_dimension: int | None = None
+    redis_embedding_model: str | None = None
+    redis_embedding_deployment: str | None = None
     redis_auth_mode: RedisAuthMode | None = None
     redis_access_key: SecretStr | None = None
     redis_object_id: str | None = None
@@ -379,6 +396,8 @@ class AppSettings(BaseSettings):
             self.redis_host,
             self.redis_index_name,
             self.redis_embedding_dimension,
+            self.redis_embedding_model,
+            self.redis_embedding_deployment,
             self.redis_auth_mode,
             self.redis_access_key,
             self.redis_object_id,
@@ -390,16 +409,20 @@ class AppSettings(BaseSettings):
             self.redis_host is None
             or self.redis_index_name is None
             or self.redis_embedding_dimension is None
+            or self.redis_embedding_model is None
+            or self.redis_embedding_deployment is None
             or self.redis_auth_mode is None
         ):
             raise ValueError(
                 "Redis semantic cache requires host, index, embedding dimension, "
-                "and auth mode"
+                "embedding model, embedding deployment, and auth mode"
             )
         return RedisSemanticCacheConfiguration(
             host=self.redis_host,
             index_name=self.redis_index_name,
             embedding_dimension=self.redis_embedding_dimension,
+            embedding_model=self.redis_embedding_model,
+            embedding_deployment=self.redis_embedding_deployment,
             auth_mode=self.redis_auth_mode,
             access_key=self.redis_access_key,
             object_id=self.redis_object_id,

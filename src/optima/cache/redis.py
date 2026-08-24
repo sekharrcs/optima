@@ -5,12 +5,21 @@ import math
 import struct
 from collections.abc import Sequence
 from decimal import Decimal, InvalidOperation
+from time import perf_counter
 from typing import Protocol
 
 from pydantic import ValidationError
 
-from optima.cache.contracts import SemanticCacheLookupRequest
+from optima.cache.contracts import (
+    EmbeddingProviderResult,
+    SemanticCacheEmbeddingProvider,
+    SemanticCacheLookupError,
+    SemanticCacheLookupRequest,
+    SemanticCacheLookupResult,
+    SemanticCacheLookupTimeout,
+)
 from optima.domain.cache import CacheCandidate
+from optima.domain.embedding import EmbeddingProfile, EmbeddingUsage
 from optima.domain.evaluation import EvaluationResult
 from optima.domain.request_binding import RequestBinding
 
@@ -24,16 +33,9 @@ _RETURN_FIELDS = (
     "prior_evaluation_json",
     "contract_compatible",
     "safe_to_reuse",
+    "embedding_profile",
     "vector_distance",
 )
-
-
-class SemanticCacheEmbeddingProvider(Protocol):
-    """Produce one provider-independent embedding for a lookup request."""
-
-    async def embed(self, request: SemanticCacheLookupRequest) -> Sequence[float]:
-        """Return the vector used only to retrieve candidate evidence."""
-        ...
 
 
 class RedisSearchClient(Protocol):
@@ -44,11 +46,14 @@ class RedisSearchClient(Protocol):
         ...
 
 
-class RedisSemanticCacheInvalidResponseError(Exception):
+class RedisSemanticCacheInvalidResponseError(SemanticCacheLookupError):
     """Report malformed or contradictory Redis cache evidence safely."""
 
-    def __init__(self) -> None:
-        super().__init__("Redis semantic-cache response is invalid")
+    def __init__(self, embedding_usage: EmbeddingUsage | None = None) -> None:
+        super().__init__(
+            embedding_usage,
+            message="Redis semantic-cache response is invalid",
+        )
 
 
 class RedisSemanticCache:
@@ -60,63 +65,116 @@ class RedisSemanticCache:
         embedding_provider: SemanticCacheEmbeddingProvider,
         *,
         index_name: str,
-        embedding_dimension: int,
+        embedding_profile: EmbeddingProfile,
         timeout_seconds: float,
     ) -> None:
         if not index_name:
             raise ValueError("Redis semantic-cache index name must not be empty")
-        if embedding_dimension <= 0:
-            raise ValueError(
-                "Redis semantic-cache embedding dimension must be positive"
-            )
         if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
             raise ValueError("Redis semantic-cache timeout must be positive and finite")
         self._client = client
         self._embedding_provider = embedding_provider
         self._index_name = index_name
-        self._embedding_dimension = embedding_dimension
+        self._embedding_profile = embedding_profile
         self._timeout_seconds = timeout_seconds
 
     async def lookup(
         self,
         request: SemanticCacheLookupRequest,
-    ) -> CacheCandidate | None:
+    ) -> SemanticCacheLookupResult:
         """Run one bounded KNN lookup and return evidence without applying policy."""
         normalized_request = SemanticCacheLookupRequest.model_validate(request)
-        async with asyncio.timeout(self._timeout_seconds):
-            embedding = await self._embedding_provider.embed(normalized_request)
-            query_vector = _encode_float32_vector(
-                embedding,
-                expected_dimension=self._embedding_dimension,
-            )
-            response = await self._client.execute_command(
-                "FT.SEARCH",
-                self._index_name,
-                _vector_query(normalized_request),
-                "PARAMS",
-                2,
-                "query_vector",
-                query_vector,
-                "SORTBY",
-                "vector_distance",
-                "ASC",
-                "RETURN",
-                len(_RETURN_FIELDS),
-                *_RETURN_FIELDS,
-                "LIMIT",
-                0,
-                1,
-                "DIALECT",
-                2,
-            )
-        return _decode_search_response(response)
+        embedding_usage: EmbeddingUsage | None = None
+        try:
+            async with asyncio.timeout(self._timeout_seconds):
+                started = perf_counter()
+                embedding_result = await self._embedding_provider.embed(
+                    normalized_request
+                )
+                embedding_usage = _build_embedding_usage(
+                    normalized_request,
+                    embedding_result,
+                    latency_ms=_elapsed_ms(perf_counter(), started),
+                )
+                if embedding_result.profile != self._embedding_profile:
+                    raise SemanticCacheLookupError(
+                        embedding_usage,
+                        message="embedding profile does not match configured profile",
+                    )
+                query_vector = _encode_float32_vector(
+                    embedding_result.vector,
+                    expected_dimension=self._embedding_profile.dimension,
+                )
+                response = await self._client.execute_command(
+                    "FT.SEARCH",
+                    self._index_name,
+                    _vector_query(normalized_request, self._embedding_profile),
+                    "PARAMS",
+                    2,
+                    "query_vector",
+                    query_vector,
+                    "SORTBY",
+                    "vector_distance",
+                    "ASC",
+                    "RETURN",
+                    len(_RETURN_FIELDS),
+                    *_RETURN_FIELDS,
+                    "LIMIT",
+                    0,
+                    1,
+                    "DIALECT",
+                    2,
+                )
+        except SemanticCacheLookupError:
+            raise
+        except TimeoutError as error:
+            raise SemanticCacheLookupTimeout(embedding_usage) from error
+        except Exception as error:
+            raise SemanticCacheLookupError(embedding_usage) from error
+        candidate = _decode_search_response(
+            response,
+            self._embedding_profile,
+            embedding_usage,
+        )
+        return SemanticCacheLookupResult(
+            candidate=candidate,
+            embedding_usage=embedding_usage,
+        )
 
 
-def _vector_query(request: SemanticCacheLookupRequest) -> str:
-    """Scope retrieval by typed profile facts without applying reuse gates."""
+def _build_embedding_usage(
+    request: SemanticCacheLookupRequest,
+    result: EmbeddingProviderResult,
+    *,
+    latency_ms: int,
+) -> EmbeddingUsage:
+    """Record the measured facts of one completed embedding request."""
+    return EmbeddingUsage(
+        run_id=request.run_id,
+        provider=result.provider,
+        deployment=result.profile.deployment,
+        embedding_profile=result.profile.identity,
+        request_id=result.request_id,
+        input_tokens=result.input_tokens,
+        latency_ms=latency_ms,
+    )
+
+
+def _elapsed_ms(now: float, started: float) -> int:
+    """Return non-negative elapsed milliseconds between two monotonic reads."""
+    return max(0, int(round((now - started) * 1000)))
+
+
+def _vector_query(
+    request: SemanticCacheLookupRequest,
+    profile: EmbeddingProfile,
+) -> str:
+    """Scope retrieval by schema, profile facts, and embedding identity."""
     return (
-        f"(@task_type:{{{request.request_profile.task_type.value}}} "
-        f"@complexity:{{{request.request_profile.complexity.value}}})"
+        f"(@schema_version:{{{REDIS_CACHE_SCHEMA_VERSION}}} "
+        f"@task_type:{{{request.request_profile.task_type.value}}} "
+        f"@complexity:{{{request.request_profile.complexity.value}}} "
+        f"@embedding_profile:{{{profile.identity}}})"
         "=>[KNN 1 @embedding $query_vector AS vector_distance]"
     )
 
@@ -155,25 +213,31 @@ def _encode_float32_vector(
     return encoded
 
 
-def _decode_search_response(response: object) -> CacheCandidate | None:
+def _decode_search_response(
+    response: object,
+    profile: EmbeddingProfile,
+    embedding_usage: EmbeddingUsage | None,
+) -> CacheCandidate | None:
     """Decode the exact RESP2 FT.SEARCH shape and fail closed on corruption."""
     if not isinstance(response, list) or not response:
-        raise RedisSemanticCacheInvalidResponseError
+        raise RedisSemanticCacheInvalidResponseError(embedding_usage)
     total = response[0]
     if type(total) is not int or total < 0:
-        raise RedisSemanticCacheInvalidResponseError
+        raise RedisSemanticCacheInvalidResponseError(embedding_usage)
     if total == 0:
         if response != [0]:
-            raise RedisSemanticCacheInvalidResponseError
+            raise RedisSemanticCacheInvalidResponseError(embedding_usage)
         return None
     if total != 1 or len(response) != 3 or not isinstance(response[2], list):
-        raise RedisSemanticCacheInvalidResponseError
-    fields = _decode_field_pairs(response[2])
+        raise RedisSemanticCacheInvalidResponseError(embedding_usage)
+    fields = _decode_field_pairs(response[2], embedding_usage)
     if set(fields) != set(_RETURN_FIELDS):
-        raise RedisSemanticCacheInvalidResponseError
+        raise RedisSemanticCacheInvalidResponseError(embedding_usage)
     try:
         if _decode_text(fields["schema_version"]) != str(REDIS_CACHE_SCHEMA_VERSION):
             raise ValueError("unsupported schema version")
+        if _decode_text(fields["embedding_profile"]) != profile.identity:
+            raise ValueError("unsupported embedding profile")
         distance = Decimal(_decode_text(fields["vector_distance"]))
         if not distance.is_finite() or not Decimal(0) <= distance <= Decimal(2):
             raise ValueError("invalid cosine distance")
@@ -198,21 +262,24 @@ def _decode_search_response(response: object) -> CacheCandidate | None:
         TypeError,
         ValidationError,
     ) as error:
-        raise RedisSemanticCacheInvalidResponseError from error
+        raise RedisSemanticCacheInvalidResponseError(embedding_usage) from error
 
 
-def _decode_field_pairs(raw_fields: list[object]) -> dict[str, object]:
+def _decode_field_pairs(
+    raw_fields: list[object],
+    embedding_usage: EmbeddingUsage | None,
+) -> dict[str, object]:
     """Build unique UTF-8 field pairs from one Redis hash result."""
     if len(raw_fields) % 2 != 0:
-        raise RedisSemanticCacheInvalidResponseError
+        raise RedisSemanticCacheInvalidResponseError(embedding_usage)
     fields: dict[str, object] = {}
     for index in range(0, len(raw_fields), 2):
         try:
             name = _decode_text(raw_fields[index])
         except (UnicodeDecodeError, TypeError) as error:
-            raise RedisSemanticCacheInvalidResponseError from error
+            raise RedisSemanticCacheInvalidResponseError(embedding_usage) from error
         if name in fields:
-            raise RedisSemanticCacheInvalidResponseError
+            raise RedisSemanticCacheInvalidResponseError(embedding_usage)
         fields[name] = raw_fields[index + 1]
     return fields
 

@@ -8,7 +8,15 @@ from optima.cache.azure_redis import (
     RedisSemanticCacheResources,
     build_redis_semantic_cache_resources,
 )
-from optima.cache.contracts import SemanticCache, SemanticCacheLookupRequest
+from optima.cache.contracts import (
+    EmbeddingProviderResult,
+    SemanticCache,
+    SemanticCacheEmbeddingProvider,
+    SemanticCacheLookupError,
+    SemanticCacheLookupRequest,
+    SemanticCacheLookupResult,
+    SemanticCacheLookupTimeout,
+)
 from optima.cache.fakes import (
     FakeSemanticCache,
     InMemoryCacheEntry,
@@ -18,7 +26,6 @@ from optima.cache.redis import (
     RedisSearchClient,
     RedisSemanticCache,
     RedisSemanticCacheInvalidResponseError,
-    SemanticCacheEmbeddingProvider,
 )
 
 __all__ = [
@@ -26,6 +33,7 @@ __all__ = [
     "AZURE_MANAGED_REDIS_SCOPE",
     "AzureRedisCredentialProvider",
     "AzureRedisToken",
+    "EmbeddingProviderResult",
     "FakeSemanticCache",
     "InMemoryCacheEntry",
     "InMemorySemanticCache",
@@ -35,6 +43,9 @@ __all__ = [
     "RedisSemanticCacheResources",
     "SemanticCache",
     "SemanticCacheEmbeddingProvider",
+    "SemanticCacheLookupError",
     "SemanticCacheLookupRequest",
+    "SemanticCacheLookupResult",
+    "SemanticCacheLookupTimeout",
     "build_redis_semantic_cache_resources",
 ]

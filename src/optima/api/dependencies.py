@@ -10,7 +10,7 @@ from azure.core.credentials import TokenCredential
 from azure.identity import AzureCliCredential, ManagedIdentityCredential
 
 from optima.cache import SemanticCache
-from optima.config import AppSettings, FoundryAuthMode
+from optima.config import AppSettings, FoundryAuthMode, FoundryProviderConfiguration
 from optima.context import ContextReducer, TokenCounter
 from optima.context.safety import ContextReducerSafetyPolicy
 from optima.cost import CostCalculator
@@ -21,6 +21,7 @@ from optima.providers import (
     ApiKeyAuthentication,
     EntraTokenAuthentication,
     FoundryAuthentication,
+    FoundryEmbeddingProvider,
     FoundryModelProvider,
     ModelProvider,
     MonotonicClock,
@@ -129,6 +130,77 @@ def build_foundry_provider_pair(
             authentication=authentication,
             client=client,
             clock=monotonic_clock,
+        ),
+        http_client=client,
+        credential=credential,
+    )
+
+
+@dataclass(frozen=True)
+class FoundryEmbeddingResources:
+    """One embedding provider with its explicitly owned transport and credential."""
+
+    provider: FoundryEmbeddingProvider
+    http_client: httpx.AsyncClient = field(repr=False)
+    credential: TokenCredential | None = field(default=None, repr=False)
+
+    async def aclose(self) -> None:
+        """Close the owned transport and any selected Azure Identity credential."""
+        try:
+            await self.http_client.aclose()
+        finally:
+            if self.credential is not None:
+                close = getattr(self.credential, "close", None)
+                if callable(close):
+                    close()
+
+
+def build_foundry_embedding_provider(
+    settings: AppSettings,
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> FoundryEmbeddingResources:
+    """Compose one embedding provider from Foundry auth and the Redis cache profile."""
+    configuration: FoundryProviderConfiguration | None = (
+        settings.foundry_provider_configuration()
+    )
+    if configuration is None:
+        raise ValueError("Foundry provider settings are not configured")
+    redis_configuration = settings.redis_semantic_cache_configuration()
+    if redis_configuration is None:
+        raise ValueError("Redis semantic-cache settings are not configured")
+    profile = redis_configuration.embedding_profile()
+
+    credential: TokenCredential | None = None
+    authentication: FoundryAuthentication
+    if configuration.auth_mode is FoundryAuthMode.API_KEY:
+        if configuration.api_key is None:
+            raise AssertionError("validated API-key configuration requires a key")
+        authentication = ApiKeyAuthentication(configuration.api_key.get_secret_value())
+    else:
+        if configuration.token_scope is None:
+            raise AssertionError("validated Entra configuration requires a scope")
+        if configuration.auth_mode is FoundryAuthMode.AZURE_CLI:
+            credential = AzureCliCredential()
+        else:
+            credential = ManagedIdentityCredential(
+                client_id=configuration.managed_identity_client_id
+            )
+        authentication = EntraTokenAuthentication(
+            credential,
+            configuration.token_scope,
+        )
+
+    client = httpx.AsyncClient(
+        timeout=httpx.Timeout(configuration.timeout_seconds),
+        transport=transport,
+    )
+    return FoundryEmbeddingResources(
+        provider=FoundryEmbeddingProvider(
+            base_url=configuration.base_url,
+            profile=profile,
+            authentication=authentication,
+            client=client,
         ),
         http_client=client,
         credential=credential,

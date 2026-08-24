@@ -179,17 +179,22 @@ outcomes. An enabled application without a semantic-cache dependency fails as a
 structural configuration error before model execution. The local in-memory
 implementation remains deterministic test and demo infrastructure only.
 
-The Slice 10C Azure Managed Redis adapter is read-only. One provider-independent
-embedding is validated and encoded as a finite, nonzero, little-endian `FLOAT32`
-vector. The adapter sends one bounded `KNN 1` COSINE query against a
-pre-provisioned HASH index, filtered by task type and complexity. It derives the
-candidate similarity from Redis vector distance and strictly reconstructs the
-complete `CacheCandidate`; it does not apply any Planner V1 reuse gate.
+The Slice 10C Azure Managed Redis adapter is read-only. The injected embedding
+provider returns a vector bound to a strict, versioned embedding profile
+(`embedding-profile-v1`, hashing the embedding model, deployment, and dimension).
+The adapter validates and encodes the vector as a finite, nonzero, little-endian
+`FLOAT32` buffer, requires the returned provider profile to equal the configured
+profile, and sends one bounded `KNN 1` COSINE query against a pre-provisioned
+HASH index filtered by schema version, task type, complexity, and embedding
+profile. It derives the candidate similarity from Redis vector distance, rejects
+any record whose stored embedding profile differs, and strictly reconstructs the
+complete `CacheCandidate`; it does not apply any Planner V1 reuse gate. The
+source `RequestBinding` is returned unchanged.
 
 Redis schema version 1 contains:
 
 * `schema_version`
-* TAG fields `task_type` and `complexity`
+* TAG fields `embedding_profile`, `task_type`, and `complexity`
 * the `embedding` VECTOR field, configured as `FLAT`, `FLOAT32`, and `COSINE`
 * `source_run_id` and `output_text`
 * complete `request_binding_json` and `prior_evaluation_json` payloads
@@ -206,10 +211,22 @@ object ID as the Redis AUTH username; a client ID is used only to select a
 user-assigned managed identity. `DefaultAzureCredential` and implicit credential
 fallback are not used. The client uses TLS with hostname verification on Azure
 Managed Redis port `10000`, RESP2 raw responses, bounded connections and
-timeouts, and zero Redis command retries. One resource owner stops background
-token renewal before closing the Redis client and selected Azure credential.
+timeouts, and zero Redis command retries. Background Microsoft Entra token
+renewal uses bounded attempts, backoff, and jitter, so one transient token or
+reauthentication failure does not permanently disable renewal; one resource
+owner stops renewal before closing the Redis client and selected Azure
+credential.
+
+The production embedding provider is a Foundry/APIM Azure OpenAI v1 `/embeddings`
+adapter that reuses the Slice 10A authentication modes, issues one non-retried
+request per lookup, strictly validates the response, and preserves optional
+provider usage. Because a lookup against a paid embeddings deployment consumes
+tokens and cost even on a hit, the lookup returns a dedicated `EmbeddingUsage`
+priced through the authoritative cost catalog, and `RunResult` token and cost
+totals include that consumption so a cache hit is never reported as free.
 Production index provisioning, role assignment, cache population, and FastAPI
-lifespan wiring remain Slice 11 responsibilities.
+lifespan ownership of the Redis and embedding resources remain Slice 11
+responsibilities.
 
 ### Run-history persistence boundary
 

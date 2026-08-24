@@ -3,6 +3,7 @@
 from decimal import Decimal
 
 from optima.cost.models import CalculatedCost, PriceCatalog
+from optima.domain.embedding import EmbeddingUsage
 from optima.domain.run import ModelUsage, PricingProvenance
 
 TOKENS_PER_MILLION = Decimal("1000000")
@@ -38,6 +39,23 @@ class CostCalculator:
         output_cost = usage.output_tokens * entry.output_rate_per_million_tokens
         return CalculatedCost(
             amount=(input_cost + output_cost) / TOKENS_PER_MILLION,
+            provenance=PricingProvenance(
+                catalog_version=self._catalog.version,
+                currency=self._catalog.currency,
+            ),
+        )
+
+    def calculate_embedding(self, usage: EmbeddingUsage) -> CalculatedCost | None:
+        """Return exact embedding cost from input tokens and catalog input rates."""
+        entry = self._catalog.find_entry(
+            provider=usage.provider,
+            deployment=usage.deployment,
+        )
+        if entry is None or usage.input_tokens is None:
+            return None
+        input_cost = usage.input_tokens * entry.input_rate_per_million_tokens
+        return CalculatedCost(
+            amount=input_cost / TOKENS_PER_MILLION,
             provenance=PricingProvenance(
                 catalog_version=self._catalog.version,
                 currency=self._catalog.currency,

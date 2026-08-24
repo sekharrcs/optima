@@ -9,6 +9,7 @@ from pydantic import Field, model_validator
 
 from optima.context.contracts import ContextPreservationEvidence
 from optima.domain.cache import CacheCandidate, CacheCandidateAssessment
+from optima.domain.embedding import EmbeddingUsage
 from optima.domain.evaluation import EvaluationResult
 from optima.domain.quality_contract import (
     OptimizationMode,
@@ -365,6 +366,7 @@ class SemanticCacheEvidence(ImmutableModel):
     similarity: Rate | None = None
     prior_evaluation: EvaluationResult | None = None
     candidate_assessment: CacheCandidateAssessment | None = None
+    embedding_usage: EmbeddingUsage | None = None
     error: NonEmptyString | None = None
 
     @model_validator(mode="after")
@@ -394,6 +396,8 @@ class SemanticCacheEvidence(ImmutableModel):
             raise ValueError("cache source evidence must match candidate assessment")
         if contract.step_status is None and self.lookup_latency_ms != 0:
             raise ValueError("cache bypass cannot claim lookup latency")
+        if contract.step_status is None and self.embedding_usage is not None:
+            raise ValueError("cache bypass cannot claim embedding usage")
         return self
 
 

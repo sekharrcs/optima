@@ -123,12 +123,13 @@ def test_in_memory_cache_returns_exact_detached_match_and_truthful_miss() -> Non
     hit = asyncio.run(cache.lookup(lookup_request()))
     miss = asyncio.run(cache.lookup(lookup_request(input_text="Different request")))
 
-    assert hit == candidate()
-    assert hit is not candidate()
-    assert hit is not None
-    assert hit.prior_evaluation.threshold == 0.80
-    assert hit.prior_evaluation.metadata == {"source_run": "run-source-1"}
-    assert miss is None
+    assert hit.candidate == candidate()
+    assert hit.candidate is not candidate()
+    assert hit.candidate is not None
+    assert hit.candidate.prior_evaluation.threshold == 0.80
+    assert hit.candidate.prior_evaluation.metadata == {"source_run": "run-source-1"}
+    assert hit.embedding_usage is None
+    assert miss.candidate is None
     assert [call.input_text for call in cache.calls] == [
         "Summarize incident ARC-9",
         "Different request",
@@ -148,7 +149,7 @@ def test_fake_cache_records_calls_and_propagates_operational_failure() -> None:
     """Keep fake errors observable without converting them to cache misses."""
     cache = FakeSemanticCache((candidate(), TimeoutError("cache timeout")))
 
-    assert asyncio.run(cache.lookup(lookup_request())) == candidate()
+    assert asyncio.run(cache.lookup(lookup_request())).candidate == candidate()
     with pytest.raises(TimeoutError, match="cache timeout"):
         asyncio.run(cache.lookup(lookup_request(input_text="Second request")))
 

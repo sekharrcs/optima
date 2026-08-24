@@ -8,7 +8,9 @@ from optima.api.dependencies import ExecutionDependencies
 from optima.api.models import ApiError, RunRequest
 from optima.cache import SemanticCacheLookupRequest
 from optima.context.safety import ContextReducerSafetyRequest
+from optima.cost import CostCalculator
 from optima.domain.cache import CacheCandidate
+from optima.domain.embedding import EmbeddingUsage
 from optima.domain.execution import (
     CachePolicy,
     ExecutionPlan,
@@ -45,6 +47,30 @@ HistoryLimit = Annotated[int | None, Query(ge=1, le=100)]
 
 RUN_HISTORY_OUTCOME_HEADER = "X-OPTIMA-Run-History"
 RUN_HISTORY_ERROR_HEADER = "X-OPTIMA-Run-History-Error"
+
+
+def _extract_embedding_usage(error: BaseException) -> EmbeddingUsage | None:
+    """Recover embedding usage that a cache failure carried, if any."""
+    usage = getattr(error, "embedding_usage", None)
+    return usage if isinstance(usage, EmbeddingUsage) else None
+
+
+def _price_embedding_usage(
+    usage: EmbeddingUsage | None,
+    cost_calculator: CostCalculator,
+) -> EmbeddingUsage | None:
+    """Apply the authoritative catalog cost to raw embedding usage."""
+    if usage is None:
+        return None
+    calculation = cost_calculator.calculate_embedding(usage)
+    if calculation is None:
+        return usage
+    return usage.model_copy(
+        update={
+            "calculated_cost": calculation.amount,
+            "pricing_provenance": calculation.provenance,
+        }
+    )
 
 
 def build_runs_router(
@@ -87,6 +113,7 @@ def build_runs_router(
         cache_outcome: SemanticCacheOutcome
         cache_error: str | None = None
         cache_lookup_latency_ms = 0
+        embedding_usage: EmbeddingUsage | None = None
         if not dependencies.settings.semantic_cache_enabled:
             cache_outcome = SemanticCacheOutcome.DISABLED_BYPASSED
         elif dependencies.semantic_cache is None:
@@ -102,7 +129,7 @@ def build_runs_router(
         else:
             lookup_started_at = clock.now()
             try:
-                resolved_candidate = await dependencies.semantic_cache.lookup(
+                lookup_result = await dependencies.semantic_cache.lookup(
                     SemanticCacheLookupRequest(
                         run_id=run_id,
                         input_text=run_request.input_text,
@@ -116,10 +143,11 @@ def build_runs_router(
                     )
                 )
                 cache_candidate = (
-                    CacheCandidate.model_validate(resolved_candidate)
-                    if resolved_candidate is not None
+                    CacheCandidate.model_validate(lookup_result.candidate)
+                    if lookup_result.candidate is not None
                     else None
                 )
+                embedding_usage = lookup_result.embedding_usage
                 cache_outcome = (
                     SemanticCacheOutcome.MISS
                     if cache_candidate is None
@@ -128,10 +156,15 @@ def build_runs_router(
             except TimeoutError as error:
                 cache_outcome = SemanticCacheOutcome.LOOKUP_TIMED_OUT
                 cache_error = f"Semantic cache {type(error).__name__}"
+                embedding_usage = _extract_embedding_usage(error)
             except Exception as error:
                 cache_outcome = SemanticCacheOutcome.LOOKUP_FAILED
                 cache_error = f"Semantic cache {type(error).__name__}"
+                embedding_usage = _extract_embedding_usage(error)
             cache_lookup_latency_ms = _elapsed_ms(clock.now(), lookup_started_at)
+            embedding_usage = _price_embedding_usage(
+                embedding_usage, dependencies.cost_calculator
+            )
         reducer_configured = (
             dependencies.context_reducer is not None
             and dependencies.token_counter is not None
@@ -199,6 +232,7 @@ def build_runs_router(
                 else None
             ),
             candidate_assessment=execution_plan.cache_candidate_assessment,
+            embedding_usage=embedding_usage,
             error=cache_error,
         )
 

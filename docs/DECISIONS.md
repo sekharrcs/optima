@@ -233,3 +233,51 @@ token renewal, and selected Azure Identity credential. Renewal is cancelled
 before transport and credential shutdown. Cache write-back, invalidation,
 population, infrastructure provisioning, role assignment, and production
 lifespan wiring remain outside Slice 10C.
+
+## ADR-021: Enforce embedding-profile identity, embedding cost, and renewal resilience
+
+Status: Accepted
+
+Different embedding models can produce vectors of identical dimension in
+incompatible vector spaces, so dimension equality alone is not truthful evidence
+of comparability. Slice 10C therefore binds every stored and queried vector to a
+strict, versioned embedding profile (`embedding-profile-v1`) whose identity is a
+SHA-256 hash of the embedding model, deployment, and dimension. The identity is
+an injection-safe RediSearch tag: model and deployment tokens are validated
+against a restricted character set. The Redis adapter requires the injected
+provider to declare the configured profile, filters `FT.SEARCH` by schema
+version and embedding profile before KNN, and rejects any stored record whose
+profile differs. Composition fails fast when the provider and index profiles
+disagree. The source `RequestBinding` is still returned unchanged and Planner V1
+remains the sole reuse authority.
+
+The smallest production embedding provider is a Foundry/APIM Azure OpenAI v1
+`/embeddings` adapter that reuses the Slice 10A authentication modes (API key,
+Azure CLI, or managed identity, with no `DefaultAzureCredential` and no
+fallback), issues exactly one non-retried HTTPS request per lookup, and strictly
+validates the response: exactly one embedding at the expected index, exact
+dimension, finite non-boolean values, and non-fabricated usage. Errors expose no
+endpoint, token, prompt, or response body. A deterministic fake provider serves
+offline tests. Production FastAPI lifespan ownership remains Slice 11.
+
+Because a lookup against a paid embeddings deployment consumes tokens and cost
+even on a hit, the lookup returns a dedicated `EmbeddingUsage` (never forced into
+a model role). It is priced through the same authoritative catalog as model
+calls; central pricing stays authoritative and provider-reported monetary cost is
+not accepted. `RunResult` token and cost totals include embedding consumption, so
+a cache hit is never reported as free, and totals return unavailable rather than
+fabricate a value when embedding tokens or pricing are missing. Embedding usage
+is carried through hit, miss, binding-mismatch fallback, and Redis-failure paths;
+a genuine embedding failure records no usage.
+
+Background Microsoft Entra token renewal uses bounded attempts with bounded
+backoff and jitter (both configurable within strict limits). A transient token
+acquisition or reauthentication failure no longer permanently disables renewal;
+renewal stops only when the bound is exhausted, the owner is closing, the failure
+is non-transient, or continued use would pass the safe expiry boundary. Renewal
+never retries a Redis search or an embedding request and never knowingly uses an
+expired token. Endpoint validation additionally rejects control characters,
+whitespace, and other non-hostname input before any network activity. The custom
+`azure-identity` streaming credential provider is retained over `redis-entraid`
+to keep explicit `AzureCliCredential` and `ManagedIdentityCredential` support and
+object-ID `AUTH` username handling under OPTIMA's own typed control.

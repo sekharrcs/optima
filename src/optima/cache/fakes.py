@@ -3,7 +3,10 @@
 from collections.abc import Iterable
 from dataclasses import dataclass
 
-from optima.cache.contracts import SemanticCacheLookupRequest
+from optima.cache.contracts import (
+    SemanticCacheLookupRequest,
+    SemanticCacheLookupResult,
+)
 from optima.domain.cache import CacheCandidate
 from optima.domain.request_binding import RequestBinding
 
@@ -13,7 +16,9 @@ class FakeSemanticCache:
 
     def __init__(
         self,
-        outcomes: Iterable[CacheCandidate | None | Exception],
+        outcomes: Iterable[
+            CacheCandidate | None | SemanticCacheLookupResult | Exception
+        ],
     ) -> None:
         self._outcomes = iter(outcomes)
         self._calls: list[SemanticCacheLookupRequest] = []
@@ -26,7 +31,7 @@ class FakeSemanticCache:
     async def lookup(
         self,
         request: SemanticCacheLookupRequest,
-    ) -> CacheCandidate | None:
+    ) -> SemanticCacheLookupResult:
         """Record one lookup and return or raise the next configured outcome."""
         self._calls.append(
             SemanticCacheLookupRequest.model_validate(request.model_dump(mode="python"))
@@ -34,7 +39,12 @@ class FakeSemanticCache:
         outcome = next(self._outcomes)
         if isinstance(outcome, Exception):
             raise outcome
-        return CacheCandidate.model_validate(outcome) if outcome is not None else None
+        if isinstance(outcome, SemanticCacheLookupResult):
+            return SemanticCacheLookupResult.model_validate(outcome)
+        candidate = (
+            CacheCandidate.model_validate(outcome) if outcome is not None else None
+        )
+        return SemanticCacheLookupResult(candidate=candidate)
 
 
 @dataclass(frozen=True)
@@ -64,12 +74,14 @@ class InMemorySemanticCache:
     async def lookup(
         self,
         request: SemanticCacheLookupRequest,
-    ) -> CacheCandidate | None:
+    ) -> SemanticCacheLookupResult:
         """Return the exact matching entry, or a truthful miss."""
         self._calls.append(
             SemanticCacheLookupRequest.model_validate(request.model_dump(mode="python"))
         )
         for entry in self._entries:
             if entry.request_binding == request.request_binding:
-                return CacheCandidate.model_validate(entry.candidate)
-        return None
+                return SemanticCacheLookupResult(
+                    candidate=CacheCandidate.model_validate(entry.candidate)
+                )
+        return SemanticCacheLookupResult()

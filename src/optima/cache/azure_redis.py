@@ -3,6 +3,7 @@
 import asyncio
 import importlib
 import inspect
+import random
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -11,16 +12,28 @@ from typing import Protocol, cast
 from azure.core.credentials import AccessToken
 from azure.identity.aio import AzureCliCredential, ManagedIdentityCredential
 
+from optima.cache.contracts import SemanticCacheEmbeddingProvider
 from optima.cache.redis import (
     RedisSearchClient,
     RedisSemanticCache,
-    SemanticCacheEmbeddingProvider,
 )
 from optima.config import AppSettings, RedisAuthMode, RedisSemanticCacheConfiguration
 
 AZURE_MANAGED_REDIS_PORT = 10_000
 AZURE_MANAGED_REDIS_SCOPE = "https://redis.azure.com/.default"
 TOKEN_REFRESH_RATIO = 0.7
+DEFAULT_TOKEN_RENEWAL_ATTEMPTS = 3
+MAX_TOKEN_RENEWAL_ATTEMPTS = 10
+DEFAULT_TOKEN_RETRY_BACKOFF_SECONDS = 0.5
+DEFAULT_TOKEN_RETRY_BACKOFF_CAP_SECONDS = 5.0
+
+SleepCallable = Callable[[float], Awaitable[None]]
+JitterCallable = Callable[[float], float]
+
+
+def _default_token_jitter(base_seconds: float) -> float:
+    """Return uniform jitter in the closed interval [0, base_seconds]."""
+    return random.random() * base_seconds
 
 
 class _RedisConnectionPool(Protocol):
@@ -98,11 +111,28 @@ class AzureRedisCredentialProvider:
         object_id: str,
         *,
         scope: str = AZURE_MANAGED_REDIS_SCOPE,
+        max_renewal_attempts: int = DEFAULT_TOKEN_RENEWAL_ATTEMPTS,
+        retry_backoff_seconds: float = DEFAULT_TOKEN_RETRY_BACKOFF_SECONDS,
+        retry_backoff_cap_seconds: float = DEFAULT_TOKEN_RETRY_BACKOFF_CAP_SECONDS,
+        sleep: SleepCallable = asyncio.sleep,
+        jitter: JitterCallable = _default_token_jitter,
     ) -> None:
+        if not 1 <= max_renewal_attempts <= MAX_TOKEN_RENEWAL_ATTEMPTS:
+            raise ValueError(
+                "max_renewal_attempts must be between 1 and "
+                f"{MAX_TOKEN_RENEWAL_ATTEMPTS}"
+            )
+        if retry_backoff_seconds <= 0 or retry_backoff_cap_seconds <= 0:
+            raise ValueError("token retry backoff seconds must be positive")
         self._credential_factory = credential_factory
         self._credential: _AsyncAzureCredential | None = None
         self._object_id = object_id
         self._scope = scope
+        self._max_renewal_attempts = max_renewal_attempts
+        self._retry_backoff_seconds = retry_backoff_seconds
+        self._retry_backoff_cap_seconds = retry_backoff_cap_seconds
+        self._sleep = sleep
+        self._jitter = jitter
         self._token: AzureRedisToken | None = None
         self._on_next: TokenCallback | None = None
         self._on_error: ErrorCallback | None = None
@@ -172,22 +202,59 @@ class AzureRedisCredentialProvider:
                 return
             remaining_ms = token.expires_at_ms - _utc_now_ms()
             if remaining_ms <= 0:
-                error = RuntimeError("Azure Redis access token expired")
-                await self._report_error(error)
+                await self._report_error(
+                    RuntimeError("Azure Redis access token expired")
+                )
                 return
+            await self._sleep((remaining_ms * TOKEN_REFRESH_RATIO) / 1000)
+            renewed = await self._renew_with_retries()
+            if renewed is None:
+                return
+            self._token = renewed
+            await self._deliver_renewed_token(renewed)
+
+    async def _renew_with_retries(self) -> "AzureRedisToken | None":
+        attempt = 0
+        while not self._closed:
             try:
-                await asyncio.sleep((remaining_ms * TOKEN_REFRESH_RATIO) / 1000)
                 renewed = await self._request_token()
-                if renewed.is_expired():
-                    raise RuntimeError("Azure Redis returned an expired access token")
-                self._token = renewed
-                if self._on_next is not None:
-                    await _maybe_await(self._on_next(renewed))
             except asyncio.CancelledError:
                 raise
             except Exception as error:
-                await self._report_error(error)
-                return
+                attempt += 1
+                current = self._token
+                if (
+                    attempt >= self._max_renewal_attempts
+                    or current is None
+                    or current.is_expired()
+                ):
+                    await self._report_error(error)
+                    return None
+                await self._sleep(self._retry_delay(attempt))
+                continue
+            if renewed.is_expired():
+                await self._report_error(
+                    RuntimeError("Azure Redis returned an expired access token")
+                )
+                return None
+            return renewed
+        return None
+
+    async def _deliver_renewed_token(self, renewed: "AzureRedisToken") -> None:
+        if self._on_next is None:
+            return
+        try:
+            await _maybe_await(self._on_next(renewed))
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            # A reauthentication failure is transient; keep renewing tokens.
+            await self._report_error(error)
+
+    def _retry_delay(self, attempt: int) -> float:
+        exponential = self._retry_backoff_seconds * (1 << (attempt - 1))
+        capped = min(exponential, self._retry_backoff_cap_seconds)
+        return capped + self._jitter(capped)
 
     async def _report_error(self, error: Exception) -> None:
         if self._on_error is not None:
@@ -227,6 +294,12 @@ def build_redis_semantic_cache_resources(
     if configuration is None:
         raise ValueError("Redis semantic-cache settings are not configured")
 
+    embedding_profile = configuration.embedding_profile()
+    if embedding_provider.profile != embedding_profile:
+        raise ValueError(
+            "embedding provider profile does not match the Redis cache profile"
+        )
+
     credential_provider: AzureRedisCredentialProvider | None = None
     password: str | None = None
     if configuration.auth_mode is RedisAuthMode.ACCESS_KEY:
@@ -262,7 +335,7 @@ def build_redis_semantic_cache_resources(
         client,
         embedding_provider,
         index_name=configuration.index_name,
-        embedding_dimension=configuration.embedding_dimension,
+        embedding_profile=embedding_profile,
         timeout_seconds=configuration.timeout_seconds,
     )
     return RedisSemanticCacheResources(

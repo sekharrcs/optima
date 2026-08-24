@@ -16,7 +16,9 @@ from test_semantic_cache import candidate, lookup_request, request_binding
 from optima.cache import (
     AzureRedisCredentialProvider,
     AzureRedisToken,
+    EmbeddingProviderResult,
     RedisSemanticCacheResources,
+    SemanticCacheLookupError,
     build_redis_semantic_cache_resources,
 )
 from optima.cache.azure_redis import _create_redis_client
@@ -27,18 +29,85 @@ from optima.cache.redis import (
 )
 from optima.config import AppSettings, RedisAuthMode
 from optima.domain.cache import CacheCandidate
+from optima.domain.embedding import EmbeddingProfile
+
+
+def embedding_profile(
+    dimension: int = 3,
+    *,
+    model: str = "text-embed-3",
+    deployment: str = "optima-embed",
+) -> EmbeddingProfile:
+    """Build one deterministic embedding profile for offline tests."""
+    return EmbeddingProfile(
+        model=model,
+        deployment=deployment,
+        dimension=dimension,
+    )
 
 
 class FakeEmbeddingProvider:
-    """Return one configured vector and record lookup requests."""
+    """Return one configured embedding result and record lookup requests."""
 
-    def __init__(self, embedding: Sequence[float]) -> None:
+    def __init__(
+        self,
+        embedding: Sequence[float],
+        *,
+        profile: EmbeddingProfile | None = None,
+        provider: str = "fake-embed",
+        input_tokens: int | None = 11,
+        request_id: str | None = "embed-req-1",
+    ) -> None:
         self.embedding = embedding
+        self._profile = (
+            profile
+            if profile is not None
+            else embedding_profile(_safe_dimension(embedding))
+        )
+        self._provider = provider
+        self._input_tokens = input_tokens
+        self._request_id = request_id
         self.calls: list[object] = []
 
-    async def embed(self, request: object) -> Sequence[float]:
+    @property
+    def profile(self) -> EmbeddingProfile:
+        return self._profile
+
+    async def embed(self, request: object) -> EmbeddingProviderResult:
         self.calls.append(request)
-        return self.embedding
+        return EmbeddingProviderResult(
+            vector=tuple(self.embedding),
+            profile=self._profile,
+            provider=self._provider,
+            input_tokens=self._input_tokens,
+            request_id=self._request_id,
+        )
+
+
+def _safe_dimension(embedding: Sequence[float]) -> int:
+    try:
+        length = len(embedding)
+    except TypeError:
+        return 1
+    return length if length > 0 else 1
+
+
+def redis_cache(
+    redis: object,
+    embeddings: FakeEmbeddingProvider,
+    *,
+    index_name: str = "optima-cache-v1",
+    timeout_seconds: float = 1.0,
+    profile: EmbeddingProfile | None = None,
+) -> RedisSemanticCache:
+    """Build one adapter bound to the fake provider's profile by default."""
+    return RedisSemanticCache(
+        redis,  # type: ignore[arg-type]
+        embeddings,
+        index_name=index_name,
+        embedding_profile=profile if profile is not None else embeddings.profile,
+        timeout_seconds=timeout_seconds,
+    )
 
 
 class FakeRedisSearchClient:
@@ -106,9 +175,11 @@ def redis_response(
     resolved: CacheCandidate,
     *,
     distance: str = "0.03",
+    profile: EmbeddingProfile | None = None,
     fields_update: dict[bytes, object] | None = None,
 ) -> list[object]:
     """Encode one candidate in the documented Redis hash response shape."""
+    resolved_profile = profile if profile is not None else embedding_profile(1)
     fields: dict[bytes, object] = {
         b"schema_version": str(REDIS_CACHE_SCHEMA_VERSION).encode(),
         b"source_run_id": resolved.source_run_id.encode(),
@@ -117,6 +188,7 @@ def redis_response(
         b"prior_evaluation_json": resolved.prior_evaluation.model_dump_json().encode(),
         b"contract_compatible": str(resolved.contract_compatible).lower().encode(),
         b"safe_to_reuse": str(resolved.safe_to_reuse).lower().encode(),
+        b"embedding_profile": resolved_profile.identity.encode(),
         b"vector_distance": distance.encode(),
     }
     if fields_update is not None:
@@ -128,26 +200,25 @@ def redis_response(
 def test_redis_lookup_runs_one_bounded_knn_query_and_decodes_candidate() -> None:
     """Retrieve evidence with exact FLOAT32 bytes and no policy threshold."""
     resolved = candidate(similarity=0.01)
-    redis = FakeRedisSearchClient(redis_response(resolved, distance="0.99"))
-    embeddings = FakeEmbeddingProvider((0.25, -0.5, 1.0))
-    cache = RedisSemanticCache(
-        redis,
-        embeddings,
-        index_name="optima-cache-v1",
-        embedding_dimension=3,
-        timeout_seconds=1.0,
+    redis = FakeRedisSearchClient(
+        redis_response(resolved, distance="0.99", profile=embedding_profile(3))
     )
+    embeddings = FakeEmbeddingProvider((0.25, -0.5, 1.0))
+    cache = redis_cache(redis, embeddings)
 
     result = asyncio.run(cache.lookup(lookup_request()))
 
-    assert result == resolved
+    assert result.candidate == resolved
+    assert result.embedding_usage is not None
+    assert result.embedding_usage.input_tokens == 11
     assert len(embeddings.calls) == 1
     assert len(redis.calls) == 1
     command = redis.calls[0]
     assert command[:3] == (
         "FT.SEARCH",
         "optima-cache-v1",
-        "(@task_type:{SUMMARIZATION} @complexity:{LOW})"
+        "(@schema_version:{1} @task_type:{SUMMARIZATION} @complexity:{LOW} "
+        f"@embedding_profile:{{{embedding_profile(3).identity}}})"
         "=>[KNN 1 @embedding $query_vector AS vector_distance]",
     )
     assert command[3:6] == ("PARAMS", 2, "query_vector")
@@ -164,18 +235,15 @@ def test_redis_lookup_returns_nonpositive_similarity_for_planner_assessment(
     expected_similarity: float,
 ) -> None:
     """Keep every valid cosine candidate available to Planner V1."""
-    cache = RedisSemanticCache(
+    cache = redis_cache(
         FakeRedisSearchClient(redis_response(candidate(), distance=distance)),
         FakeEmbeddingProvider((1.0,)),
-        index_name="optima-cache-v1",
-        embedding_dimension=1,
-        timeout_seconds=1.0,
     )
 
     result = asyncio.run(cache.lookup(lookup_request()))
 
-    assert result is not None
-    assert result.similarity == expected_similarity
+    assert result.candidate is not None
+    assert result.candidate.similarity == expected_similarity
 
 
 @pytest.mark.parametrize(
@@ -187,50 +255,40 @@ def test_redis_lookup_maps_positive_cosine_distance_to_similarity(
     expected_similarity: float,
 ) -> None:
     """Preserve the exact cosine boundary at distance 0 and interior distances."""
-    cache = RedisSemanticCache(
+    cache = redis_cache(
         FakeRedisSearchClient(redis_response(candidate(), distance=distance)),
         FakeEmbeddingProvider((1.0,)),
-        index_name="optima-cache-v1",
-        embedding_dimension=1,
-        timeout_seconds=1.0,
     )
 
     result = asyncio.run(cache.lookup(lookup_request()))
 
-    assert result is not None
-    assert result.similarity == expected_similarity
+    assert result.candidate is not None
+    assert result.candidate.similarity == expected_similarity
 
 
 def test_redis_lookup_returns_binding_mismatch_for_planner_assessment() -> None:
     """Return mismatched evidence so Planner V1 owns the final binding gate."""
     mismatched = candidate(request_binding=request_binding(input_text="Other input"))
-    cache = RedisSemanticCache(
+    cache = redis_cache(
         FakeRedisSearchClient(redis_response(mismatched)),
         FakeEmbeddingProvider((1.0,)),
-        index_name="optima-cache-v1",
-        embedding_dimension=1,
-        timeout_seconds=1.0,
     )
 
     result = asyncio.run(cache.lookup(lookup_request()))
 
-    assert result is not None
-    assert result.request_binding == mismatched.request_binding
-    assert result.request_binding != lookup_request().request_binding
+    assert result.candidate is not None
+    assert result.candidate.request_binding == mismatched.request_binding
+    assert result.candidate.request_binding != lookup_request().request_binding
 
 
 def test_redis_lookup_returns_truthful_miss() -> None:
     """Map the exact empty Redis search shape to no candidate."""
     redis = FakeRedisSearchClient([0])
-    cache = RedisSemanticCache(
-        redis,
-        FakeEmbeddingProvider((1.0,)),
-        index_name="optima-cache-v1",
-        embedding_dimension=1,
-        timeout_seconds=1.0,
-    )
+    cache = redis_cache(redis, FakeEmbeddingProvider((1.0,)))
 
-    assert asyncio.run(cache.lookup(lookup_request())) is None
+    result = asyncio.run(cache.lookup(lookup_request()))
+    assert result.candidate is None
+    assert result.embedding_usage is not None
     assert len(redis.calls) == 1
 
 
@@ -247,18 +305,16 @@ def test_redis_lookup_returns_truthful_miss() -> None:
         redis_response(candidate(), fields_update={b"vector_distance": b"nan"}),
         redis_response(candidate(), fields_update={b"safe_to_reuse": b"1"}),
         redis_response(candidate(), fields_update={b"prior_evaluation_json": b"{}"}),
+        redis_response(candidate(), fields_update={b"embedding_profile": b"0" * 64}),
     ],
 )
 def test_redis_lookup_rejects_malformed_or_unsupported_evidence(
     response: object,
 ) -> None:
     """Fail closed instead of returning partial or fabricated cache evidence."""
-    cache = RedisSemanticCache(
+    cache = redis_cache(
         FakeRedisSearchClient(response),
         FakeEmbeddingProvider((1.0,)),
-        index_name="optima-cache-v1",
-        embedding_dimension=1,
-        timeout_seconds=1.0,
     )
 
     with pytest.raises(RedisSemanticCacheInvalidResponseError):
@@ -281,15 +337,9 @@ def test_redis_lookup_rejects_invalid_vectors_before_redis(
 ) -> None:
     """Reject unsafe vector values before issuing a Redis command."""
     redis = FakeRedisSearchClient([0])
-    cache = RedisSemanticCache(
-        redis,
-        FakeEmbeddingProvider(embedding),
-        index_name="optima-cache-v1",
-        embedding_dimension=1,
-        timeout_seconds=1.0,
-    )
+    cache = redis_cache(redis, FakeEmbeddingProvider(embedding))
 
-    with pytest.raises(ValueError):
+    with pytest.raises(SemanticCacheLookupError):
         asyncio.run(cache.lookup(lookup_request()))
     assert redis.calls == []
 
@@ -298,15 +348,21 @@ def test_redis_lookup_timeout_is_observable_to_api_fallback() -> None:
     """Propagate built-in TimeoutError for the existing typed API outcome."""
 
     class SlowEmbeddingProvider:
-        async def embed(self, request: Any) -> Sequence[float]:
+        profile = embedding_profile(1)
+
+        async def embed(self, request: Any) -> EmbeddingProviderResult:
             await asyncio.sleep(0.01)
-            return (1.0,)
+            return EmbeddingProviderResult(
+                vector=(1.0,),
+                profile=embedding_profile(1),
+                provider="fake-embed",
+            )
 
     cache = RedisSemanticCache(
         FakeRedisSearchClient([0]),
         SlowEmbeddingProvider(),
         index_name="optima-cache-v1",
-        embedding_dimension=1,
+        embedding_profile=embedding_profile(1),
         timeout_seconds=0.001,
     )
 
@@ -327,18 +383,14 @@ def test_redis_lookup_propagates_client_failure_without_fabricating_hit() -> Non
 
     redis = FailingRedisSearchClient()
     embeddings = FakeEmbeddingProvider((1.0,))
-    cache = RedisSemanticCache(
-        redis,
-        embeddings,
-        index_name="optima-cache-v1",
-        embedding_dimension=1,
-        timeout_seconds=1.0,
-    )
+    cache = redis_cache(redis, embeddings)
 
-    with pytest.raises(RuntimeError, match="no such index"):
+    with pytest.raises(SemanticCacheLookupError) as excinfo:
         asyncio.run(cache.lookup(lookup_request()))
     assert redis.calls == 1
     assert len(embeddings.calls) == 1
+    assert excinfo.value.embedding_usage is not None
+    assert excinfo.value.embedding_usage.input_tokens == 11
 
 
 def redis_settings(auth_mode: RedisAuthMode, **updates: object) -> AppSettings:
@@ -347,6 +399,8 @@ def redis_settings(auth_mode: RedisAuthMode, **updates: object) -> AppSettings:
         "redis_host": "optima.eastus.redis.azure.net",
         "redis_index_name": "optima-cache-v1",
         "redis_embedding_dimension": 3,
+        "redis_embedding_model": "text-embed-3",
+        "redis_embedding_deployment": "optima-embed",
         "redis_auth_mode": auth_mode,
     }
     values.update(updates)
@@ -588,7 +642,7 @@ def test_redis_resources_close_identity_when_client_close_fails() -> None:
             client,
             FakeEmbeddingProvider((1.0,)),
             index_name="cache",
-            embedding_dimension=1,
+            embedding_profile=embedding_profile(1),
             timeout_seconds=1.0,
         ),
         client=client,
@@ -681,3 +735,216 @@ def test_redis_client_uses_tls_resp2_bounded_pool_and_zero_retries(
     assert isinstance(retry, FakeRetry)
     assert isinstance(retry.backoff, FakeNoBackoff)
     assert retry.retries == 0
+
+
+def test_redis_lookup_records_embedding_usage_on_hit() -> None:
+    """Record the embedding request so a cache hit is not falsely free."""
+    resolved = candidate(similarity=0.01)
+    embeddings = FakeEmbeddingProvider((1.0,), input_tokens=13, request_id="apim-req-9")
+    cache = redis_cache(
+        FakeRedisSearchClient(redis_response(resolved, profile=embeddings.profile)),
+        embeddings,
+    )
+
+    result = asyncio.run(cache.lookup(lookup_request()))
+
+    assert result.candidate is not None
+    assert result.candidate.source_run_id == resolved.source_run_id
+    usage = result.embedding_usage
+    assert usage is not None
+    assert usage.run_id == "run-current-1"
+    assert usage.provider == "fake-embed"
+    assert usage.deployment == "optima-embed"
+    assert usage.embedding_profile == embeddings.profile.identity
+    assert usage.input_tokens == 13
+    assert usage.request_id == "apim-req-9"
+    assert usage.calculated_cost is None
+
+
+def test_redis_lookup_rejects_provider_profile_mismatch() -> None:
+    """Refuse a provider whose returned profile is not the configured profile."""
+    redis = FakeRedisSearchClient([0])
+    embeddings = FakeEmbeddingProvider((1.0,), profile=embedding_profile(1))
+    cache = redis_cache(
+        redis,
+        embeddings,
+        profile=embedding_profile(2),
+    )
+
+    with pytest.raises(SemanticCacheLookupError, match="profile") as excinfo:
+        asyncio.run(cache.lookup(lookup_request()))
+    assert redis.calls == []
+    assert excinfo.value.embedding_usage is not None
+
+
+def test_redis_composition_rejects_mismatched_embedding_profile() -> None:
+    """Fail fast when the provider and Redis index profiles disagree."""
+    with pytest.raises(ValueError, match="profile"):
+        build_redis_semantic_cache_resources(
+            redis_settings(
+                RedisAuthMode.ACCESS_KEY,
+                redis_access_key="fake-access-key",
+            ),
+            FakeEmbeddingProvider(
+                (0.25, -0.5, 1.0),
+                profile=embedding_profile(3, model="other-model"),
+            ),
+        )
+
+
+def test_embedding_profile_identity_is_deterministic_and_distinct() -> None:
+    """Bind identity to model, deployment, and dimension without collisions."""
+    base = embedding_profile(3)
+    assert base.identity == embedding_profile(3).identity
+    assert len(base.identity) == 64
+    assert base.identity != embedding_profile(4).identity
+    assert base.identity != embedding_profile(3, model="other-model").identity
+    assert base.identity != embedding_profile(3, deployment="other-deploy").identity
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["bad model!", "with space", "tag{injection", "pipe|value", "semi;colon"],
+)
+def test_embedding_profile_rejects_injection_values(value: str) -> None:
+    """Reject profile tokens that could inject RediSearch query syntax."""
+    with pytest.raises(ValueError):
+        EmbeddingProfile(model=value, deployment="optima-embed", dimension=3)
+
+
+def _flaky_token_credential(
+    failing_calls: set[int],
+    *,
+    park: asyncio.Event | None = None,
+    park_from: int | None = None,
+) -> "FakeAzureCredential":
+    class FlakyAzureCredential(FakeAzureCredential):
+        async def get_token(self, *scopes: str, **kwargs: object) -> AccessToken:
+            call = len(self.get_token_calls) + 1
+            self.get_token_calls.append(scopes)
+            if park is not None and park_from is not None and call >= park_from:
+                await park.wait()
+            if call in failing_calls:
+                raise RuntimeError("transient token failure")
+            return AccessToken("secret-token", int(time()) + 3600)
+
+    return FlakyAzureCredential()
+
+
+def test_token_renewal_retries_transient_failure_then_succeeds() -> None:
+    """A transient token failure must not permanently disable renewal."""
+    park = asyncio.Event()
+    credential = _flaky_token_credential({2}, park=park, park_from=4)
+    sleeps: list[float] = []
+    delivered: list[AzureRedisToken] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    provider = AzureRedisCredentialProvider(
+        lambda: credential,
+        "object-id",
+        max_renewal_attempts=3,
+        sleep=fake_sleep,
+        jitter=lambda base: 0.0,
+    )
+
+    async def on_next(token: AzureRedisToken) -> None:
+        delivered.append(token)
+
+    async def exercise() -> None:
+        provider.on_next(on_next)
+        await provider.get_credentials_async()
+        for _ in range(500):
+            if delivered:
+                break
+            await asyncio.sleep(0)
+        assert delivered
+        park.set()
+        await provider.aclose()
+
+    asyncio.run(exercise())
+
+    assert len(delivered) == 1
+    assert len(sleeps) >= 2
+    assert credential.close_calls == 1
+
+
+def test_token_renewal_stops_after_exhausting_bounded_attempts() -> None:
+    """Give up renewal after the configured bounded attempts are exhausted."""
+    credential = _flaky_token_credential({2, 3, 4, 5, 6})
+    errors: list[Exception] = []
+
+    async def fake_sleep(delay: float) -> None:
+        return None
+
+    provider = AzureRedisCredentialProvider(
+        lambda: credential,
+        "object-id",
+        max_renewal_attempts=3,
+        sleep=fake_sleep,
+        jitter=lambda base: 0.0,
+    )
+
+    async def on_error(error: Exception) -> None:
+        errors.append(error)
+
+    async def exercise() -> None:
+        provider.on_error(on_error)
+        await provider.get_credentials_async()
+        for _ in range(500):
+            if not provider.is_streaming():
+                break
+            await asyncio.sleep(0)
+        assert provider.is_streaming() is False
+        await provider.aclose()
+
+    asyncio.run(exercise())
+
+    assert len(errors) == 1
+    assert len(credential.get_token_calls) == 4
+
+
+def test_token_renewal_survives_reauthentication_callback_failure() -> None:
+    """A transient reauthentication failure must not stop token renewal."""
+    park = asyncio.Event()
+    credential = _flaky_token_credential(set(), park=park, park_from=4)
+    delivered: list[AzureRedisToken] = []
+    errors: list[Exception] = []
+    reauth_calls = {"count": 0}
+
+    async def fake_sleep(delay: float) -> None:
+        return None
+
+    async def failing_on_next(token: AzureRedisToken) -> None:
+        reauth_calls["count"] += 1
+        if reauth_calls["count"] == 1:
+            raise RuntimeError("reauthentication failed")
+        delivered.append(token)
+
+    async def on_error(error: Exception) -> None:
+        errors.append(error)
+
+    provider = AzureRedisCredentialProvider(
+        lambda: credential,
+        "object-id",
+        sleep=fake_sleep,
+        jitter=lambda base: 0.0,
+    )
+
+    async def exercise() -> None:
+        provider.on_next(failing_on_next)
+        provider.on_error(on_error)
+        await provider.get_credentials_async()
+        for _ in range(500):
+            if delivered:
+                break
+            await asyncio.sleep(0)
+        assert delivered
+        park.set()
+        await provider.aclose()
+
+    asyncio.run(exercise())
+
+    assert len(delivered) == 1
+    assert len(errors) >= 1

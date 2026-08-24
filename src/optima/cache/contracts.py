@@ -1,16 +1,19 @@
 """Semantic-cache lookup contracts independent of storage providers."""
 
+import math
 from typing import Annotated, Protocol, runtime_checkable
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from optima.domain.cache import CacheCandidate
+from optima.domain.embedding import EmbeddingProfile, EmbeddingUsage
 from optima.domain.quality_contract import QualityContract
 from optima.domain.request_binding import RequestBinding, build_request_binding
 from optima.domain.request_profile import RequestProfile
 from optima.immutable import ImmutableJsonObject, ImmutableModel
 
 NonEmptyString = Annotated[str, Field(strict=True, min_length=1)]
+NonNegativeCount = Annotated[int, Field(strict=True, ge=0)]
 
 
 class SemanticCacheLookupRequest(ImmutableModel):
@@ -50,6 +53,83 @@ class SemanticCache(Protocol):
     async def lookup(
         self,
         request: SemanticCacheLookupRequest,
-    ) -> CacheCandidate | None:
-        """Return one resolved candidate or a truthful miss."""
+    ) -> "SemanticCacheLookupResult":
+        """Return one resolved candidate and any embedding usage consumed."""
+        ...
+
+
+class EmbeddingProviderResult(ImmutableModel):
+    """One embedding vector with its declared profile and optional usage."""
+
+    vector: tuple[float, ...]
+    profile: EmbeddingProfile
+    provider: NonEmptyString
+    request_id: NonEmptyString | None = None
+    input_tokens: NonNegativeCount | None = None
+
+    @field_validator("vector", mode="before")
+    @classmethod
+    def validate_vector(cls, value: object) -> tuple[float, ...]:
+        """Require a non-empty sequence of finite, non-boolean real numbers."""
+        if isinstance(value, str | bytes | bytearray):
+            raise ValueError("embedding vector must be a numeric sequence")
+        try:
+            elements = list(value)  # type: ignore[call-overload]
+        except TypeError as error:
+            raise ValueError("embedding vector must be a numeric sequence") from error
+        if not elements:
+            raise ValueError("embedding vector must not be empty")
+        numbers: list[float] = []
+        for element in elements:
+            if isinstance(element, bool) or not isinstance(element, int | float):
+                raise ValueError("embedding vector values must be numeric")
+            number = float(element)
+            if not math.isfinite(number):
+                raise ValueError("embedding vector values must be finite")
+            numbers.append(number)
+        return tuple(numbers)
+
+
+class SemanticCacheLookupResult(ImmutableModel):
+    """One resolved candidate and the embedding usage the lookup consumed."""
+
+    candidate: CacheCandidate | None = None
+    embedding_usage: EmbeddingUsage | None = None
+
+
+class SemanticCacheLookupError(Exception):
+    """A cache lookup failure that may carry already-consumed embedding usage."""
+
+    def __init__(
+        self,
+        embedding_usage: EmbeddingUsage | None = None,
+        *,
+        message: str = "semantic-cache lookup failed",
+    ) -> None:
+        super().__init__(message)
+        self.embedding_usage = embedding_usage
+
+
+class SemanticCacheLookupTimeout(TimeoutError):
+    """A cache lookup timeout that may carry already-consumed embedding usage."""
+
+    def __init__(self, embedding_usage: EmbeddingUsage | None = None) -> None:
+        super().__init__("semantic-cache lookup timed out")
+        self.embedding_usage = embedding_usage
+
+
+@runtime_checkable
+class SemanticCacheEmbeddingProvider(Protocol):
+    """Produce one provider-independent embedding for a lookup request."""
+
+    @property
+    def profile(self) -> EmbeddingProfile:
+        """Return the embedding profile this provider produces."""
+        ...
+
+    async def embed(
+        self,
+        request: SemanticCacheLookupRequest,
+    ) -> EmbeddingProviderResult:
+        """Return the vector, profile, and usage for one lookup request."""
         ...
