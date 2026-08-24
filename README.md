@@ -389,6 +389,78 @@ No live Redis resource is exercised by the default test suite. Lookup parsing,
 query construction, embedding-profile enforcement, authentication selection,
 token renewal, client options, and lifecycle are validated with offline fakes.
 
+## Application Insights observability
+
+Corrective Slice 10D adds provider-independent run and stage observation backed
+by the Azure Monitor OpenTelemetry Distro. Observability is disabled by default.
+The default API and deterministic demo therefore create no exporter, Azure
+credential, background telemetry thread, network request, or offline telemetry
+file.
+
+Enable Application Insights only in an explicitly composed API process:
+
+```powershell
+$env:OPTIMA_APPLICATION_INSIGHTS_ENABLED="true"
+$env:OPTIMA_APPLICATION_INSIGHTS_CONNECTION_STRING="InstrumentationKey=<uuid>;IngestionEndpoint=https://<region>.in.applicationinsights.azure.com/"
+$env:OPTIMA_APPLICATION_INSIGHTS_SERVICE_NAME="optima-api"
+$env:OPTIMA_APPLICATION_INSIGHTS_SERVICE_VERSION="0.1.0"
+$env:OPTIMA_APPLICATION_INSIGHTS_DEPLOYMENT_ENVIRONMENT="demo"
+$env:OPTIMA_APPLICATION_INSIGHTS_SAMPLING_RATIO="1.0"
+```
+
+`AppSettings` rejects enabled telemetry without a syntactically valid
+connection string before exporter construction. The connection string must
+include an instrumentation-key UUID and an explicit credential-free HTTPS
+Azure Application Insights ingestion endpoint. Ambiguous suffix-based endpoint
+construction, unknown fields, plaintext endpoints, URL credentials, queries,
+and fragments are rejected. `create_app` resolves the configured observer when
+it receives `ExecutionDependencies`; tests can inject `InMemoryObservability`
+instead. Repeated application composition reuses one identically configured
+process-wide Azure Monitor runtime and rejects a conflicting second
+configuration.
+
+The default privacy and volume controls are explicit:
+
+- Azure Monitor log export is disabled
+- Live Metrics and performance counters are disabled
+- offline retry storage is disabled
+- Azure SDK, requests, urllib, urllib3, FastAPI, Django, Flask, and psycopg2
+  distro auto-instrumentation are disabled
+- ambient OpenTelemetry service and resource attributes are cleared before the
+  distro builds its resource
+- Azure Monitor control-plane configuration, Statsbeat, SDK statistics, and
+  OpenTelemetry resource metrics are disabled
+- exporter redirects and transport retries are disabled
+- one custom FastAPI server span is created per non-health request
+- request and response bodies, headers, query strings, raw URLs, user IDs,
+  endpoints, exception messages, and exception stack contents are not exported
+- `/api/v1/health` is excluded by default
+
+The sampling ratio is a validated parent-based trace-ID ratio from `0.0` through
+`1.0`. The root decision uses the configured ratio, while local and remote child
+spans preserve their parent's sampled flag. The default `1.0` retains complete
+traces for the hackathon demo; production operators should lower it to control
+ingestion cost. Sampling applies only to traces. Terminal metrics are projected
+exactly once from each validated `RunResult` and remain unsampled.
+
+Application Insights configuration also supports these explicit switches:
+
+```powershell
+$env:OPTIMA_APPLICATION_INSIGHTS_LIVE_METRICS_ENABLED="false"
+$env:OPTIMA_APPLICATION_INSIGHTS_PERFORMANCE_COUNTERS_ENABLED="false"
+$env:OPTIMA_APPLICATION_INSIGHTS_OFFLINE_STORAGE_ENABLED="false"
+$env:OPTIMA_APPLICATION_INSIGHTS_FASTAPI_INSTRUMENTATION_ENABLED="true"
+$env:OPTIMA_APPLICATION_INSIGHTS_EXCLUDE_HEALTH_ROUTES="true"
+```
+
+The adapter exposes idempotent `force_flush()` and `close()` operations. Slice
+11 remains responsible for invoking them from the production FastAPI lifespan.
+A pre-existing process-wide OpenTelemetry provider prevents Azure Monitor
+initialization rather than creating an orphaned exporter or claiming another
+owner's provider. Runtime initializer failures degrade to the inert observer and
+are not retried; typed configuration conflicts still fail fast. No live
+Application Insights resource is exercised by the default test suite.
+
 On Windows ARM64, use an x64 Python 3.12 interpreter for Streamlit because its
 Pandas and PyArrow dependencies may not have Windows ARM64 wheels in the
 configured package feed.

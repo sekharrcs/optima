@@ -316,8 +316,115 @@ Stores aggregated evidence such as task/profile/mode-specific pass rate, cost, l
 Planner V1 may use this evidence only within the guardrails defined in `docs/PLANNER_V1.md`.
 
 ### Telemetry
-Records actual execution facts including correlation ID, plan, steps, usage, latency, evaluation, escalation, and final outcome.
-It must not silently convert predictions/estimates into measured actuals.
+
+Telemetry observes existing domain evidence and never participates in planning,
+execution, evaluation, caching, pricing, or persistence decisions. The
+provider-independent boundary exposes run observation, bounded stage
+observation, validated terminal-result projection, safe pre-result failure
+classification, and explicit flush/close operations. No domain, planner,
+executor, evaluator, cache, provider, or history contract depends on Azure
+Monitor or OpenTelemetry types.
+
+The default implementation is inert. Tests can inject a deterministic
+context-local in-memory recorder. The production adapter translates the same
+contract to OpenTelemetry and initializes the Azure Monitor OpenTelemetry Distro
+only when `application_insights_enabled` is true and its complete typed
+configuration is valid.
+
+Telemetry schema version 1 uses this hierarchy beneath one explicitly
+instrumented FastAPI server span:
+
+```text
+POST /api/v1/runs
+        optima.run
+                optima.quality_contract.build
+                optima.semantic_cache.lookup        # only when attempted
+                optima.planner.select
+                optima.context_reduction            # only when attempted
+                optima.model.generate               # once per actual provider call
+                optima.evaluation.evaluate          # once per actual evaluator call
+                optima.run_history.save             # only when configured and attempted
+                optima.outcome.project              # one validated terminal projection
+```
+
+Context-local activation preserves parentage across asynchronous calls. Every
+stage and terminal projection is close-once or emit-once. A failure-isolation
+wrapper contains recorder, exporter, instrumentation, flush, and shutdown
+exceptions so telemetry cannot alter the API response or any business call
+count.
+
+The `optima.run` span carries only bounded or validated trace attributes:
+
+- schema version, run ID, and correlation ID
+- plan family, Optimization Mode, Quality Profile, and task type
+- authoritative terminal status and contract result
+- escalation state and actual model-attempt count
+- semantic-cache and context-reduction outcomes
+- availability flags for token, cost, and evaluation measurements
+- measured totals only when present
+- exact aggregate cost as a decimal string when present
+
+Run ID, correlation ID, and validated provider request ID are trace-only
+attributes. They are never metric dimensions. Expected or planned values are
+not emitted as actual measurements.
+
+Schema version 1 defines these custom metrics:
+
+- `optima.runs` by terminal status and plan family
+- `optima.run.duration` by terminal status and plan family
+- `optima.model.attempts` by model role and operation result
+- `optima.model.duration` by model role and operation result
+- `optima.tokens` by `INPUT`, `OUTPUT`, `CACHED`, or `EMBEDDING` category and
+        model role where applicable
+- `optima.cache.lookups` by semantic-cache outcome
+- `optima.embedding.attempts` by measured, unmeasured outbound, or pre-outbound
+        result
+- `optima.escalations` by plan family
+- `optima.quality_contract.results` by met, not met, or unavailable result
+- `optima.evaluation.score` by valid pass, valid rejection, or invalid evidence
+- `optima.run_history.persistence` by persisted or failed result
+- `optima.telemetry.projections` by terminal or pre-result projection category
+
+Metrics never include request IDs, run IDs, correlation IDs, provider request
+IDs, endpoint names, hostnames, exception messages, or caller metadata. Missing
+measurements produce no numeric data point. Custom cost metrics are omitted
+because OpenTelemetry accepts binary numeric values while the domain preserves
+exact `Decimal` cost. Exact cost remains in `RunResult` and, when available, as
+a decimal-string trace attribute.
+
+Completed contract misses are successful system operations. Failed and timed-out
+runs use OpenTelemetry error status. Cache failure can coexist with a successful
+root run, and history-save failure marks only the history child operation. Raw
+exceptions are never recorded; spans contain only bounded failure categories or
+validated exception class names at the HTTP boundary.
+
+The FastAPI middleware extracts only W3C `traceparent` and `tracestate` headers,
+uses registered route templates, and excludes the health route by default. It
+does not inspect bodies or export raw paths, query strings, headers, cookies,
+authorization values, API keys, or user IDs. Distro auto-instrumentation for
+FastAPI, Azure SDK, requests, urllib, urllib3, Django, Flask, and psycopg2 is
+disabled to avoid duplicate operations and endpoint leakage.
+
+The Azure adapter uses a parent-based trace-ID ratio sampler. The validated root
+ratio defaults to `1.0` for complete demo traces and can be reduced to control
+ingestion cost. Remote and local parent decisions propagate through each trace;
+metrics are not sampled. Logs, Live Metrics, performance counters, offline retry
+storage, control-plane configuration, Statsbeat, SDK statistics, and resource
+metrics default to disabled. Exporter redirects and transport retries are zero.
+
+Initialization clears ambient OpenTelemetry service and resource attributes,
+then supplies only the validated service name, service version, and deployment
+environment. The Application Insights connection string requires an explicit
+credential-free HTTPS Azure ingestion endpoint; suffix-derived, plaintext,
+credential-bearing, queried, fragmented, unknown, or non-Azure endpoints fail
+before exporter creation.
+
+One process-wide registry initializes one exact configuration. A conflicting
+configuration fails fast. Existing external OpenTelemetry providers or runtime
+initializer failures select the inert observer rather than orphaning exporters,
+claiming another component's provider, or preventing application construction.
+Partially created owned providers are shut down best effort. Slice 11 retains
+production FastAPI lifespan ownership for flush and shutdown.
 
 ## Module configuration
 

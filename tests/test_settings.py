@@ -57,6 +57,17 @@ def isolate_settings_sources(
         "OPTIMA_REDIS_MANAGED_IDENTITY_CLIENT_ID",
         "OPTIMA_REDIS_TIMEOUT_SECONDS",
         "OPTIMA_REDIS_MAX_CONNECTIONS",
+        "OPTIMA_APPLICATION_INSIGHTS_ENABLED",
+        "OPTIMA_APPLICATION_INSIGHTS_CONNECTION_STRING",
+        "OPTIMA_APPLICATION_INSIGHTS_SERVICE_NAME",
+        "OPTIMA_APPLICATION_INSIGHTS_SERVICE_VERSION",
+        "OPTIMA_APPLICATION_INSIGHTS_DEPLOYMENT_ENVIRONMENT",
+        "OPTIMA_APPLICATION_INSIGHTS_SAMPLING_RATIO",
+        "OPTIMA_APPLICATION_INSIGHTS_LIVE_METRICS_ENABLED",
+        "OPTIMA_APPLICATION_INSIGHTS_PERFORMANCE_COUNTERS_ENABLED",
+        "OPTIMA_APPLICATION_INSIGHTS_OFFLINE_STORAGE_ENABLED",
+        "OPTIMA_APPLICATION_INSIGHTS_FASTAPI_INSTRUMENTATION_ENABLED",
+        "OPTIMA_APPLICATION_INSIGHTS_EXCLUDE_HEALTH_ROUTES",
     ):
         monkeypatch.delenv(variable, raising=False)
 
@@ -166,6 +177,17 @@ def test_settings_accept_explicit_injection() -> None:
         "redis_token_acquisition_timeout_seconds": 10.0,
         "redis_token_reauth_timeout_seconds": 10.0,
         "redis_token_expiry_safety_margin_seconds": 180.0,
+        "application_insights_enabled": False,
+        "application_insights_connection_string": None,
+        "application_insights_service_name": "optima-api",
+        "application_insights_service_version": "0.1.0",
+        "application_insights_deployment_environment": "local",
+        "application_insights_sampling_ratio": 1.0,
+        "application_insights_live_metrics_enabled": False,
+        "application_insights_performance_counters_enabled": False,
+        "application_insights_offline_storage_enabled": False,
+        "application_insights_fastapi_instrumentation_enabled": True,
+        "application_insights_exclude_health_routes": True,
     }
 
 
@@ -298,6 +320,129 @@ def test_default_settings_do_not_request_foundry_composition() -> None:
 def test_default_settings_do_not_request_redis_composition() -> None:
     """Keep local API and tests free from Redis credentials and connections."""
     assert AppSettings().redis_semantic_cache_configuration() is None
+
+
+def test_default_settings_do_not_request_application_insights() -> None:
+    """Keep default application construction free from telemetry exporters."""
+    assert AppSettings().application_insights_configuration() is None
+
+
+def test_enabled_application_insights_requires_connection_string() -> None:
+    """Fail settings validation before an exporter can be constructed."""
+    with pytest.raises(ValidationError, match="requires a configured connection"):
+        AppSettings(application_insights_enabled=True)
+
+
+def test_settings_build_explicit_application_insights_configuration() -> None:
+    """Preserve explicit privacy, sampling, and resource configuration."""
+    settings = AppSettings(
+        application_insights_enabled=True,
+        application_insights_connection_string=SecretStr(
+            "InstrumentationKey=00000000-0000-0000-0000-000000000001;"
+            "IngestionEndpoint=https://example.applicationinsights.azure.com/;"
+            "LiveEndpoint=https://example.livediagnostics.monitor.azure.com/;"
+            "Authorization=ikey;"
+            "ApplicationId=00000000-0000-0000-0000-000000000002"
+        ),
+        application_insights_service_name="optima-test",
+        application_insights_service_version="1.2.3",
+        application_insights_deployment_environment="test",
+        application_insights_sampling_ratio=0.25,
+        application_insights_live_metrics_enabled=True,
+        application_insights_performance_counters_enabled=True,
+        application_insights_offline_storage_enabled=True,
+        application_insights_fastapi_instrumentation_enabled=False,
+        application_insights_exclude_health_routes=False,
+    )
+
+    configuration = settings.application_insights_configuration()
+
+    assert configuration is not None
+    assert configuration.connection_string.get_secret_value().startswith(
+        "InstrumentationKey="
+    )
+    assert "00000000-0000-0000-0000-000000000001" not in repr(configuration)
+    assert configuration.service_name == "optima-test"
+    assert configuration.service_version == "1.2.3"
+    assert configuration.deployment_environment == "test"
+    assert configuration.sampling_ratio == 0.25
+    assert configuration.live_metrics_enabled is True
+    assert configuration.performance_counters_enabled is True
+    assert configuration.offline_storage_enabled is True
+    assert configuration.fastapi_instrumentation_enabled is False
+    assert configuration.exclude_health_routes is False
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"application_insights_connection_string": "not-a-connection-string"},
+        {"application_insights_connection_string": ("InstrumentationKey=not-a-uuid")},
+        {
+            "application_insights_connection_string": (
+                "InstrumentationKey=00000000-0000-0000-0000-000000000001;"
+                "IngestionEndpoint=http://evil.applicationinsights.azure.com/"
+            )
+        },
+        {
+            "application_insights_connection_string": (
+                "InstrumentationKey=00000000-0000-0000-0000-000000000001;"
+                "IngestionEndpoint=https://evil.example/"
+            )
+        },
+        {
+            "application_insights_connection_string": (
+                "InstrumentationKey=00000000-0000-0000-0000-000000000001;"
+                "IngestionEndpoint=https://.applicationinsights.azure.com/"
+            )
+        },
+        {
+            "application_insights_connection_string": (
+                "InstrumentationKey=00000000-0000-0000-0000-000000000001;"
+                "IngestionEndpoint=https://foo..applicationinsights.azure.com/"
+            )
+        },
+        {
+            "application_insights_connection_string": (
+                "InstrumentationKey=00000000-0000-0000-0000-000000000001;"
+                "IngestionEndpoint=https://foo-.applicationinsights.azure.com/"
+            )
+        },
+        {
+            "application_insights_connection_string": (
+                "InstrumentationKey=00000000-0000-0000-0000-000000000001;"
+                "EndpointSuffix=applicationinsights.azure.com"
+            )
+        },
+        {
+            "application_insights_connection_string": (
+                "InstrumentationKey=00000000-0000-0000-0000-000000000001;"
+                "IngestionEndpoint=https://example.applicationinsights.azure.com/"
+            ),
+            "application_insights_sampling_ratio": -0.01,
+        },
+        {
+            "application_insights_connection_string": (
+                "InstrumentationKey=00000000-0000-0000-0000-000000000001;"
+                "IngestionEndpoint=https://example.applicationinsights.azure.com/"
+            ),
+            "application_insights_sampling_ratio": 1.01,
+        },
+        {
+            "application_insights_connection_string": (
+                "InstrumentationKey=00000000-0000-0000-0000-000000000001;"
+                "IngestionEndpoint=https://example.applicationinsights.azure.com/"
+            ),
+            "application_insights_service_name": "unsafe service name",
+        },
+    ],
+)
+def test_settings_reject_invalid_application_insights_configuration(
+    updates: dict[str, object],
+) -> None:
+    """Reject malformed telemetry configuration before SDK initialization."""
+    with pytest.raises(ValidationError):
+        AppSettings.model_validate({"application_insights_enabled": True, **updates})
 
 
 @pytest.mark.parametrize(

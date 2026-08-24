@@ -35,6 +35,16 @@ from optima.execution.contracts import (
     ExecutionRequest,
     UnsupportedExecutionPlanError,
 )
+from optima.observability import (
+    NO_OP_RUN,
+    ContextStageOutcome,
+    EvaluationStageOutcome,
+    FailureCategory,
+    ModelStageOutcome,
+    ObservationStage,
+    ObservationStatus,
+    RunObservation,
+)
 from optima.providers import (
     ModelProvider,
     ModelProviderRequest,
@@ -89,6 +99,7 @@ class PlanExecutor:
         request: ExecutionRequest,
         *,
         started_at: float | None = None,
+        observation: RunObservation = NO_OP_RUN,
     ) -> RunResult:
         """Execute the selected model policy and its mandatory verification."""
         self._validate_supported_plan(request)
@@ -113,6 +124,7 @@ class PlanExecutor:
         effective_context, context_source = await self._prepare_context(
             request=request,
             steps=steps,
+            observation=observation,
         )
 
         if request.execution_plan.model_policy is ModelPolicy.STRONG_DIRECT:
@@ -125,6 +137,7 @@ class PlanExecutor:
                 steps=steps,
                 usages=usages,
                 evaluations=evaluations,
+                observation=observation,
             )
             if isinstance(strong_attempt, RunStatus):
                 return self._interrupted_result(
@@ -161,6 +174,7 @@ class PlanExecutor:
             steps=steps,
             usages=usages,
             evaluations=evaluations,
+            observation=observation,
         )
         if isinstance(small_attempt, RunStatus):
             return self._interrupted_result(
@@ -219,6 +233,7 @@ class PlanExecutor:
             steps=steps,
             usages=usages,
             evaluations=evaluations,
+            observation=observation,
         )
         if isinstance(strong_attempt, RunStatus):
             return self._interrupted_result(
@@ -256,6 +271,7 @@ class PlanExecutor:
         steps: list[ExecutionStep],
         usages: list[ModelUsage],
         evaluations: list[EvaluationResult],
+        observation: RunObservation,
     ) -> tuple[ModelProviderResult, EvaluationResult] | RunStatus:
         """Call and evaluate one model role while preserving completed evidence."""
         result = await self._call_provider(
@@ -265,6 +281,7 @@ class PlanExecutor:
             effective_context=effective_context,
             context_source=context_source,
             steps=steps,
+            observation=observation,
         )
         if isinstance(result, RunStatus):
             return result
@@ -275,6 +292,7 @@ class PlanExecutor:
             output_text=result.output_text,
             role=role,
             steps=steps,
+            observation=observation,
         )
         if isinstance(evaluation, RunStatus):
             return evaluation
@@ -347,77 +365,109 @@ class PlanExecutor:
         effective_context: str | None,
         context_source: ContextSource,
         steps: list[ExecutionStep],
+        observation: RunObservation,
     ) -> ModelProviderResult | RunStatus:
-        started_at = self._clock.now()
-        try:
-            result = await provider.generate(
-                ModelProviderRequest(
-                    run_id=request.run_id,
-                    model_role=role,
-                    input_text=request.input_text,
-                    context=effective_context,
-                    metadata={
-                        "task_type": request.request_profile.task_type.value,
-                        "complexity": request.request_profile.complexity.value,
-                    },
+        with observation.start_stage(ObservationStage.MODEL_GENERATE) as observed:
+            started_at = self._clock.now()
+            try:
+                result = await provider.generate(
+                    ModelProviderRequest(
+                        run_id=request.run_id,
+                        model_role=role,
+                        input_text=request.input_text,
+                        context=effective_context,
+                        metadata={
+                            "task_type": request.request_profile.task_type.value,
+                            "complexity": request.request_profile.complexity.value,
+                        },
+                    )
                 )
-            )
-            if result.usage.run_id != request.run_id:
-                raise ValueError("provider usage run_id does not match the request")
-            if result.usage.model_role is not role:
-                raise ValueError("provider usage role does not match the request")
-            if result.usage.provider != provider.provider_name:
-                raise ValueError("provider usage identity does not match the provider")
-            if result.usage.deployment != provider.deployment_name:
-                raise ValueError(
-                    "provider usage deployment does not match the provider"
+                if result.usage.run_id != request.run_id:
+                    raise ValueError("provider usage run_id does not match the request")
+                if result.usage.model_role is not role:
+                    raise ValueError("provider usage role does not match the request")
+                if result.usage.provider != provider.provider_name:
+                    raise ValueError(
+                        "provider usage identity does not match the provider"
+                    )
+                if result.usage.deployment != provider.deployment_name:
+                    raise ValueError(
+                        "provider usage deployment does not match the provider"
+                    )
+                result = self._with_authoritative_cost(result)
+            except TimeoutError as error:
+                self._append_failed_step(
+                    steps=steps,
+                    step_type=ExecutionStepType.MODEL_CALL,
+                    status=ExecutionStatus.TIMED_OUT,
+                    started_at=started_at,
+                    role=role,
+                    error=error,
+                    context_source=context_source,
                 )
-            result = self._with_authoritative_cost(result)
-        except TimeoutError as error:
-            self._append_failed_step(
-                steps=steps,
-                step_type=ExecutionStepType.MODEL_CALL,
-                status=ExecutionStatus.TIMED_OUT,
-                started_at=started_at,
-                role=role,
-                error=error,
-                context_source=context_source,
-            )
-            return RunStatus.TIMED_OUT
-        except Exception as error:
-            self._append_failed_step(
-                steps=steps,
-                step_type=ExecutionStepType.MODEL_CALL,
-                status=ExecutionStatus.FAILED,
-                started_at=started_at,
-                role=role,
-                error=error,
-                context_source=context_source,
-            )
-            return RunStatus.FAILED
+                observed.finish(
+                    ModelStageOutcome(
+                        status=ObservationStatus.TIMED_OUT,
+                        model_role=role,
+                        latency_ms=steps[-1].latency_ms,
+                        failure_category=FailureCategory.TIMEOUT,
+                    )
+                )
+                return RunStatus.TIMED_OUT
+            except Exception as error:
+                self._append_failed_step(
+                    steps=steps,
+                    step_type=ExecutionStepType.MODEL_CALL,
+                    status=ExecutionStatus.FAILED,
+                    started_at=started_at,
+                    role=role,
+                    error=error,
+                    context_source=context_source,
+                )
+                observed.finish(
+                    ModelStageOutcome(
+                        status=ObservationStatus.FAILED,
+                        model_role=role,
+                        latency_ms=steps[-1].latency_ms,
+                        failure_category=FailureCategory.MODEL_PROVIDER,
+                    )
+                )
+                return RunStatus.FAILED
 
-        steps.append(
-            ExecutionStep(
-                sequence=len(steps),
-                step_type=ExecutionStepType.MODEL_CALL,
-                status=ExecutionStatus.SUCCEEDED,
-                latency_ms=self._elapsed_ms(started_at),
-                facts={
-                    "model_role": role.value,
-                    "provider": result.usage.provider,
-                    "deployment": result.usage.deployment,
-                    "request_id": result.usage.request_id,
-                },
-                context_source=context_source,
+            steps.append(
+                ExecutionStep(
+                    sequence=len(steps),
+                    step_type=ExecutionStepType.MODEL_CALL,
+                    status=ExecutionStatus.SUCCEEDED,
+                    latency_ms=self._elapsed_ms(started_at),
+                    facts={
+                        "model_role": role.value,
+                        "provider": result.usage.provider,
+                        "deployment": result.usage.deployment,
+                        "request_id": result.usage.request_id,
+                    },
+                    context_source=context_source,
+                )
             )
-        )
-        return result
+            observed.finish(
+                ModelStageOutcome(
+                    status=ObservationStatus.SUCCEEDED,
+                    model_role=role,
+                    latency_ms=steps[-1].latency_ms,
+                    provider_request_id=result.usage.request_id,
+                    input_tokens=result.usage.input_tokens,
+                    output_tokens=result.usage.output_tokens,
+                    cached_tokens=result.usage.cached_tokens,
+                )
+            )
+            return result
 
     async def _prepare_context(
         self,
         *,
         request: ExecutionRequest,
         steps: list[ExecutionStep],
+        observation: RunObservation,
     ) -> tuple[str | None, ContextSource]:
         """Apply selected reduction once or recover explicitly with original context."""
         if request.execution_plan.context_policy is ContextPolicy.KEEP_ORIGINAL:
@@ -431,70 +481,104 @@ class PlanExecutor:
                 "REDUCE plan requires original context"
             )
 
-        original_count = self._token_counter.count(request.context)
-        started_at = self._clock.now()
-        try:
-            raw_result = await self._context_reducer.reduce(
-                ContextReductionRequest(
-                    run_id=request.run_id,
-                    input_text=request.input_text,
-                    context=request.context,
+        with observation.start_stage(ObservationStage.CONTEXT_REDUCTION) as observed:
+            original_count = self._token_counter.count(request.context)
+            started_at = self._clock.now()
+            try:
+                raw_result = await self._context_reducer.reduce(
+                    ContextReductionRequest(
+                        run_id=request.run_id,
+                        input_text=request.input_text,
+                        context=request.context,
+                    )
                 )
-            )
-            result = ContextReductionResult.model_validate(
-                raw_result.model_dump(mode="python")
-            )
-            reduced_count = self._token_counter.count(result.reduced_context)
-            if result.reducer_name != self._context_reducer.reducer_name:
-                raise ValueError("reducer result name does not match dependency")
-            if result.token_counter_name != self._token_counter.counter_name:
-                raise ValueError(
-                    "reducer result token counter does not match dependency"
+                result = ContextReductionResult.model_validate(
+                    raw_result.model_dump(mode="python")
                 )
-            if result.original_token_count != original_count:
-                raise ValueError("reported original token count disagrees with counter")
-            if result.reduced_token_count != reduced_count:
-                raise ValueError("reported reduced token count disagrees with counter")
-            if reduced_count >= original_count:
-                raise ValueError("reducer output did not reduce measured tokens")
-        except TimeoutError as error:
-            self._append_reduction_fallback(
-                steps=steps,
-                status=ExecutionStatus.TIMED_OUT,
-                started_at=started_at,
-                original_token_count=original_count,
-                error=error,
-            )
-            return request.context, ContextSource.ORIGINAL
-        except Exception as error:
-            self._append_reduction_fallback(
-                steps=steps,
-                status=ExecutionStatus.FAILED,
-                started_at=started_at,
-                original_token_count=original_count,
-                error=error,
-            )
-            return request.context, ContextSource.ORIGINAL
-
-        steps.append(
-            ExecutionStep(
-                sequence=len(steps),
-                step_type=ExecutionStepType.CONTEXT_REDUCTION,
-                status=ExecutionStatus.SUCCEEDED,
-                latency_ms=self._elapsed_ms(started_at),
-                context_reduction=ContextReductionEvidence(
-                    outcome=ContextReductionOutcome.APPLIED,
+                reduced_count = self._token_counter.count(result.reduced_context)
+                if result.reducer_name != self._context_reducer.reducer_name:
+                    raise ValueError("reducer result name does not match dependency")
+                if result.token_counter_name != self._token_counter.counter_name:
+                    raise ValueError(
+                        "reducer result token counter does not match dependency"
+                    )
+                if result.original_token_count != original_count:
+                    raise ValueError(
+                        "reported original token count disagrees with counter"
+                    )
+                if result.reduced_token_count != reduced_count:
+                    raise ValueError(
+                        "reported reduced token count disagrees with counter"
+                    )
+                if reduced_count >= original_count:
+                    raise ValueError("reducer output did not reduce measured tokens")
+            except TimeoutError as error:
+                self._append_reduction_fallback(
+                    steps=steps,
+                    status=ExecutionStatus.TIMED_OUT,
+                    started_at=started_at,
                     original_token_count=original_count,
-                    effective_token_count=reduced_count,
-                    reducer_name=result.reducer_name,
-                    method=result.method,
-                    token_counter_name=result.token_counter_name,
-                    context_source=ContextSource.REDUCED,
-                    preservation=result.preservation,
+                    error=error,
+                )
+                observed.finish(
+                    ContextStageOutcome(
+                        status=ObservationStatus.TIMED_OUT,
+                        outcome=ContextReductionOutcome.FAILED_USING_ORIGINAL,
+                        original_tokens=original_count,
+                        effective_tokens=original_count,
+                        latency_ms=steps[-1].latency_ms,
+                        failure_category=FailureCategory.TIMEOUT,
+                    )
+                )
+                return request.context, ContextSource.ORIGINAL
+            except Exception as error:
+                self._append_reduction_fallback(
+                    steps=steps,
+                    status=ExecutionStatus.FAILED,
+                    started_at=started_at,
+                    original_token_count=original_count,
+                    error=error,
+                )
+                observed.finish(
+                    ContextStageOutcome(
+                        status=ObservationStatus.FAILED,
+                        outcome=ContextReductionOutcome.FAILED_USING_ORIGINAL,
+                        original_tokens=original_count,
+                        effective_tokens=original_count,
+                        latency_ms=steps[-1].latency_ms,
+                        failure_category=FailureCategory.CONTEXT_REDUCTION,
+                    )
+                )
+                return request.context, ContextSource.ORIGINAL
+
+            steps.append(
+                ExecutionStep(
+                    sequence=len(steps),
+                    step_type=ExecutionStepType.CONTEXT_REDUCTION,
+                    status=ExecutionStatus.SUCCEEDED,
+                    latency_ms=self._elapsed_ms(started_at),
+                    context_reduction=ContextReductionEvidence(
+                        outcome=ContextReductionOutcome.APPLIED,
+                        original_token_count=original_count,
+                        effective_token_count=reduced_count,
+                        reducer_name=result.reducer_name,
+                        method=result.method,
+                        token_counter_name=result.token_counter_name,
+                        context_source=ContextSource.REDUCED,
+                        preservation=result.preservation,
+                    ),
                 ),
             )
-        )
-        return result.reduced_context, ContextSource.REDUCED
+            observed.finish(
+                ContextStageOutcome(
+                    status=ObservationStatus.SUCCEEDED,
+                    outcome=ContextReductionOutcome.APPLIED,
+                    original_tokens=original_count,
+                    effective_tokens=reduced_count,
+                    latency_ms=steps[-1].latency_ms,
+                )
+            )
+            return result.reduced_context, ContextSource.REDUCED
 
     def _append_reduction_fallback(
         self,
@@ -560,78 +644,106 @@ class PlanExecutor:
         output_text: str,
         role: ModelRole,
         steps: list[ExecutionStep],
+        observation: RunObservation,
     ) -> EvaluationResult | RunStatus:
-        started_at = self._clock.now()
-        try:
-            result = await self._evaluator.evaluate(
-                EvaluationRequest(
-                    run_id=request.run_id,
-                    input_text=request.input_text,
-                    output_text=output_text,
-                    context=request.context,
-                    reference_output=request.reference_output,
-                    criteria=request.criteria,
-                    metadata={
-                        **request.metadata,
-                        "model_role": role.value,
-                        "task_type": request.request_profile.task_type.value,
-                        "complexity": request.request_profile.complexity.value,
-                    },
-                ),
-                request.quality_contract,
-            )
-            result = EvaluationResult.model_validate(result)
-            if result.threshold != request.quality_contract.minimum_quality_score:
-                raise ValueError(
-                    "evaluation threshold does not match the Quality Contract"
+        with observation.start_stage(ObservationStage.EVALUATION_EVALUATE) as observed:
+            started_at = self._clock.now()
+            try:
+                result = await self._evaluator.evaluate(
+                    EvaluationRequest(
+                        run_id=request.run_id,
+                        input_text=request.input_text,
+                        output_text=output_text,
+                        context=request.context,
+                        reference_output=request.reference_output,
+                        criteria=request.criteria,
+                        metadata={
+                            **request.metadata,
+                            "model_role": role.value,
+                            "task_type": request.request_profile.task_type.value,
+                            "complexity": request.request_profile.complexity.value,
+                        },
+                    ),
+                    request.quality_contract,
                 )
-        except TimeoutError as error:
-            self._append_failed_step(
-                steps=steps,
-                step_type=ExecutionStepType.QUALITY_EVALUATION,
-                status=ExecutionStatus.TIMED_OUT,
-                started_at=started_at,
-                role=role,
-                error=error,
-            )
-            return RunStatus.TIMED_OUT
-        except Exception as error:
-            self._append_failed_step(
-                steps=steps,
-                step_type=ExecutionStepType.QUALITY_EVALUATION,
-                status=ExecutionStatus.FAILED,
-                started_at=started_at,
-                role=role,
-                error=error,
-            )
-            return RunStatus.FAILED
+                result = EvaluationResult.model_validate(result)
+                if result.threshold != request.quality_contract.minimum_quality_score:
+                    raise ValueError(
+                        "evaluation threshold does not match the Quality Contract"
+                    )
+            except TimeoutError as error:
+                self._append_failed_step(
+                    steps=steps,
+                    step_type=ExecutionStepType.QUALITY_EVALUATION,
+                    status=ExecutionStatus.TIMED_OUT,
+                    started_at=started_at,
+                    role=role,
+                    error=error,
+                )
+                observed.finish(
+                    EvaluationStageOutcome(
+                        status=ObservationStatus.TIMED_OUT,
+                        model_role=role,
+                        latency_ms=steps[-1].latency_ms,
+                        failure_category=FailureCategory.TIMEOUT,
+                    )
+                )
+                return RunStatus.TIMED_OUT
+            except Exception as error:
+                self._append_failed_step(
+                    steps=steps,
+                    step_type=ExecutionStepType.QUALITY_EVALUATION,
+                    status=ExecutionStatus.FAILED,
+                    started_at=started_at,
+                    role=role,
+                    error=error,
+                )
+                observed.finish(
+                    EvaluationStageOutcome(
+                        status=ObservationStatus.FAILED,
+                        model_role=role,
+                        latency_ms=steps[-1].latency_ms,
+                        failure_category=FailureCategory.EVALUATOR,
+                    )
+                )
+                return RunStatus.FAILED
 
-        event_codes: tuple[ExecutionEventCode, ...] = ()
-        if result.passed:
-            event_codes = (ExecutionEventCode.QUALITY_CONTRACT_MET,)
-        else:
-            if result.evaluator_valid and result.score < result.threshold:
-                event_codes += (ExecutionEventCode.QUALITY_THRESHOLD_NOT_MET,)
-            if role is ModelRole.STRONG and result.evaluator_valid:
-                event_codes += (ExecutionEventCode.FINAL_QUALITY_CONTRACT_NOT_MET,)
-        steps.append(
-            ExecutionStep(
-                sequence=len(steps),
-                step_type=ExecutionStepType.QUALITY_EVALUATION,
-                status=ExecutionStatus.SUCCEEDED,
-                latency_ms=self._elapsed_ms(started_at),
-                event_codes=event_codes,
-                facts={
-                    "model_role": role.value,
-                    "evaluator_type": result.evaluator_type,
-                    "evaluator_valid": result.evaluator_valid,
-                    "score": result.score,
-                    "threshold": result.threshold,
-                    "passed": result.passed,
-                },
+            event_codes: tuple[ExecutionEventCode, ...] = ()
+            if result.passed:
+                event_codes = (ExecutionEventCode.QUALITY_CONTRACT_MET,)
+            else:
+                if result.evaluator_valid and result.score < result.threshold:
+                    event_codes += (ExecutionEventCode.QUALITY_THRESHOLD_NOT_MET,)
+                if role is ModelRole.STRONG and result.evaluator_valid:
+                    event_codes += (ExecutionEventCode.FINAL_QUALITY_CONTRACT_NOT_MET,)
+            steps.append(
+                ExecutionStep(
+                    sequence=len(steps),
+                    step_type=ExecutionStepType.QUALITY_EVALUATION,
+                    status=ExecutionStatus.SUCCEEDED,
+                    latency_ms=self._elapsed_ms(started_at),
+                    event_codes=event_codes,
+                    facts={
+                        "model_role": role.value,
+                        "evaluator_type": result.evaluator_type,
+                        "evaluator_valid": result.evaluator_valid,
+                        "score": result.score,
+                        "threshold": result.threshold,
+                        "passed": result.passed,
+                    },
+                )
             )
-        )
-        return result
+            observed.finish(
+                EvaluationStageOutcome(
+                    status=ObservationStatus.SUCCEEDED,
+                    model_role=role,
+                    latency_ms=steps[-1].latency_ms,
+                    evaluator_valid=result.evaluator_valid,
+                    score=result.score,
+                    passed=result.passed,
+                )
+            )
+            return result
 
     def _validate_supported_plan(self, request: ExecutionRequest) -> None:
         plan = request.execution_plan

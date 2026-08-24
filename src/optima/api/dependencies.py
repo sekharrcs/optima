@@ -17,6 +17,7 @@ from optima.cost import CostCalculator
 from optima.domain.execution import ModelRole
 from optima.evaluation import QualityEvaluator
 from optima.execution.executor import system_utc_now
+from optima.observability import Observability
 from optima.providers import (
     ApiKeyAuthentication,
     EntraTokenAuthentication,
@@ -57,6 +58,7 @@ class ExecutionDependencies:
     utc_now: Callable[[], datetime] = system_utc_now
     run_id_factory: Callable[[], str] = new_run_id
     correlation_id_factory: Callable[[], str] = new_correlation_id
+    observability: Observability | None = None
 
 
 @dataclass(frozen=True)

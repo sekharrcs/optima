@@ -346,3 +346,49 @@ or SDK error text. All renewal bounds (attempts, backoff, cap, acquisition
 timeout, reauthentication timeout, and expiry safety margin) are configurable
 within strict limits. This section supersedes any earlier claim that these
 behaviors held before Slice 10C's round-three and round-four corrections.
+
+## ADR-023: Project authoritative evidence through a provider-independent observability boundary
+
+Status: Accepted
+
+Slice 10D adds a small observability contract that starts one run observation,
+observes only attempted stages, projects one validated terminal `RunResult`,
+records bounded pre-result failures, and exposes explicit flush and close
+operations. The default implementation is inert, deterministic tests use an
+in-memory recorder, and the Azure adapter is isolated from domain, planner,
+executor, evaluator, cache, provider, and history contracts.
+
+The Azure implementation uses `azure-monitor-opentelemetry` and manual
+`optima.*` spans. It disables distro log export and automatic instrumentation
+for FastAPI, Azure SDK, requests, urllib, urllib3, Django, Flask, and psycopg2.
+A custom FastAPI middleware emits one server span, extracts only W3C trace
+context, uses registered route templates, and never captures bodies, headers,
+query strings, raw URLs, or raw exceptions. This avoids duplicate spans and
+prevents endpoint, credential, or caller data from entering telemetry.
+
+Terminal metrics are emitted once from existing `RunResult` evidence. Metric
+dimensions use only bounded statuses, plan families, model roles, token
+categories, cache outcomes, contract results, and persistence outcomes. Missing
+measurements produce no numeric point. Run, correlation, and provider request
+IDs remain trace-only. Aggregate cost is intentionally absent from metrics
+because converting the exact domain `Decimal` to a floating-point metric would
+weaken the evidence contract; exact cost stays in `RunResult` and a decimal
+string trace attribute.
+
+Application Insights is disabled by default. Enabled composition requires a
+validated `SecretStr` connection string and initializes one process-wide runtime
+for one exact configuration. The connection string requires an explicit
+credential-free HTTPS Azure ingestion endpoint and rejects suffix-derived or
+unknown endpoint configuration. Parent-based trace-ID ratio sampling defaults
+to `1.0` for root traces and preserves remote and local parent decisions;
+metrics remain unsampled. Live Metrics, performance counters, offline storage,
+telemetry logs, control-plane configuration, Statsbeat, SDK statistics, resource
+metrics, redirects, and exporter retries default to disabled. Ambient service
+and resource attributes are cleared before resource construction.
+
+A pre-existing process-wide OpenTelemetry provider disables Azure initialization
+rather than being claimed by OPTIMA. Runtime initialization failures select the
+inert observer and are not retried, while typed configuration errors and a
+conflicting second configuration still fail before initialization. Adapter
+failures are contained and never alter business behavior. Slice 11 owns
+production lifespan calls to the provided flush and close operations.
