@@ -326,10 +326,23 @@ cache-population tooling must use the same builder to remain comparable.
 Background Microsoft Entra token renewal bounds each token acquisition with an
 explicit timeout, classifies failures so only transient transport, throttling,
 and transient server statuses are retried while authentication and authorization
-failures stop immediately, refuses to sleep a retry that would cross a safe
-margin before the current token expires, retries reauthentication of the pool
-within the same bounds, and publishes a renewed token only after the pool has
-accepted it. All renewal bounds (attempts, backoff, cap, acquisition timeout,
-and expiry safety margin) are configurable within strict limits. This section
-supersedes any earlier claim that these behaviors held before Slice 10C's
-round-three correction.
+failures stop immediately, and publishes a renewed token only after the pool has
+accepted it. A renewal step is scheduled and retried against a conservative safe
+deadline: the whole next-attempt budget — the actual jittered delay plus the
+operation's bounded timeout plus a pre-expiry safety margin — must fit before the
+relevant token expires, so a retry can never begin yet block past the deadline in
+acquisition or reauthentication. The pre-expiry margin defaults to 180 seconds,
+matching Microsoft's guidance to send a renewed `AUTH` token at least three
+minutes before expiry, and reauthentication retries are measured against the
+current (still-serving) token rather than the renewed token, because live
+connections depend on the current token until reauthentication succeeds. The
+first refresh is scheduled at the sooner of a proactive refresh ratio or the last
+moment that still reserves one full acquisition, one full reauthentication, and
+the margin; a short-lived token whose ratio point would already breach that
+reserve is refreshed immediately. Cancellation is preserved during sleeps,
+acquisition, and reauthentication; renewal never retries a Redis search or an
+embedding request, never knowingly uses an expired token, and never exposes token
+or SDK error text. All renewal bounds (attempts, backoff, cap, acquisition
+timeout, reauthentication timeout, and expiry safety margin) are configurable
+within strict limits. This section supersedes any earlier claim that these
+behaviors held before Slice 10C's round-three and round-four corrections.

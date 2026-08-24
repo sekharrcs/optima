@@ -22,7 +22,12 @@ from optima.cache import (
     SemanticCacheLookupError,
     build_redis_semantic_cache_resources,
 )
-from optima.cache.azure_redis import _create_redis_client
+from optima.cache.azure_redis import (
+    DEFAULT_TOKEN_EXPIRY_SAFETY_MARGIN_SECONDS,
+    DEFAULT_TOKEN_REAUTH_TIMEOUT_SECONDS,
+    _attempt_fits_before_deadline,
+    _create_redis_client,
+)
 from optima.cache.redis import (
     REDIS_CACHE_SCHEMA_VERSION,
     RedisSemanticCache,
@@ -1000,3 +1005,354 @@ def test_token_renewal_retries_reauthentication_then_delivers() -> None:
     assert reauth_calls["count"] == 2
     assert len(delivered) == 1
     assert errors == []
+
+
+def _lifetime_credential(
+    lifetimes: list[int],
+    *,
+    values: list[str] | None = None,
+    park: asyncio.Event | None = None,
+    park_from: int | None = None,
+) -> "FakeAzureCredential":
+    """Return a credential whose Nth token uses the Nth configured lifetime."""
+
+    class LifetimeCredential(FakeAzureCredential):
+        async def get_token(self, *scopes: str, **kwargs: object) -> AccessToken:
+            call = len(self.get_token_calls) + 1
+            if park is not None and park_from is not None and call >= park_from:
+                await park.wait()
+            self.get_token_calls.append(scopes)
+            index = min(call - 1, len(lifetimes) - 1)
+            value = (
+                values[min(call - 1, len(values) - 1)]
+                if values is not None
+                else "secret-token"
+            )
+            return AccessToken(value, int(time()) + lifetimes[index])
+
+    return LifetimeCredential()
+
+
+def test_default_expiry_safety_margin_matches_microsoft_guidance() -> None:
+    """Default the pre-expiry margin to Microsoft's three-minute recommendation."""
+    assert DEFAULT_TOKEN_EXPIRY_SAFETY_MARGIN_SECONDS == 180.0
+    provider = AzureRedisCredentialProvider(lambda: FakeAzureCredential(), "object-id")
+    assert provider._expiry_safety_margin_seconds == 180.0
+    assert provider._reauth_timeout_seconds == DEFAULT_TOKEN_REAUTH_TIMEOUT_SECONDS
+
+
+def test_attempt_fits_before_deadline_requires_full_next_attempt_budget() -> None:
+    """Count delay, operation timeout, and margin, not the delay alone."""
+    margin = DEFAULT_TOKEN_EXPIRY_SAFETY_MARGIN_SECONDS
+    # The delay plus margin alone fits (180.5 <= 185), but the acquisition
+    # timeout pushes the full budget (190.5) past the deadline.
+    assert (
+        _attempt_fits_before_deadline(
+            remaining_seconds=185.0,
+            delay_seconds=0.5,
+            operation_timeout_seconds=10.0,
+            safety_margin_seconds=margin,
+        )
+        is False
+    )
+    # Exactly enough room for delay + timeout + margin completes safely.
+    assert (
+        _attempt_fits_before_deadline(
+            remaining_seconds=190.5,
+            delay_seconds=0.5,
+            operation_timeout_seconds=10.0,
+            safety_margin_seconds=margin,
+        )
+        is True
+    )
+    # One tick short of the safe deadline is refused.
+    assert (
+        _attempt_fits_before_deadline(
+            remaining_seconds=190.0,
+            delay_seconds=0.5,
+            operation_timeout_seconds=10.0,
+            safety_margin_seconds=margin,
+        )
+        is False
+    )
+
+
+def test_initial_refresh_immediate_for_short_lived_token() -> None:
+    """Refresh at once when even the proactive ratio would breach the margin."""
+    provider = AzureRedisCredentialProvider(lambda: FakeAzureCredential(), "object-id")
+    assert provider._initial_refresh_delay(100.0) == 0.0
+
+
+def test_initial_refresh_moves_earlier_than_ratio_when_budget_requires() -> None:
+    """Reserve the full acquisition, reauthentication, and margin lead time."""
+    provider = AzureRedisCredentialProvider(lambda: FakeAzureCredential(), "object-id")
+    # required lead = 180 margin + 10 acquisition + 10 reauth = 200; the lead
+    # point (100s elapsed) precedes the 70% ratio point (210s elapsed).
+    assert provider._initial_refresh_delay(300.0) == 100.0
+
+
+def test_initial_refresh_uses_ratio_for_long_lived_token() -> None:
+    """Use the proactive refresh ratio when the lifetime is comfortably long."""
+    provider = AzureRedisCredentialProvider(lambda: FakeAzureCredential(), "object-id")
+    assert provider._initial_refresh_delay(3600.0) == pytest.approx(2520.0)
+
+
+def test_acquisition_retry_stops_when_full_budget_exceeds_deadline() -> None:
+    """Refuse an acquisition retry whose full budget cannot beat the deadline."""
+    lifetime = 185
+
+    class ShortThenTransient(FakeAzureCredential):
+        async def get_token(self, *scopes: str, **kwargs: object) -> AccessToken:
+            call = len(self.get_token_calls) + 1
+            self.get_token_calls.append(scopes)
+            if call == 1:
+                return AccessToken("secret-token", int(time()) + lifetime)
+            raise ServiceRequestError("transient token failure")
+
+    credential = ShortThenTransient()
+    errors: list[Exception] = []
+
+    async def fake_sleep(delay: float) -> None:
+        return None
+
+    provider = AzureRedisCredentialProvider(
+        lambda: credential,
+        "object-id",
+        max_renewal_attempts=3,
+        sleep=fake_sleep,
+        jitter=lambda base: 0.0,
+    )
+
+    async def on_error(error: Exception) -> None:
+        errors.append(error)
+
+    async def exercise() -> None:
+        provider.on_error(on_error)
+        await provider.get_credentials_async()
+        for _ in range(500):
+            if not provider.is_streaming():
+                break
+            await asyncio.sleep(0)
+        assert provider.is_streaming() is False
+        await provider.aclose()
+
+    asyncio.run(exercise())
+
+    # One initial success and exactly one failed attempt: the full budget
+    # (0.5 + 10 + 180 = 190.5) exceeds the 185s deadline, so there is no retry.
+    assert len(credential.get_token_calls) == 2
+    assert len(errors) == 1
+
+
+def test_reauth_retry_uses_current_token_deadline_not_renewed_expiry() -> None:
+    """Measure reauthentication retries against the old, still-serving token."""
+    credential = _lifetime_credential([185, 3600], values=["old-token", "new-token"])
+    delivered: list[AzureRedisToken] = []
+    errors: list[Exception] = []
+    reauth_calls = {"count": 0}
+
+    async def fake_sleep(delay: float) -> None:
+        return None
+
+    async def failing_on_next(token: AzureRedisToken) -> None:
+        reauth_calls["count"] += 1
+        delivered.append(token)
+        raise RuntimeError("reauthentication failed")
+
+    async def on_error(error: Exception) -> None:
+        errors.append(error)
+
+    provider = AzureRedisCredentialProvider(
+        lambda: credential,
+        "object-id",
+        max_renewal_attempts=3,
+        sleep=fake_sleep,
+        jitter=lambda base: 0.0,
+    )
+
+    async def exercise() -> None:
+        provider.on_next(failing_on_next)
+        provider.on_error(on_error)
+        await provider.get_credentials_async()
+        for _ in range(500):
+            if not provider.is_streaming():
+                break
+            await asyncio.sleep(0)
+        assert provider.is_streaming() is False
+        await provider.aclose()
+
+    asyncio.run(exercise())
+
+    # The renewed token's long lifetime would fit a retry, but the old token's
+    # 185s deadline does not, so delivery gives up after one attempt and the
+    # old token is never replaced.
+    assert reauth_calls["count"] == 1
+    assert len(delivered) == 1
+    assert len(errors) == 1
+    assert provider._token is not None
+    assert provider._token.value == "old-token"
+
+
+def test_reauthentication_hang_is_bounded_by_timeout() -> None:
+    """Bound a hanging reauthentication callback with the reauth timeout."""
+    credential = FakeAzureCredential()
+    errors: list[Exception] = []
+    delivered: list[AzureRedisToken] = []
+    never = asyncio.Event()
+    reauth_calls = {"count": 0}
+
+    async def fake_sleep(delay: float) -> None:
+        return None
+
+    async def hanging_on_next(token: AzureRedisToken) -> None:
+        reauth_calls["count"] += 1
+        await never.wait()
+        delivered.append(token)
+
+    async def on_error(error: Exception) -> None:
+        errors.append(error)
+
+    provider = AzureRedisCredentialProvider(
+        lambda: credential,
+        "object-id",
+        max_renewal_attempts=1,
+        reauth_timeout_seconds=0.02,
+        sleep=fake_sleep,
+        jitter=lambda base: 0.0,
+    )
+
+    async def exercise() -> None:
+        provider.on_next(hanging_on_next)
+        provider.on_error(on_error)
+        await provider.get_credentials_async()
+        # Wait past the reauthentication timeout so the bounded hang resolves.
+        for _ in range(200):
+            if not provider.is_streaming():
+                break
+            await asyncio.sleep(0.005)
+        assert provider.is_streaming() is False
+        never.set()
+        await provider.aclose()
+
+    asyncio.run(exercise())
+
+    assert reauth_calls["count"] == 1
+    assert delivered == []
+    assert len(errors) == 1
+    assert isinstance(errors[0], TimeoutError)
+
+
+def test_close_during_reauthentication_cancels_cleanly() -> None:
+    """Cancel a reauthentication in flight without leaking a running task."""
+    credential = FakeAzureCredential()
+    entered = asyncio.Event()
+    never = asyncio.Event()
+
+    async def fake_sleep(delay: float) -> None:
+        return None
+
+    async def hanging_on_next(token: AzureRedisToken) -> None:
+        entered.set()
+        await never.wait()
+
+    provider = AzureRedisCredentialProvider(
+        lambda: credential,
+        "object-id",
+        reauth_timeout_seconds=30.0,
+        sleep=fake_sleep,
+        jitter=lambda base: 0.0,
+    )
+
+    async def exercise() -> None:
+        provider.on_next(hanging_on_next)
+        await provider.get_credentials_async()
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        await provider.aclose()
+        assert provider.is_streaming() is False
+
+    asyncio.run(exercise())
+    assert credential.close_calls == 1
+
+
+def test_successful_delivery_publishes_renewed_token() -> None:
+    """Publish the renewed token only once the pool has accepted it."""
+    park = asyncio.Event()
+    credential = _lifetime_credential(
+        [3600, 3600],
+        values=["old-token", "new-token"],
+        park=park,
+        park_from=3,
+    )
+    delivered: list[AzureRedisToken] = []
+
+    async def fake_sleep(delay: float) -> None:
+        return None
+
+    async def on_next(token: AzureRedisToken) -> None:
+        delivered.append(token)
+
+    provider = AzureRedisCredentialProvider(
+        lambda: credential,
+        "object-id",
+        sleep=fake_sleep,
+        jitter=lambda base: 0.0,
+    )
+
+    async def exercise() -> None:
+        provider.on_next(on_next)
+        await provider.get_credentials_async()
+        for _ in range(500):
+            if delivered:
+                break
+            await asyncio.sleep(0)
+        assert delivered
+        assert provider._token is not None
+        assert provider._token.value == "new-token"
+        park.set()
+        await provider.aclose()
+
+    asyncio.run(exercise())
+
+    assert delivered[0].value == "new-token"
+
+
+def test_token_renewal_performs_no_redis_or_embedding_calls() -> None:
+    """Renewal only acquires tokens and reauthenticates; it never queries Redis."""
+    park = asyncio.Event()
+    credential = _lifetime_credential([3600, 3600], park=park, park_from=3)
+    reauth: list[AzureRedisToken] = []
+
+    async def fake_sleep(delay: float) -> None:
+        return None
+
+    async def on_next(token: AzureRedisToken) -> None:
+        reauth.append(token)
+
+    provider = AzureRedisCredentialProvider(
+        lambda: credential,
+        "object-id",
+        sleep=fake_sleep,
+        jitter=lambda base: 0.0,
+    )
+
+    async def exercise() -> None:
+        provider.on_next(on_next)
+        await provider.get_credentials_async()
+        for _ in range(500):
+            if reauth:
+                break
+            await asyncio.sleep(0)
+        assert reauth
+        park.set()
+        await provider.aclose()
+
+    asyncio.run(exercise())
+
+    # Exactly one clean renew (initial + one acquisition) and one reauthentication;
+    # the credential provider holds no Redis client or embedding provider, so it
+    # can issue neither an FT.SEARCH lookup nor an embedding request.
+    assert len(credential.get_token_calls) == 2
+    assert len(reauth) == 1
+    assert not hasattr(provider, "execute_command")
+    assert not hasattr(provider, "embed")
+    assert not hasattr(provider, "lookup")

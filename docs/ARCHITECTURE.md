@@ -213,12 +213,15 @@ fallback are not used. The client uses TLS with hostname verification on Azure
 Managed Redis port `10000`, RESP2 raw responses, bounded connections and
 timeouts, and zero Redis command retries. Background Microsoft Entra token
 renewal bounds each token acquisition with a timeout, retries only transient
-failures (stopping immediately on authentication or authorization errors),
-never sleeps a retry past a safe margin before the current token expires,
-retries pool reauthentication within the same bounds, and publishes a renewed
-token only after the pool accepts it, so one transient failure does not
-permanently disable renewal; one resource owner stops renewal before closing the
-Redis client and selected Azure credential.
+failures (stopping immediately on authentication or authorization errors), and
+schedules and retries every step against a conservative safe deadline so the
+whole next-attempt budget — actual delay plus the operation timeout plus a
+pre-expiry margin that defaults to Microsoft's recommended three minutes — fits
+before expiry; reauthentication retries are measured against the current
+still-serving token, and a renewed token is published only after the pool accepts
+it, so one transient failure does not permanently disable renewal. One resource
+owner stops renewal before closing the Redis client and selected Azure
+credential.
 
 The production embedding provider is a Foundry/APIM Azure OpenAI v1 `/embeddings`
 adapter that reuses the Slice 10A authentication modes, issues one non-retried

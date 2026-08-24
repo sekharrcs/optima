@@ -346,11 +346,13 @@ its `cache` into `ExecutionDependencies`, retain the returned resources, and cal
 `RedisSemanticCacheResources.aclose()` during application shutdown. The resource
 owner renews Microsoft Entra tokens with a bounded acquisition timeout and
 bounded retries that apply only to transient failures — authentication and
-authorization errors stop renewal immediately, retries never cross a safe margin
-before token expiry, and a renewed token is published only after the pool
-accepts it — and stops renewal before closing Redis and Azure Identity. The
-default API and deterministic demo do not call this builder or probe Azure
-credentials.
+authorization errors stop renewal immediately, every scheduled refresh and retry
+must fit its full next-attempt budget (delay plus operation timeout plus a
+pre-expiry margin defaulting to Microsoft's recommended three minutes) before the
+relevant token expires, reauthentication retries are measured against the current
+still-serving token, and a renewed token is published only after the pool accepts
+it — and stops renewal before closing Redis and Azure Identity. The default API
+and deterministic demo do not call this builder or probe Azure credentials.
 
 `build_foundry_embedding_provider(AppSettings())` composes the production
 embedding provider from the Slice 10A Foundry base URL and authentication mode

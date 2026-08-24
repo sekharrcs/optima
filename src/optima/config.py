@@ -29,7 +29,7 @@ BoundedTimeoutSeconds = Annotated[
 ]
 BoundedSafetyMarginSeconds = Annotated[
     float,
-    Field(ge=0, le=120, allow_inf_nan=False),
+    Field(ge=0, le=1800, allow_inf_nan=False),
 ]
 NonEmptyString = Annotated[str, Field(strict=True, min_length=1)]
 
@@ -76,7 +76,8 @@ class RedisSemanticCacheConfiguration(ImmutableModel):
     token_retry_backoff_seconds: BoundedTimeoutSeconds = 0.5
     token_retry_backoff_cap_seconds: BoundedTimeoutSeconds = 5.0
     token_acquisition_timeout_seconds: BoundedTimeoutSeconds = 10.0
-    token_expiry_safety_margin_seconds: BoundedSafetyMarginSeconds = 5.0
+    token_reauth_timeout_seconds: BoundedTimeoutSeconds = 10.0
+    token_expiry_safety_margin_seconds: BoundedSafetyMarginSeconds = 180.0
 
     def embedding_profile(self) -> EmbeddingProfile:
         """Build the versioned embedding profile bound to this cache index."""
@@ -291,7 +292,8 @@ class AppSettings(BaseSettings):
     redis_token_retry_backoff_seconds: BoundedTimeoutSeconds = 0.5
     redis_token_retry_backoff_cap_seconds: BoundedTimeoutSeconds = 5.0
     redis_token_acquisition_timeout_seconds: BoundedTimeoutSeconds = 10.0
-    redis_token_expiry_safety_margin_seconds: BoundedSafetyMarginSeconds = 5.0
+    redis_token_reauth_timeout_seconds: BoundedTimeoutSeconds = 10.0
+    redis_token_expiry_safety_margin_seconds: BoundedSafetyMarginSeconds = 180.0
 
     @model_validator(mode="after")
     def validate_quality_threshold_order(self) -> "AppSettings":
@@ -451,6 +453,7 @@ class AppSettings(BaseSettings):
             token_acquisition_timeout_seconds=(
                 self.redis_token_acquisition_timeout_seconds
             ),
+            token_reauth_timeout_seconds=self.redis_token_reauth_timeout_seconds,
             token_expiry_safety_margin_seconds=(
                 self.redis_token_expiry_safety_margin_seconds
             ),
