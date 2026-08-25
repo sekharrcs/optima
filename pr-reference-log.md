@@ -23,22 +23,20 @@ description: Primary sources and verified package APIs used for OPTIMA Correctiv
 - [OpenTelemetry Python sampling SDK](https://opentelemetry-python.readthedocs.io/en/latest/sdk/trace.sampling.html)
 - [OpenTelemetry Python metrics API](https://opentelemetry-python.readthedocs.io/en/latest/api/metrics.html)
 
-The Microsoft guidance verified that the distro is the recommended Python
-integration, metrics are not sampled, fixed-percentage and rate-limited sampling
-are supported, Live Metrics and performance counters default to enabled, and
-offline retry storage defaults to enabled. The implementation overrides those
-defaults explicitly for OPTIMA.
+The Microsoft guidance identifies the distro as the default Python integration.
+Installed-source review found that its global providers, environment reads, and
+singleton features conflict with OPTIMA's host-noninterference requirement. The
+final implementation therefore composes the direct exporter package instead.
 
 ## Verified Package APIs
 
 The approved Microsoft package feed
 `https://packagefeedproxy.microsoft.io/pypi/simple` resolved:
 
-- `azure-monitor-opentelemetry==1.8.9`
+- `azure-monitor-opentelemetry==1.8.9` (inspected, then removed)
 - `azure-monitor-opentelemetry-exporter==1.0.0b56`
 - `opentelemetry-api==1.43.0`
 - `opentelemetry-sdk==1.43.0`
-- `opentelemetry-instrumentation-fastapi==0.64b0`
 
 The installed source confirmed:
 
@@ -57,17 +55,22 @@ The installed source confirmed:
   explicit server middleware that does not record exception events or messages
 - OpenTelemetry providers expose bounded `force_flush` and `shutdown` lifecycle
   operations
-- Azure Core transport defaults to retries and redirects unless the exporter
-  receives explicit zero values
+- Azure Core transport retries honor explicit zero values; the exporter
+  hardcodes automatic pipeline redirects off and owns separate bounded 307/308
+  handling for accepted Azure Monitor domains
 - the distro recognizes environment switches for control-plane configuration,
   Statsbeat, SDK statistics, and OpenTelemetry resource metrics
 
+These facts motivated the exporter-only correction. The direct exporter retains
+the verified retry and redirect behavior while OPTIMA supplies local providers,
+explicit resources, parent-based sampling, and custom FastAPI instrumentation.
+
 ## Validation Boundary
 
-No live Azure resource, credential, or ingestion endpoint is used by automated
-tests. Azure initialization arguments are captured through an injected
-configurator, and trace/metric behavior is validated with local in-memory
-OpenTelemetry providers and exporters.
+No live Azure resource, credential, or ingestion request is used by automated
+tests. Trace/metric behavior is validated with local in-memory OpenTelemetry
+providers and exporters, and an isolated subprocess constructs and closes the
+installed direct exporters without emitting telemetry.
 
 ## Final Validation
 
@@ -76,8 +79,9 @@ OpenTelemetry providers and exporters.
 - `ruff format --check .`: 116 files formatted
 - `ruff check .`: passed
 - `mypy src tests`: 98 source files passed
-- focused settings and observability tests: 90 passed
-- full `pytest`: 1,006 passed
+- focused settings and observability tests: 112 passed
+- focused observability/settings/health/API tests: 162 passed
+- full `pytest`: 1,028 passed
 - `git diff --check`: passed
 - secret-pattern scan: zero added-content matches
 - blocked package-source scan: zero matches in `pyproject.toml` and `uv.lock`
@@ -91,7 +95,7 @@ The first independent review found one BLOCKING, three HIGH, two MEDIUM, and
 three LOW issues. The implementation then added strict Azure HTTPS endpoint
 validation, ambient resource scrubbing, parent-based sampling, runtime startup
 containment, global-provider ownership checks, cleanup-preserving wrappers,
-zero exporter redirects and retries, disabled control-plane/statistics
+zero Azure Core retries, SDK-owned redirects, disabled control-plane/statistics
 components, one-deadline flushing, and stronger deterministic fakes.
 
 The second independent review confirmed all prior BLOCKING, HIGH, and MEDIUM
@@ -100,18 +104,25 @@ malformed DNS labels now fail endpoint validation, and pre-result failures and
 terminal projections are mutually exclusive in the in-memory recorder. A
 focused flush-deadline regression test was also added.
 
-An additional installed-source audit found that the distro checks the resource
-metric disable flag during export rather than only during initialization. The
-adapter now owns that flag for its full lifetime and restores the prior process
-value during idempotent close.
+An additional installed-source audit found late environment reads and
+process-global provider/class behavior in the distro. Focused round-two
+verification removed that composition path. Direct exporters now use explicit
+local resources and providers; concurrent host threads retain their original
+environment, global providers, resource detectors, SDK classes, and logs.
+
+Round-two verification also added close-once registry leases, rejection after
+final close, explicit local-component ownership, a detectable unavailable state
+for failed enabled initialization, serialized terminal projection, redacted bounded
+failure diagnostics, and numerical fixed-point Decimal canonicalization. The
+focused suite passes 162 tests and the full suite passes 1,028 tests.
 
 ## Dependency Assessment
 
-The project adds one direct dependency:
-`azure-monitor-opentelemetry==1.8.9`. Its transitive OpenTelemetry and Azure
-Monitor packages are required by the distro. `uv lock` repinned Microsoft feed
-mirror aliases across the lockfile while preserving approved feed URLs and
-cryptographic hashes. The lockfile was generated by `uv`, not hand-edited.
+The project directly pins `azure-monitor-opentelemetry-exporter==1.0.0b56`.
+Round-two correction removes `azure-monitor-opentelemetry==1.8.9` and its 17
+auto-instrumentation dependencies. `uv lock` preserves approved Microsoft feed
+URLs and cryptographic hashes. The lockfile was generated by `uv`, not
+hand-edited.
 
 ## Live Azure Limitation
 

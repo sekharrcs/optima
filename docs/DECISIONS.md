@@ -358,9 +358,9 @@ operations. The default implementation is inert, deterministic tests use an
 in-memory recorder, and the Azure adapter is isolated from domain, planner,
 executor, evaluator, cache, provider, and history contracts.
 
-The Azure implementation uses `azure-monitor-opentelemetry` and manual
-`optima.*` spans. It disables distro log export and automatic instrumentation
-for FastAPI, Azure SDK, requests, urllib, urllib3, Django, Flask, and psycopg2.
+The Azure implementation uses `azure-monitor-opentelemetry-exporter` with
+locally owned OpenTelemetry providers and manual `optima.*` spans. The distro
+and its automatic-instrumentation packages are not installed.
 A custom FastAPI middleware emits one server span, extracts only W3C trace
 context, uses registered route templates, and never captures bodies, headers,
 query strings, raw URLs, or raw exceptions. This avoids duplicate spans and
@@ -373,7 +373,11 @@ measurements produce no numeric point. Run, correlation, and provider request
 IDs remain trace-only. Aggregate cost is intentionally absent from metrics
 because converting the exact domain `Decimal` to a floating-point metric would
 weaken the evidence contract; exact cost stays in `RunResult` and a decimal
-string trace attribute.
+string trace attribute. That attribute is a numerical canonicalization: fixed
+point, no scientific notation, zero represented as `0`, and insignificant
+fractional trailing zeros removed. It preserves exact numeric equality rather
+than the Decimal's original exponent representation and is absent when pricing
+evidence is incomplete.
 
 Application Insights is disabled by default. Enabled composition requires a
 validated `SecretStr` connection string and initializes one process-wide runtime
@@ -381,16 +385,27 @@ for one exact configuration. The connection string requires an explicit
 credential-free HTTPS Azure ingestion endpoint and rejects suffix-derived or
 unknown endpoint configuration. Parent-based trace-ID ratio sampling defaults
 to `1.0` for root traces and preserves remote and local parent decisions;
-metrics remain unsampled. Live Metrics, performance counters, offline storage,
-telemetry logs, control-plane configuration, Statsbeat, SDK statistics, resource
-metrics, and exporter transport retries default to disabled. Redirect handling
-remains the distro exporter's own fixed behavior and is not an OPTIMA-controlled
-setting. Ambient service
-and resource attributes are cleared before resource construction.
+metrics remain unsampled. Offline storage, telemetry logs, control-plane
+configuration, Statsbeat, SDK statistics, resource metrics, and Azure Core
+transport retries default to disabled. Live Metrics and performance counters
+are rejected because their SDK implementations are process-global. The exporter
+hardcodes automatic pipeline redirects off and separately owns bounded 307/308
+handling for accepted Azure Monitor domains. OPTIMA supplies neither
+`redirect_max` nor another redirect policy. Local provider resources contain
+only validated OPTIMA attributes.
 
-A pre-existing process-wide OpenTelemetry provider disables Azure initialization
-rather than being claimed by OPTIMA. Runtime initialization failures select the
-inert observer and are not retried, while typed configuration errors and a
-conflicting second configuration still fail before initialization. Adapter
-failures are contained and never alter business behavior. Slice 11 owns
-production lifespan calls to the provided flush and close operations.
+A pre-existing process-wide OpenTelemetry provider can coexist with OPTIMA.
+Initialization is serialized and directly builds local providers and exporters;
+it never mutates environment values, global providers, resource detectors, SDK
+classes, or host provider ownership. Temporary same-thread filters suppress raw
+SDK records during OPTIMA-owned operations and preserve concurrent host
+diagnostics. OPTIMA shuts down only its explicit local components.
+Equivalent compositions receive close-once
+leases, final close permanently closes the registry, and reconstruction is
+rejected. Runtime initialization failures are cached as unavailable and are not
+retried; `force_flush()` returns false and one redacted warning exposes the
+failure. Typed configuration errors and a conflicting second configuration
+still fail before initialization. Terminal projection is serialized and never
+retries a partially emitted metric batch. Adapter failures never alter business
+behavior. Slice 11 owns production lifespan calls to the provided flush and
+close operations.

@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 from contextlib import AbstractContextManager
+from decimal import Decimal
 from threading import RLock
 from time import monotonic
 from types import TracebackType
@@ -338,19 +339,21 @@ class OpenTelemetryRunObservation:
             set_status_on_exception=False,
         )
         self._scope: AbstractContextManager[Span] | None = None
+        self._lock = RLock()
         self._projected = False
         self._failed = False
         self._closed = False
 
     def __enter__(self) -> Self:
-        if self._scope is None and not self._closed:
-            self._scope = trace.use_span(
-                self._span,
-                end_on_exit=False,
-                record_exception=False,
-                set_status_on_exception=False,
-            )
-            self._scope.__enter__()
+        with self._lock:
+            if self._scope is None and not self._closed:
+                self._scope = trace.use_span(
+                    self._span,
+                    end_on_exit=False,
+                    record_exception=False,
+                    set_status_on_exception=False,
+                )
+                self._scope.__enter__()
         return self
 
     def __exit__(
@@ -359,73 +362,76 @@ class OpenTelemetryRunObservation:
         exc_value: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        if not self._projected and not self._failed:
-            self._span.set_attribute("optima.run.observation_incomplete", True)
-            self._span.set_status(Status(StatusCode.ERROR))
-        if self._scope is not None:
-            self._scope.__exit__(None, None, None)
-        self._span.end()
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            if not self._projected and not self._failed:
+                self._span.set_attribute("optima.run.observation_incomplete", True)
+                self._span.set_status(Status(StatusCode.ERROR))
+            if self._scope is not None:
+                self._scope.__exit__(None, None, None)
+            self._span.end()
 
     def start_stage(self, stage: ObservationStage) -> OpenTelemetryStageObservation:
         return OpenTelemetryStageObservation(self._owner, stage)
 
     def project_result(self, result: RunResult) -> None:
-        if self._projected or self._failed or self._closed:
-            return
-        self._projected = True
-        if (
-            result.run_id != self._run_id
-            or result.correlation_id != self._correlation_id
-        ):
-            self._span.set_attribute(
-                "optima.error.category",
-                FailureCategory.VALIDATION.value,
-            )
-            self._span.set_status(Status(StatusCode.ERROR))
-            raise ValueError("terminal result identity does not match observation")
-
-        outcome_span = self._owner.tracer.start_span(
-            ObservationStage.OUTCOME_PROJECT.value,
-            attributes={
-                "optima.telemetry.schema_version": TELEMETRY_SCHEMA_VERSION,
-            },
-            record_exception=False,
-            set_status_on_exception=False,
-        )
-        with trace.use_span(
-            outcome_span,
-            end_on_exit=False,
-            record_exception=False,
-            set_status_on_exception=False,
-        ):
-            try:
-                self._project_terminal_attributes(result)
-                self._owner.project_metrics(result)
-                outcome_span.set_attribute(
-                    "optima.run.status",
-                    result.status.value,
-                )
-                outcome_span.set_status(Status(StatusCode.OK))
-            except Exception:
-                outcome_span.set_attribute(
+        with self._lock:
+            if self._projected or self._failed or self._closed:
+                return
+            self._projected = True
+            if (
+                result.run_id != self._run_id
+                or result.correlation_id != self._correlation_id
+            ):
+                self._span.set_attribute(
                     "optima.error.category",
                     FailureCategory.VALIDATION.value,
                 )
-                outcome_span.set_status(Status(StatusCode.ERROR))
-                raise
-            finally:
-                outcome_span.end()
+                self._span.set_status(Status(StatusCode.ERROR))
+                raise ValueError("terminal result identity does not match observation")
+
+            outcome_span = self._owner.tracer.start_span(
+                ObservationStage.OUTCOME_PROJECT.value,
+                attributes={
+                    "optima.telemetry.schema_version": TELEMETRY_SCHEMA_VERSION,
+                },
+                record_exception=False,
+                set_status_on_exception=False,
+            )
+            with trace.use_span(
+                outcome_span,
+                end_on_exit=False,
+                record_exception=False,
+                set_status_on_exception=False,
+            ):
+                try:
+                    self._project_terminal_attributes(result)
+                    self._owner.project_metrics(result)
+                    outcome_span.set_attribute(
+                        "optima.run.status",
+                        result.status.value,
+                    )
+                    outcome_span.set_status(Status(StatusCode.OK))
+                except Exception:
+                    outcome_span.set_attribute(
+                        "optima.error.category",
+                        FailureCategory.VALIDATION.value,
+                    )
+                    outcome_span.set_status(Status(StatusCode.ERROR))
+                    raise
+                finally:
+                    outcome_span.end()
 
     def record_pre_result_failure(self, category: FailureCategory) -> None:
-        if self._failed or self._projected or self._closed:
-            return
-        self._failed = True
-        self._span.set_attribute("optima.error.category", category.value)
-        self._span.set_status(Status(StatusCode.ERROR))
-        self._owner.record_pre_result_failure(category)
+        with self._lock:
+            if self._failed or self._projected or self._closed:
+                return
+            self._failed = True
+            self._span.set_attribute("optima.error.category", category.value)
+            self._span.set_status(Status(StatusCode.ERROR))
+            self._owner.record_pre_result_failure(category)
 
     def _project_terminal_attributes(self, result: RunResult) -> None:
         quality_contract = result.quality_contract
@@ -485,10 +491,9 @@ class OpenTelemetryRunObservation:
             result.total_tokens,
         )
         if result.total_calculated_cost is not None:
-            # Canonical fixed-point form: never scientific notation for small costs.
             self._span.set_attribute(
                 "optima.run.total_cost_exact",
-                format(result.total_calculated_cost, "f"),
+                _canonical_decimal_text(result.total_calculated_cost),
             )
         if result.final_evaluation is not None:
             self._span.set_attribute(
@@ -781,6 +786,16 @@ def _add_optional_counter(
 ) -> None:
     if value is not None:
         counter.add(value, attributes)
+
+
+def _canonical_decimal_text(value: Decimal) -> str:
+    """Return one exact fixed-point representation for a finite Decimal value."""
+    if value.is_zero():
+        return "0"
+    fixed_point = format(value, "f")
+    if "." not in fixed_point:
+        return fixed_point
+    return fixed_point.rstrip("0").rstrip(".")
 
 
 def _step_model_role(step: ExecutionStep) -> ModelRole | None:

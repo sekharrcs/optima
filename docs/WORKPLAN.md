@@ -199,7 +199,7 @@ Implemented:
 
 - provider-independent run and stage observation contracts
 - inert and deterministic in-memory implementations
-- Azure Monitor OpenTelemetry Distro adapter
+- direct Azure Monitor OpenTelemetry exporter adapter with local providers
 - explicit privacy-safe FastAPI server spans
 - planner, semantic-cache, context-reduction, model, evaluation, persistence,
   and terminal-outcome spans
@@ -230,8 +230,9 @@ Acceptance:
   plus an optional decimal-string trace attribute
 - repeated app composition does not duplicate providers, exporters, or HTTP
   instrumentation
-- ambient OpenTelemetry resource attributes, exporter retries, and distro
-  control-plane/statistics background components are disabled
+- ambient OpenTelemetry resource attributes, exporter retries, and exporter
+	control-plane/statistics background components are disabled without global
+	environment or provider mutation
 - runtime initialization failures degrade once to inert observation, while
   invalid or conflicting typed configuration fails before initialization
 - all automated tests use fakes or local in-memory OpenTelemetry providers

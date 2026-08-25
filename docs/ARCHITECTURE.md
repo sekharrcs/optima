@@ -327,9 +327,9 @@ Monitor or OpenTelemetry types.
 
 The default implementation is inert. Tests can inject a deterministic
 context-local in-memory recorder. The production adapter translates the same
-contract to OpenTelemetry and initializes the Azure Monitor OpenTelemetry Distro
-only when `application_insights_enabled` is true and its complete typed
-configuration is valid.
+contract to locally owned OpenTelemetry providers and direct Azure Monitor
+exporters only when `application_insights_enabled` is true and its complete
+typed configuration is valid.
 
 Telemetry schema version 1 uses this hierarchy beneath one explicitly
 instrumented FastAPI server span:
@@ -351,7 +351,10 @@ Context-local activation preserves parentage across asynchronous calls. Every
 stage and terminal projection is close-once or emit-once. A failure-isolation
 wrapper contains recorder, exporter, instrumentation, flush, and shutdown
 exceptions so telemetry cannot alter the API response or any business call
-count.
+count. Terminal projection is serialized per run. Its emitted guard is set
+before metrics begin, so a partial metric batch cannot be retried into duplicate
+points or presented as a complete projection. The failed projection span and a
+single redacted warning remain the operational signal.
 
 The `optima.run` span carries only bounded or validated trace attributes:
 
@@ -362,7 +365,8 @@ The `optima.run` span carries only bounded or validated trace attributes:
 - semantic-cache and context-reduction outcomes
 - availability flags for token, cost, and evaluation measurements
 - measured totals only when present
-- exact aggregate cost as a decimal string when present
+- exact aggregate cost as a numerically canonical fixed-point decimal string
+        when complete pricing evidence is present
 
 Run ID, correlation ID, and validated provider request ID are trace-only
 attributes. They are never metric dimensions. Expected or planned values are
@@ -390,7 +394,11 @@ IDs, endpoint names, hostnames, exception messages, or caller metadata. Missing
 measurements produce no numeric data point. Custom cost metrics are omitted
 because OpenTelemetry accepts binary numeric values while the domain preserves
 exact `Decimal` cost. Exact cost remains in `RunResult` and, when available, as
-a decimal-string trace attribute.
+a decimal-string trace attribute. The trace string preserves the exact numeric
+value without float conversion or scientific notation, canonicalizes zero to
+`0`, and removes insignificant fractional trailing zeros. It does not preserve
+the Decimal's original exponent representation. Incomplete pricing evidence
+produces no cost attribute.
 
 Completed contract misses are successful system operations. Failed and timed-out
 runs use OpenTelemetry error status. Cache failure can coexist with a successful
@@ -403,30 +411,43 @@ uses registered route templates, and excludes the health route by default. It
 does not inspect bodies or export raw paths, query strings, headers, cookies,
 authorization values, API keys, or user IDs. Distro auto-instrumentation for
 FastAPI, Azure SDK, requests, urllib, urllib3, Django, Flask, and psycopg2 is
-disabled to avoid duplicate operations and endpoint leakage.
+not installed. OPTIMA's custom middleware is the only HTTP instrumentation.
 
 The Azure adapter uses a parent-based trace-ID ratio sampler. The validated root
 ratio defaults to `1.0` for complete demo traces and can be reduced to control
 ingestion cost. Remote and local parent decisions propagate through each trace;
-metrics are not sampled. Logs, Live Metrics, performance counters, offline retry
-storage, control-plane configuration, Statsbeat, SDK statistics, and resource
-metrics default to disabled. Exporter transport retries are zero (`retry_total=0`).
-Redirect handling is the exporter's own fixed behavior and is not an
-OPTIMA-controlled setting.
+metrics are not sampled. Logs, offline retry storage, control-plane
+configuration, Statsbeat, SDK statistics, and resource metrics default to
+disabled. Live Metrics and performance counters are rejected because the SDK
+implements them with process-global singleton state. Exporter transport retries
+are zero (`retry_total=0`).
+The installed exporter sets the Azure Core pipeline to
+`RedirectPolicy(permit_redirects=False)` and separately handles bounded 307/308
+responses only for its accepted Azure Monitor domains. `redirect_max` is not an
+OPTIMA argument, and redirect behavior is not OPTIMA-controlled.
 
-Initialization clears ambient OpenTelemetry service and resource attributes,
-then supplies only the validated service name, service version, and deployment
-environment. The Application Insights connection string requires an explicit
-credential-free HTTPS Azure ingestion endpoint; suffix-derived, plaintext,
-credential-bearing, queried, fragmented, unknown, or non-Azure endpoints fail
-before exporter creation.
+Initialization is serialized and directly constructs local tracer and meter
+providers, one trace exporter, and one metric exporter. No process environment,
+global provider, SDK class, resource detector, or host logger is replaced. The
+local providers receive only the validated service name, service version, and
+deployment environment. OPTIMA-owned exporter subclasses suppress control-plane
+setup, Statsbeat, SDK statistics, resource metrics, and raw dependency logs.
+The Application Insights connection string requires
+an explicit credential-free HTTPS Azure ingestion endpoint; suffix-derived,
+plaintext, credential-bearing, queried, fragmented, unknown, or non-Azure
+endpoints fail before exporter creation.
 
-One process-wide registry initializes one exact configuration. A conflicting
-configuration fails fast. Existing external OpenTelemetry providers or runtime
-initializer failures select the inert observer rather than orphaning exporters,
-claiming another component's provider, or preventing application construction.
-Partially created owned providers are shut down best effort. Slice 11 retains
-production FastAPI lifespan ownership for flush and shutdown.
+One process-wide registry initializes one exact OPTIMA configuration. Equivalent
+application compositions hold close-once leases; the final lease shuts down the
+locally owned providers and permanently closes the registry. A conflicting
+configuration or reconstruction after close fails before construction. Existing
+external OpenTelemetry providers remain installed and are never claimed,
+replaced, or shut down. Partially created owned exporters, processors, readers,
+and providers are shut down best effort. Runtime initialization failures are
+cached as an unavailable observer and are not retried; one redacted warning and
+`force_flush() == false` make the failure detectable without changing a run
+result. Slice 11 retains production FastAPI lifespan ownership for flush and
+shutdown.
 
 ## Module configuration
 

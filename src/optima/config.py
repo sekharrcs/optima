@@ -269,6 +269,14 @@ class ApplicationInsightsConfiguration(ImmutableModel):
     @model_validator(mode="after")
     def validate_connection_string(self) -> "ApplicationInsightsConfiguration":
         """Reject malformed connection strings before exporter construction."""
+        if self.live_metrics_enabled:
+            raise ValueError(
+                "isolated Application Insights does not support Live Metrics"
+            )
+        if self.performance_counters_enabled:
+            raise ValueError(
+                "isolated Application Insights does not support performance counters"
+            )
         value = self.connection_string.get_secret_value()
         if (
             not value

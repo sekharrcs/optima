@@ -1,5 +1,6 @@
 """Failure isolation for observational adapters."""
 
+import logging
 from types import TracebackType
 from typing import Self
 
@@ -15,6 +16,8 @@ from optima.observability.contracts import (
     StageOutcomeEvidence,
 )
 from optima.observability.noop import NO_OP_RUN, NO_OP_STAGE
+
+_logger = logging.getLogger(__name__)
 
 
 class FailureIsolatedStageObservation:
@@ -111,6 +114,9 @@ class FailureIsolatedRunObservation:
                 delegate.project_result(result)
             except Exception:
                 self._emission_delegate = None
+                _logger.warning(
+                    "Terminal telemetry projection failed; telemetry may be incomplete"
+                )
 
     def record_pre_result_failure(self, category: FailureCategory) -> None:
         delegate = self._emission_delegate

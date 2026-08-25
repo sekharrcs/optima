@@ -348,8 +348,6 @@ def test_settings_build_explicit_application_insights_configuration() -> None:
         application_insights_service_version="1.2.3",
         application_insights_deployment_environment="test",
         application_insights_sampling_ratio=0.25,
-        application_insights_live_metrics_enabled=True,
-        application_insights_performance_counters_enabled=True,
         application_insights_offline_storage_enabled=True,
         application_insights_fastapi_instrumentation_enabled=False,
         application_insights_exclude_health_routes=False,
@@ -366,11 +364,36 @@ def test_settings_build_explicit_application_insights_configuration() -> None:
     assert configuration.service_version == "1.2.3"
     assert configuration.deployment_environment == "test"
     assert configuration.sampling_ratio == 0.25
-    assert configuration.live_metrics_enabled is True
-    assert configuration.performance_counters_enabled is True
+    assert configuration.live_metrics_enabled is False
+    assert configuration.performance_counters_enabled is False
     assert configuration.offline_storage_enabled is True
     assert configuration.fastapi_instrumentation_enabled is False
     assert configuration.exclude_health_routes is False
+
+
+@pytest.mark.parametrize(
+    "unsupported_setting",
+    (
+        "application_insights_live_metrics_enabled",
+        "application_insights_performance_counters_enabled",
+    ),
+)
+def test_isolated_application_insights_rejects_global_sdk_features(
+    unsupported_setting: str,
+) -> None:
+    """Reject SDK-global telemetry features before exporter construction."""
+    with pytest.raises(ValidationError, match="isolated Application Insights"):
+        AppSettings.model_validate(
+            {
+                "application_insights_enabled": True,
+                "application_insights_connection_string": SecretStr(
+                    "InstrumentationKey=00000000-0000-0000-0000-000000000001;"
+                    "IngestionEndpoint="
+                    "https://example.applicationinsights.azure.com/"
+                ),
+                unsupported_setting: True,
+            }
+        ).application_insights_configuration()
 
 
 @pytest.mark.parametrize(

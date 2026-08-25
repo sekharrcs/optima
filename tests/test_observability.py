@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import threading
 from collections.abc import Iterable
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
+from io import StringIO
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Self
@@ -16,6 +18,7 @@ from typing import Any, Self
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from httpx import ASGITransport, AsyncClient
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 from opentelemetry.sdk.resources import Resource
@@ -29,6 +32,7 @@ from opentelemetry.sdk.trace.sampling import (
     ALWAYS_ON,
     ParentBased,
     Sampler,
+    TraceIdRatioBased,
 )
 from opentelemetry.trace import SpanKind, StatusCode
 from pydantic import SecretStr, ValidationError
@@ -407,6 +411,23 @@ def run_result_from_response(response: Any) -> RunResult:
     return RunResult.model_validate(payload)
 
 
+def run_result_with_model_cost(result: RunResult, cost: Decimal) -> RunResult:
+    """Revalidate a terminal result with one exact model-cost representation."""
+    payload = result.model_dump(
+        exclude={
+            "total_input_tokens",
+            "total_output_tokens",
+            "total_tokens",
+            "total_calculated_cost",
+            "total_cost_provenance",
+        }
+    )
+    usage = result.model_usages[0].model_dump()
+    usage["calculated_cost"] = cost
+    payload["model_usages"] = [usage]
+    return RunResult.model_validate(payload)
+
+
 def test_disabled_observability_is_inert(
     tmp_path: Path,
 ) -> None:
@@ -477,15 +498,80 @@ def test_runtime_registry_initializes_once_and_rejects_conflicts() -> None:
     assert len(calls) == 1
 
 
-def test_runtime_initializer_failure_is_cached_as_inert() -> None:
-    """Contain exporter startup failure and never retry process initialization."""
+def test_closed_runtime_registry_rejects_reconstruction() -> None:
+    """Do not return a process-global runtime after its owner has closed it."""
+    registry = AzureMonitorRuntimeRegistry()
+    calls: list[ApplicationInsightsConfiguration] = []
+
+    def initialize(
+        configuration: ApplicationInsightsConfiguration,
+    ) -> InMemoryObservability:
+        calls.append(configuration)
+        return InMemoryObservability()
+
+    settings = AppSettings(
+        application_insights_enabled=True,
+        application_insights_connection_string=SecretStr(_CONNECTION_STRING),
+    )
+    observer = build_observability(
+        settings,
+        registry=registry,
+        initializer=initialize,
+    )
+    observer.close()
+
+    with pytest.raises(RuntimeError, match="registry is closed"):
+        build_observability(
+            settings,
+            registry=registry,
+            initializer=initialize,
+        )
+
+    assert len(calls) == 1
+
+
+def test_runtime_leases_close_shared_runtime_after_last_owner() -> None:
+    """Keep a shared runtime alive until every equivalent composition closes."""
+    registry = AzureMonitorRuntimeRegistry()
+    runtimes: list[InMemoryObservability] = []
+
+    def initialize(
+        configuration: ApplicationInsightsConfiguration,
+    ) -> InMemoryObservability:
+        runtime = InMemoryObservability()
+        runtimes.append(runtime)
+        return runtime
+
+    settings = AppSettings(
+        application_insights_enabled=True,
+        application_insights_connection_string=SecretStr(_CONNECTION_STRING),
+    )
+    first = build_observability(settings, registry=registry, initializer=initialize)
+    second = build_observability(settings, registry=registry, initializer=initialize)
+
+    first.close()
+    first.close()
+    assert runtimes[0]._closed is False
+    assert second.force_flush() is True
+
+    second.close()
+    assert runtimes[0]._closed is True
+    with pytest.raises(RuntimeError, match="registry is closed"):
+        build_observability(settings, registry=registry, initializer=initialize)
+    assert len(runtimes) == 1
+
+
+def test_runtime_initializer_failure_is_cached_as_unavailable(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Contain startup failure, report it safely once, and never retry."""
     registry = AzureMonitorRuntimeRegistry()
     calls = 0
 
     def fail(configuration: ApplicationInsightsConfiguration) -> InMemoryObservability:
         nonlocal calls
         calls += 1
-        raise RuntimeError("SECRET_INITIALIZER_FAILURE")
+        raise RuntimeError(f"SECRET_INITIALIZER_FAILURE {_CONNECTION_STRING}")
 
     settings = AppSettings(
         application_insights_enabled=True,
@@ -495,392 +581,388 @@ def test_runtime_initializer_failure_is_cached_as_inert() -> None:
     first = build_observability(settings, registry=registry, initializer=fail)
     second = build_observability(settings, registry=registry, initializer=fail)
 
-    assert first.force_flush() is True
-    assert second.force_flush() is True
+    assert first.force_flush() is False
+    assert second.force_flush() is False
     assert calls == 1
+    assert caplog.text.count("Application Insights initialization failed") == 1
+    assert "SECRET_INITIALIZER_FAILURE" not in caplog.text
+    assert _CONNECTION_STRING not in caplog.text
 
 
-def test_azure_initializer_passes_explicit_privacy_options(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Configure only trace/metric export with every auto-instrumentation disabled."""
-    captured: dict[str, Any] = {}
-    observed_environment: dict[str, str | None] = {}
-    processed_resource_attributes: dict[str, Any] = {}
-    processed_configuration: dict[str, Any] = {}
-    from opentelemetry import metrics, trace
+class TrackingAzureExporter:
+    """Capture direct exporter options and lifecycle without network activity."""
 
-    previous_tracer_provider = trace.get_tracer_provider()
-    previous_meter_provider = metrics.get_meter_provider()
-    tracer_provider = TracerProvider()
-    meter_provider = MeterProvider()
-    initialized = False
+    def __init__(self, **options: Any) -> None:
+        self.options = options
+        self.shutdown_calls = 0
 
-    def capture_configuration(**kwargs: Any) -> None:
-        nonlocal initialized
-        from azure.monitor.opentelemetry._utils.configurations import (
-            _get_configurations,
+    def force_flush(self, timeout_millis: int = 30_000) -> bool:
+        return True
+
+    def shutdown(self, *args: object, **kwargs: object) -> None:
+        self.shutdown_calls += 1
+
+
+class TrackingSpanProcessor:
+    """Own one fake trace exporter like an SDK span processor."""
+
+    def __init__(self, exporter: TrackingAzureExporter, **options: Any) -> None:
+        self.exporter = exporter
+        self.options = options
+        self.shutdown_calls = 0
+
+    def force_flush(self, timeout_millis: int = 30_000) -> bool:
+        return True
+
+    def shutdown(self) -> None:
+        self.shutdown_calls += 1
+        self.exporter.shutdown()
+
+
+class TrackingMetricReader:
+    """Own one fake metric exporter like an SDK metric reader."""
+
+    def __init__(self, exporter: TrackingAzureExporter, **options: Any) -> None:
+        self.exporter = exporter
+        self.options = options
+        self.shutdown_calls = 0
+
+    def force_flush(self, timeout_millis: int = 30_000) -> bool:
+        return True
+
+    def shutdown(self) -> None:
+        self.shutdown_calls += 1
+        self.exporter.shutdown()
+
+
+class TrackingInternalMeterProvider:
+    """Private meter provider used only for SDK self-observation."""
+
+
+class TrackingLocalTracerProvider:
+    """Provide a real local tracer while exposing owned lifecycle calls."""
+
+    def __init__(
+        self,
+        *,
+        sampler: Sampler,
+        resource: Resource,
+        **options: Any,
+    ) -> None:
+        self.resource = resource
+        self.options = options
+        self.shutdown_calls = 0
+        self.processors: list[TrackingSpanProcessor] = []
+        self._provider = TracerProvider(sampler=sampler, resource=resource)
+
+    def add_span_processor(self, processor: TrackingSpanProcessor) -> None:
+        self.processors.append(processor)
+
+    def get_tracer(self, name: str, version: str) -> Any:
+        return self._provider.get_tracer(name, version)
+
+    def force_flush(self, timeout_millis: int = 30_000) -> bool:
+        return all(
+            processor.force_flush(timeout_millis) for processor in self.processors
         )
 
-        captured.update(kwargs)
-        processed = _get_configurations(**kwargs)
-        for flag in (
-            "disable_logging",
-            "disable_metrics",
-            "disable_tracing",
-            "enable_live_metrics",
-            "enable_performance_counters",
-            "sampler_type",
-            "sampling_arg",
-        ):
-            processed_configuration[flag] = processed.get(flag)
-        processed_resource = processed["resource"]
-        assert isinstance(processed_resource, Resource)
-        processed_resource_attributes.update(processed_resource.attributes)
-        for name in (
-            "APPLICATIONINSIGHTS_CONTROLPLANE_DISABLED",
-            "APPLICATIONINSIGHTS_OPENTELEMETRY_RESOURCE_METRIC_DISABLED",
-            "APPLICATIONINSIGHTS_SDKSTATS_DISABLED",
-            "APPLICATIONINSIGHTS_STATSBEAT_DISABLED_ALL",
-            "OTEL_EXPERIMENTAL_RESOURCE_DETECTORS",
-            "OTEL_LOGS_EXPORTER",
-            "OTEL_METRICS_EXPORTER",
-            "OTEL_RESOURCE_ATTRIBUTES",
-            "OTEL_SERVICE_NAME",
-            "OTEL_TRACES_EXPORTER",
-            "OTEL_TRACES_SAMPLER",
-            "OTEL_TRACES_SAMPLER_ARG",
-        ):
-            observed_environment[name] = os.environ.get(name)
-        initialized = True
+    def shutdown(self) -> None:
+        self.shutdown_calls += 1
+        for processor in self.processors:
+            processor.shutdown()
+        self._provider.shutdown()
 
-    monkeypatch.setenv("OTEL_LOGS_EXPORTER", "console")
-    monkeypatch.delenv(
-        "APPLICATIONINSIGHTS_OPENTELEMETRY_RESOURCE_METRIC_DISABLED",
-        raising=False,
+
+class TrackingLocalMeterProvider:
+    """Provide a real local meter while exposing owned lifecycle calls."""
+
+    def __init__(
+        self,
+        *,
+        metric_readers: list[TrackingMetricReader],
+        resource: Resource,
+        **options: Any,
+    ) -> None:
+        self.resource = resource
+        self.readers = metric_readers
+        self.options = options
+        self.shutdown_calls = 0
+        self._provider = MeterProvider(resource=resource)
+
+    def get_meter(self, name: str, version: str) -> Any:
+        return self._provider.get_meter(name, version)
+
+    def force_flush(self, timeout_millis: int = 30_000) -> bool:
+        return all(reader.force_flush(timeout_millis) for reader in self.readers)
+
+    def shutdown(self) -> None:
+        self.shutdown_calls += 1
+        for reader in self.readers:
+            reader.shutdown()
+        self._provider.shutdown()
+
+
+def tracking_azure_components(state: dict[str, list[Any]]) -> Any:
+    """Build direct runtime factories whose created components are inspectable."""
+
+    def capture(name: str, factory: Any) -> Any:
+        def build(*args: object, **kwargs: object) -> Any:
+            component = factory(*args, **kwargs)
+            state.setdefault(name, []).append(component)
+            return component
+
+        return build
+
+    return azure_monitor_module._AzureRuntimeComponents(
+        trace_exporter_factory=capture("trace_exporters", TrackingAzureExporter),
+        metric_exporter_factory=capture("metric_exporters", TrackingAzureExporter),
+        span_processor_factory=capture("span_processors", TrackingSpanProcessor),
+        metric_reader_factory=capture("metric_readers", TrackingMetricReader),
+        tracer_provider_factory=capture(
+            "tracer_providers", TrackingLocalTracerProvider
+        ),
+        meter_provider_factory=capture("meter_providers", TrackingLocalMeterProvider),
+        internal_meter_provider_factory=capture(
+            "internal_meter_providers", TrackingInternalMeterProvider
+        ),
+        resource_factory=lambda *, attributes: Resource(attributes),
+        sampler_factory=lambda ratio: ParentBased(TraceIdRatioBased(ratio)),
+        span_limits_factory=object,
+        exemplar_filter_factory=object,
     )
+
+
+def test_direct_initializer_uses_only_explicit_local_components(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Build exact resources and exporters without touching host globals or env."""
+    from opentelemetry import metrics, trace
+
+    host_tracer_provider = trace.get_tracer_provider()
+    host_meter_provider = metrics.get_meter_provider()
+    monkeypatch.setenv("OTEL_RESOURCE_ATTRIBUTES", "secret.attribute=SECRET_RESOURCE")
     monkeypatch.setenv("OTEL_SERVICE_NAME", "SECRET_SERVICE")
-    monkeypatch.setenv(
-        "OTEL_RESOURCE_ATTRIBUTES",
-        "secret.attribute=SECRET_RESOURCE,enduser.id=SECRET_USER,server.address=SECRET_HOST",
-    )
-    configuration = ApplicationInsightsConfiguration(
-        connection_string=SecretStr(_CONNECTION_STRING),
-        service_name="optima-test",
-        service_version="1.2.3",
-        deployment_environment="test",
-        sampling_ratio=0.25,
-    )
+    environment_before = os.environ.copy()
+    state: dict[str, list[Any]] = {}
 
     observer = azure_monitor_module._initialize_azure_monitor(
-        configuration,
-        configurator=capture_configuration,
-        tracer_provider_getter=(
-            lambda: tracer_provider if initialized else previous_tracer_provider
+        ApplicationInsightsConfiguration(
+            connection_string=SecretStr(_CONNECTION_STRING),
+            service_name="optima-test",
+            service_version="1.2.3",
+            deployment_environment="test",
+            sampling_ratio=0.25,
         ),
-        meter_provider_getter=(
-            lambda: meter_provider if initialized else previous_meter_provider
-        ),
+        components=tracking_azure_components(state),
     )
 
-    assert captured["connection_string"] == _CONNECTION_STRING
-    assert captured["disable_offline_storage"] is True
-    assert captured["enable_live_metrics"] is False
-    assert captured["enable_performance_counters"] is False
-    assert captured["enable_trace_based_sampling_for_logs"] is False
-    assert captured["browser_sdk_loader_config"] == {"enabled": False}
-    assert captured["retry_total"] == 0
-    assert captured["retry_connect"] == 0
-    assert captured["retry_read"] == 0
-    assert captured["retry_status"] == 0
-    assert "redirect_max" not in captured
-    assert all(
-        option == {"enabled": False}
-        for option in captured["instrumentation_options"].values()
-    )
-    assert observed_environment == {
-        "APPLICATIONINSIGHTS_CONTROLPLANE_DISABLED": "true",
-        "APPLICATIONINSIGHTS_OPENTELEMETRY_RESOURCE_METRIC_DISABLED": "true",
-        "APPLICATIONINSIGHTS_SDKSTATS_DISABLED": "true",
-        "APPLICATIONINSIGHTS_STATSBEAT_DISABLED_ALL": "true",
-        "OTEL_EXPERIMENTAL_RESOURCE_DETECTORS": "",
-        "OTEL_LOGS_EXPORTER": "none",
-        "OTEL_METRICS_EXPORTER": "",
-        "OTEL_RESOURCE_ATTRIBUTES": "",
-        "OTEL_SERVICE_NAME": "",
-        "OTEL_TRACES_EXPORTER": "",
-        "OTEL_TRACES_SAMPLER": "parentbased_trace_id_ratio",
-        "OTEL_TRACES_SAMPLER_ARG": "0.25",
+    expected_resource = {
+        "service.name": "optima-test",
+        "service.version": "1.2.3",
+        "deployment.environment.name": "test",
     }
-    assert os.environ["OTEL_LOGS_EXPORTER"] == "console"
-    assert os.environ["OTEL_SERVICE_NAME"] == "SECRET_SERVICE"
-    assert "SECRET_RESOURCE" in os.environ["OTEL_RESOURCE_ATTRIBUTES"]
-    assert processed_resource_attributes["service.name"] == "optima-test"
-    assert processed_resource_attributes["service.version"] == "1.2.3"
-    assert processed_resource_attributes["deployment.environment.name"] == "test"
-    assert not any(
-        "SECRET" in str(value) for value in processed_resource_attributes.values()
-    )
-    # The installed distro must resolve OPTIMA's inputs into a trace-only,
-    # custom-metric configuration with a parent-based trace-ID ratio sampler.
-    from azure.monitor.opentelemetry._utils.configurations import (
-        _get_sampler_from_name,
-    )
-    from opentelemetry.sdk.trace.sampling import ParentBased
+    assert dict(state["tracer_providers"][0].resource.attributes) == expected_resource
+    assert dict(state["meter_providers"][0].resource.attributes) == expected_resource
+    assert trace.get_tracer_provider() is host_tracer_provider
+    assert metrics.get_meter_provider() is host_meter_provider
+    assert os.environ.copy() == environment_before
+    internal_meter = state["internal_meter_providers"][0]
+    span_processor = state["span_processors"][0]
+    metric_reader = state["metric_readers"][0]
+    tracer_provider = state["tracer_providers"][0]
+    meter_provider = state["meter_providers"][0]
+    assert span_processor.options == {
+        "max_queue_size": 2_048,
+        "schedule_delay_millis": 5_000,
+        "max_export_batch_size": 512,
+        "export_timeout_millis": 30_000,
+        "meter_provider": internal_meter,
+    }
+    assert metric_reader.options == {
+        "export_interval_millis": 60_000,
+        "export_timeout_millis": 30_000,
+    }
+    assert tracer_provider.options["shutdown_on_exit"] is False
+    assert tracer_provider.options["meter_provider"] is internal_meter
+    assert "span_limits" in tracer_provider.options
+    assert meter_provider.options["shutdown_on_exit"] is False
+    assert "exemplar_filter" in meter_provider.options
+    for exporter in (
+        state["trace_exporters"][0],
+        state["metric_exporters"][0],
+    ):
+        assert exporter.options["connection_string"] == _CONNECTION_STRING
+        assert exporter.options["disable_offline_storage"] is True
+        assert exporter.options["retry_total"] == 0
+        assert exporter.options["retry_connect"] == 0
+        assert exporter.options["retry_read"] == 0
+        assert exporter.options["retry_status"] == 0
+        assert exporter.options["instrumentation_collection"] is True
+        assert "redirect_max" not in exporter.options
 
-    assert processed_configuration["disable_logging"] is True
-    assert processed_configuration["disable_metrics"] is False
-    assert processed_configuration["disable_tracing"] is False
-    assert processed_configuration["enable_live_metrics"] is False
-    assert processed_configuration["enable_performance_counters"] is False
-    assert processed_configuration["sampler_type"] == "parentbased_trace_id_ratio"
-    assert processed_configuration["sampling_arg"] == 0.25
-    resolved_sampler = _get_sampler_from_name(  # type: ignore[no-untyped-call]
-        processed_configuration["sampler_type"],
-        processed_configuration["sampling_arg"],
-    )
-    assert isinstance(resolved_sampler, ParentBased)
-    sampler_description = resolved_sampler.get_description()  # type: ignore[no-untyped-call]
-    assert "TraceIdRatioBased{0.25}" in sampler_description
-    assert (
-        os.environ["APPLICATIONINSIGHTS_OPENTELEMETRY_RESOURCE_METRIC_DISABLED"]
-        == "true"
-    )
     observer.close()
-    assert (
-        "APPLICATIONINSIGHTS_OPENTELEMETRY_RESOURCE_METRIC_DISABLED" not in os.environ
-    )
+    assert state["tracer_providers"][0].shutdown_calls == 1
+    assert state["meter_providers"][0].shutdown_calls == 1
+    assert state["trace_exporters"][0].shutdown_calls == 1
+    assert state["metric_exporters"][0].shutdown_calls == 1
 
 
-def test_preconfigured_global_provider_disables_azure_initialization() -> None:
-    """Do not orphan or claim ownership of an existing telemetry provider."""
-    registry = AzureMonitorRuntimeRegistry()
-    configure_calls = 0
+def test_direct_initializer_cleans_only_created_components_on_failure() -> None:
+    """Close an already-created exporter when the next owned factory fails."""
+    state: dict[str, list[Any]] = {}
+    components = tracking_azure_components(state)
 
-    def initialize(
-        configuration: ApplicationInsightsConfiguration,
-    ) -> Any:
-        nonlocal configure_calls
+    def fail_metric_exporter(**kwargs: Any) -> None:
+        raise RuntimeError("SECRET_METRIC_CONSTRUCTION")
 
-        def configure(**kwargs: Any) -> None:
-            nonlocal configure_calls
-            configure_calls += 1
+    components = replace(components, metric_exporter_factory=fail_metric_exporter)
 
-        return azure_monitor_module._initialize_azure_monitor(
-            configuration,
-            configurator=configure,
-            tracer_provider_getter=lambda: TracerProvider(),
-            meter_provider_getter=lambda: MeterProvider(),
-        )
-
-    settings = AppSettings(
-        application_insights_enabled=True,
-        application_insights_connection_string=SecretStr(_CONNECTION_STRING),
-    )
-
-    observer = build_observability(
-        settings,
-        registry=registry,
-        initializer=initialize,
-    )
-
-    assert observer.force_flush() is True
-    assert configure_calls == 0
-
-
-def test_partial_initializer_failure_closes_new_providers(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Clean up SDK providers created before a configurator failure."""
-    from opentelemetry import metrics, trace
-
-    previous_tracer_provider = trace.get_tracer_provider()
-    previous_meter_provider = metrics.get_meter_provider()
-    monkeypatch.delenv(
-        "APPLICATIONINSIGHTS_OPENTELEMETRY_RESOURCE_METRIC_DISABLED",
-        raising=False,
-    )
-
-    class TrackingTracerProvider(TracerProvider):
-        def __init__(self) -> None:
-            super().__init__()
-            self.shutdown_calls = 0
-            self.guard_values: list[str | None] = []
-
-        def shutdown(self) -> None:
-            self.shutdown_calls += 1
-            self.guard_values.append(
-                os.environ.get(
-                    "APPLICATIONINSIGHTS_OPENTELEMETRY_RESOURCE_METRIC_DISABLED"
-                )
-            )
-
-    class TrackingMeterProvider(MeterProvider):
-        def __init__(self) -> None:
-            super().__init__()
-            self.shutdown_calls = 0
-            self.guard_values: list[str | None] = []
-
-        def shutdown(self, timeout_millis: float = 30_000) -> None:
-            self.shutdown_calls += 1
-            self.guard_values.append(
-                os.environ.get(
-                    "APPLICATIONINSIGHTS_OPENTELEMETRY_RESOURCE_METRIC_DISABLED"
-                )
-            )
-
-    tracer_provider = TrackingTracerProvider()
-    meter_provider = TrackingMeterProvider()
-    initialized = False
-
-    def fail(**kwargs: Any) -> None:
-        nonlocal initialized
-        initialized = True
-        raise RuntimeError("SECRET_PARTIAL_INITIALIZATION")
-
-    configuration = ApplicationInsightsConfiguration(
-        connection_string=SecretStr(_CONNECTION_STRING)
-    )
-
-    with pytest.raises(RuntimeError, match="SECRET_PARTIAL_INITIALIZATION"):
+    with pytest.raises(RuntimeError, match="SECRET_METRIC_CONSTRUCTION"):
         azure_monitor_module._initialize_azure_monitor(
-            configuration,
-            configurator=fail,
-            tracer_provider_getter=(
-                lambda: tracer_provider if initialized else previous_tracer_provider
+            ApplicationInsightsConfiguration(
+                connection_string=SecretStr(_CONNECTION_STRING)
             ),
-            meter_provider_getter=(
-                lambda: meter_provider if initialized else previous_meter_provider
-            ),
+            components=components,
         )
 
-    assert tracer_provider.shutdown_calls == 1
-    assert meter_provider.shutdown_calls == 1
-    assert tracer_provider.guard_values == ["true"]
-    assert meter_provider.guard_values == ["true"]
-    assert (
-        "APPLICATIONINSIGHTS_OPENTELEMETRY_RESOURCE_METRIC_DISABLED" not in os.environ
-    )
+    assert state["trace_exporters"][0].shutdown_calls == 1
+    assert "tracer_providers" not in state
+    assert "meter_providers" not in state
 
 
-def test_adapter_construction_failure_closes_owned_providers(
+def test_direct_initializer_cancellation_cleans_owned_components() -> None:
+    """Propagate cancellation after closing components created before it."""
+    state: dict[str, list[Any]] = {}
+    components = tracking_azure_components(state)
+
+    def cancel_metric_exporter(**kwargs: Any) -> None:
+        raise asyncio.CancelledError
+
+    components = replace(components, metric_exporter_factory=cancel_metric_exporter)
+
+    with pytest.raises(asyncio.CancelledError):
+        azure_monitor_module._initialize_azure_monitor(
+            ApplicationInsightsConfiguration(
+                connection_string=SecretStr(_CONNECTION_STRING)
+            ),
+            components=components,
+        )
+
+    assert state["trace_exporters"][0].shutdown_calls == 1
+
+
+def test_direct_initializer_cleans_complete_runtime_if_adapter_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Clean up providers when adapter construction fails after SDK setup."""
-    from opentelemetry import metrics, trace
-
-    previous_tracer_provider = trace.get_tracer_provider()
-    previous_meter_provider = metrics.get_meter_provider()
-    tracer_provider = TracerProvider()
-    meter_provider = MeterProvider()
-    initialized = False
-    shutdown_guards: list[str | None] = []
-
-    monkeypatch.delenv(
-        "APPLICATIONINSIGHTS_OPENTELEMETRY_RESOURCE_METRIC_DISABLED",
-        raising=False,
-    )
-    monkeypatch.setattr(
-        tracer_provider,
-        "shutdown",
-        lambda: shutdown_guards.append(
-            os.environ.get("APPLICATIONINSIGHTS_OPENTELEMETRY_RESOURCE_METRIC_DISABLED")
-        ),
-    )
-    monkeypatch.setattr(
-        meter_provider,
-        "shutdown",
-        lambda timeout_millis=30_000: shutdown_guards.append(
-            os.environ.get("APPLICATIONINSIGHTS_OPENTELEMETRY_RESOURCE_METRIC_DISABLED")
-        ),
-    )
-
-    def configure(**kwargs: Any) -> None:
-        nonlocal initialized
-        initialized = True
-
-    def fail_adapter(**kwargs: Any) -> None:
-        raise RuntimeError("SECRET_ADAPTER_CONSTRUCTION")
-
+    """Close both local providers if observer construction fails last."""
+    state: dict[str, list[Any]] = {}
     monkeypatch.setattr(
         azure_monitor_module,
         "OpenTelemetryObservability",
-        fail_adapter,
-    )
-    configuration = ApplicationInsightsConfiguration(
-        connection_string=SecretStr(_CONNECTION_STRING)
+        lambda **kwargs: (_ for _ in ()).throw(
+            RuntimeError("SECRET_ADAPTER_CONSTRUCTION")
+        ),
     )
 
     with pytest.raises(RuntimeError, match="SECRET_ADAPTER_CONSTRUCTION"):
         azure_monitor_module._initialize_azure_monitor(
-            configuration,
-            configurator=configure,
-            tracer_provider_getter=(
-                lambda: tracer_provider if initialized else previous_tracer_provider
+            ApplicationInsightsConfiguration(
+                connection_string=SecretStr(_CONNECTION_STRING)
             ),
-            meter_provider_getter=(
-                lambda: meter_provider if initialized else previous_meter_provider
-            ),
+            components=tracking_azure_components(state),
         )
 
-    assert shutdown_guards == ["true", "true"]
-    assert (
-        "APPLICATIONINSIGHTS_OPENTELEMETRY_RESOURCE_METRIC_DISABLED" not in os.environ
-    )
+    assert state["tracer_providers"][0].shutdown_calls == 1
+    assert state["meter_providers"][0].shutdown_calls == 1
+    assert state["trace_exporters"][0].shutdown_calls == 1
+    assert state["metric_exporters"][0].shutdown_calls == 1
 
 
-def test_meter_retrieval_failure_closes_retained_tracer(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Do not lose a retrieved tracer when the later meter lookup fails."""
-    from opentelemetry import metrics, trace
+def test_direct_initializers_serialize_without_mutating_host_state() -> None:
+    """Serialize owned construction while leaving concurrent host state unchanged."""
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_started = threading.Event()
+    second_entered = threading.Event()
+    errors: list[BaseException] = []
+    observers: list[Any] = []
 
-    previous_tracer_provider = trace.get_tracer_provider()
-    previous_meter_provider = metrics.get_meter_provider()
-    tracer_provider = TracerProvider()
-    initialized = False
-    tracer_shutdown_guards: list[str | None] = []
+    def initialize(name: str) -> None:
+        state: dict[str, list[Any]] = {}
+        components = tracking_azure_components(state)
+        original_trace_factory = components.trace_exporter_factory
 
-    monkeypatch.delenv(
-        "APPLICATIONINSIGHTS_OPENTELEMETRY_RESOURCE_METRIC_DISABLED",
-        raising=False,
-    )
-    monkeypatch.setattr(
-        tracer_provider,
-        "shutdown",
-        lambda: tracer_shutdown_guards.append(
-            os.environ.get("APPLICATIONINSIGHTS_OPENTELEMETRY_RESOURCE_METRIC_DISABLED")
-        ),
-    )
+        def trace_exporter(**kwargs: Any) -> Any:
+            if name == "first":
+                first_entered.set()
+                assert release_first.wait(2)
+            else:
+                second_entered.set()
+            return original_trace_factory(**kwargs)
 
-    def configure(**kwargs: Any) -> None:
-        nonlocal initialized
-        initialized = True
+        try:
+            observers.append(
+                azure_monitor_module._initialize_azure_monitor(
+                    ApplicationInsightsConfiguration(
+                        connection_string=SecretStr(_CONNECTION_STRING)
+                    ),
+                    components=replace(
+                        components,
+                        trace_exporter_factory=trace_exporter,
+                    ),
+                )
+            )
+        except BaseException as error:
+            errors.append(error)
 
-    def get_tracer_provider() -> object:
-        return tracer_provider if initialized else previous_tracer_provider
+    first = threading.Thread(target=initialize, args=("first",))
 
-    def get_meter_provider() -> object:
-        if initialized:
-            raise RuntimeError("SECRET_METER_RETRIEVAL")
-        return previous_meter_provider
+    def start_second() -> None:
+        second_started.set()
+        initialize("second")
 
-    configuration = ApplicationInsightsConfiguration(
-        connection_string=SecretStr(_CONNECTION_STRING)
-    )
+    second = threading.Thread(target=start_second)
+    first.start()
+    assert first_entered.wait(2)
+    second.start()
+    assert second_started.wait(2)
+    assert second_entered.wait(0.05) is False
+    release_first.set()
+    first.join(2)
+    second.join(2)
 
-    with pytest.raises(RuntimeError, match="SECRET_METER_RETRIEVAL"):
-        azure_monitor_module._initialize_azure_monitor(
-            configuration,
-            configurator=configure,
-            tracer_provider_getter=get_tracer_provider,
-            meter_provider_getter=get_meter_provider,
-        )
+    assert errors == []
+    assert second_entered.is_set()
+    for observer in observers:
+        observer.close()
 
-    assert tracer_shutdown_guards == ["true"]
-    assert (
-        "APPLICATIONINSIGHTS_OPENTELEMETRY_RESOURCE_METRIC_DISABLED" not in os.environ
-    )
+
+def test_sdk_log_suppression_covers_last_resort_and_preserves_host_thread() -> None:
+    """Drop owned raw SDK logs while retaining concurrent host SDK diagnostics."""
+    root = logging.getLogger()
+    previous_handlers = list(root.handlers)
+    previous_last_resort = logging.lastResort
+    output = StringIO()
+    handler = logging.StreamHandler(output)
+    root.handlers.clear()
+    logging.lastResort = handler
+    try:
+        with azure_monitor_module._suppress_current_thread_sdk_logs():
+            logging.getLogger("azure.optima.new").error("SECRET_RAW_SDK_FAILURE")
+            host_thread = threading.Thread(
+                target=lambda: logging.getLogger("azure.host.new").error(
+                    "HOST_SDK_DIAGNOSTIC"
+                )
+            )
+            host_thread.start()
+            host_thread.join(2)
+            assert not host_thread.is_alive()
+    finally:
+        root.handlers[:] = previous_handlers
+        logging.lastResort = previous_last_resort
+
+    assert "SECRET_RAW_SDK_FAILURE" not in output.getvalue()
+    assert "HOST_SDK_DIAGNOSTIC" in output.getvalue()
 
 
 def test_stage_emission_failure_still_closes_entered_delegate() -> None:
@@ -1049,6 +1131,52 @@ def test_cache_hit_records_lookup_without_model_or_evaluator_spans() -> None:
     assert ObservationStage.MODEL_GENERATE not in names
     assert ObservationStage.EVALUATION_EVALUATE not in names
     assert len(cache.calls) == 1
+    assert small.calls == ()
+    assert strong.calls == ()
+    assert evaluator.calls == ()
+
+
+def test_otel_cache_hit_has_no_model_or_evaluator_spans() -> None:
+    """Export only the cache path and terminal projection for a reused result."""
+    observer, exporter, reader, _, _ = local_otel_observer()
+    configured, small, strong, evaluator = dependencies((0.93,), observability=observer)
+    payload = request_payload(
+        request_profile={
+            "task_type": "SUMMARIZATION",
+            "complexity": "LOW",
+            "input_tokens": 100,
+            "risk_tier": "LOW",
+            "cache_eligible": True,
+            "has_large_context": False,
+        }
+    )
+    configured = replace(
+        configured,
+        settings=AppSettings(
+            semantic_cache_enabled=True,
+            context_reduction_enabled=False,
+            historical_policy_enabled=False,
+        ),
+        semantic_cache=FakeSemanticCache((cache_candidate(payload),)),
+    )
+
+    response = TestClient(create_app(execution_dependencies=configured)).post(
+        "/api/v1/runs", json=payload
+    )
+
+    spans = exporter.get_finished_spans()
+    root = next(span for span in spans if span.name == "optima.run")
+    names = {span.name for span in spans}
+    assert response.status_code == 200
+    assert ObservationStage.SEMANTIC_CACHE_LOOKUP in names
+    assert ObservationStage.MODEL_GENERATE not in names
+    assert ObservationStage.EVALUATION_EVALUATE not in names
+    outcome = next(
+        span for span in spans if span.name == ObservationStage.OUTCOME_PROJECT
+    )
+    assert outcome.parent is not None
+    assert outcome.parent.span_id == root.context.span_id
+    assert any(name == "optima.cache.lookups" for name, _ in metric_points(reader))
     assert small.calls == ()
     assert strong.calls == ()
     assert evaluator.calls == ()
@@ -1319,7 +1447,9 @@ def test_pre_result_configuration_failure_is_bounded() -> None:
     assert evaluator.calls == ()
 
 
-def test_projection_failure_does_not_change_response_or_call_counts() -> None:
+def test_projection_failure_does_not_change_response_or_call_counts(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """Contain a recorder failure after result construction and persistence."""
     failing = FailingProjectionObservability()
     configured, small, strong, evaluator = dependencies((0.93,), observability=failing)
@@ -1333,19 +1463,42 @@ def test_projection_failure_does_not_change_response_or_call_counts() -> None:
     assert len(strong.calls) == 0
     assert len(evaluator.calls) == 1
     assert failing.run.exit_calls == 1
+    assert caplog.text.count("Terminal telemetry projection failed") == 1
+    assert "SECRET_EXPORTER_FAILURE" not in caplog.text
 
 
-def test_otel_spans_are_parented_and_privacy_safe() -> None:
+def test_otel_spans_are_parented_and_privacy_safe(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """Export one safe server/run hierarchy without user or secret material."""
     observer, exporter, reader, _, _ = local_otel_observer()
-    configured, _, _, _ = dependencies((0.93,), observability=observer)
+    small = build_fake_small_provider(
+        provider_name="fake",
+        deployment_name="small",
+        responses=(
+            FakeProviderResponse(
+                output_text="SECRET_MODEL_OUTPUT SECRET_RESPONSE_BODY",
+                input_tokens=100,
+                output_tokens=20,
+            ),
+        ),
+        clock=IncrementingClock(),
+    )
+    configured, _, _, _ = dependencies(
+        (0.93,), observability=observer, small_provider=small
+    )
     application = create_app(execution_dependencies=configured)
 
     response = TestClient(application).post(
         "/api/v1/runs?user_id=SECRET_QUERY",
-        json=request_payload(),
+        json=request_payload(
+            context=(
+                "SECRET_CONTEXT SECRET_ENDPOINT SECRET_VECTOR "
+                "SECRET_REQUEST_BODY SECRET_RAW_EXCEPTION"
+            ),
+        ),
         headers={
-            "Authorization": "Bearer SECRET_TOKEN",
+            "Authorization": "Bearer SECRET_ACCESS_TOKEN",
             "X-API-Key": "SECRET_API_KEY",
             "Cookie": "session=SECRET_COOKIE",
         },
@@ -1363,13 +1516,23 @@ def test_otel_spans_are_parented_and_privacy_safe() -> None:
                 span.name,
                 dict(span.attributes or {}),
                 [(event.name, dict(event.attributes or {})) for event in span.events],
-                span.status.status_code,
+                (span.status.status_code, span.status.description),
+                dict(span.resource.attributes),
             )
             for span in spans
         ]
     )
     points = metric_points(reader)
     metric_serialized = repr([(name, dict(point.attributes)) for name, point in points])
+    metric_data = reader.get_metrics_data()
+    metric_resources = repr(
+        []
+        if metric_data is None
+        else [
+            dict(resource_metrics.resource.attributes)
+            for resource_metrics in metric_data.resource_metrics
+        ]
+    )
 
     assert response.status_code == 200
     assert len(server_spans) == 1
@@ -1388,14 +1551,21 @@ def test_otel_spans_are_parented_and_privacy_safe() -> None:
         "SECRET_CRITERION",
         "SECRET_METADATA",
         "SECRET_MODEL_OUTPUT",
+        "SECRET_RESPONSE_BODY",
         "SECRET_QUERY",
-        "SECRET_TOKEN",
+        "SECRET_ACCESS_TOKEN",
         "SECRET_API_KEY",
         "SECRET_COOKIE",
+        "SECRET_ENDPOINT",
+        "SECRET_VECTOR",
+        "SECRET_REQUEST_BODY",
+        "SECRET_RAW_EXCEPTION",
         _CONNECTION_STRING,
     ):
         assert secret not in serialized
         assert secret not in metric_serialized
+        assert secret not in metric_resources
+        assert secret not in caplog.text
     assert "authorization" not in serialized.lower()
     assert "cookie" not in serialized.lower()
     assert "url.query" not in serialized.lower()
@@ -1413,7 +1583,7 @@ def test_otel_spans_are_parented_and_privacy_safe() -> None:
 
 def test_metric_schema_uses_only_bounded_dimensions() -> None:
     """Lock the names and dimension keys emitted for a successful small run."""
-    observer, _, reader, _, _ = local_otel_observer()
+    observer, exporter, reader, _, _ = local_otel_observer()
     configured, _, _, _ = dependencies((0.93,), observability=observer)
 
     response = TestClient(create_app(execution_dependencies=configured)).post(
@@ -1501,6 +1671,51 @@ def test_business_rejection_and_history_failure_have_separate_otel_statuses() ->
     assert history.status.status_code is StatusCode.ERROR
 
 
+def test_otel_escalation_exports_small_and_strong_attempts() -> None:
+    """Export both actual model attempts and one escalation in the same run tree."""
+    observer, exporter, reader, _, _ = local_otel_observer()
+    configured, small, strong, evaluator = dependencies(
+        (0.70, 0.95), observability=observer
+    )
+
+    response = TestClient(create_app(execution_dependencies=configured)).post(
+        "/api/v1/runs", json=request_payload()
+    )
+
+    spans = exporter.get_finished_spans()
+    root = next(span for span in spans if span.name == "optima.run")
+    model_spans = [
+        span for span in spans if span.name == ObservationStage.MODEL_GENERATE
+    ]
+    evaluation_spans = [
+        span for span in spans if span.name == ObservationStage.EVALUATION_EVALUATE
+    ]
+    assert response.json()["escalated"] is True
+    assert [
+        dict(span.attributes or {})["optima.model.role"] for span in model_spans
+    ] == [
+        "SMALL",
+        "STRONG",
+    ]
+    assert [
+        dict(span.attributes or {})["optima.model.role"] for span in evaluation_spans
+    ] == [
+        "SMALL",
+        "STRONG",
+    ]
+    assert all(
+        span.parent is not None and span.parent.span_id == root.context.span_id
+        for span in (*model_spans, *evaluation_spans)
+    )
+    escalation_points = [
+        point for name, point in metric_points(reader) if name == "optima.escalations"
+    ]
+    assert len(escalation_points) == 1
+    assert escalation_points[0].value == 1
+    assert len(small.calls) == len(strong.calls) == 1
+    assert len(evaluator.calls) == 2
+
+
 def test_unsampled_traces_do_not_suppress_terminal_metrics() -> None:
     """Apply trace sampling consistently while retaining unsampled metrics."""
     observer, exporter, reader, _, _ = local_otel_observer(ALWAYS_OFF)
@@ -1583,6 +1798,44 @@ def test_unavailable_measurements_are_not_emitted_as_zero() -> None:
     assert not any(name.startswith("optima.cost") for name in metric_names)
 
 
+def test_incomplete_pricing_omits_exact_cost_attribute() -> None:
+    """Do not expose a partial cost when a successful call has no catalog entry."""
+    observer, exporter, _, _, _ = local_otel_observer()
+    calculator = CostCalculator(
+        PriceCatalog(
+            version="missing-small-v1",
+            currency="TEST",
+            entries=(
+                PriceCatalogEntry(
+                    provider="other-provider",
+                    deployment="other-deployment",
+                    input_rate_per_million_tokens=Decimal("1"),
+                    output_rate_per_million_tokens=Decimal("1"),
+                ),
+            ),
+        )
+    )
+    configured, _, _, _ = dependencies(
+        (0.93,),
+        observability=observer,
+        cost_calculator=calculator,
+    )
+
+    response = TestClient(create_app(execution_dependencies=configured)).post(
+        "/api/v1/runs", json=request_payload()
+    )
+
+    result = run_result_from_response(response)
+    root = next(
+        span for span in exporter.get_finished_spans() if span.name == "optima.run"
+    )
+    attributes = dict(root.attributes or {})
+    assert response.status_code == 200
+    assert result.total_calculated_cost is None
+    assert attributes["optima.measurement.total_cost.available"] is False
+    assert "optima.run.total_cost_exact" not in attributes
+
+
 def test_terminal_projection_and_close_are_emit_once() -> None:
     """Ignore repeated terminal projection and cleanup requests."""
     seed = InMemoryObservability()
@@ -1659,11 +1912,16 @@ def test_normal_close_shuts_providers_before_restoring_guard(
     shutdown_guards: list[str | None] = []
 
     class CloseProvider:
+        def __init__(self, *, fail: bool) -> None:
+            self._fail = fail
+
         def force_flush(self, timeout_millis: int = 30_000) -> bool:
             return True
 
         def shutdown(self) -> None:
             shutdown_guards.append(os.environ.get(flag))
+            if self._fail:
+                raise RuntimeError("SECRET_PROVIDER_SHUTDOWN")
 
     tracer_provider = TracerProvider()
     meter_provider = MeterProvider()
@@ -1674,8 +1932,8 @@ def test_normal_close_shuts_providers_before_restoring_guard(
     observer = OpenTelemetryObservability(
         tracer=tracer_provider.get_tracer("optima.close", "1"),
         meter=meter_provider.get_meter("optima.close", "1"),
-        tracer_provider=CloseProvider(),
-        meter_provider=CloseProvider(),
+        tracer_provider=CloseProvider(fail=True),
+        meter_provider=CloseProvider(fail=False),
         close_callbacks=(restore_guard,),
     )
 
@@ -1759,50 +2017,50 @@ def test_repeated_app_construction_adds_one_http_middleware_per_app() -> None:
     )
 
 
-def test_total_cost_exact_uses_fixed_point_not_scientific_notation() -> None:
-    """Export a tiny exact cost as canonical fixed-point, never scientific."""
-    observer, exporter, _, _, _ = local_otel_observer()
-    tiny_calculator = CostCalculator(
-        PriceCatalog(
-            version="telemetry-cost-v1",
-            currency="TEST",
-            entries=(
-                PriceCatalogEntry(
-                    provider="fake",
-                    deployment="small",
-                    input_rate_per_million_tokens=Decimal("0.005"),
-                    output_rate_per_million_tokens=Decimal("0.005"),
-                ),
-                PriceCatalogEntry(
-                    provider="fake",
-                    deployment="strong",
-                    input_rate_per_million_tokens=Decimal("0.005"),
-                    output_rate_per_million_tokens=Decimal("0.005"),
-                ),
-            ),
-        )
-    )
-    configured, _, _, _ = dependencies(
-        (0.93,),
-        observability=observer,
-        cost_calculator=tiny_calculator,
-    )
-
+@pytest.mark.parametrize(
+    ("terminal_cost", "expected"),
+    (
+        (Decimal("0"), "0"),
+        (Decimal("0.00"), "0"),
+        (Decimal("7.5E-7"), "0.00000075"),
+        (Decimal("0.0100"), "0.01"),
+        (
+            Decimal("0.1234567890123456789012345678"),
+            "0.1234567890123456789012345678",
+        ),
+        (Decimal("1E+3"), "1000"),
+    ),
+)
+def test_total_cost_exact_is_numerically_canonical_fixed_point(
+    terminal_cost: Decimal,
+    expected: str,
+) -> None:
+    """Export one exact numerical form without float or scientific notation."""
+    seed = InMemoryObservability()
+    configured, _, _, _ = dependencies((0.93,), observability=seed)
     response = TestClient(create_app(execution_dependencies=configured)).post(
         "/api/v1/runs", json=request_payload()
     )
+    result = run_result_with_model_cost(
+        run_result_from_response(response),
+        terminal_cost,
+    )
+    observer, exporter, _, _, _ = local_otel_observer()
 
-    result = run_result_from_response(response)
-    assert result.total_calculated_cost is not None
-    assert result.total_calculated_cost < Decimal("0.000001")
+    with observer.start_run(
+        run_id=result.run_id,
+        correlation_id=result.correlation_id,
+    ) as run:
+        run.project_result(result)
+
     root = next(
         span for span in exporter.get_finished_spans() if span.name == "optima.run"
     )
     cost_attribute = dict(root.attributes or {})["optima.run.total_cost_exact"]
+    assert cost_attribute == expected
     assert isinstance(cost_attribute, str)
     assert "E" not in cost_attribute
     assert "e" not in cost_attribute
-    assert cost_attribute == format(result.total_calculated_cost, "f")
     assert Decimal(cost_attribute) == result.total_calculated_cost
 
 
@@ -1857,6 +2115,80 @@ def test_concurrent_runs_keep_isolated_span_parentage() -> None:
         )
         assert all(
             child.parent is not None and child.parent.span_id not in other_span_ids
+            for child in children
+        )
+
+
+def test_concurrent_http_requests_have_distinct_trace_trees() -> None:
+    """Keep each concurrent server request, run, and stage hierarchy isolated."""
+    observer, exporter, _, _, _ = local_otel_observer()
+    small = build_fake_small_provider(
+        provider_name="fake",
+        deployment_name="small",
+        responses=(
+            FakeProviderResponse(
+                output_text="first output",
+                input_tokens=100,
+                output_tokens=20,
+            ),
+            FakeProviderResponse(
+                output_text="second output",
+                input_tokens=100,
+                output_tokens=20,
+            ),
+        ),
+        clock=IncrementingClock(),
+    )
+    configured, _, _, _ = dependencies(
+        (0.93, 0.94),
+        observability=observer,
+        small_provider=small,
+    )
+    run_ids = iter(("run-concurrent-a", "run-concurrent-b"))
+    correlation_ids = iter(("corr-concurrent-a", "corr-concurrent-b"))
+    configured = replace(
+        configured,
+        run_id_factory=lambda: next(run_ids),
+        correlation_id_factory=lambda: next(correlation_ids),
+    )
+    application = create_app(execution_dependencies=configured)
+
+    async def drive() -> tuple[Any, Any]:
+        async with AsyncClient(
+            transport=ASGITransport(app=application),
+            base_url="http://testserver",
+        ) as client:
+            return await asyncio.gather(
+                client.post("/api/v1/runs", json=request_payload()),
+                client.post("/api/v1/runs", json=request_payload()),
+            )
+
+    responses = asyncio.run(drive())
+    spans = exporter.get_finished_spans()
+    server_spans = [span for span in spans if span.kind is SpanKind.SERVER]
+    roots = [span for span in spans if span.name == "optima.run"]
+
+    assert all(response.status_code == 200 for response in responses)
+    assert len(server_spans) == len(roots) == 2
+    assert len({root.context.trace_id for root in roots}) == 2
+    for root in roots:
+        server = next(
+            span
+            for span in server_spans
+            if span.context.trace_id == root.context.trace_id
+        )
+        assert root.parent is not None
+        assert root.parent.span_id == server.context.span_id
+        children = [
+            span
+            for span in spans
+            if span.name.startswith("optima.")
+            and span.name != "optima.run"
+            and span.context.trace_id == root.context.trace_id
+        ]
+        assert children
+        assert all(
+            child.parent is not None and child.parent.span_id == root.context.span_id
             for child in children
         )
 
@@ -1931,6 +2263,7 @@ def test_failure_isolation_never_swallows_cancellation() -> None:
 
 def test_partial_metric_projection_does_not_duplicate_points(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Guard exactly-once projection when a meter instrument fails midway."""
     seed = InMemoryObservability()
@@ -1939,26 +2272,109 @@ def test_partial_metric_projection_does_not_duplicate_points(
         "/api/v1/runs", json=request_payload()
     )
     result = run_result_from_response(response)
-    observer, _, reader, _, _ = local_otel_observer()
+    observer, exporter, reader, _, _ = local_otel_observer()
 
     class FailingCounter:
         def add(self, amount: int, attributes: dict[str, str]) -> None:
             raise RuntimeError("SECRET_METER_FAILURE")
 
     monkeypatch.setattr(observer, "_contract_results", FailingCounter())
-    run = observer.start_run(run_id=result.run_id, correlation_id=result.correlation_id)
+    raw_run = observer.start_run(
+        run_id=result.run_id,
+        correlation_id=result.correlation_id,
+    )
+    run = FailureIsolatedRunObservation(raw_run)
     run.__enter__()
-    with pytest.raises(RuntimeError):
-        run.project_result(result)
+    run.project_result(result)
     run.project_result(result)
     run.__exit__(None, None, None)
 
+    spans = exporter.get_finished_spans()
     run_points = [
         point for name, point in metric_points(reader) if name == "optima.runs"
     ]
     assert len(run_points) == 1
     assert run_points[0].value == 1
+    assert sum(span.name == ObservationStage.OUTCOME_PROJECT for span in spans) == 1
+    outcome = next(
+        span for span in spans if span.name == ObservationStage.OUTCOME_PROJECT
+    )
+    assert outcome.status.status_code is StatusCode.ERROR
+    assert not any(
+        name == "optima.telemetry.projections" for name, _ in metric_points(reader)
+    )
+    assert caplog.text.count("Terminal telemetry projection failed") == 1
+    assert "SECRET_METER_FAILURE" not in caplog.text
     assert "SECRET_METER_FAILURE" not in repr(metric_points(reader))
+
+
+def test_concurrent_projection_calls_do_not_interleave(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Block a repeated finalizer until the active metric batch completes."""
+    seed = InMemoryObservability()
+    configured, _, _, _ = dependencies((0.93,), observability=seed)
+    response = TestClient(create_app(execution_dependencies=configured)).post(
+        "/api/v1/runs", json=request_payload()
+    )
+    result = run_result_from_response(response)
+    observer, exporter, reader, _, _ = local_otel_observer()
+    run = observer.start_run(run_id=result.run_id, correlation_id=result.correlation_id)
+    projection_entered = threading.Event()
+    release_projection = threading.Event()
+    second_started = threading.Event()
+    second_returned = threading.Event()
+    errors: list[BaseException] = []
+    original_project_metrics = observer.project_metrics
+
+    def blocking_project_metrics(projected: RunResult) -> None:
+        projection_entered.set()
+        assert release_projection.wait(2)
+        original_project_metrics(projected)
+
+    monkeypatch.setattr(observer, "project_metrics", blocking_project_metrics)
+
+    def first_projection() -> None:
+        try:
+            with run:
+                run.project_result(result)
+        except BaseException as error:
+            errors.append(error)
+
+    def second_projection() -> None:
+        second_started.set()
+        try:
+            run.project_result(result)
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            second_returned.set()
+
+    first = threading.Thread(target=first_projection)
+    second = threading.Thread(target=second_projection)
+    first.start()
+    assert projection_entered.wait(2)
+    second.start()
+    assert second_started.wait(2)
+    assert second_returned.wait(0.05) is False
+    release_projection.set()
+    first.join(2)
+    second.join(2)
+
+    assert errors == []
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert (
+        sum(
+            span.name == ObservationStage.OUTCOME_PROJECT
+            for span in exporter.get_finished_spans()
+        )
+        == 1
+    )
+    assert (
+        len([point for name, point in metric_points(reader) if name == "optima.runs"])
+        == 1
+    )
 
 
 def test_disabled_observability_has_no_azure_import_in_subprocess() -> None:
@@ -1992,3 +2408,99 @@ def test_disabled_observability_has_no_azure_import_in_subprocess() -> None:
     )
     assert completed.returncode == 0, completed.stderr
     assert "DISABLED_OK" in completed.stdout
+
+
+def test_actual_direct_initializer_preserves_host_state_in_subprocess() -> None:
+    """Run direct exporters beside host providers without global mutation."""
+    import subprocess
+    import sys
+
+    script = (
+        "import os\n"
+        "os.environ['OTEL_RESOURCE_ATTRIBUTES'] = 'secret.attribute=SECRET_HOST'\n"
+        "os.environ['OTEL_SERVICE_NAME'] = 'SECRET_SERVICE'\n"
+        "os.environ['AZURE_MONITOR_DISTRO_VERSION'] = 'HOST_DISTRO'\n"
+        "from opentelemetry import metrics, trace\n"
+        "from opentelemetry.sdk.metrics import MeterProvider\n"
+        "from opentelemetry.sdk.trace import TracerProvider\n"
+        "class HostTracer(TracerProvider):\n"
+        "    shutdown_calls = 0\n"
+        "    def shutdown(self): self.shutdown_calls += 1\n"
+        "class HostMeter(MeterProvider):\n"
+        "    shutdown_calls = 0\n"
+        "    get_meter_calls = 0\n"
+        "    def shutdown(self, timeout_millis=30000): self.shutdown_calls += 1\n"
+        "    def get_meter(self, *args, **kwargs):\n"
+        "        self.get_meter_calls += 1\n"
+        "        return super().get_meter(*args, **kwargs)\n"
+        "host_tracer = HostTracer()\n"
+        "host_meter = HostMeter()\n"
+        "trace.set_tracer_provider(host_tracer)\n"
+        "metrics.set_meter_provider(host_meter)\n"
+        "os.environ['OTEL_PYTHON_SDK_INTERNAL_METRICS_ENABLED'] = 'true'\n"
+        "os.environ['OTEL_BSP_MAX_QUEUE_SIZE'] = 'SECRET_BAD_BSP'\n"
+        "os.environ['OTEL_SDK_DISABLED'] = 'true'\n"
+        "os.environ['APPLICATIONINSIGHTS_METRICS_TO_LOGANALYTICS_ENABLED'] = 'false'\n"
+        "from pydantic import SecretStr\n"
+        "from optima.config import ApplicationInsightsConfiguration\n"
+        "from optima.observability.azure_monitor import _initialize_azure_monitor\n"
+        "config = ApplicationInsightsConfiguration("
+        "connection_string=SecretStr("
+        f"{_CONNECTION_STRING!r}),"
+        "service_name='optima-proof',service_version='1.2.3',"
+        "deployment_environment='test',sampling_ratio=0.25)\n"
+        "observer = _initialize_azure_monitor(config)\n"
+        "tracer_lifecycle = observer._tracer_provider\n"
+        "meter_lifecycle = observer._meter_provider\n"
+        "trace_exporter = tracer_lifecycle._exporter\n"
+        "expected = {'service.name': 'optima-proof', "
+        "'service.version': '1.2.3', "
+        "'deployment.environment.name': 'test'}\n"
+        "assert dict(tracer_lifecycle._provider.resource.attributes) == expected\n"
+        "assert dict(meter_lifecycle._provider._sdk_config.resource.attributes) "
+        "== expected\n"
+        "assert trace.get_tracer_provider() is host_tracer\n"
+        "assert metrics.get_meter_provider() is host_meter\n"
+        "assert host_meter.get_meter_calls == 0\n"
+        "assert tracer_lifecycle._provider._disabled is False\n"
+        "assert meter_lifecycle._provider._disabled is False\n"
+        "assert trace_exporter._should_collect_stats() is False\n"
+        "assert trace_exporter._should_collect_customer_sdkstats() is False\n"
+        "assert trace_exporter._should_collect_otel_resource_metric() is False\n"
+        "metric_exporter = meter_lifecycle._exporter\n"
+        "assert metric_exporter._determine_metrics_to_log_analytics() is True\n"
+        "sampler = tracer_lifecycle._provider.sampler\n"
+        "sampled = next(sampler.should_sample(None, trace_id, 'root') "
+        "for trace_id in range(1, 10000) "
+        "if sampler.should_sample(None, trace_id, 'root').decision.is_sampled())\n"
+        "assert sampled.attributes['_MS.sampleRate'] == 25.0\n"
+        "retry = trace_exporter.client._config.retry_policy\n"
+        "assert (retry.total_retries, retry.connect_retries, "
+        "retry.read_retries, retry.status_retries) == (0, 0, 0, 0)\n"
+        "policies = trace_exporter.client._client._pipeline._impl_policies\n"
+        "redirect = next(policy for policy in policies "
+        "if type(policy).__name__ == 'RedirectPolicy')\n"
+        "assert redirect.allow is False\n"
+        "import azure.monitor.opentelemetry as parent_package\n"
+        "assert not hasattr(parent_package, 'configure_azure_monitor')\n"
+        "assert os.environ['OTEL_RESOURCE_ATTRIBUTES'] == "
+        "'secret.attribute=SECRET_HOST'\n"
+        "assert os.environ['OTEL_SERVICE_NAME'] == 'SECRET_SERVICE'\n"
+        "assert os.environ['AZURE_MONITOR_DISTRO_VERSION'] == 'HOST_DISTRO'\n"
+        "observer.close()\n"
+        "observer.close()\n"
+        "assert host_tracer.shutdown_calls == 0\n"
+        "assert host_meter.shutdown_calls == 0\n"
+        "print('DIRECT_INITIALIZER_OK')\n"
+    )
+    source_root = str(Path(__file__).resolve().parents[1] / "src")
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PYTHONPATH": source_root},
+        timeout=120,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "DIRECT_INITIALIZER_OK" in completed.stdout
+    assert "SECRET_BAD_BSP" not in completed.stderr
