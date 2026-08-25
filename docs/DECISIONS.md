@@ -360,7 +360,11 @@ executor, evaluator, cache, provider, and history contracts.
 
 The Azure implementation uses `azure-monitor-opentelemetry-exporter` with
 locally owned OpenTelemetry providers and manual `optima.*` spans. The distro
-and its automatic-instrumentation packages are not installed.
+and its automatic-instrumentation packages are not installed. The exporter is
+pinned to the exact pre-release build `1.0.0b56`; disabling Statsbeat, customer
+SDK statistics, the control-plane worker, and resource metrics relies on that
+build's internal exporter hooks, so the exact pin is deliberate and offline
+real-exporter tests guard the behavior against an unreviewed upgrade.
 A custom FastAPI middleware emits one server span, extracts only W3C trace
 context, uses registered route templates, and never captures bodies, headers,
 query strings, raw URLs, or raw exceptions. This avoids duplicate spans and
@@ -377,7 +381,8 @@ string trace attribute. That attribute is a numerical canonicalization: fixed
 point, no scientific notation, zero represented as `0`, and insignificant
 fractional trailing zeros removed. It preserves exact numeric equality rather
 than the Decimal's original exponent representation and is absent when pricing
-evidence is incomplete.
+evidence is incomplete or when the exact value would exceed the bounded
+fixed-point width that guards against unbounded rate exponents.
 
 Application Insights is disabled by default. Enabled composition requires a
 validated `SecretStr` connection string and initializes one process-wide runtime

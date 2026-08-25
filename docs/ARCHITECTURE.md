@@ -431,7 +431,9 @@ providers, one trace exporter, and one metric exporter. No process environment,
 global provider, SDK class, resource detector, or host logger is replaced. The
 local providers receive only the validated service name, service version, and
 deployment environment. OPTIMA-owned exporter subclasses suppress control-plane
-setup, Statsbeat, SDK statistics, resource metrics, and raw dependency logs.
+setup, Statsbeat, SDK statistics, resource metrics, and raw dependency logs
+through internal hooks of the pinned pre-release exporter (`1.0.0b56`), so the
+exact pin is deliberate and offline real-exporter tests guard those hooks.
 The Application Insights connection string requires
 an explicit credential-free HTTPS Azure ingestion endpoint; suffix-derived,
 plaintext, credential-bearing, queried, fragmented, unknown, or non-Azure
