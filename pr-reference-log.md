@@ -130,3 +130,27 @@ hand-edited.
 No live Application Insights resource was used. Azure resource provisioning,
 secret injection, production FastAPI lifespan ownership, and an opt-in live
 ingestion smoke test remain Slice 11 work.
+
+## Round-Three Verification
+
+An independent round-three review re-grounded the rewrite in the installed
+`azure-monitor-opentelemetry-exporter==1.0.0b56` source and the OpenTelemetry
+SDK `1.43.0` provider signatures. It confirmed:
+
+- the exact beta exporter pin, approved-feed sources, and cryptographic hashes;
+  a frozen sync removes the distro and its 17 auto-instrumentation packages
+- `TracerProvider`, `MeterProvider`, `BatchSpanProcessor`, and
+  `PeriodicExportingMetricReader` accept every keyword the adapter supplies, and
+  the SDK internal metrics route to a no-op meter provider
+- the base exporter reads `redirect_max` for its manual 307/308 recursion, so
+  `redirect_max=0` with `RedirectPolicy(permit_redirects=False)` disables both
+  paths, and `retry_total=0` with offline storage disabled yields one attempt
+- Statsbeat, customer SDK statistics, the control-plane worker, offline storage,
+  and resource metrics stay off through internal exporter hooks and
+  `instrumentation_collection=True`, independent of host environment variables
+
+One LOW robustness defect was corrected: the exact-cost fixed-point trace
+attribute could expand an unbounded-exponent Decimal, so the projection now
+bounds the fixed-point width and omits the attribute past the bound. The exact
+beta pin and its internal-hook reliance are now recorded in the architecture and
+decision records. The full suite passes 1,030 tests.

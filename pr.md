@@ -23,9 +23,9 @@ description: Draft pull request summary for OPTIMA Corrective Slice 10D
 - `ruff format --check .`: passed (116 files)
 - `ruff check .`: passed
 - `mypy src tests`: passed (98 source files)
-- focused observability tests (`tests/test_observability.py`): 54 passed
-- focused observability/settings/health/API tests: 162 passed
-- full `pytest`: 1,028 passed with one existing FastAPI TestClient deprecation
+- focused observability tests (`tests/test_observability.py`): 56 passed
+- focused observability/settings/health/API tests: 164 passed
+- full `pytest`: 1,030 passed with one existing FastAPI TestClient deprecation
   warning
 - `git diff --check`: passed
 - added-content secret-pattern scan: zero matches
@@ -68,6 +68,17 @@ The correction now:
 Subprocess regressions exercise disabled mode and the actual direct exporter
 initialization beside pre-existing host providers without sending telemetry.
 
+Round-three independent verification re-grounded the rewrite in the installed
+`azure-monitor-opentelemetry-exporter` `1.0.0b56` source, the OpenTelemetry SDK
+`1.43.0` provider signatures, and the frozen lock, confirming the direct-exporter
+architecture, environment isolation, `retry_total=0`/`redirect_max=0`
+enforcement, owned-worker ownership, and privacy bounds. It corrected one LOW
+robustness defect: the exact-cost fixed-point attribute could expand an
+unbounded-exponent Decimal, so the projection now bounds the fixed-point width
+and omits the attribute past the bound while keeping the cost-availability flag
+truthful. It also recorded the exact beta exporter pin and its internal-hook
+reliance in the architecture and decision records.
+
 ## Operational Notes
 
 - Application Insights remains disabled by default
@@ -78,7 +89,9 @@ initialization beside pre-existing host providers without sending telemetry.
 - Azure Core automatic redirects are disabled by the exporter, and
   `redirect_max=0` disables its separate manual 307/308 recursion
 - exact aggregate cost remains domain evidence and a numerically canonical
-  fixed-point decimal-string trace attribute, not a floating-point metric
+  fixed-point decimal-string trace attribute, not a floating-point metric; the
+  attribute is omitted when pricing is incomplete or the value would exceed the
+  bounded fixed-point width
 - initialization failure is detectable but cannot alter a run result or expose
   raw exception, credential, connection-string, or endpoint text
 - Slice 11 remains responsible for production lifespan ownership and live Azure
