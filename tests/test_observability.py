@@ -797,8 +797,8 @@ def test_direct_initializer_uses_only_explicit_local_components(
         assert exporter.options["retry_connect"] == 0
         assert exporter.options["retry_read"] == 0
         assert exporter.options["retry_status"] == 0
+        assert exporter.options["redirect_max"] == 0
         assert exporter.options["instrumentation_collection"] is True
-        assert "redirect_max" not in exporter.options
 
     observer.close()
     assert state["tracer_providers"][0].shutdown_calls == 1
@@ -2481,6 +2481,7 @@ def test_actual_direct_initializer_preserves_host_state_in_subprocess() -> None:
         "redirect = next(policy for policy in policies "
         "if type(policy).__name__ == 'RedirectPolicy')\n"
         "assert redirect.allow is False\n"
+        "assert trace_exporter.client._config.redirect_policy.max_redirects == 0\n"
         "import azure.monitor.opentelemetry as parent_package\n"
         "assert not hasattr(parent_package, 'configure_azure_monitor')\n"
         "assert os.environ['OTEL_RESOURCE_ATTRIBUTES'] == "

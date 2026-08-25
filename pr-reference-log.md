@@ -56,14 +56,15 @@ The installed source confirmed:
 - OpenTelemetry providers expose bounded `force_flush` and `shutdown` lifecycle
   operations
 - Azure Core transport retries honor explicit zero values; the exporter
-  hardcodes automatic pipeline redirects off and owns separate bounded 307/308
-  handling for accepted Azure Monitor domains
+  hardcodes automatic pipeline redirects off, while its separate manual 307/308
+  path consumes `client._config.redirect_policy.max_redirects`
 - the distro recognizes environment switches for control-plane configuration,
   Statsbeat, SDK statistics, and OpenTelemetry resource metrics
 
-These facts motivated the exporter-only correction. The direct exporter retains
-the verified retry and redirect behavior while OPTIMA supplies local providers,
-explicit resources, parent-based sampling, and custom FastAPI instrumentation.
+These facts motivated the exporter-only correction. OPTIMA supplies local
+providers, explicit resources, parent-based sampling, custom FastAPI
+instrumentation, zero retries, and `redirect_max=0` to disable the exporter's
+manual redirect recursion.
 
 ## Validation Boundary
 
@@ -95,7 +96,7 @@ The first independent review found one BLOCKING, three HIGH, two MEDIUM, and
 three LOW issues. The implementation then added strict Azure HTTPS endpoint
 validation, ambient resource scrubbing, parent-based sampling, runtime startup
 containment, global-provider ownership checks, cleanup-preserving wrappers,
-zero Azure Core retries, SDK-owned redirects, disabled control-plane/statistics
+zero Azure Core retries and redirects, disabled control-plane/statistics
 components, one-deadline flushing, and stronger deterministic fakes.
 
 The second independent review confirmed all prior BLOCKING, HIGH, and MEDIUM

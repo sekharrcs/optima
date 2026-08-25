@@ -438,8 +438,8 @@ The default privacy and volume controls are explicit:
   raw dependency logs are suppressed on OPTIMA-owned exporters
 - Azure Core transport retries are disabled (`retry_total=0`); the installed
   exporter hardcodes `RedirectPolicy(permit_redirects=False)` for the pipeline
-  and separately performs its own bounded, trusted-domain handling of 307/308
-  responses, neither of which is controlled by OPTIMA
+  and separately reads `redirect_max` for its manual 307/308 recursion; OPTIMA
+  sets `redirect_max=0`, so neither path follows a redirect
 - one custom FastAPI server span is created per non-health request
 - request and response bodies, headers, query strings, raw URLs, user IDs,
   endpoints, exception messages, and exception stack contents are not exported

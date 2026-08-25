@@ -389,10 +389,9 @@ metrics remain unsampled. Offline storage, telemetry logs, control-plane
 configuration, Statsbeat, SDK statistics, resource metrics, and Azure Core
 transport retries default to disabled. Live Metrics and performance counters
 are rejected because their SDK implementations are process-global. The exporter
-hardcodes automatic pipeline redirects off and separately owns bounded 307/308
-handling for accepted Azure Monitor domains. OPTIMA supplies neither
-`redirect_max` nor another redirect policy. Local provider resources contain
-only validated OPTIMA attributes.
+hardcodes automatic pipeline redirects off. Its separate manual 307/308 branch
+consumes `redirect_max`; OPTIMA sets it to zero so no recursive redirect is
+attempted. Local provider resources contain only validated OPTIMA attributes.
 
 A pre-existing process-wide OpenTelemetry provider can coexist with OPTIMA.
 Initialization is serialized and directly builds local providers and exporters;

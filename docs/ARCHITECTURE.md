@@ -422,9 +422,9 @@ disabled. Live Metrics and performance counters are rejected because the SDK
 implements them with process-global singleton state. Exporter transport retries
 are zero (`retry_total=0`).
 The installed exporter sets the Azure Core pipeline to
-`RedirectPolicy(permit_redirects=False)` and separately handles bounded 307/308
-responses only for its accepted Azure Monitor domains. `redirect_max` is not an
-OPTIMA argument, and redirect behavior is not OPTIMA-controlled.
+`RedirectPolicy(permit_redirects=False)`. Its separate manual 307/308 branch
+reads `client._config.redirect_policy.max_redirects`; OPTIMA supplies
+`redirect_max=0`, so the branch records failure without recursive transmission.
 
 Initialization is serialized and directly constructs local tracer and meter
 providers, one trace exporter, and one metric exporter. No process environment,

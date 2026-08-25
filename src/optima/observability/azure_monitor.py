@@ -488,6 +488,7 @@ def _azure_exporter_options(
         "retry_connect": 0,
         "retry_read": 0,
         "retry_status": 0,
+        "redirect_max": 0,
         "instrumentation_collection": True,
         "optima_failure_signal": failure_signal,
     }

@@ -39,8 +39,9 @@ exporter retries, SDK background components, flush deadlines, fake-observer
 identity, and duplicate sample configuration. The third pass additionally
 grounded every Azure Monitor claim in the installed `azure-monitor-opentelemetry`
 `1.8.9` source and corrected two truthfulness defects: small exact costs that
-rendered in scientific notation, and an ineffective `redirect_max` exporter
-argument with imprecise redirect documentation. It added offline regressions for
+rendered in scientific notation, and imprecise redirect documentation. A later
+source/runtime check proved `redirect_max` is consumed by the exporter's manual
+307/308 path, so OPTIMA restores `redirect_max=0`. It added offline regressions for
 fixed-point cost, installed-SDK configuration and sampler resolution,
 concurrent-run span isolation, cancellation preservation, exactly-once partial
 metric projection, and a disabled-mode subprocess proof.
@@ -74,8 +75,8 @@ initialization beside pre-existing host providers without sending telemetry.
   default to disabled; dependency auto-instrumentation is not installed
 - exporter transport retries, control-plane configuration, Statsbeat, SDK
   statistics, and resource metrics are disabled
-- Azure Core automatic redirects are disabled by the exporter; the exporter
-  separately owns bounded trusted-domain 307/308 handling
+- Azure Core automatic redirects are disabled by the exporter, and
+  `redirect_max=0` disables its separate manual 307/308 recursion
 - exact aggregate cost remains domain evidence and a numerically canonical
   fixed-point decimal-string trace attribute, not a floating-point metric
 - initialization failure is detectable but cannot alter a run result or expose
