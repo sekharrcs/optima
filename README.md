@@ -389,6 +389,102 @@ No live Redis resource is exercised by the default test suite. Lookup parsing,
 query construction, embedding-profile enforcement, authentication selection,
 token renewal, client options, and lifecycle are validated with offline fakes.
 
+## Application Insights observability
+
+Corrective Slice 10D adds provider-independent run and stage observation backed
+by the Azure Monitor OpenTelemetry exporter. Observability is disabled by default.
+The default API and deterministic demo therefore create no exporter, Azure
+credential, background telemetry thread, network request, or offline telemetry
+file.
+
+Enable Application Insights only in an explicitly composed API process:
+
+```powershell
+$env:OPTIMA_APPLICATION_INSIGHTS_ENABLED="true"
+$env:OPTIMA_APPLICATION_INSIGHTS_CONNECTION_STRING="InstrumentationKey=<uuid>;IngestionEndpoint=https://<region>.in.applicationinsights.azure.com/"
+$env:OPTIMA_APPLICATION_INSIGHTS_SERVICE_NAME="optima-api"
+$env:OPTIMA_APPLICATION_INSIGHTS_SERVICE_VERSION="0.1.0"
+$env:OPTIMA_APPLICATION_INSIGHTS_DEPLOYMENT_ENVIRONMENT="demo"
+$env:OPTIMA_APPLICATION_INSIGHTS_SAMPLING_RATIO="1.0"
+```
+
+`AppSettings` rejects enabled telemetry without a syntactically valid
+connection string before exporter construction. The connection string must
+include an instrumentation-key UUID and an explicit credential-free HTTPS
+Azure Application Insights ingestion endpoint. Ambiguous suffix-based endpoint
+construction, unknown fields, plaintext endpoints, URL credentials, queries,
+and fragments are rejected. `create_app` resolves the configured observer when
+it receives `ExecutionDependencies`; tests can inject `InMemoryObservability`
+instead. Repeated application composition reuses one identically configured
+process-wide Azure Monitor runtime and rejects a conflicting second
+configuration before initialization. Each composition receives a close-once
+lease; the final lease closes the owned providers, and the closed registry
+rejects reconstruction instead of returning a stale runtime.
+
+The default privacy and volume controls are explicit:
+
+- Azure Monitor log export is disabled
+- Live Metrics and performance counters are unsupported by the isolated adapter;
+  typed configuration rejects enabling either feature
+- offline retry storage is disabled
+- no distro auto-instrumentation package is installed; OPTIMA creates only its
+  custom FastAPI, run, and stage spans
+- local tracer and meter providers receive an explicit resource containing only
+  validated service name, service version, and deployment environment
+- the adapter never mutates OpenTelemetry/Azure Monitor environment settings or
+  replaces process-global providers; ambient values do not control OPTIMA's
+  providers, resources, root sampling, or custom-metric routing
+- control-plane configuration, Statsbeat, SDK statistics, resource metrics, and
+  raw dependency logs are suppressed on OPTIMA-owned exporters
+- Azure Core transport retries are disabled (`retry_total=0`); the installed
+  exporter hardcodes `RedirectPolicy(permit_redirects=False)` for the pipeline
+  and separately reads `redirect_max` for its manual 307/308 recursion; OPTIMA
+  sets `redirect_max=0`, so neither path follows a redirect
+- one custom FastAPI server span is created per non-health request
+- request and response bodies, headers, query strings, raw URLs, user IDs,
+  endpoints, exception messages, and exception stack contents are not exported
+- `/api/v1/health` is excluded by default
+
+The sampling ratio is a validated parent-based trace-ID ratio from `0.0` through
+`1.0`. The root decision uses the configured ratio, while local and remote child
+spans preserve their parent's sampled flag. The default `1.0` retains complete
+traces for the hackathon demo; production operators should lower it to control
+ingestion cost. Sampling applies only to traces. Terminal metrics are projected
+exactly once from each validated `RunResult` and remain unsampled. Concurrent
+finalizers serialize on the run observation. A partial metric failure is not
+retried or reported as complete; one failed projection span and one redacted
+warning expose the incomplete telemetry without retrying business work.
+
+When complete pricing evidence exists, `optima.run.total_cost_exact` is the
+numerically canonical fixed-point text of the terminal `Decimal`. It never uses
+float or scientific notation, emits zero as `0`, and removes insignificant
+fractional trailing zeros. It preserves the exact numeric value, not the input
+Decimal's original exponent or trailing-zero representation. Incomplete pricing
+evidence omits the attribute.
+
+Application Insights configuration also supports these explicit switches:
+
+```powershell
+$env:OPTIMA_APPLICATION_INSIGHTS_OFFLINE_STORAGE_ENABLED="false"
+$env:OPTIMA_APPLICATION_INSIGHTS_FASTAPI_INSTRUMENTATION_ENABLED="true"
+$env:OPTIMA_APPLICATION_INSIGHTS_EXCLUDE_HEALTH_ROUTES="true"
+```
+
+`OPTIMA_APPLICATION_INSIGHTS_LIVE_METRICS_ENABLED` and
+`OPTIMA_APPLICATION_INSIGHTS_PERFORMANCE_COUNTERS_ENABLED` must remain `false`.
+The installed SDK implements them with process-global singleton state, so the
+isolated adapter rejects `true` before constructing an exporter.
+
+The adapter exposes idempotent `force_flush()` and `close()` operations. Slice
+11 remains responsible for invoking them from the production FastAPI lifespan.
+A pre-existing process-wide OpenTelemetry installation can coexist with OPTIMA:
+the adapter uses separate local providers and never replaces or shuts down host
+providers. Runtime initializer failures
+are cached as unavailable and are not retried: run behavior stays unchanged,
+`force_flush()` returns `false`, and one bounded warning omits connection data
+and raw exception text. Typed configuration conflicts still fail fast. No live
+Application Insights resource is exercised by the default test suite.
+
 On Windows ARM64, use an x64 Python 3.12 interpreter for Streamlit because its
 Pandas and PyArrow dependencies may not have Windows ARM64 wheels in the
 configured package feed.

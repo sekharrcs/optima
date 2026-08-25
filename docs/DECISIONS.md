@@ -346,3 +346,70 @@ or SDK error text. All renewal bounds (attempts, backoff, cap, acquisition
 timeout, reauthentication timeout, and expiry safety margin) are configurable
 within strict limits. This section supersedes any earlier claim that these
 behaviors held before Slice 10C's round-three and round-four corrections.
+
+## ADR-023: Project authoritative evidence through a provider-independent observability boundary
+
+Status: Accepted
+
+Slice 10D adds a small observability contract that starts one run observation,
+observes only attempted stages, projects one validated terminal `RunResult`,
+records bounded pre-result failures, and exposes explicit flush and close
+operations. The default implementation is inert, deterministic tests use an
+in-memory recorder, and the Azure adapter is isolated from domain, planner,
+executor, evaluator, cache, provider, and history contracts.
+
+The Azure implementation uses `azure-monitor-opentelemetry-exporter` with
+locally owned OpenTelemetry providers and manual `optima.*` spans. The distro
+and its automatic-instrumentation packages are not installed. The exporter is
+pinned to the exact pre-release build `1.0.0b56`; disabling Statsbeat, customer
+SDK statistics, the control-plane worker, and resource metrics relies on that
+build's internal exporter hooks, so the exact pin is deliberate and offline
+real-exporter tests guard the behavior against an unreviewed upgrade.
+A custom FastAPI middleware emits one server span, extracts only W3C trace
+context, uses registered route templates, and never captures bodies, headers,
+query strings, raw URLs, or raw exceptions. This avoids duplicate spans and
+prevents endpoint, credential, or caller data from entering telemetry.
+
+Terminal metrics are emitted once from existing `RunResult` evidence. Metric
+dimensions use only bounded statuses, plan families, model roles, token
+categories, cache outcomes, contract results, and persistence outcomes. Missing
+measurements produce no numeric point. Run, correlation, and provider request
+IDs remain trace-only. Aggregate cost is intentionally absent from metrics
+because converting the exact domain `Decimal` to a floating-point metric would
+weaken the evidence contract; exact cost stays in `RunResult` and a decimal
+string trace attribute. That attribute is a numerical canonicalization: fixed
+point, no scientific notation, zero represented as `0`, and insignificant
+fractional trailing zeros removed. It preserves exact numeric equality rather
+than the Decimal's original exponent representation and is absent when pricing
+evidence is incomplete or when the exact value would exceed the bounded
+fixed-point width that guards against unbounded rate exponents.
+
+Application Insights is disabled by default. Enabled composition requires a
+validated `SecretStr` connection string and initializes one process-wide runtime
+for one exact configuration. The connection string requires an explicit
+credential-free HTTPS Azure ingestion endpoint and rejects suffix-derived or
+unknown endpoint configuration. Parent-based trace-ID ratio sampling defaults
+to `1.0` for root traces and preserves remote and local parent decisions;
+metrics remain unsampled. Offline storage, telemetry logs, control-plane
+configuration, Statsbeat, SDK statistics, resource metrics, and Azure Core
+transport retries default to disabled. Live Metrics and performance counters
+are rejected because their SDK implementations are process-global. The exporter
+hardcodes automatic pipeline redirects off. Its separate manual 307/308 branch
+consumes `redirect_max`; OPTIMA sets it to zero so no recursive redirect is
+attempted. Local provider resources contain only validated OPTIMA attributes.
+
+A pre-existing process-wide OpenTelemetry provider can coexist with OPTIMA.
+Initialization is serialized and directly builds local providers and exporters;
+it never mutates environment values, global providers, resource detectors, SDK
+classes, or host provider ownership. Temporary same-thread filters suppress raw
+SDK records during OPTIMA-owned operations and preserve concurrent host
+diagnostics. OPTIMA shuts down only its explicit local components.
+Equivalent compositions receive close-once
+leases, final close permanently closes the registry, and reconstruction is
+rejected. Runtime initialization failures are cached as unavailable and are not
+retried; `force_flush()` returns false and one redacted warning exposes the
+failure. Typed configuration errors and a conflicting second configuration
+still fail before initialization. Terminal projection is serialized and never
+retries a partially emitted metric batch. Adapter failures never alter business
+behavior. Slice 11 owns production lifespan calls to the provided flush and
+close operations.

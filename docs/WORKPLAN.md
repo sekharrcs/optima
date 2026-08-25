@@ -195,9 +195,53 @@ Deferred to Slice 11 or a separately approved cache-population slice:
 
 ## Slice 10D - Application Insights tracing
 
-Implement:
+Implemented:
 
-- Application Insights tracing for planner, execution, evaluation, and outcome evidence
+- provider-independent run and stage observation contracts
+- inert and deterministic in-memory implementations
+- direct Azure Monitor OpenTelemetry exporter adapter with local providers
+- explicit privacy-safe FastAPI server spans
+- planner, semantic-cache, context-reduction, model, evaluation, persistence,
+  and terminal-outcome spans
+- bounded operational metrics projected from validated domain evidence
+- parent-based trace-ID ratio sampling with unsampled metrics
+- process-wide idempotent Azure Monitor initialization and explicit lifecycle
+  operations
+
+Acceptance:
+
+- disabled observability performs no Azure initialization, network access,
+  credential acquisition, background work, or telemetry persistence
+- every logical operation is represented once and only when attempted
+- async context keeps each `optima.*` operation beneath one `optima.run` span
+  and the explicit FastAPI server span
+- terminal spans and metrics are projected once from validated `RunResult`
+  evidence without inferred zero values
+- completed contract misses remain successful system operations, while timeout
+  and failed operations use error status
+- cache and history failures remain child-operation failures and cannot rewrite
+  a successful terminal run
+- no prompt, context, criterion, reference, output, metadata payload, vector,
+  secret, endpoint, body, header, raw URL, query string, raw exception message,
+  or stack content is exported
+- metric dimensions contain only bounded values and never run, correlation, or
+  provider request IDs
+- exact `Decimal` cost is omitted from metrics and retained as domain evidence
+  plus an optional decimal-string trace attribute
+- repeated app composition does not duplicate providers, exporters, or HTTP
+  instrumentation
+- ambient OpenTelemetry resource attributes, exporter retries, and exporter
+	control-plane/statistics background components are disabled without global
+	environment or provider mutation
+- runtime initialization failures degrade once to inert observation, while
+  invalid or conflicting typed configuration fails before initialization
+- all automated tests use fakes or local in-memory OpenTelemetry providers
+
+Deferred to Slice 11:
+
+- production FastAPI lifespan ownership of telemetry flush and shutdown
+- Azure resource provisioning, connection-string injection, and RBAC
+- opt-in live-Azure smoke validation
 
 ## Slice 11 - Azure infrastructure and deployment
 Implement:

@@ -4,6 +4,7 @@ import re
 from enum import StrEnum
 from typing import Annotated
 from urllib.parse import urlparse
+from uuid import UUID
 
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -31,7 +32,20 @@ BoundedSafetyMarginSeconds = Annotated[
     float,
     Field(ge=0, le=1800, allow_inf_nan=False),
 ]
+BoundedSamplingRatio = Annotated[
+    float,
+    Field(ge=0.0, le=1.0, allow_inf_nan=False),
+]
 NonEmptyString = Annotated[str, Field(strict=True, min_length=1)]
+TelemetryResourceName = Annotated[
+    str,
+    Field(
+        strict=True,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$",
+    ),
+]
 
 
 class FoundryAuthMode(StrEnum):
@@ -238,6 +252,142 @@ class FoundryProviderConfiguration(ImmutableModel):
         return self
 
 
+class ApplicationInsightsConfiguration(ImmutableModel):
+    """Complete privacy-conscious Azure Monitor configuration."""
+
+    connection_string: SecretStr
+    service_name: TelemetryResourceName = "optima-api"
+    service_version: TelemetryResourceName = "0.1.0"
+    deployment_environment: TelemetryResourceName = "local"
+    sampling_ratio: BoundedSamplingRatio = 1.0
+    live_metrics_enabled: bool = False
+    performance_counters_enabled: bool = False
+    offline_storage_enabled: bool = False
+    fastapi_instrumentation_enabled: bool = True
+    exclude_health_routes: bool = True
+
+    @model_validator(mode="after")
+    def validate_connection_string(self) -> "ApplicationInsightsConfiguration":
+        """Reject malformed connection strings before exporter construction."""
+        if self.live_metrics_enabled:
+            raise ValueError(
+                "isolated Application Insights does not support Live Metrics"
+            )
+        if self.performance_counters_enabled:
+            raise ValueError(
+                "isolated Application Insights does not support performance counters"
+            )
+        value = self.connection_string.get_secret_value()
+        if (
+            not value
+            or len(value) > 4096
+            or any(character.isspace() for character in value)
+        ):
+            raise ValueError("Application Insights connection string is malformed")
+        segments = value.split(";")
+        if any("=" not in segment for segment in segments):
+            raise ValueError("Application Insights connection string is malformed")
+        parsed: dict[str, str] = {}
+        for segment in segments:
+            key, segment_value = segment.split("=", 1)
+            normalized_key = key.lower()
+            if (
+                re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", key) is None
+                or not segment_value
+                or normalized_key in parsed
+            ):
+                raise ValueError("Application Insights connection string is malformed")
+            parsed[normalized_key] = segment_value
+        supported_keys = {
+            "applicationid",
+            "authorization",
+            "ingestionendpoint",
+            "instrumentationkey",
+            "liveendpoint",
+        }
+        if not set(parsed).issubset(supported_keys):
+            raise ValueError(
+                "Application Insights connection string contains unsupported keys"
+            )
+        instrumentation_key = parsed.get("instrumentationkey")
+        if instrumentation_key is None:
+            raise ValueError(
+                "Application Insights connection string requires InstrumentationKey"
+            )
+        try:
+            UUID(instrumentation_key)
+        except ValueError as error:
+            raise ValueError(
+                "Application Insights InstrumentationKey must be a UUID"
+            ) from error
+        ingestion_endpoint = parsed.get("ingestionendpoint")
+        if ingestion_endpoint is None:
+            raise ValueError(
+                "Application Insights connection string requires IngestionEndpoint"
+            )
+        _validate_application_insights_endpoint(
+            ingestion_endpoint,
+            allowed_host_suffixes=(
+                ".applicationinsights.azure.com",
+                ".applicationinsights.azure.us",
+                ".applicationinsights.azure.cn",
+            ),
+        )
+        live_endpoint = parsed.get("liveendpoint")
+        if live_endpoint is not None:
+            _validate_application_insights_endpoint(
+                live_endpoint,
+                allowed_host_suffixes=(
+                    ".livediagnostics.monitor.azure.com",
+                    ".livediagnostics.monitor.azure.us",
+                    ".livediagnostics.monitor.azure.cn",
+                ),
+            )
+        authorization = parsed.get("authorization")
+        if authorization is not None and authorization.lower() != "ikey":
+            raise ValueError("Application Insights Authorization must use ikey")
+        application_id = parsed.get("applicationid")
+        if application_id is not None:
+            try:
+                UUID(application_id)
+            except ValueError as error:
+                raise ValueError(
+                    "Application Insights ApplicationId must be a UUID"
+                ) from error
+        return self
+
+
+def _validate_application_insights_endpoint(
+    value: str,
+    *,
+    allowed_host_suffixes: tuple[str, ...],
+) -> None:
+    """Require one credential-free HTTPS Azure Application Insights endpoint."""
+    parsed = urlparse(value)
+    hostname = parsed.hostname
+    if (
+        parsed.scheme != "https"
+        or hostname is None
+        or re.fullmatch(
+            r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+            r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*",
+            hostname,
+        )
+        is None
+        or not any(hostname.endswith(suffix) for suffix in allowed_host_suffixes)
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.port not in {None, 443}
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+    ):
+        raise ValueError(
+            "Application Insights endpoints must be credential-free Azure HTTPS roots"
+        )
+
+
 class AppSettings(BaseSettings):
     """Configure MVP optimization modules and quality thresholds."""
 
@@ -294,6 +444,17 @@ class AppSettings(BaseSettings):
     redis_token_acquisition_timeout_seconds: BoundedTimeoutSeconds = 10.0
     redis_token_reauth_timeout_seconds: BoundedTimeoutSeconds = 10.0
     redis_token_expiry_safety_margin_seconds: BoundedSafetyMarginSeconds = 180.0
+    application_insights_enabled: bool = False
+    application_insights_connection_string: SecretStr | None = None
+    application_insights_service_name: TelemetryResourceName = "optima-api"
+    application_insights_service_version: TelemetryResourceName = "0.1.0"
+    application_insights_deployment_environment: TelemetryResourceName = "local"
+    application_insights_sampling_ratio: BoundedSamplingRatio = 1.0
+    application_insights_live_metrics_enabled: bool = False
+    application_insights_performance_counters_enabled: bool = False
+    application_insights_offline_storage_enabled: bool = False
+    application_insights_fastapi_instrumentation_enabled: bool = True
+    application_insights_exclude_health_routes: bool = True
 
     @model_validator(mode="after")
     def validate_quality_threshold_order(self) -> "AppSettings":
@@ -303,6 +464,7 @@ class AppSettings(BaseSettings):
         self.foundry_provider_configuration()
         self.cosmos_run_history_configuration()
         self.redis_semantic_cache_configuration()
+        self.application_insights_configuration()
         return self
 
     def quality_thresholds(self) -> QualityThresholds:
@@ -457,4 +619,31 @@ class AppSettings(BaseSettings):
             token_expiry_safety_margin_seconds=(
                 self.redis_token_expiry_safety_margin_seconds
             ),
+        )
+
+    def application_insights_configuration(
+        self,
+    ) -> ApplicationInsightsConfiguration | None:
+        """Build Azure Monitor settings only when observability is enabled."""
+        if not self.application_insights_enabled:
+            return None
+        if self.application_insights_connection_string is None:
+            raise ValueError(
+                "Application Insights requires a configured connection string"
+            )
+        return ApplicationInsightsConfiguration(
+            connection_string=self.application_insights_connection_string,
+            service_name=self.application_insights_service_name,
+            service_version=self.application_insights_service_version,
+            deployment_environment=(self.application_insights_deployment_environment),
+            sampling_ratio=self.application_insights_sampling_ratio,
+            live_metrics_enabled=self.application_insights_live_metrics_enabled,
+            performance_counters_enabled=(
+                self.application_insights_performance_counters_enabled
+            ),
+            offline_storage_enabled=(self.application_insights_offline_storage_enabled),
+            fastapi_instrumentation_enabled=(
+                self.application_insights_fastapi_instrumentation_enabled
+            ),
+            exclude_health_routes=(self.application_insights_exclude_health_routes),
         )
