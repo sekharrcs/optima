@@ -23,20 +23,26 @@ description: Draft pull request summary for OPTIMA Corrective Slice 10D
 - `ruff format --check .`: 116 files formatted
 - `ruff check .`: passed
 - `mypy src tests`: 98 source files passed
-- focused settings and observability tests: 90 passed
-- full `pytest`: 1,006 passed with one existing FastAPI TestClient deprecation
+- focused observability tests (`tests/test_observability.py`): 40 passed
+- full `pytest`: 1,012 passed with one existing FastAPI TestClient deprecation
   warning
 - `git diff --check`: passed
 - added-content secret-pattern scan: zero matches
 - project dependency-source scan: zero `pypi.org` or `pythonhosted.org`
   matches in `pyproject.toml` and `uv.lock`
 
-Two independent adversarial review passes found and then verified remediation
+Three independent adversarial review passes found and then verified remediation
 of ambient-resource leakage, endpoint validation, startup failure isolation,
 global-provider ownership, parent sampling, cleanup after recorder failure,
 exporter retries, distro background components, flush deadlines, fake-observer
-identity, and duplicate sample configuration. The final pass reported no open
-BLOCKING, HIGH, or MEDIUM issue. Its two LOW findings were also corrected.
+identity, and duplicate sample configuration. The third pass additionally
+grounded every Azure Monitor claim in the installed `azure-monitor-opentelemetry`
+`1.8.9` source and corrected two truthfulness defects: small exact costs that
+rendered in scientific notation, and an ineffective `redirect_max` exporter
+argument with imprecise redirect documentation. It added offline regressions for
+fixed-point cost, installed-SDK configuration and sampler resolution,
+concurrent-run span isolation, cancellation preservation, exactly-once partial
+metric projection, and a disabled-mode subprocess proof.
 
 ## Operational Notes
 
@@ -45,7 +51,7 @@ BLOCKING, HIGH, or MEDIUM issue. Its two LOW findings were also corrected.
   auto-instrumentation default to disabled
 - exporter transport retries, control-plane configuration, Statsbeat, SDK
   statistics, and resource metrics are disabled
-- exact aggregate cost remains domain evidence and a decimal-string trace
-  attribute, not a floating-point metric
+- exact aggregate cost remains domain evidence and a canonical fixed-point
+  decimal-string trace attribute, not a floating-point metric
 - Slice 11 remains responsible for production lifespan ownership and live Azure
   validation
