@@ -410,7 +410,9 @@ ratio defaults to `1.0` for complete demo traces and can be reduced to control
 ingestion cost. Remote and local parent decisions propagate through each trace;
 metrics are not sampled. Logs, Live Metrics, performance counters, offline retry
 storage, control-plane configuration, Statsbeat, SDK statistics, and resource
-metrics default to disabled. Exporter redirects and transport retries are zero.
+metrics default to disabled. Exporter transport retries are zero (`retry_total=0`).
+Redirect handling is the exporter's own fixed behavior and is not an
+OPTIMA-controlled setting.
 
 Initialization clears ambient OpenTelemetry service and resource attributes,
 then supplies only the validated service name, service version, and deployment

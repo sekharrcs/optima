@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import threading
 from collections.abc import Iterable
@@ -61,6 +62,7 @@ from optima.observability import (
     ObservationStage,
     ObservationStatus,
     PersistenceStageOutcome,
+    StageOutcome,
 )
 from optima.observability import azure_monitor as azure_monitor_module
 from optima.observability.azure_monitor import (
@@ -69,7 +71,10 @@ from optima.observability.azure_monitor import (
 )
 from optima.observability.noop import NO_OP_STAGE
 from optima.observability.opentelemetry import OpenTelemetryObservability
-from optima.observability.resilient import FailureIsolatedStageObservation
+from optima.observability.resilient import (
+    FailureIsolatedRunObservation,
+    FailureIsolatedStageObservation,
+)
 from optima.providers import (
     FakeModelProvider,
     FakeProviderResponse,
@@ -205,6 +210,7 @@ def dependencies(
     *,
     observability: Any,
     small_provider: Any | None = None,
+    cost_calculator: CostCalculator | None = None,
 ) -> tuple[ExecutionDependencies, Any, FakeModelProvider, FakeEvaluator]:
     """Build one complete offline API composition."""
     small = small_provider or build_fake_small_provider(
@@ -242,7 +248,7 @@ def dependencies(
             for score in scores
         )
     )
-    calculator = CostCalculator(
+    calculator = cost_calculator or CostCalculator(
         PriceCatalog(
             version="telemetry-test-v1",
             currency="TEST",
@@ -501,6 +507,7 @@ def test_azure_initializer_passes_explicit_privacy_options(
     captured: dict[str, Any] = {}
     observed_environment: dict[str, str | None] = {}
     processed_resource_attributes: dict[str, Any] = {}
+    processed_configuration: dict[str, Any] = {}
     from opentelemetry import metrics, trace
 
     previous_tracer_provider = trace.get_tracer_provider()
@@ -517,6 +524,16 @@ def test_azure_initializer_passes_explicit_privacy_options(
 
         captured.update(kwargs)
         processed = _get_configurations(**kwargs)
+        for flag in (
+            "disable_logging",
+            "disable_metrics",
+            "disable_tracing",
+            "enable_live_metrics",
+            "enable_performance_counters",
+            "sampler_type",
+            "sampling_arg",
+        ):
+            processed_configuration[flag] = processed.get(flag)
         processed_resource = processed["resource"]
         assert isinstance(processed_resource, Resource)
         processed_resource_attributes.update(processed_resource.attributes)
@@ -576,7 +593,7 @@ def test_azure_initializer_passes_explicit_privacy_options(
     assert captured["retry_connect"] == 0
     assert captured["retry_read"] == 0
     assert captured["retry_status"] == 0
-    assert captured["redirect_max"] == 0
+    assert "redirect_max" not in captured
     assert all(
         option == {"enabled": False}
         for option in captured["instrumentation_options"].values()
@@ -604,6 +621,27 @@ def test_azure_initializer_passes_explicit_privacy_options(
     assert not any(
         "SECRET" in str(value) for value in processed_resource_attributes.values()
     )
+    # The installed distro must resolve OPTIMA's inputs into a trace-only,
+    # custom-metric configuration with a parent-based trace-ID ratio sampler.
+    from azure.monitor.opentelemetry._utils.configurations import (
+        _get_sampler_from_name,
+    )
+    from opentelemetry.sdk.trace.sampling import ParentBased
+
+    assert processed_configuration["disable_logging"] is True
+    assert processed_configuration["disable_metrics"] is False
+    assert processed_configuration["disable_tracing"] is False
+    assert processed_configuration["enable_live_metrics"] is False
+    assert processed_configuration["enable_performance_counters"] is False
+    assert processed_configuration["sampler_type"] == "parentbased_trace_id_ratio"
+    assert processed_configuration["sampling_arg"] == 0.25
+    resolved_sampler = _get_sampler_from_name(  # type: ignore[no-untyped-call]
+        processed_configuration["sampler_type"],
+        processed_configuration["sampling_arg"],
+    )
+    assert isinstance(resolved_sampler, ParentBased)
+    sampler_description = resolved_sampler.get_description()  # type: ignore[no-untyped-call]
+    assert "TraceIdRatioBased{0.25}" in sampler_description
     assert (
         os.environ["APPLICATIONINSIGHTS_OPENTELEMETRY_RESOURCE_METRIC_DISABLED"]
         == "true"
@@ -1719,3 +1757,238 @@ def test_repeated_app_construction_adds_one_http_middleware_per_app() -> None:
         )
         == 1
     )
+
+
+def test_total_cost_exact_uses_fixed_point_not_scientific_notation() -> None:
+    """Export a tiny exact cost as canonical fixed-point, never scientific."""
+    observer, exporter, _, _, _ = local_otel_observer()
+    tiny_calculator = CostCalculator(
+        PriceCatalog(
+            version="telemetry-cost-v1",
+            currency="TEST",
+            entries=(
+                PriceCatalogEntry(
+                    provider="fake",
+                    deployment="small",
+                    input_rate_per_million_tokens=Decimal("0.005"),
+                    output_rate_per_million_tokens=Decimal("0.005"),
+                ),
+                PriceCatalogEntry(
+                    provider="fake",
+                    deployment="strong",
+                    input_rate_per_million_tokens=Decimal("0.005"),
+                    output_rate_per_million_tokens=Decimal("0.005"),
+                ),
+            ),
+        )
+    )
+    configured, _, _, _ = dependencies(
+        (0.93,),
+        observability=observer,
+        cost_calculator=tiny_calculator,
+    )
+
+    response = TestClient(create_app(execution_dependencies=configured)).post(
+        "/api/v1/runs", json=request_payload()
+    )
+
+    result = run_result_from_response(response)
+    assert result.total_calculated_cost is not None
+    assert result.total_calculated_cost < Decimal("0.000001")
+    root = next(
+        span for span in exporter.get_finished_spans() if span.name == "optima.run"
+    )
+    cost_attribute = dict(root.attributes or {})["optima.run.total_cost_exact"]
+    assert isinstance(cost_attribute, str)
+    assert "E" not in cost_attribute
+    assert "e" not in cost_attribute
+    assert cost_attribute == format(result.total_calculated_cost, "f")
+    assert Decimal(cost_attribute) == result.total_calculated_cost
+
+
+def test_concurrent_runs_keep_isolated_span_parentage() -> None:
+    """Prove async runs never inherit another run's telemetry context."""
+    observer, exporter, _, _, _ = local_otel_observer()
+
+    async def drive(run_id: str) -> None:
+        with observer.start_run(run_id=run_id, correlation_id=f"corr-{run_id}") as run:
+            with run.start_stage(ObservationStage.PLANNER_SELECT) as stage:
+                await asyncio.sleep(0)
+                stage.finish(StageOutcome(status=ObservationStatus.SUCCEEDED))
+            with run.start_stage(ObservationStage.MODEL_GENERATE) as stage:
+                await asyncio.sleep(0)
+                stage.finish(
+                    ModelStageOutcome(
+                        status=ObservationStatus.SUCCEEDED,
+                        model_role=ModelRole.SMALL,
+                        latency_ms=1,
+                    )
+                )
+
+    async def main() -> None:
+        await asyncio.gather(drive("run-a"), drive("run-b"))
+
+    asyncio.run(main())
+
+    spans = exporter.get_finished_spans()
+    roots = {
+        dict(span.attributes or {})["optima.run.id"]: span
+        for span in spans
+        if span.name == "optima.run"
+    }
+    assert set(roots) == {"run-a", "run-b"}
+    assert roots["run-a"].context.trace_id != roots["run-b"].context.trace_id
+    for root in roots.values():
+        children = [
+            span
+            for span in spans
+            if span.name != "optima.run"
+            and span.context.trace_id == root.context.trace_id
+        ]
+        other_span_ids = {
+            span.context.span_id
+            for span in spans
+            if span.context.trace_id != root.context.trace_id
+        }
+        assert len(children) == 2
+        assert all(
+            child.parent is not None and child.parent.span_id == root.context.span_id
+            for child in children
+        )
+        assert all(
+            child.parent is not None and child.parent.span_id not in other_span_ids
+            for child in children
+        )
+
+
+def test_run_observation_preserves_cancellation_and_stays_incomplete() -> None:
+    """Propagate CancelledError while marking the run span incomplete."""
+    observer, exporter, reader, _, _ = local_otel_observer()
+
+    with pytest.raises(asyncio.CancelledError):
+        with observer.start_run(
+            run_id="run-cancel", correlation_id="corr-cancel"
+        ) as run:
+            with run.start_stage(ObservationStage.MODEL_GENERATE):
+                raise asyncio.CancelledError
+
+    spans = exporter.get_finished_spans()
+    root = next(span for span in spans if span.name == "optima.run")
+    attributes = dict(root.attributes or {})
+    assert attributes.get("optima.run.observation_incomplete") is True
+    assert root.status.status_code is StatusCode.ERROR
+    assert all(span.name != ObservationStage.OUTCOME_PROJECT for span in spans)
+    assert not any(name == "optima.runs" for name, _ in metric_points(reader))
+
+
+def test_failure_isolation_never_swallows_cancellation() -> None:
+    """Keep CancelledError propagating through telemetry containment."""
+
+    class CancellingStage:
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc_value: BaseException | None,
+            traceback: TracebackType | None,
+        ) -> None:
+            return None
+
+        def finish(self, outcome: Any) -> None:
+            raise asyncio.CancelledError
+
+    class CancellingRun:
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc_value: BaseException | None,
+            traceback: TracebackType | None,
+        ) -> None:
+            return None
+
+        def start_stage(self, stage: ObservationStage) -> Any:
+            return CancellingStage()
+
+        def project_result(self, result: RunResult) -> None:
+            raise asyncio.CancelledError
+
+        def record_pre_result_failure(self, category: FailureCategory) -> None:
+            raise asyncio.CancelledError
+
+    isolated_stage = FailureIsolatedStageObservation(CancellingStage())
+    with pytest.raises(asyncio.CancelledError):
+        isolated_stage.finish(StageOutcome(status=ObservationStatus.SUCCEEDED))
+
+    isolated_run = FailureIsolatedRunObservation(CancellingRun())
+    with pytest.raises(asyncio.CancelledError):
+        isolated_run.record_pre_result_failure(FailureCategory.TIMEOUT)
+
+
+def test_partial_metric_projection_does_not_duplicate_points(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Guard exactly-once projection when a meter instrument fails midway."""
+    seed = InMemoryObservability()
+    configured, _, _, _ = dependencies((0.93,), observability=seed)
+    response = TestClient(create_app(execution_dependencies=configured)).post(
+        "/api/v1/runs", json=request_payload()
+    )
+    result = run_result_from_response(response)
+    observer, _, reader, _, _ = local_otel_observer()
+
+    class FailingCounter:
+        def add(self, amount: int, attributes: dict[str, str]) -> None:
+            raise RuntimeError("SECRET_METER_FAILURE")
+
+    monkeypatch.setattr(observer, "_contract_results", FailingCounter())
+    run = observer.start_run(run_id=result.run_id, correlation_id=result.correlation_id)
+    run.__enter__()
+    with pytest.raises(RuntimeError):
+        run.project_result(result)
+    run.project_result(result)
+    run.__exit__(None, None, None)
+
+    run_points = [
+        point for name, point in metric_points(reader) if name == "optima.runs"
+    ]
+    assert len(run_points) == 1
+    assert run_points[0].value == 1
+    assert "SECRET_METER_FAILURE" not in repr(metric_points(reader))
+
+
+def test_disabled_observability_has_no_azure_import_in_subprocess() -> None:
+    """Prove disabled mode never imports Azure Monitor or starts a thread."""
+    import subprocess
+    import sys
+
+    script = (
+        "import sys, threading\n"
+        "from optima.config import AppSettings\n"
+        "from optima.observability.azure_monitor import build_observability\n"
+        "from optima.observability.noop import NO_OP_OBSERVABILITY\n"
+        "baseline = threading.active_count()\n"
+        "obs = build_observability("
+        "AppSettings(application_insights_enabled=False))\n"
+        "assert obs is NO_OP_OBSERVABILITY, 'disabled must be inert'\n"
+        "assert threading.active_count() == baseline, 'no new thread'\n"
+        "assert 'azure.monitor' not in sys.modules, 'no azure import'\n"
+        "assert obs.force_flush() is True\n"
+        "obs.close()\n"
+        "print('DISABLED_OK')\n"
+    )
+    source_root = str(Path(__file__).resolve().parents[1] / "src")
+    environment = {**os.environ, "PYTHONPATH": source_root}
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=120,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "DISABLED_OK" in completed.stdout

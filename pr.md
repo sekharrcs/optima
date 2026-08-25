@@ -43,7 +43,7 @@ BLOCKING, HIGH, or MEDIUM issue. Its two LOW findings were also corrected.
 - Application Insights remains disabled by default
 - Live Metrics, performance counters, offline storage, logs, and dependency
   auto-instrumentation default to disabled
-- exporter redirects, retries, control-plane configuration, Statsbeat, SDK
+- exporter transport retries, control-plane configuration, Statsbeat, SDK
   statistics, and resource metrics are disabled
 - exact aggregate cost remains domain evidence and a decimal-string trace
   attribute, not a floating-point metric

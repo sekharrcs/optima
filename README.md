@@ -430,7 +430,8 @@ The default privacy and volume controls are explicit:
   distro builds its resource
 - Azure Monitor control-plane configuration, Statsbeat, SDK statistics, and
   OpenTelemetry resource metrics are disabled
-- exporter redirects and transport retries are disabled
+- exporter transport retries are disabled (`retry_total=0`); redirect handling
+  is the exporter's own fixed behavior, not an OPTIMA setting
 - one custom FastAPI server span is created per non-health request
 - request and response bodies, headers, query strings, raw URLs, user IDs,
   endpoints, exception messages, and exception stack contents are not exported

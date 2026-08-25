@@ -485,9 +485,10 @@ class OpenTelemetryRunObservation:
             result.total_tokens,
         )
         if result.total_calculated_cost is not None:
+            # Canonical fixed-point form: never scientific notation for small costs.
             self._span.set_attribute(
                 "optima.run.total_cost_exact",
-                str(result.total_calculated_cost),
+                format(result.total_calculated_cost, "f"),
             )
         if result.final_evaluation is not None:
             self._span.set_attribute(

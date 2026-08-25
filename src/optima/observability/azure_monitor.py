@@ -169,7 +169,6 @@ def _initialize_azure_monitor(
                 retry_connect=0,
                 retry_read=0,
                 retry_status=0,
-                redirect_max=0,
             )
         tracer_provider = get_tracer_provider()
         meter_provider = get_meter_provider()

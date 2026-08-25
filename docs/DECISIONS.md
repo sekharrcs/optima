@@ -383,7 +383,9 @@ unknown endpoint configuration. Parent-based trace-ID ratio sampling defaults
 to `1.0` for root traces and preserves remote and local parent decisions;
 metrics remain unsampled. Live Metrics, performance counters, offline storage,
 telemetry logs, control-plane configuration, Statsbeat, SDK statistics, resource
-metrics, redirects, and exporter retries default to disabled. Ambient service
+metrics, and exporter transport retries default to disabled. Redirect handling
+remains the distro exporter's own fixed behavior and is not an OPTIMA-controlled
+setting. Ambient service
 and resource attributes are cleared before resource construction.
 
 A pre-existing process-wide OpenTelemetry provider disables Azure initialization
