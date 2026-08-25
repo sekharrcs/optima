@@ -56,6 +56,7 @@ _ATTEMPTED_CACHE_OUTCOMES = frozenset(
         SemanticCacheOutcome.LOOKUP_TIMED_OUT,
     }
 )
+_MAX_COST_FIXED_POINT_CHARS = 96
 
 
 class FlushableProvider(Protocol):
@@ -491,10 +492,9 @@ class OpenTelemetryRunObservation:
             result.total_tokens,
         )
         if result.total_calculated_cost is not None:
-            self._span.set_attribute(
-                "optima.run.total_cost_exact",
-                _canonical_decimal_text(result.total_calculated_cost),
-            )
+            cost_text = _canonical_decimal_text(result.total_calculated_cost)
+            if cost_text is not None:
+                self._span.set_attribute("optima.run.total_cost_exact", cost_text)
         if result.final_evaluation is not None:
             self._span.set_attribute(
                 "optima.evaluation.final_score",
@@ -788,10 +788,23 @@ def _add_optional_counter(
         counter.add(value, attributes)
 
 
-def _canonical_decimal_text(value: Decimal) -> str:
-    """Return one exact fixed-point representation for a finite Decimal value."""
+def _canonical_decimal_text(value: Decimal) -> str | None:
+    """Return one bounded exact fixed-point representation, or None when unsafe.
+
+    Cost rates carry no exponent bound in the domain, so an extreme-exponent
+    Decimal is omitted rather than expanded into a pathologically wide fixed-
+    point attribute. Significant digits are already capped by the Decimal
+    context; only the exponent-driven width is bounded here.
+    """
     if value.is_zero():
         return "0"
+    _sign, digits, exponent = value.as_tuple()
+    if not isinstance(exponent, int):
+        return None
+    integer_places = len(digits) + exponent
+    fractional_places = -exponent if exponent < 0 else 0
+    if max(integer_places, 1) + fractional_places > _MAX_COST_FIXED_POINT_CHARS:
+        return None
     fixed_point = format(value, "f")
     if "." not in fixed_point:
         return fixed_point

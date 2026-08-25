@@ -2029,6 +2029,7 @@ def test_repeated_app_construction_adds_one_http_middleware_per_app() -> None:
             "0.1234567890123456789012345678",
         ),
         (Decimal("1E+3"), "1000"),
+        (Decimal("1E+40"), "1" + "0" * 40),
     ),
 )
 def test_total_cost_exact_is_numerically_canonical_fixed_point(
@@ -2062,6 +2063,34 @@ def test_total_cost_exact_is_numerically_canonical_fixed_point(
     assert "E" not in cost_attribute
     assert "e" not in cost_attribute
     assert Decimal(cost_attribute) == result.total_calculated_cost
+
+
+def test_total_cost_exact_omitted_when_exponent_width_is_unbounded() -> None:
+    """Omit the exact cost rather than expand an extreme-exponent Decimal."""
+    seed = InMemoryObservability()
+    configured, _, _, _ = dependencies((0.93,), observability=seed)
+    response = TestClient(create_app(execution_dependencies=configured)).post(
+        "/api/v1/runs", json=request_payload()
+    )
+    result = run_result_with_model_cost(
+        run_result_from_response(response),
+        Decimal("1E+100000"),
+    )
+    assert result.total_calculated_cost == Decimal("1E+100000")
+    observer, exporter, _, _, _ = local_otel_observer()
+
+    with observer.start_run(
+        run_id=result.run_id,
+        correlation_id=result.correlation_id,
+    ) as run:
+        run.project_result(result)
+
+    root = next(
+        span for span in exporter.get_finished_spans() if span.name == "optima.run"
+    )
+    attributes = dict(root.attributes or {})
+    assert "optima.run.total_cost_exact" not in attributes
+    assert attributes["optima.measurement.total_cost.available"] is True
 
 
 def test_concurrent_runs_keep_isolated_span_parentage() -> None:
