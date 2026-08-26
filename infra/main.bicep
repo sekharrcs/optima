@@ -12,6 +12,9 @@ param environmentName string = 'hackathon'
 @description('Deploy API and UI only after images, runtime composition, and data-plane access are ready.')
 param deployContainerApps bool = false
 
+@description('Create OPTIMA-owned runtime access assignments. Requires Azure RBAC administration on the registry.')
+param deployRuntimeAccess bool = false
+
 @description('Immutable container image tag produced by a later build slice.')
 param imageTag string
 
@@ -67,6 +70,7 @@ module resources 'resource-group.bicep' = {
   params: {
     applicationInsightsSamplingRatio: applicationInsightsSamplingRatio
     deployContainerApps: deployContainerApps
+    deployRuntimeAccess: deployRuntimeAccess
     environmentName: environmentName
     foundryBaseUrl: foundryBaseUrl
     foundrySmallDeployment: foundrySmallDeployment

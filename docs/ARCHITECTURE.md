@@ -98,15 +98,17 @@ Subscription-scope Bicep
                 +--> Azure Managed Redis Balanced B0
                 +--> Log Analytics + Application Insights
                 +--> separate API and UI managed identities
+                +--> optional runtime access assignments
 
 OPTIMA API --> Foundry or APIM Azure OpenAI v1 endpoint
 ```
 
 Slice 11A omits Key Vault because runtime service authentication uses managed
-identity and the generated Application Insights connection string is held as a
-Container Apps secret. APIM and Foundry resources remain external reviewed
-inputs because the current provider supports either direct Foundry or an APIM
-gateway and no gateway is required by application behavior.
+identity. The generated Application Insights connection string identifies the
+telemetry destination and is not a security token. APIM and Foundry resources
+remain external reviewed inputs because the current provider supports either
+direct Foundry or an APIM gateway and no gateway is required by application
+behavior.
 
 Public Azure service endpoints are an intentional hackathon tradeoff. Cosmos
 local auth, Redis access keys, and ACR admin credentials are disabled. The API

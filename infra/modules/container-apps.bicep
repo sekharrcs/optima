@@ -70,7 +70,6 @@ param foundryStrongDeployment string
 @description('OAuth token scope accepted by the configured Foundry or APIM endpoint.')
 param foundryTokenScope string
 
-@secure()
 @description('Application Insights connection string.')
 param applicationInsightsConnectionString string
 
@@ -124,12 +123,6 @@ resource api 'Microsoft.App/containerApps@2025-07-01' = {
         {
           identity: apiIdentityResourceId
           server: registryLoginServer
-        }
-      ]
-      secrets: [
-        {
-          name: 'application-insights-connection-string'
-          value: applicationInsightsConnectionString
         }
       ]
     }
@@ -221,7 +214,7 @@ resource api 'Microsoft.App/containerApps@2025-07-01' = {
             }
             {
               name: 'OPTIMA_APPLICATION_INSIGHTS_CONNECTION_STRING'
-              secretRef: 'application-insights-connection-string'
+              value: applicationInsightsConnectionString
             }
             {
               name: 'OPTIMA_APPLICATION_INSIGHTS_SERVICE_NAME'

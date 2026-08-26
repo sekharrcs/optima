@@ -9,8 +9,9 @@ description: Slice 11A Azure topology, deployment contracts, identity model, cos
 
 > [!IMPORTANT]
 > Slice 11A defines architecture and infrastructure as code only. It does not
-> deploy, update, or delete Azure resources. It does not create federated
-> credentials, role assignments, GitHub environments, or GitHub secrets.
+> deploy, update, or delete Azure resources. It defines optional runtime access
+> assignments, but it does not create federated credentials, GitHub
+> environments, or GitHub secrets.
 
 The reviewed target metadata is:
 
@@ -74,6 +75,7 @@ Azure Resource Manager
                 +-- workspace-based Application Insights
                 +-- API user-assigned managed identity
                 +-- UI user-assigned managed identity
+                +-- optional OPTIMA runtime access assignments
 
 OPTIMA API --managed identity--> Foundry or APIM endpoint (external input)
 OPTIMA API --managed identity--> Cosmos DB
@@ -125,12 +127,12 @@ No static Azure service credential remains in the proposed runtime:
 * ACR admin authentication is disabled
 
 Application Insights still uses its generated connection string because the
-installed exporter does not accept a managed-identity credential. The value is
-passed as a secure module output into a Container Apps secret and is never
-returned by the root template. It identifies the telemetry destination and
-contains an instrumentation key, but it is not an Azure management credential.
-Adding Key Vault for this single generated value would add lifecycle and access
-complexity without improving the current threat boundary.
+installed exporter does not accept a managed-identity credential. Microsoft
+documents the contained instrumentation key as a resource identifier, not a
+security token or key. The value is passed as ordinary Container Apps
+configuration and is never returned by the root template. Adding Key Vault for
+this generated destination value would add lifecycle and access complexity
+without improving the current threat boundary.
 
 ### Networking stack
 
@@ -219,7 +221,7 @@ The UI receives no Foundry, Cosmos, Redis, or Application Insights setting.
 | `OPTIMA_REDIS_OBJECT_ID`                            | API identity principal/object ID               | No     | Redis AUTH username            | IaC                |
 | `OPTIMA_REDIS_MANAGED_IDENTITY_CLIENT_ID`           | API identity client ID                         | No     | Selects user-assigned identity | IaC                |
 | `OPTIMA_APPLICATION_INSIGHTS_ENABLED`               | Literal `true`                                 | No     | Not applicable                 | IaC                |
-| `OPTIMA_APPLICATION_INSIGHTS_CONNECTION_STRING`     | Application Insights secure output             | Yes    | None in current exporter       | IaC                |
+| `OPTIMA_APPLICATION_INSIGHTS_CONNECTION_STRING`     | Application Insights connection string         | No     | None in current exporter       | IaC                |
 | `OPTIMA_APPLICATION_INSIGHTS_SERVICE_NAME`          | Literal `optima-api`                           | No     | Not applicable                 | IaC                |
 | `OPTIMA_APPLICATION_INSIGHTS_DEPLOYMENT_ENVIRONMENT`| Literal `hackathon`                             | No     | Not applicable                 | IaC                |
 | `OPTIMA_APPLICATION_INSIGHTS_SAMPLING_RATIO`        | Environment parameter, default `0.25`          | No     | Not applicable                 | IaC/operations     |
@@ -230,20 +232,23 @@ quality thresholds, planner thresholds, Redis timeouts, Redis connection bounds,
 Cosmos retry limits, and history list limits retain their typed application
 defaults unless benchmark calibration supplies an explicit override.
 
-No account key, Redis access key, Foundry API key, password, connection string,
-subscription credential, or tenant credential is present in a parameter file or
-template output.
+No account key, Redis access key, Foundry API key, password, subscription
+credential, or tenant credential is present in a parameter file or template
+output. The generated Application Insights destination is passed between
+modules but is not exposed as a root output.
 
 ## Runtime identity model
 
-Role and policy assignment resources are deliberately absent from Slice 11A.
-The matrix below is the required later state.
+`infra/modules/runtime-access.bicep` defines the OPTIMA-owned runtime grants.
+They are conditional because creating the ACR assignments requires access
+administration that the routine Contributor deployment identity does not have.
+Set `deployRuntimeAccess=true` only for a reviewed access-bootstrap deployment.
 
 | Identity             | Resource                      | Required access                                    | Scope                            | Reason                                 |
 |----------------------|-------------------------------|----------------------------------------------------|----------------------------------|----------------------------------------|
 | API managed identity | ACR                           | `AcrPull` (`7f951dda-4ed3-4680-a7ca-43fe172d538d`) | OPTIMA registry                  | Pull the API image                     |
 | API managed identity | Cosmos DB                     | Cosmos DB Built-in Data Contributor (`...0002`)    | `/dbs/optima/colls/runs`         | Create/read immutable runs and query   |
-| API managed identity | Managed Redis database        | Custom Redis ACL access-policy assignment          | Managed Redis `default` database | Execute bounded cache lookup           |
+| API managed identity | Managed Redis database        | Stable `default` access-policy assignment           | Managed Redis `default` database | Authenticate cache operations          |
 | API managed identity | Foundry Azure OpenAI resource | Cognitive Services OpenAI User                     | Exact Foundry/OpenAI resource    | Invoke model and embedding deployments |
 | UI managed identity  | ACR                           | `AcrPull` (`7f951dda-4ed3-4680-a7ca-43fe172d538d`) | OPTIMA registry                  | Pull the UI image                      |
 | UI managed identity  | Cosmos, Redis, Foundry        | None                                               | None                             | UI calls only the internal API         |
@@ -254,17 +259,16 @@ the Cosmos account. The assignment should use the most granular relative scope
 `/dbs/optima/colls/runs`.
 
 Managed Redis does not use an Azure RBAC data role. It uses
-`Microsoft.Cache/redisEnterprise/databases/accessPolicyAssignments`. The
-proposed runtime ACL is:
+`Microsoft.Cache/redisEnterprise/databases/accessPolicyAssignments`. The stable
+`2025-07-01` API supports only the `default` policy, which grants full Redis
+data-plane access. Fine-grained access strings require a preview API and are
+not supported on instances with modules such as RediSearch enabled. The API
+identity is therefore isolated from the UI but is not command-scoped within
+Redis. Revisit this residual risk when Azure Managed Redis supports custom ACLs
+with the required search capability.
 
-```text
-+ping +ft.search ~optima-cache-v1 ~optima:semantic-cache:*
-```
-
-That ACL must be validated against the deployed Redis version and redis-py
-connection bootstrap before app activation. Index provisioning requires a
-separate temporary administrative principal; remove that principal after
-`FT.CREATE` succeeds.
+Index provisioning remains a separate authenticated data-plane bootstrap step.
+The application does not create the index.
 
 ## GitHub OIDC design
 
@@ -286,23 +290,28 @@ ID as non-secret variables. OIDC creates no client secret.
 
 ### Deployment RBAC
 
-| Phase                           | Role        | Scope                  | Why                                            |
-|---------------------------------|-------------|------------------------|------------------------------------------------|
-| One-time subscription bootstrap | Contributor | Target subscription    | Create the resource group and its resources    |
-| Routine infrastructure deploy   | Contributor | `rg-optima-hackathon`  | Deploy only OPTIMA resource-group resources    |
-| Image build and publish          | `AcrPush`   | OPTIMA registry        | Push immutable API and UI images               |
+| Phase                           | Role                     | Scope                     | Why                                    |
+|---------------------------------|--------------------------|---------------------------|----------------------------------------|
+| One-time subscription bootstrap | Contributor              | Target subscription       | Create resource group and resources    |
+| Routine infrastructure deploy   | Contributor              | `rg-optima-hackathon`     | Deploy OPTIMA resources                |
+| Runtime access bootstrap        | Contributor + RBAC admin | Resource group + registry | Create finite runtime assignments      |
+| Image build and publish         | `AcrPush`                | OPTIMA registry           | Push immutable API and UI images       |
 
 `AcrPush` has role ID `8311e382-0749-4cb8-b61a-304f252e45ec`.
-Subscription Contributor is temporary. After `infra/main.bicep` creates the
-resource group, replace it with resource-group Contributor and run routine
-deployments against `infra/resource-group.bicep`. Contributor cannot create
-Azure RBAC role assignments, which is desirable here.
+Subscription Contributor is temporary. First deploy resources with
+`deployRuntimeAccess=false`. Then a reviewed bootstrap principal with
+Contributor on the resource group and Role Based Access Control Administrator
+on the exact registry can rerun `infra/resource-group.bicep` with
+`deployRuntimeAccess=true`. Cosmos and Redis assignments are native child
+resources covered by Contributor; only the two ACR assignments require Azure
+RBAC administration.
 
 Do not grant Owner, User Access Administrator, or Role Based Access Control
-Administrator to the GitHub deployment identity. A human bootstrap principal
-with existing access administration authority should apply the finite ACR and
-Foundry Azure RBAC assignments plus the Cosmos and Redis native data-plane
-assignments. This avoids giving CI permission to delegate access.
+Administrator to the routine GitHub deployment identity. After bootstrap,
+return `deployRuntimeAccess` to `false`. The Foundry resource owner must grant
+Cognitive Services OpenAI User on the exact external resource. The image-build
+identity owner must grant `AcrPush` on the exact registry. These external grants
+cannot be derived safely from the endpoint-only OPTIMA parameters.
 
 ## Resource providers
 
@@ -320,10 +329,10 @@ register them.
 | `Microsoft.OperationalInsights` | Log Analytics workspace                             |
 | `Microsoft.Insights`            | Application Insights component                      |
 
-`Microsoft.Authorization` is needed only when a later human or reviewed access
-bootstrap creates Azure RBAC assignments. `Microsoft.CognitiveServices` is
-needed only if a later slice deploys Foundry/OpenAI resources. `Microsoft.KeyVault`
-is not required by this architecture.
+`Microsoft.Authorization` is needed when the reviewed runtime-access bootstrap
+enables the two ACR role assignments. `Microsoft.CognitiveServices` is needed
+only if a later slice deploys Foundry/OpenAI resources. `Microsoft.KeyVault` is
+not required by this architecture.
 
 ## Cost assessment
 
@@ -366,7 +375,8 @@ or random value participates in naming.
 
 The templates use incremental deployment semantics when invoked normally. They
 do not own unrelated subscription resources, define deletion scripts, use
-deployment stacks, emit credentials, or create wildcard role assignments.
+deployment stacks, emit credentials, or create wildcard role assignments. The
+optional runtime assignments use deterministic names and exact resource scopes.
 Resource deletion must be a separate reviewed action.
 
 Container Apps deployment is gated by `deployContainerApps=false`. Before
@@ -377,7 +387,8 @@ setting it to `true`, all of these conditions must hold:
    providers, evaluator, cost catalog, store, cache, and lifecycle owners.
 3. The API lifespan flushes and closes observability, Foundry transports,
    Cosmos resources, Redis renewal/client resources, and embedding resources.
-4. Runtime ACR, Cosmos, Redis, and Foundry access has been applied and verified.
+4. OPTIMA runtime access was bootstrapped with `deployRuntimeAccess=true`, then
+  returned to `false`; external Foundry access was applied and verified.
 5. `optima-cache-v1` exists with the reviewed embedding dimension.
 6. Placeholder Foundry and embedding parameters have been replaced.
 7. The API health endpoint and UI startup have passed container smoke tests.
@@ -397,6 +408,8 @@ Azure Resource Manager
       |
       +-- routine: resource-group.bicep
       |
+      +-- reviewed access bootstrap: deployRuntimeAccess=true
+      |
       v
 Build and push immutable API/UI images
       |
@@ -412,8 +425,11 @@ No workflow is implemented in Slice 11A.
   wired into the FastAPI entry point.
 * Container packaging is absent and intentionally excluded from Slice 11A.
 * Foundry resource, deployment names, quotas, and model pricing are unresolved.
-* The Redis runtime ACL and RediSearch index creation require authenticated live
-  validation before semantic cache is enabled.
+* The stable Redis access policy grants the API identity full Redis data-plane
+  access; custom module-compatible ACLs are unavailable and remain a residual
+  risk.
+* RediSearch index creation requires authenticated live validation before
+  semantic cache is enabled.
 * B0 Redis availability in East US and subscription quota must be confirmed
   before deployment.
 * Public UI access has no application authentication, as specified for the MVP.

@@ -3,6 +3,7 @@ using '../main.bicep'
 param location = 'eastus'
 param environmentName = 'hackathon'
 param deployContainerApps = false
+param deployRuntimeAccess = false
 
 // Slice 11B/11C must replace these deployment gates with reviewed build/model values.
 param imageTag = 'slice-11a-unbuilt'

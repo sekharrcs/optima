@@ -441,8 +441,9 @@ Status: Accepted
 Separate user-assigned identities give the API and UI stable, pre-assignable
 principals. The API uses identity for Foundry, Cosmos, Redis, and ACR; the UI uses
 identity only for ACR. Cosmos keys, Redis access keys, and ACR admin credentials
-are disabled. The generated Application Insights connection string is held in a
-Container Apps secret, so no concrete Key Vault requirement remains.
+are disabled. The generated Application Insights connection string identifies
+the telemetry destination and is not a security token, so no concrete Key Vault
+requirement remains.
 
 ## ADR-027: Use simple public-service networking for the hackathon
 
@@ -473,3 +474,16 @@ Retention is 30 days with immediate purge, root trace sampling defaults to
 `0.25`, Container Apps platform-log forwarding is disabled, and the workspace
 has a 0.25 GB/day emergency cap. The cap limits spikes but is not a precise cost
 or primary filtering mechanism.
+
+## ADR-030: Define runtime access in IaC behind a bootstrap gate
+
+Status: Accepted
+
+Define OPTIMA-owned ACR pull, Cosmos data-plane, and Redis access-policy
+assignments in a dedicated Bicep module with deterministic names and exact
+resource scopes. Keep `deployRuntimeAccess=false` for routine Contributor
+deployments. A reviewed bootstrap principal may enable it with Contributor on
+the resource group and Role Based Access Control Administrator on the exact
+registry, then disable the gate again. Foundry inference access and image
+publisher access remain with the external resource owners because OPTIMA does
+not own those principals or resources.

@@ -12,6 +12,9 @@ param environmentName string = 'hackathon'
 @description('Deploy API and UI only after images, runtime composition, and data-plane access are ready.')
 param deployContainerApps bool = false
 
+@description('Create OPTIMA-owned runtime access assignments. Requires Azure RBAC administration on the registry.')
+param deployRuntimeAccess bool = false
+
 @description('Immutable container image tag produced by a later build slice.')
 param imageTag string
 
@@ -114,6 +117,24 @@ module redis 'modules/managed-redis.bicep' = {
     redisName: resourceNames.redis
     tags: tags
   }
+}
+
+module runtimeAccess 'modules/runtime-access.bicep' = if (deployRuntimeAccess) {
+  name: 'optima-runtime-access'
+  params: {
+    apiPrincipalId: identities.outputs.apiPrincipalId
+    cosmosAccountName: resourceNames.cosmosAccount
+    cosmosContainerName: 'runs'
+    cosmosDatabaseName: 'optima'
+    redisName: resourceNames.redis
+    registryName: resourceNames.containerRegistry
+    uiPrincipalId: identities.outputs.uiPrincipalId
+  }
+  dependsOn: [
+    registry
+    cosmos
+    redis
+  ]
 }
 
 module containerApps 'modules/container-apps.bicep' = if (deployContainerApps) {

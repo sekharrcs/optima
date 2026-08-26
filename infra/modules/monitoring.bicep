@@ -55,6 +55,4 @@ resource applicationInsights 'Microsoft.Insights/components@2020-02-02' = {
 
 output workspaceResourceId string = workspace.id
 output applicationInsightsResourceId string = applicationInsights.id
-
-@secure()
 output connectionString string = applicationInsights.properties.ConnectionString

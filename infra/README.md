@@ -21,7 +21,8 @@ description: Offline validation and deployment boundaries for the Slice 11A Bice
   deployments.
 
 Both parameter files contain non-deployable model and image placeholders. Both
-keep `deployContainerApps=false`. These values are deliberate deployment gates.
+keep `deployContainerApps=false` and `deployRuntimeAccess=false`. These values
+are deliberate deployment gates.
 
 ## Modules
 
@@ -32,11 +33,20 @@ keep `deployContainerApps=false`. These values are deliberate deployment gates.
 | `monitoring.bicep`         | Log Analytics and Application Insights           |
 | `cosmos.bicep`             | Serverless NoSQL account, database, and container|
 | `managed-redis.bicep`      | B0 Redis and RediSearch-capable database          |
+| `runtime-access.bicep`     | Conditional ACR, Cosmos, and Redis runtime grants |
 | `container-apps.bicep`     | Gated API/UI Container Apps definitions           |
 
-No module defines Azure RBAC assignments, Cosmos SQL role assignments, Managed
-Redis access-policy assignments, deployment scripts, federated credentials, or
-provider registration.
+The runtime-access module uses deterministic names and exact scopes. It grants
+`AcrPull` to the API and UI identities, Cosmos data contribution to the API on
+`optima/runs`, and the stable Redis `default` policy to the API. It is disabled
+for routine deployments because its ACR assignments require a reviewed
+principal with Role Based Access Control Administrator on the exact registry.
+Foundry access, image-publisher `AcrPush`, deployment scripts, federated
+credentials, and provider registration remain outside this template graph.
+
+The Application Insights connection string is ordinary destination
+configuration, not a security token. It is passed directly to the API app and
+is not exposed as a root output.
 
 ## Offline validation
 
