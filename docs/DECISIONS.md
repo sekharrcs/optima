@@ -413,3 +413,63 @@ still fail before initialization. Terminal projection is serialized and never
 retries a partially emitted metric batch. Adapter failures never alter business
 behavior. Slice 11 owns production lifespan calls to the provided flush and
 close operations.
+
+## ADR-024: Use separate Consumption Container Apps for API and UI
+
+Status: Accepted
+
+Deploy FastAPI and Streamlit as separate Container Apps in one consumption-only
+environment. Both scale to zero, use `0.5` vCPU and `1.0Gi` memory per replica,
+and have conservative replica maxima. The API uses internal ingress; the UI is
+the only public app endpoint. This preserves process, port, scaling, and
+permission boundaries without a dedicated compute floor.
+
+## ADR-025: Split subscription bootstrap from routine resource deployment
+
+Status: Accepted
+
+`infra/main.bicep` is subscription-scoped and creates the OPTIMA resource group.
+It delegates resource creation to `infra/resource-group.bicep`, which is also the
+routine deployment entry point. A deployment identity may use temporary
+subscription Contributor for the first bootstrap, then be reduced to Contributor
+on `rg-optima-hackathon`. CI receives no role-assignment administration.
+
+## ADR-026: Use managed identity without Key Vault for the hackathon runtime
+
+Status: Accepted
+
+Separate user-assigned identities give the API and UI stable, pre-assignable
+principals. The API uses identity for Foundry, Cosmos, Redis, and ACR; the UI uses
+identity only for ACR. Cosmos keys, Redis access keys, and ACR admin credentials
+are disabled. The generated Application Insights connection string is held in a
+Container Apps secret, so no concrete Key Vault requirement remains.
+
+## ADR-027: Use simple public-service networking for the hackathon
+
+Status: Accepted
+
+Use public Azure service endpoints with identity-based authorization. Do not add
+VNet integration, private endpoints, private DNS, NAT Gateway, Firewall, Front
+Door, Application Gateway, or zone redundancy in the hackathon environment.
+This is a cost and delivery decision, not the production security target.
+
+## ADR-028: Use serverless Cosmos DB and non-HA Balanced B0 Redis
+
+Status: Accepted
+
+Cosmos DB for NoSQL uses serverless request-unit billing, one East US region,
+Session consistency, database `optima`, container `runs`, and `/id` partitioning.
+Azure Managed Redis uses Balanced B0, disabled high availability, RediSearch,
+Enterprise clustering, NoEviction, TLS port `10000`, and no persistence. Cache
+unavailability falls back to model execution, so a replica is not justified for
+the hackathon.
+
+## ADR-029: Bound telemetry retention, sampling, and ingestion
+
+Status: Accepted
+
+Application Insights is workspace-based on a PerGB2018 Log Analytics workspace.
+Retention is 30 days with immediate purge, root trace sampling defaults to
+`0.25`, Container Apps platform-log forwarding is disabled, and the workspace
+has a 0.25 GB/day emergency cap. The cap limits spikes but is not a precise cost
+or primary filtering mechanism.

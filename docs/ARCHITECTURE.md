@@ -82,32 +82,40 @@ Context reduction is independent of model policy and may be disabled through typ
 ## Azure target
 
 ```text
-GitHub
-  |
-  | GitHub Actions / azd
-  v
-Azure Container Registry
-  |
-  v
-Azure Container Apps
-  |- OPTIMA FastAPI
-  |- OPTIMA Streamlit UI
-  |
-  +--> Azure API Management AI Gateway
-  |       |
-  |       +--> Microsoft Foundry model deployments
-  |
-  +--> Azure Managed Redis
-  |       |- semantic cache
-  |
-  +--> Azure Cosmos DB
-  |       |- run history
-  |       |- historical policy statistics
-  |
-  +--> Application Insights / Azure Monitor
-  |
-  +--> Key Vault / Managed Identity
+GitHub Actions
+        |
+        | OIDC (later slice)
+        v
+Subscription-scope Bicep
+        |
+        +--> rg-optima-hackathon
+                |
+                +--> Azure Container Registry Basic
+                +--> Azure Container Apps Consumption
+                |     |- internal OPTIMA FastAPI API
+                |     |- public OPTIMA Streamlit UI
+                +--> Azure Cosmos DB for NoSQL serverless
+                +--> Azure Managed Redis Balanced B0
+                +--> Log Analytics + Application Insights
+                +--> separate API and UI managed identities
+
+OPTIMA API --> Foundry or APIM Azure OpenAI v1 endpoint
 ```
+
+Slice 11A omits Key Vault because runtime service authentication uses managed
+identity and the generated Application Insights connection string is held as a
+Container Apps secret. APIM and Foundry resources remain external reviewed
+inputs because the current provider supports either direct Foundry or an APIM
+gateway and no gateway is required by application behavior.
+
+Public Azure service endpoints are an intentional hackathon tradeoff. Cosmos
+local auth, Redis access keys, and ACR admin credentials are disabled. The API
+is internal to the Container Apps environment because it has no caller
+authentication; only the UI has public ingress.
+
+See `docs/AZURE_INFRASTRUCTURE.md` for resource configuration, configuration
+mapping, identity scopes, provider registrations, cost controls, and deployment
+gates.
 
 ## Design boundaries
 
@@ -388,17 +396,6 @@ Schema version 1 defines these custom metrics:
 - `optima.evaluation.score` by valid pass, valid rejection, or invalid evidence
 - `optima.run_history.persistence` by persisted or failed result
 - `optima.telemetry.projections` by terminal or pre-result projection category
-
-Metrics never include request IDs, run IDs, correlation IDs, provider request
-IDs, endpoint names, hostnames, exception messages, or caller metadata. Missing
-measurements produce no numeric data point. Custom cost metrics are omitted
-because OpenTelemetry accepts binary numeric values while the domain preserves
-exact `Decimal` cost. Exact cost remains in `RunResult` and, when available, as
-a decimal-string trace attribute. The trace string preserves the exact numeric
-value without float conversion or scientific notation, canonicalizes zero to
-`0`, and removes insignificant fractional trailing zeros. It does not preserve
-the Decimal's original exponent representation. Incomplete pricing evidence
-produces no cost attribute.
 
 Completed contract misses are successful system operations. Failed and timed-out
 runs use OpenTelemetry error status. Cache failure can coexist with a successful
