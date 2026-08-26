@@ -24,6 +24,17 @@ from optima.domain.evaluation import EvaluationResult
 from optima.domain.request_binding import RequestBinding
 
 REDIS_CACHE_SCHEMA_VERSION = 1
+REDIS_CACHE_KEY_PREFIX = "optima:semantic-cache:"
+REDIS_CACHE_TAG_FIELDS = (
+    "schema_version",
+    "embedding_profile",
+    "task_type",
+    "complexity",
+)
+REDIS_CACHE_VECTOR_FIELD = "embedding"
+REDIS_CACHE_VECTOR_ALGORITHM = "FLAT"
+REDIS_CACHE_VECTOR_TYPE = "FLOAT32"
+REDIS_CACHE_DISTANCE_METRIC = "COSINE"
 
 _RETURN_FIELDS = (
     "schema_version",
@@ -204,7 +215,7 @@ def _vector_query(
         f"@task_type:{{{request.request_profile.task_type.value}}} "
         f"@complexity:{{{request.request_profile.complexity.value}}} "
         f"@embedding_profile:{{{profile.identity}}})"
-        "=>[KNN 1 @embedding $query_vector AS vector_distance]"
+        f"=>[KNN 1 @{REDIS_CACHE_VECTOR_FIELD} $query_vector AS vector_distance]"
     )
 
 

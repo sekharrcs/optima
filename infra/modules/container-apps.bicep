@@ -133,6 +133,18 @@ resource api 'Microsoft.App/containerApps@2025-07-01' = {
           image: apiImage
           env: [
             {
+              name: 'OPTIMA_DEPLOYMENT_ENVIRONMENT'
+              value: environmentName
+            }
+            {
+              name: 'OPTIMA_PRODUCTION_EVALUATOR_MODE'
+              value: 'EXACT_REFERENCE'
+            }
+            {
+              name: 'OPTIMA_PRODUCTION_REQUIRE_REFERENCE_OUTPUT'
+              value: 'true'
+            }
+            {
               name: 'OPTIMA_FOUNDRY_BASE_URL'
               value: foundryBaseUrl
             }
@@ -334,6 +346,14 @@ resource ui 'Microsoft.App/containerApps@2025-07-01' = {
           name: 'ui'
           image: uiImage
           env: [
+            {
+              name: 'OPTIMA_DEPLOYMENT_ENVIRONMENT'
+              value: environmentName
+            }
+            {
+              name: 'OPTIMA_REQUIRE_REFERENCE_OUTPUT'
+              value: 'true'
+            }
             {
               name: 'OPTIMA_API_BASE_URL'
               value: 'https://${api.properties.configuration.ingress.fqdn}'

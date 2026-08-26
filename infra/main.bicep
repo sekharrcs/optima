@@ -1,7 +1,10 @@
 targetScope = 'subscription'
 
 @description('Azure region code used by all OPTIMA resources.')
-param location string = 'eastus'
+@allowed([
+  'eastus2'
+])
+param location string = 'eastus2'
 
 @description('Deployment environment name.')
 @allowed([
@@ -15,8 +18,15 @@ param deployContainerApps bool = false
 @description('Create OPTIMA-owned runtime access assignments. Requires Azure RBAC administration on the registry.')
 param deployRuntimeAccess bool = false
 
-@description('Immutable container image tag produced by a later build slice.')
-param imageTag string
+@description('Immutable API image manifest digest produced by a later build slice.')
+@minLength(71)
+@maxLength(71)
+param apiImageDigest string
+
+@description('Immutable UI image manifest digest produced by a later build slice.')
+@minLength(71)
+@maxLength(71)
+param uiImageDigest string
 
 @description('Foundry or APIM Azure OpenAI v1 API root.')
 param foundryBaseUrl string
@@ -50,6 +60,113 @@ param redisEmbeddingDimension int
 ])
 param applicationInsightsSamplingRatio string = '0.25'
 
+var placeholderImageDigest = 'sha256:0000000000000000000000000000000000000000000000000000000000000000'
+var apiDigestHex = substring(apiImageDigest, 7, 64)
+var uiDigestHex = substring(uiImageDigest, 7, 64)
+var apiImageDigestIsDeployable = startsWith(apiImageDigest, 'sha256:') && apiImageDigest == toLower(apiImageDigest) && empty(replace(
+  replace(
+    replace(
+      replace(
+        replace(
+          replace(
+            replace(
+              replace(
+                replace(
+                  replace(
+                    replace(
+                      replace(
+                        replace(replace(replace(replace(apiDigestHex, '0', ''), '1', ''), '2', ''), '3', ''),
+                        '4',
+                        ''
+                      ),
+                      '5',
+                      ''
+                    ),
+                    '6',
+                    ''
+                  ),
+                  '7',
+                  ''
+                ),
+                '8',
+                ''
+              ),
+              '9',
+              ''
+            ),
+            'a',
+            ''
+          ),
+          'b',
+          ''
+        ),
+        'c',
+        ''
+      ),
+      'd',
+      ''
+    ),
+    'e',
+    ''
+  ),
+  'f',
+  ''
+)) && apiImageDigest != placeholderImageDigest
+var uiImageDigestIsDeployable = startsWith(uiImageDigest, 'sha256:') && uiImageDigest == toLower(uiImageDigest) && empty(replace(
+  replace(
+    replace(
+      replace(
+        replace(
+          replace(
+            replace(
+              replace(
+                replace(
+                  replace(
+                    replace(
+                      replace(
+                        replace(replace(replace(replace(uiDigestHex, '0', ''), '1', ''), '2', ''), '3', ''),
+                        '4',
+                        ''
+                      ),
+                      '5',
+                      ''
+                    ),
+                    '6',
+                    ''
+                  ),
+                  '7',
+                  ''
+                ),
+                '8',
+                ''
+              ),
+              '9',
+              ''
+            ),
+            'a',
+            ''
+          ),
+          'b',
+          ''
+        ),
+        'c',
+        ''
+      ),
+      'd',
+      ''
+    ),
+    'e',
+    ''
+  ),
+  'f',
+  ''
+)) && uiImageDigest != placeholderImageDigest
+var validatedApiImageDigest = !deployContainerApps || apiImageDigestIsDeployable
+  ? apiImageDigest
+  : fail('Container Apps deployment requires a non-placeholder API sha256 digest.')
+var validatedUiImageDigest = !deployContainerApps || uiImageDigestIsDeployable
+  ? uiImageDigest
+  : fail('Container Apps deployment requires a non-placeholder UI sha256 digest.')
 var resourceGroupName = 'rg-optima-${environmentName}'
 var tags = {
   application: 'optima'
@@ -69,6 +186,7 @@ module resources 'resource-group.bicep' = {
   scope: resourceGroup
   params: {
     applicationInsightsSamplingRatio: applicationInsightsSamplingRatio
+    apiImageDigest: validatedApiImageDigest
     deployContainerApps: deployContainerApps
     deployRuntimeAccess: deployRuntimeAccess
     environmentName: environmentName
@@ -76,11 +194,11 @@ module resources 'resource-group.bicep' = {
     foundrySmallDeployment: foundrySmallDeployment
     foundryStrongDeployment: foundryStrongDeployment
     foundryTokenScope: foundryTokenScope
-    imageTag: imageTag
     location: location
     redisEmbeddingDeployment: redisEmbeddingDeployment
     redisEmbeddingDimension: redisEmbeddingDimension
     redisEmbeddingModel: redisEmbeddingModel
+    uiImageDigest: validatedUiImageDigest
   }
 }
 

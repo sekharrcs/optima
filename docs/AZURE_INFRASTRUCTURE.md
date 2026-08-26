@@ -1,6 +1,6 @@
 ---
-title: OPTIMA Azure Infrastructure Foundation
-description: Slice 11A Azure topology, deployment contracts, identity model, cost controls, and prerequisites
+title: OPTIMA Azure Infrastructure and Runtime Readiness
+description: Slice 11A and 11B Azure topology, runtime composition, deployment contracts, cost controls, and prerequisites
 ---
 
 # OPTIMA Azure Infrastructure Foundation
@@ -8,7 +8,7 @@ description: Slice 11A Azure topology, deployment contracts, identity model, cos
 ## Slice boundary
 
 > [!IMPORTANT]
-> Slice 11A defines architecture and infrastructure as code only. It does not
+> Slices 11A and 11B define infrastructure and deployment readiness only. They do not
 > deploy, update, or delete Azure resources. It defines optional runtime access
 > assignments, but it does not create federated credentials, GitHub
 > environments, or GitHub secrets.
@@ -21,7 +21,7 @@ The reviewed target metadata is:
 | Subscription ID   | `cce38a08-26e8-4b74-8fdb-df7a6db795ed`   |
 | Tenant ID         | `d04cc813-b8d5-4eba-aca4-391c3278fd1a`   |
 | Tenant domain     | `sekhar183live.onmicrosoft.com`            |
-| Azure region      | East US (`eastus`)                         |
+| Application region | East US 2 (`eastus2`)                     |
 | Environment       | `hackathon`                                |
 | GitHub repository | `sekharrcs/optima`                         |
 
@@ -37,18 +37,20 @@ infrastructure preserves them rather than introducing replacement services.
 
 | Integration          | Repository contract                                                                 | Startup behavior                                  |
 |----------------------|--------------------------------------------------------------------------------------|---------------------------------------------------|
-| FastAPI API          | ASGI export `optima.api.app:app`, port `8000`, health at `/api/v1/health`             | Bare export has no production Azure composition   |
+| FastAPI API          | Factory `optima.api.production:create_production_app`, port `8000`, health at `/api/v1/health` | Lifespan composes Azure resources before readiness |
 | Streamlit UI         | `streamlit run src/ui/app.py`, port `8501`, `OPTIMA_API_BASE_URL`                    | Starts without an available API                   |
 | Foundry/APIM         | HTTPS Azure OpenAI v1 root ending `/openai/v1`; SMALL, STRONG, and embedding names   | First model or embedding request performs I/O     |
 | Cosmos DB            | NoSQL API, database and container supplied by settings, partition key `/id`          | Client is lazy; database and container must exist |
-| Azure Managed Redis  | TLS port `10000`, RESP2, RediSearch HASH index, `FLOAT32`/COSINE, read-only lookup    | Connection is lazy; database and index must exist |
+| Azure Managed Redis  | TLS port `10000`, RESP2, RediSearch HASH index, `FLOAT32`/COSINE, read-only lookup    | Lifespan validates or creates the index idempotently |
 | Application Insights | Workspace-based connection string, local OpenTelemetry providers, explicit close     | Failure-isolated initialization during app build  |
 
-The default FastAPI export has no production dependency factory or lifespan
-owner for Foundry, Cosmos, Redis, and observability resources. Container images
-also do not exist in the repository. These are deployment blockers for a live
-API, not reasons to change the IaC contract in Slice 11A. The
-`deployContainerApps` parameter therefore defaults to `false`.
+The default FastAPI export remains intentionally unconfigured for library and
+local health use. The production factory validates all Azure settings, composes
+Foundry, exact-reference evaluation, centralized pricing, context reduction,
+Redis, Cosmos, and observability, then owns cleanup through FastAPI lifespan.
+Separate API and UI image definitions now exist. `deployContainerApps` remains
+`false` until Slice 11C publishes immutable images and completes live access and
+regional preflight.
 
 ## Azure topology
 
@@ -87,7 +89,7 @@ OPTIMA UI  --HTTPS-------------> internal OPTIMA API
 
 | Resource                       | Selected configuration                                                                 | Purpose                                      |
 |--------------------------------|----------------------------------------------------------------------------------------|----------------------------------------------|
-| Resource group                 | `rg-optima-hackathon` in East US                                                       | Own all Slice 11A resources                  |
+| Resource group                 | `rg-optima-hackathon` in East US 2                                                     | Own all application resources                |
 | Azure Container Registry       | Basic, public endpoint, admin disabled, no dedicated data endpoint                     | Store API and UI images                      |
 | Container Apps environment     | Consumption-only, non-zone-redundant, no VNet, platform logs disabled                 | Host separate API and UI apps                |
 | API Container App              | Internal ingress, `0.5` vCPU/`1.0Gi`, min `0`, max `3`, HTTP health probes            | Execute OPTIMA and own Azure integrations    |
@@ -171,9 +173,9 @@ optimization: lookup failure already falls back to normal model execution.
 Persistence, replicas, geo-replication, and clustering for scale are omitted.
 
 RediSearch requires `EnterpriseCluster` and `NoEviction`. The module enables the
-RediSearch capability, but ARM does not create the application-level index. A
-later authenticated data-plane step must create `optima-cache-v1` with this
-schema before semantic cache is enabled:
+RediSearch capability, but ARM does not create the application-level index. The
+production API lifespan now owns an authenticated, idempotent bootstrap for
+`optima-cache-v1` with this schema:
 
 ```text
 FT.CREATE optima-cache-v1 ON HASH PREFIX 1 optima:semantic-cache: SCHEMA
@@ -184,8 +186,16 @@ FT.CREATE optima-cache-v1 ON HASH PREFIX 1 optima:semantic-cache: SCHEMA
   embedding VECTOR FLAT 6 TYPE FLOAT32 DIM <reviewed-dimension> DISTANCE_METRIC COSINE
 ```
 
-The embedding model, deployment, dimension, and the index dimension must be
-reviewed as one immutable profile. A mismatch is expected to fail closed.
+The bootstrap uses `FT._LIST` and `FT.INFO`. It creates the index only when the
+index and companion contract hash are both absent. An existing index is a
+read-only no-op only when its name, HASH prefix, exact TAG fields, vector type,
+dimension, algorithm, metric, cache schema version, semantic-input policy, and
+embedding-profile identity match. Any mismatch fails startup without dropping
+the index or deleting cache data.
+
+A bounded Redis lock coordinates concurrent replica startup. Followers wait for
+the creator's contract and then perform the same full validation. A stale
+contractless index fails closed once no active creator owns the lock.
 
 ## Configuration mapping
 
@@ -194,6 +204,7 @@ reviewed as one immutable profile. A mismatch is expected to fail closed.
 | Application setting   | Azure source                    | Secret | Identity alternative | Owner          |
 |-----------------------|---------------------------------|--------|----------------------|----------------|
 | `OPTIMA_API_BASE_URL` | Internal API Container App FQDN | No     | Not applicable       | Container Apps |
+| `OPTIMA_DEPLOYMENT_ENVIRONMENT` | Literal `hackathon`       | No     | Not applicable       | IaC            |
 
 The UI receives no Foundry, Cosmos, Redis, or Application Insights setting.
 
@@ -201,6 +212,7 @@ The UI receives no Foundry, Cosmos, Redis, or Application Insights setting.
 
 | Application setting                                 | Azure source                                   | Secret | Identity alternative           | Owner              |
 |-----------------------------------------------------|------------------------------------------------|--------|--------------------------------|--------------------|
+| `OPTIMA_DEPLOYMENT_ENVIRONMENT`                     | Literal `hackathon`                             | No     | Not applicable                 | IaC                |
 | `OPTIMA_FOUNDRY_BASE_URL`                           | Reviewed Foundry/APIM parameter                | No     | Not applicable                 | AI/gateway slice   |
 | `OPTIMA_FOUNDRY_SMALL_DEPLOYMENT`                   | Reviewed model deployment parameter            | No     | Not applicable                 | AI/model slice     |
 | `OPTIMA_FOUNDRY_STRONG_DEPLOYMENT`                  | Reviewed model deployment parameter            | No     | Not applicable                 | AI/model slice     |
@@ -267,8 +279,9 @@ identity is therefore isolated from the UI but is not command-scoped within
 Redis. Revisit this residual risk when Azure Managed Redis supports custom ACLs
 with the required search capability.
 
-Index provisioning remains a separate authenticated data-plane bootstrap step.
-The application does not create the index.
+The API managed identity performs index inspection and creation during startup.
+The reviewed stable Redis `default` policy remains broader than the desired
+command-level access because custom ACLs are incompatible with RediSearch.
 
 ## GitHub OIDC design
 
@@ -336,8 +349,8 @@ not required by this architecture.
 
 ## Cost assessment
 
-The figures below are a 2026-08-26 snapshot from the unauthenticated Azure Retail
-Prices API for East US in INR. They are reference meters, not a quote. Enterprise
+The figures below are a 2026-08-26 reference snapshot in INR. Slice 11C must
+refresh applicable East US 2 meters before deployment. They are not a quote. Enterprise
 agreement discounts, taxes, free grants, changed meters, data transfer, and
 actual usage can change the bill. Recheck pricing before deployment.
 
@@ -382,14 +395,14 @@ Resource deletion must be a separate reviewed action.
 Container Apps deployment is gated by `deployContainerApps=false`. Before
 setting it to `true`, all of these conditions must hold:
 
-1. API and UI Linux AMD64 images exist under the immutable `imageTag`.
+1. API and UI Linux AMD64 images exist at the configured immutable manifest digests.
 2. The API image exposes a production entry point that composes all required
    providers, evaluator, cost catalog, store, cache, and lifecycle owners.
 3. The API lifespan flushes and closes observability, Foundry transports,
    Cosmos resources, Redis renewal/client resources, and embedding resources.
 4. OPTIMA runtime access was bootstrapped with `deployRuntimeAccess=true`, then
   returned to `false`; external Foundry access was applied and verified.
-5. `optima-cache-v1` exists with the reviewed embedding dimension.
+5. Redis bootstrap can inspect or create `optima-cache-v1` with the reviewed profile.
 6. Placeholder Foundry and embedding parameters have been replaced.
 7. The API health endpoint and UI startup have passed container smoke tests.
 
@@ -417,20 +430,21 @@ Build and push immutable API/UI images
 Enable Container Apps after access and runtime gates pass
 ```
 
-No workflow is implemented in Slice 11A.
+No workflow is implemented in Slice 11A or Slice 11B.
 
 ## Risks and deployment blockers
 
-* Production dependency composition and application-lifetime cleanup are not yet
-  wired into the FastAPI entry point.
-* Container packaging is absent and intentionally excluded from Slice 11A.
 * Foundry resource, deployment names, quotas, and model pricing are unresolved.
+* The current production-safe evaluator is exact-reference. Requests without a
+  reference are rejected before paid work until a separately reviewed
+  natural-language evaluator is implemented.
+* The production price catalog is intentionally empty until reviewed deployment
+  rates are supplied, so monetary cost remains unavailable rather than fabricated.
 * The stable Redis access policy grants the API identity full Redis data-plane
   access; custom module-compatible ACLs are unavailable and remain a residual
   risk.
-* RediSearch index creation requires authenticated live validation before
-  semantic cache is enabled.
-* B0 Redis availability in East US and subscription quota must be confirmed
+* RediSearch bootstrap requires authenticated live validation on first startup.
+* B0 Redis availability in East US 2 and subscription quota must be confirmed
   before deployment.
 * Public UI access has no application authentication, as specified for the MVP.
 * Scale-to-zero introduces API/UI cold starts and may affect demo latency.

@@ -1,12 +1,13 @@
 using '../resource-group.bicep'
 
-param location = 'eastus'
+param location = 'eastus2'
 param environmentName = 'hackathon'
 param deployContainerApps = false
 param deployRuntimeAccess = false
 
-// Slice 11B/11C must replace these deployment gates with reviewed build/model values.
-param imageTag = 'slice-11a-unbuilt'
+// Slice 11C must replace these non-deployable digests and model placeholders.
+param apiImageDigest = 'sha256:0000000000000000000000000000000000000000000000000000000000000000'
+param uiImageDigest = 'sha256:0000000000000000000000000000000000000000000000000000000000000000'
 param foundryBaseUrl = 'https://replace-before-deployment.openai.azure.com/openai/v1'
 param foundrySmallDeployment = 'replace-small-deployment'
 param foundryStrongDeployment = 'replace-strong-deployment'

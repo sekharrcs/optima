@@ -72,6 +72,12 @@ class RedisAuthMode(StrEnum):
     MANAGED_IDENTITY = "MANAGED_IDENTITY"
 
 
+class ProductionEvaluatorMode(StrEnum):
+    """Reviewed evaluator implementations available to production composition."""
+
+    EXACT_REFERENCE = "EXACT_REFERENCE"
+
+
 class RedisSemanticCacheConfiguration(ImmutableModel):
     """Complete settings for one application-lifetime Redis cache client."""
 
@@ -397,6 +403,9 @@ class AppSettings(BaseSettings):
         extra="ignore",
     )
 
+    deployment_environment: TelemetryResourceName = "local"
+    production_evaluator_mode: ProductionEvaluatorMode | None = None
+    production_require_reference_output: bool = False
     semantic_cache_enabled: bool = True
     context_reduction_enabled: bool = True
     historical_policy_enabled: bool = True
@@ -647,3 +656,58 @@ class AppSettings(BaseSettings):
             ),
             exclude_health_routes=(self.application_insights_exclude_health_routes),
         )
+
+    def validate_production_runtime(self) -> "AppSettings":
+        """Require every dependency owned by the production API lifespan."""
+        if (
+            self.production_evaluator_mode
+            is not ProductionEvaluatorMode.EXACT_REFERENCE
+        ):
+            raise ValueError(
+                "Production runtime requires an explicit supported evaluator mode"
+            )
+        if not self.production_require_reference_output:
+            raise ValueError(
+                "EXACT_REFERENCE production evaluation requires reference output"
+            )
+        foundry = self.foundry_provider_configuration()
+        if foundry is None:
+            raise ValueError("Production runtime requires Foundry configuration")
+        cosmos = self.cosmos_run_history_configuration()
+        if cosmos is None:
+            raise ValueError("Production runtime requires Cosmos configuration")
+        redis = self.redis_semantic_cache_configuration()
+        if redis is None:
+            raise ValueError("Production runtime requires Redis configuration")
+        if self.application_insights_configuration() is None:
+            raise ValueError(
+                "Production runtime requires Application Insights configuration"
+            )
+
+        managed_identity_client_ids = (
+            (
+                foundry.auth_mode is FoundryAuthMode.MANAGED_IDENTITY,
+                foundry.managed_identity_client_id,
+                "Foundry",
+            ),
+            (
+                cosmos.auth_mode is CosmosAuthMode.MANAGED_IDENTITY,
+                cosmos.managed_identity_client_id,
+                "Cosmos",
+            ),
+            (
+                redis.auth_mode is RedisAuthMode.MANAGED_IDENTITY,
+                redis.managed_identity_client_id,
+                "Redis",
+            ),
+        )
+        for (
+            managed_identity_selected,
+            client_id,
+            service_name,
+        ) in managed_identity_client_ids:
+            if managed_identity_selected and client_id is None:
+                raise ValueError(
+                    f"Production {service_name} Managed Identity requires a client ID"
+                )
+        return self

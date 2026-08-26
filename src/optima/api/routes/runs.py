@@ -1,5 +1,6 @@
 """Versioned API routes for OPTIMA execution and run history."""
 
+from collections.abc import Callable
 from typing import Annotated, Never
 
 from fastapi import APIRouter, HTTPException, Query, Response, status
@@ -58,6 +59,7 @@ from optima.storage import (
 )
 
 HistoryLimit = Annotated[int | None, Query(ge=1, le=100)]
+ExecutionDependencyResolver = Callable[[], ExecutionDependencies | None]
 
 RUN_HISTORY_OUTCOME_HEADER = "X-OPTIMA-Run-History"
 RUN_HISTORY_ERROR_HEADER = "X-OPTIMA-Run-History-Error"
@@ -89,25 +91,40 @@ def _price_embedding_attempt(
 
 
 def build_runs_router(
-    dependencies: ExecutionDependencies | None,
+    dependencies: ExecutionDependencies | None | ExecutionDependencyResolver,
 ) -> APIRouter:
     """Build a run router bound to one immutable dependency composition."""
     router = APIRouter()
 
+    def resolve_dependencies() -> ExecutionDependencies | None:
+        if callable(dependencies):
+            return dependencies()
+        return dependencies
+
     @router.post("/runs", response_model=RunResult)
     async def execute_run(run_request: RunRequest, response: Response) -> RunResult:
         """Plan and execute one supported Planner V1 OPTIMA run."""
-        if dependencies is None:
+        resolved = resolve_dependencies()
+        if resolved is None:
             _raise_api_error(
                 status.HTTP_503_SERVICE_UNAVAILABLE,
                 code="EXECUTION_NOT_CONFIGURED",
                 message="Model providers and quality evaluator are not configured",
             )
-        run_id = dependencies.run_id_factory()
-        correlation_id = dependencies.correlation_id_factory()
-        clock = dependencies.monotonic_clock or SystemMonotonicClock()
+        if (
+            resolved.settings.production_require_reference_output
+            and run_request.reference_output is None
+        ):
+            _raise_api_error(
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
+                code="REFERENCE_OUTPUT_REQUIRED",
+                message="The configured production evaluator requires reference output",
+            )
+        run_id = resolved.run_id_factory()
+        correlation_id = resolved.correlation_id_factory()
+        clock = resolved.monotonic_clock or SystemMonotonicClock()
         request_started_at = clock.now()
-        observability = dependencies.observability
+        observability = resolved.observability
         if observability is None:
             raise AssertionError("application composition must resolve observability")
         with observability.start_run(
@@ -118,7 +135,7 @@ def build_runs_router(
                 return await _execute_observed_run(
                     run_request=run_request,
                     response=response,
-                    dependencies=dependencies,
+                    dependencies=resolved,
                     run_id=run_id,
                     correlation_id=correlation_id,
                     clock=clock,
@@ -134,7 +151,8 @@ def build_runs_router(
     @router.get("/runs/{run_id}", response_model=RunResult)
     async def get_run(run_id: str) -> RunResult:
         """Return one validated persisted run by opaque identifier."""
-        store = dependencies.run_history_store if dependencies is not None else None
+        resolved = resolve_dependencies()
+        store = resolved.run_history_store if resolved is not None else None
         if store is None:
             _raise_history_not_configured()
         try:
@@ -158,10 +176,11 @@ def build_runs_router(
     @router.get("/runs", response_model=tuple[RunResult, ...])
     async def list_runs(limit: HistoryLimit = None) -> tuple[RunResult, ...]:
         """Return a strictly bounded newest-first run-history sequence."""
-        store = dependencies.run_history_store if dependencies is not None else None
-        if store is None or dependencies is None:
+        resolved = resolve_dependencies()
+        store = resolved.run_history_store if resolved is not None else None
+        if store is None or resolved is None:
             _raise_history_not_configured()
-        configured_limit = dependencies.settings.cosmos_history_list_limit
+        configured_limit = resolved.settings.cosmos_history_list_limit
         effective_limit = configured_limit if limit is None else limit
         if effective_limit > configured_limit:
             _raise_api_error(

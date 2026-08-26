@@ -103,6 +103,41 @@ uv run streamlit run src/ui/app.py
 The UI uses `http://127.0.0.1:8000` by default. Set `OPTIMA_API_BASE_URL` or use
 the advanced demo input to target another configured OPTIMA API.
 
+The Azure-backed API uses a separate factory and fails startup unless Foundry,
+Cosmos, Redis, user-assigned identity, and Application Insights settings are
+complete:
+
+```powershell
+uv run uvicorn optima.api.production:create_production_app --factory --port 8000
+```
+
+The production lifespan creates one dependency graph, validates or creates the
+Redis index before readiness, and closes Cosmos, Redis, embedding, Foundry, and
+telemetry resources in reverse ownership order.
+
+The current production evaluator mode is `EXACT_REFERENCE`. Production requires
+`reference_output` and rejects a missing reference before any cache or model
+call. The Streamlit production form collects this value explicitly.
+
+## Container images
+
+`Dockerfile.api` packages the production FastAPI factory on port `8000`.
+`Dockerfile.ui` packages Streamlit on port `8501`. Both images install the
+checked-in lockfile without the development dependency group and run as UID and
+GID `10001`.
+
+```powershell
+docker build --file Dockerfile.api --tag optima-api:local .
+docker build --file Dockerfile.ui --tag optima-ui:local .
+docker run --rm --env-file .env -p 8000:8000 optima-api:local
+docker run --rm -e OPTIMA_API_BASE_URL=http://host.docker.internal:8000 -p 8501:8501 optima-ui:local
+```
+
+The production API command requires real Azure configuration. Use
+`optima.api.demo:app` as an explicit command override for cloud-free API smoke
+testing; production never falls back to demo providers. Container Apps image
+parameters accept manifest digests (`sha256:...`), not mutable tags.
+
 The local demo remains intentionally narrow:
 
 - Request Profile fields are supplied demo inputs because no backend request
@@ -223,13 +258,13 @@ $env:OPTIMA_COSMOS_MANAGED_IDENTITY_CLIENT_ID="<user-assigned-client-id>"
 The Cosmos container must use `/id` as its partition-key path. The deterministic
 recent-history query orders by one descending `sort_key` property, so the
 default container index serves it without a composite index. Infrastructure
-creation and role assignment remain Slice 11.
+creation and role assignment remain Slice 11C.
 
 `build_cosmos_run_history_resources(AppSettings())` creates one asynchronous
 Cosmos client and only the selected credential. Inject its `store` into
 `ExecutionDependencies`, retain the returned resources for the application
-lifetime, and call `CosmosRunHistoryResources.aclose()` during shutdown. Full
-production lifespan composition remains Slice 11.
+lifetime, and call `CosmosRunHistoryResources.aclose()` during shutdown. The
+production factory performs this composition and cleanup.
 
 Persisted evidence uses create-only writes. A duplicate run ID succeeds only
 when a point read validates to the same complete `RunResult`; different evidence
@@ -363,7 +398,7 @@ never a fallback) plus the Redis embedding profile. It calls one Azure OpenAI v1
 values, a `model` that matches the configured profile, `total_tokens` equal to
 `prompt_tokens`, and non-fabricated usage), and never leaks the endpoint, token,
 prompt, or response body. A deterministic `FakeEmbeddingProvider` serves offline
-tests. Production FastAPI lifespan ownership of these resources remains Slice 11.
+tests. The production FastAPI lifespan owns and closes these resources.
 
 A cache lookup against a paid embeddings deployment consumes input tokens and
 cost even when it produces a hit, and a failed request may already have been
@@ -475,8 +510,8 @@ $env:OPTIMA_APPLICATION_INSIGHTS_EXCLUDE_HEALTH_ROUTES="true"
 The installed SDK implements them with process-global singleton state, so the
 isolated adapter rejects `true` before constructing an exporter.
 
-The adapter exposes idempotent `force_flush()` and `close()` operations. Slice
-11 remains responsible for invoking them from the production FastAPI lifespan.
+The adapter exposes idempotent `force_flush()` and `close()` operations. The
+production FastAPI lifespan invokes close during deterministic reverse cleanup.
 A pre-existing process-wide OpenTelemetry installation can coexist with OPTIMA:
 the adapter uses separate local providers and never replaces or shuts down host
 providers. Runtime initializer failures
