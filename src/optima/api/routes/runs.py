@@ -8,6 +8,7 @@ from fastapi import APIRouter, HTTPException, Query, Response, status
 from optima.api.dependencies import ExecutionDependencies
 from optima.api.models import ApiError, RunRequest
 from optima.cache import SemanticCacheLookupRequest
+from optima.config import ProductionEvaluatorMode
 from optima.context.safety import ContextReducerSafetyRequest
 from optima.cost import CostCalculator
 from optima.domain.cache import CacheCandidate
@@ -120,6 +121,22 @@ def build_runs_router(
                 code="REFERENCE_OUTPUT_REQUIRED",
                 message="The configured production evaluator requires reference output",
             )
+        if run_request.grounding_required and run_request.context is None:
+            _raise_api_error(
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
+                code="GROUNDING_CONTEXT_REQUIRED",
+                message="The Quality Contract requires supplied grounding context",
+            )
+        if (
+            resolved.settings.production_evaluator_mode
+            is ProductionEvaluatorMode.EXACT_REFERENCE
+            and run_request.grounding_required
+        ):
+            _raise_api_error(
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
+                code="GROUNDING_NOT_SUPPORTED",
+                message="EXACT_REFERENCE cannot establish grounding",
+            )
         run_id = resolved.run_id_factory()
         correlation_id = resolved.correlation_id_factory()
         clock = resolved.monotonic_clock or SystemMonotonicClock()
@@ -221,6 +238,7 @@ async def _execute_observed_run(
                 quality_profile=run_request.quality_profile,
                 optimization_mode=run_request.optimization_mode,
                 risk_tier=run_request.risk_tier,
+                grounding_required=run_request.grounding_required,
                 max_latency_ms=run_request.max_latency_ms,
                 thresholds=dependencies.settings.quality_thresholds(),
             )

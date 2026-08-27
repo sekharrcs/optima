@@ -1697,6 +1697,120 @@ def test_run_rejects_evaluation_step_facts_that_contradict_evidence() -> None:
         )
 
 
+def llm_judge_run_evidence() -> tuple[EvaluationResult, ExecutionStep, ModelUsage]:
+    """Build mutually consistent successful LLM-judge result facts."""
+    evaluation = passing_evaluation().model_copy(update={"evaluator_type": "llm_judge"})
+    step = successful_step(1, ExecutionStepType.QUALITY_EVALUATION).model_copy(
+        update={
+            "facts": {
+                "model_role": ModelRole.SMALL.value,
+                "evaluator_type": "llm_judge",
+                "evaluator_valid": True,
+                "score": 0.93,
+                "threshold": 0.90,
+                "passed": True,
+                "judge_call_recorded": True,
+            }
+        }
+    )
+    return evaluation, step, model_usage(model_role=ModelRole.JUDGE)
+
+
+def test_run_rejects_exact_reference_with_judge_usage() -> None:
+    """Keep deterministic benchmark evidence separate from JUDGE consumption."""
+    evaluation = passing_evaluation().model_copy(
+        update={"evaluator_type": "exact_reference"}
+    )
+    step = successful_step(1, ExecutionStepType.QUALITY_EVALUATION).model_copy(
+        update={
+            "facts": {
+                "model_role": ModelRole.SMALL.value,
+                "evaluator_type": "exact_reference",
+                "evaluator_valid": True,
+                "score": 0.93,
+                "threshold": 0.90,
+                "passed": True,
+                "judge_call_recorded": True,
+            }
+        }
+    )
+
+    with pytest.raises(ValidationError, match="cannot record JUDGE usage"):
+        completed_run(
+            steps=(
+                successful_step(0, ExecutionStepType.MODEL_CALL),
+                step,
+                successful_step(2, ExecutionStepType.RETURN),
+            ),
+            model_usages=(model_usage(), model_usage(model_role=ModelRole.JUDGE)),
+            evaluations=(evaluation,),
+            final_evaluation=evaluation,
+        )
+
+
+def test_run_rejects_successful_llm_judge_without_usage() -> None:
+    """Require one JUDGE usage record for every successful LLM-judge measurement."""
+    evaluation, step, _ = llm_judge_run_evidence()
+    step = step.model_copy(
+        update={
+            "facts": {
+                key: value
+                for key, value in step.facts.items()
+                if key != "judge_call_recorded"
+            }
+        }
+    )
+
+    with pytest.raises(ValidationError, match="requires JUDGE usage"):
+        completed_run(
+            steps=(
+                successful_step(0, ExecutionStepType.MODEL_CALL),
+                step,
+                successful_step(2, ExecutionStepType.RETURN),
+            ),
+            evaluations=(evaluation,),
+            final_evaluation=evaluation,
+        )
+
+
+def test_run_rejects_excess_judge_usage() -> None:
+    """Reject evaluator economics with more JUDGE calls than recorded attempts."""
+    evaluation, step, judge_usage = llm_judge_run_evidence()
+
+    with pytest.raises(ValidationError, match="judge usage cannot exceed"):
+        completed_run(
+            steps=(
+                successful_step(0, ExecutionStepType.MODEL_CALL),
+                step,
+                successful_step(2, ExecutionStepType.RETURN),
+            ),
+            model_usages=(
+                model_usage(),
+                judge_usage,
+                judge_usage.model_copy(update={"request_id": "judge-request-2"}),
+            ),
+            evaluations=(evaluation,),
+            final_evaluation=evaluation,
+        )
+
+
+def test_run_rejects_reordered_judge_usage() -> None:
+    """Require usage ordering to follow generation and evaluation causality."""
+    evaluation, step, judge_usage = llm_judge_run_evidence()
+
+    with pytest.raises(ValidationError, match="must follow model and evaluation"):
+        completed_run(
+            steps=(
+                successful_step(0, ExecutionStepType.MODEL_CALL),
+                step,
+                successful_step(2, ExecutionStepType.RETURN),
+            ),
+            model_usages=(judge_usage, model_usage()),
+            evaluations=(evaluation,),
+            final_evaluation=evaluation,
+        )
+
+
 def test_run_rejects_evaluation_after_failed_model_call() -> None:
     """Do not evaluate or return a candidate that no model call produced."""
     with pytest.raises(ValidationError, match="requires a successful model call"):

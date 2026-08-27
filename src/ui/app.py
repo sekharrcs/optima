@@ -9,6 +9,7 @@ from typing import cast
 import streamlit as st
 
 from optima.comparison import BaselineComparison
+from optima.domain.execution import ModelRole
 from optima.domain.quality_contract import OptimizationMode, QualityProfile, RiskTier
 from optima.domain.request_profile import Complexity, TaskType
 from optima.domain.run import PricingProvenance, RunResult
@@ -86,6 +87,9 @@ def execute_page() -> None:
         "the required quality threshold."
     )
 
+    reference_required = (
+        os.getenv("OPTIMA_REQUIRE_REFERENCE_OUTPUT", "false").casefold() == "true"
+    )
     with st.form("execute_optima"):
         input_text = st.text_area(
             "Task or request",
@@ -98,9 +102,17 @@ def execute_page() -> None:
             placeholder="Add evidence or context required for the answer.",
         )
         reference_output = st.text_area(
-            "Reference output",
+            (
+                "Reference output (required for exact-reference benchmark)"
+                if reference_required
+                else "Reference output (optional benchmark input)"
+            ),
             height=90,
-            placeholder="Provide the expected output for quality verification.",
+            placeholder=(
+                "Provide the expected output for deterministic comparison."
+                if reference_required
+                else "Leave empty for reference-free evaluation."
+            ),
         )
         quality_profile = _enum_selectbox(
             "Quality Profile",
@@ -144,6 +156,10 @@ def execute_page() -> None:
                 tuple(RiskTier),
                 default=RiskTier.LOW,
             )
+            grounding_required = st.checkbox(
+                "Require grounding in supplied context",
+                value=False,
+            )
             cache_eligible = st.checkbox("Cache eligible", value=False)
             has_large_context = st.checkbox("Has large context", value=False)
             api_base_url = st.text_input(
@@ -161,13 +177,12 @@ def execute_page() -> None:
         )
 
     if submitted:
-        reference_required = (
-            os.getenv("OPTIMA_REQUIRE_REFERENCE_OUTPUT", "false").casefold() == "true"
-        )
         if not input_text.strip():
             st.error("Enter a task or request before running OPTIMA.")
         elif reference_required and not reference_output.strip():
             st.error("Enter a reference output before running OPTIMA.")
+        elif grounding_required and not context.strip():
+            st.error("Enter supporting context when grounding is required.")
         else:
             request = ExecuteInputs(
                 input_text=input_text.strip(),
@@ -180,6 +195,7 @@ def execute_page() -> None:
                 input_tokens=int(input_tokens),
                 profile_risk_tier=profile_risk,
                 contract_risk_tier=contract_risk,
+                grounding_required=grounding_required,
                 cache_eligible=cache_eligible,
                 has_large_context=has_large_context,
             ).to_run_request()
@@ -248,20 +264,24 @@ def _render_execute_result(entry: HistoryEntry) -> None:
         st.write(f"- {reason}")
 
     st.subheader("Measured resources")
-    resource_columns = st.columns(4)
+    resource_columns = st.columns(5)
     resource_columns[0].metric(
-        "Model calls",
+        "Generation calls",
         decision.model_calls,
     )
     resource_columns[1].metric(
+        "Judge calls",
+        sum(usage.model_role is ModelRole.JUDGE for usage in result.model_usages),
+    )
+    resource_columns[2].metric(
         "Total tokens",
         result.total_tokens if result.total_tokens is not None else "Unavailable",
     )
-    resource_columns[2].metric(
+    resource_columns[3].metric(
         "Calculated cost",
         format_cost(result.total_calculated_cost, result.total_cost_provenance),
     )
-    resource_columns[3].metric("Latency", f"{result.latency_ms} ms")
+    resource_columns[4].metric("Latency", f"{result.latency_ms} ms")
 
     _render_semantic_cache(result)
 
@@ -631,6 +651,15 @@ def _render_run_detail(entry: HistoryEntry) -> None:
         [asdict(row) for row in trace_rows(result.steps)],
         hide_index=True,
         width="stretch",
+    )
+    call_columns = st.columns(2)
+    call_columns[0].metric(
+        "Generation calls",
+        decision_view(result).model_calls,
+    )
+    call_columns[1].metric(
+        "Judge calls",
+        sum(usage.model_role is ModelRole.JUDGE for usage in result.model_usages),
     )
     st.subheader("Model usage")
     if result.model_usages:

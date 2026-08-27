@@ -329,6 +329,14 @@ class RunResult(ImmutableModel):
 
         if any(usage.run_id != self.run_id for usage in self.model_usages):
             raise ValueError("every model usage must belong to this run")
+        generator_usages = tuple(
+            usage
+            for usage in self.model_usages
+            if usage.model_role is not ModelRole.JUDGE
+        )
+        judge_usages = tuple(
+            usage for usage in self.model_usages if usage.model_role is ModelRole.JUDGE
+        )
 
         cost_provenances = {
             (
@@ -391,7 +399,7 @@ class RunResult(ImmutableModel):
                     "strong-direct model-call steps require STRONG model_role facts"
                 )
             if any(
-                usage.model_role is not ModelRole.STRONG for usage in self.model_usages
+                usage.model_role is not ModelRole.STRONG for usage in generator_usages
             ):
                 raise ValueError("strong-direct runs require STRONG model usage")
             if any(
@@ -407,11 +415,7 @@ class RunResult(ImmutableModel):
                     "strong-direct evaluation and return steps require STRONG "
                     "model_role facts"
                 )
-        if (
-            not successful_model_calls
-            <= len(self.model_usages)
-            <= attempted_model_calls
-        ):
+        if not successful_model_calls <= len(generator_usages) <= attempted_model_calls:
             raise ValueError(
                 "model usage count must cover successful calls without exceeding "
                 "non-skipped attempts"
@@ -480,6 +484,50 @@ class RunResult(ImmutableModel):
                     "evaluation result count must cover successful evaluations without "
                     "exceeding non-skipped attempts"
                 )
+            if len(judge_usages) > attempted_evaluations:
+                raise ValueError(
+                    "judge usage cannot exceed quality-evaluation attempts"
+                )
+
+        expected_usage_roles: list[ModelRole] = []
+        for step in self.steps:
+            if step.step_type is ExecutionStepType.MODEL_CALL:
+                raw_role = step.facts.get("model_role")
+                if raw_role not in {ModelRole.SMALL.value, ModelRole.STRONG.value}:
+                    raise ValueError("model-call step requires a generator role")
+                role = ModelRole(raw_role)
+                if step.status is ExecutionStatus.SUCCEEDED:
+                    expected_usage_roles.append(role)
+                elif (
+                    len(self.model_usages) > len(expected_usage_roles)
+                    and self.model_usages[len(expected_usage_roles)].model_role is role
+                ):
+                    expected_usage_roles.append(role)
+            elif step.step_type is ExecutionStepType.QUALITY_EVALUATION:
+                judge_recorded = step.facts.get("judge_call_recorded", False)
+                if not isinstance(judge_recorded, bool):
+                    raise ValueError("judge_call_recorded must be boolean")
+                evaluator_type = step.facts.get("evaluator_type")
+                if (
+                    step.status is ExecutionStatus.SUCCEEDED
+                    and evaluator_type == "llm_judge"
+                    and not judge_recorded
+                ):
+                    raise ValueError(
+                        "successful llm_judge evaluation requires JUDGE usage"
+                    )
+                if evaluator_type == "exact_reference" and judge_recorded:
+                    raise ValueError(
+                        "exact_reference evaluation cannot record JUDGE usage"
+                    )
+                if judge_recorded:
+                    expected_usage_roles.append(ModelRole.JUDGE)
+        if tuple(usage.model_role for usage in self.model_usages) != tuple(
+            expected_usage_roles
+        ):
+            raise ValueError(
+                "model usage roles must follow model and evaluation step order"
+            )
 
         is_cache_hit = self.execution_plan.cache_policy is CachePolicy.USE_CACHED_RESULT
         if not is_cache_hit and any(
@@ -539,9 +587,14 @@ class RunResult(ImmutableModel):
             if step.step_type is ExecutionStepType.MODEL_CALL
             and step.status is ExecutionStatus.SUCCEEDED
         )
-        if len(self.model_usages) < len(model_steps):
+        generator_usages = tuple(
+            usage
+            for usage in self.model_usages
+            if usage.model_role is not ModelRole.JUDGE
+        )
+        if len(generator_usages) < len(model_steps):
             raise ValueError("successful model steps require model usage evidence")
-        for step, usage in zip(model_steps, self.model_usages, strict=False):
+        for step, usage in zip(model_steps, generator_usages, strict=False):
             if step.facts != {
                 "model_role": usage.model_role.value,
                 "provider": usage.provider,
@@ -580,14 +633,17 @@ class RunResult(ImmutableModel):
                     expected_events += (
                         ExecutionEventCode.FINAL_QUALITY_CONTRACT_NOT_MET,
                     )
-            if step.event_codes != expected_events or step.facts != {
+            expected_facts: dict[str, object] = {
                 "model_role": role,
                 "evaluator_type": evaluation.evaluator_type,
                 "evaluator_valid": evaluation.evaluator_valid,
                 "score": evaluation.score,
                 "threshold": evaluation.threshold,
                 "passed": evaluation.passed,
-            }:
+            }
+            if step.facts.get("judge_call_recorded") is True:
+                expected_facts["judge_call_recorded"] = True
+            if step.event_codes != expected_events or step.facts != expected_facts:
                 raise ValueError(
                     "evaluation step facts and events must match evaluation evidence"
                 )
@@ -615,8 +671,13 @@ class RunResult(ImmutableModel):
 
         if policy is ModelPolicy.STRONG_DIRECT:
             self._validate_candidate_attempt(trace, ModelRole.STRONG)
+            generator_usages = tuple(
+                usage
+                for usage in self.model_usages
+                if usage.model_role is not ModelRole.JUDGE
+            )
             if any(
-                usage.model_role is not ModelRole.STRONG for usage in self.model_usages
+                usage.model_role is not ModelRole.STRONG for usage in generator_usages
             ):
                 raise ValueError("strong-direct usage must identify STRONG")
             return
@@ -659,11 +720,16 @@ class RunResult(ImmutableModel):
                 )
             expected_usage_roles = (ModelRole.SMALL,)
 
+        generator_usages = tuple(
+            usage
+            for usage in self.model_usages
+            if usage.model_role is not ModelRole.JUDGE
+        )
         if any(
             usage.model_role is not expected_usage_roles[index]
-            for index, usage in enumerate(self.model_usages)
+            for index, usage in enumerate(generator_usages)
             if index < len(expected_usage_roles)
-        ) or len(self.model_usages) > len(expected_usage_roles):
+        ) or len(generator_usages) > len(expected_usage_roles):
             raise ValueError("small-first model usage must follow SMALL then STRONG")
 
     def _validate_candidate_attempt(
@@ -838,6 +904,9 @@ class RunResult(ImmutableModel):
             and step.status is not ExecutionStatus.SKIPPED
             for step in self.steps
         )
-        if len(self.model_usages) != attempted_model_calls:
+        generator_usage_count = sum(
+            usage.model_role is not ModelRole.JUDGE for usage in self.model_usages
+        )
+        if generator_usage_count != attempted_model_calls:
             return None
         return self.model_usages

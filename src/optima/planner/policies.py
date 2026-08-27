@@ -96,6 +96,10 @@ def evaluate_cache_policy(
         reason = PlannerReasonCode.CACHE_PRIOR_EVALUATION_FAILED
     elif candidate.prior_evaluation.score < contract.minimum_quality_score:
         reason = PlannerReasonCode.CACHE_QUALITY_BELOW_CONTRACT_THRESHOLD
+    elif contract.grounding_required and (
+        candidate.prior_evaluation.metadata.get("grounded") is not True
+    ):
+        reason = PlannerReasonCode.CACHE_CONTRACT_INCOMPATIBLE
     elif not candidate.contract_compatible:
         reason = PlannerReasonCode.CACHE_CONTRACT_INCOMPATIBLE
     elif not candidate.safe_to_reuse:

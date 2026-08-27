@@ -43,8 +43,10 @@ Avoid generic chatbot branding or a chat-style conversation layout.
 Required controls:
 - Task/request text area
 - Optional context/supporting-data text area
+- Reference output required only for `EXACT_REFERENCE` benchmark deployments and optional in `LLM_JUDGE` deployments
 - Quality profile selector: Standard / High / Critical
 - Optimization mode selector: Cost / Balanced / Quality
+- Advanced Quality Contract control for requiring grounding in supplied context
 - Primary action: Run with OPTIMA
 
 Hackathon demo defaults:
@@ -257,6 +259,7 @@ Selecting a run shows:
 - Planner reason codes
 - Execution steps
 - Model usage
+- Generation-call and JUDGE-call counts
 - Evaluations
 - Baseline comparison
 - Errors/timeouts if any

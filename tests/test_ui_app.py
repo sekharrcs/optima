@@ -19,7 +19,26 @@ def test_streamlit_app_starts_without_network_calls() -> None:
     assert app.title[0].value == "OPTIMA"
     assert app.selectbox[0].value is QualityProfile.HIGH
     assert app.selectbox[1].value is OptimizationMode.COST
+    assert app.text_area[2].label == "Reference output (optional benchmark input)"
     assert app.button[0].label == "Run with OPTIMA"
+
+
+def test_exact_reference_deployment_marks_reference_as_required() -> None:
+    """Explain the benchmark input requirement without adding a settings console."""
+    app = AppTest.from_string(
+        """
+import os
+os.environ["OPTIMA_REQUIRE_REFERENCE_OUTPUT"] = "true"
+from ui.app import execute_page
+execute_page()
+"""
+    ).run()
+
+    assert not app.exception
+    assert (
+        app.text_area[2].label
+        == "Reference output (required for exact-reference benchmark)"
+    )
 
 
 def test_empty_dashboard_and_history_views_start() -> None:
@@ -116,7 +135,8 @@ _render_execute_result(HistoryEntry(result=result))
 
     assert not app.exception
     assert "Strong -> Verify" in [element.value for element in app.subheader]
-    assert metrics["Model calls"] == "1"
+    assert metrics["Generation calls"] == "1"
+    assert metrics["Judge calls"] == "0"
     assert metrics["Escalation"] == "Not required"
     assert metrics["Total tokens"] == "772"
     assert metrics["Calculated cost"] == "USD 0.00277 (catalog local-demo-v1)"
@@ -171,7 +191,8 @@ _render_execute_result(HistoryEntry(result=result))
 
     assert not app.exception
     assert "Cached Result" in [element.value for element in app.subheader]
-    assert metrics["Model calls"] == "0"
+    assert metrics["Generation calls"] == "0"
+    assert metrics["Judge calls"] == "0"
     assert metrics["Escalation"] == "Not required"
     assert metrics["Contract"] == "Contract Met"
     assert metrics["Cache outcome"] == "Reused"
@@ -186,3 +207,40 @@ _render_execute_result(HistoryEntry(result=result))
         for value in markdown_values
     )
     assert any("Semantic Cache: Succeeded" in item.value for item in app.success)
+
+
+def test_run_history_detail_shows_generation_and_judge_call_counts() -> None:
+    """Expose both model-call categories before the detailed usage table."""
+    app = AppTest.from_string(
+        """
+from fastapi.testclient import TestClient
+from optima.api.demo import app as demo_app
+from optima.domain.run import RunResult
+from ui.app import _render_run_detail
+from ui.history import HistoryEntry
+from ui.models import ExecuteInputs
+
+inputs = ExecuteInputs(input_text="Summarize incident requirements")
+response = TestClient(demo_app).post(
+    "/api/v1/runs",
+    json=inputs.to_run_request().model_dump(mode="json", exclude_none=True),
+)
+payload = response.json()
+for field in (
+    "total_input_tokens",
+    "total_output_tokens",
+    "total_tokens",
+    "total_calculated_cost",
+    "total_cost_provenance",
+):
+    payload.pop(field)
+result = RunResult.model_validate(payload)
+_render_run_detail(HistoryEntry(result=result))
+""",
+        default_timeout=20,
+    ).run()
+
+    metrics = {metric.label: metric.value for metric in app.metric}
+    assert not app.exception
+    assert metrics["Generation calls"] == "1"
+    assert metrics["Judge calls"] == "0"

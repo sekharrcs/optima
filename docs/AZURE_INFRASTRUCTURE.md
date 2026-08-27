@@ -39,18 +39,18 @@ infrastructure preserves them rather than introducing replacement services.
 |----------------------|--------------------------------------------------------------------------------------|---------------------------------------------------|
 | FastAPI API          | Factory `optima.api.production:create_production_app`, port `8000`, health at `/api/v1/health` | Lifespan composes Azure resources before readiness |
 | Streamlit UI         | `streamlit run src/ui/app.py`, port `8501`, `OPTIMA_API_BASE_URL`                    | Starts without an available API                   |
-| Foundry/APIM         | HTTPS Azure OpenAI v1 root ending `/openai/v1`; SMALL, STRONG, and embedding names   | First model or embedding request performs I/O     |
+| Foundry/APIM         | HTTPS Azure OpenAI v1 root ending `/openai/v1`; SMALL, STRONG, JUDGE, and embedding names | First model, judge, or embedding request performs I/O |
 | Cosmos DB            | NoSQL API, database and container supplied by settings, partition key `/id`          | Client is lazy; database and container must exist |
 | Azure Managed Redis  | TLS port `10000`, RESP2, RediSearch HASH index, `FLOAT32`/COSINE, read-only lookup    | Lifespan validates or creates the index idempotently |
 | Application Insights | Workspace-based connection string, local OpenTelemetry providers, explicit close     | Failure-isolated initialization during app build  |
 
 The default FastAPI export remains intentionally unconfigured for library and
 local health use. The production factory validates all Azure settings, composes
-Foundry, exact-reference evaluation, centralized pricing, context reduction,
-Redis, Cosmos, and observability, then owns cleanup through FastAPI lifespan.
-Separate API and UI image definitions now exist. `deployContainerApps` remains
-`false` until Slice 11C publishes immutable images and completes live access and
-regional preflight.
+Foundry generator and optional JUDGE resources, mode-selected evaluation,
+centralized pricing, context reduction, Redis, Cosmos, and observability, then
+owns cleanup through FastAPI lifespan. Separate API and UI image definitions now
+exist. `deployContainerApps` remains `false` until Slice 11C publishes immutable
+images and completes live access and regional preflight.
 
 ## Azure topology
 
@@ -205,6 +205,7 @@ contractless index fails closed once no active creator owns the lock.
 |-----------------------|---------------------------------|--------|----------------------|----------------|
 | `OPTIMA_API_BASE_URL` | Internal API Container App FQDN | No     | Not applicable       | Container Apps |
 | `OPTIMA_DEPLOYMENT_ENVIRONMENT` | Literal `hackathon`       | No     | Not applicable       | IaC            |
+| `OPTIMA_REQUIRE_REFERENCE_OUTPUT` | Derived from evaluator mode | No   | Not applicable       | IaC            |
 
 The UI receives no Foundry, Cosmos, Redis, or Application Insights setting.
 
@@ -213,9 +214,14 @@ The UI receives no Foundry, Cosmos, Redis, or Application Insights setting.
 | Application setting                                 | Azure source                                   | Secret | Identity alternative           | Owner              |
 |-----------------------------------------------------|------------------------------------------------|--------|--------------------------------|--------------------|
 | `OPTIMA_DEPLOYMENT_ENVIRONMENT`                     | Literal `hackathon`                             | No     | Not applicable                 | IaC                |
+| `OPTIMA_PRODUCTION_EVALUATOR_MODE`                  | Reviewed `EXACT_REFERENCE` or `LLM_JUDGE` parameter | No | Not applicable                 | AI/model slice     |
+| `OPTIMA_PRODUCTION_REQUIRE_REFERENCE_OUTPUT`        | Derived from evaluator mode                    | No     | Not applicable                 | IaC                |
 | `OPTIMA_FOUNDRY_BASE_URL`                           | Reviewed Foundry/APIM parameter                | No     | Not applicable                 | AI/gateway slice   |
 | `OPTIMA_FOUNDRY_SMALL_DEPLOYMENT`                   | Reviewed model deployment parameter            | No     | Not applicable                 | AI/model slice     |
 | `OPTIMA_FOUNDRY_STRONG_DEPLOYMENT`                  | Reviewed model deployment parameter            | No     | Not applicable                 | AI/model slice     |
+| `OPTIMA_JUDGE_DEPLOYMENT`                           | Reviewed judge deployment parameter            | No     | Not applicable                 | AI/model slice     |
+| `OPTIMA_JUDGE_MODEL`                                | Reviewed judge model identity                  | No     | Not applicable                 | AI/model slice     |
+| `OPTIMA_JUDGE_TIMEOUT_SECONDS`                      | Bounded judge timeout parameter                | No     | Not applicable                 | AI/model slice     |
 | `OPTIMA_FOUNDRY_AUTH_MODE`                          | Literal `MANAGED_IDENTITY`                     | No     | Selected mode                  | IaC                |
 | `OPTIMA_FOUNDRY_TOKEN_SCOPE`                        | Reviewed direct Foundry or APIM token scope    | No     | Token audience                 | AI/gateway slice   |
 | `OPTIMA_FOUNDRY_MANAGED_IDENTITY_CLIENT_ID`         | API identity client ID                         | No     | Selects user-assigned identity | IaC                |
@@ -434,10 +440,11 @@ No workflow is implemented in Slice 11A or Slice 11B.
 
 ## Risks and deployment blockers
 
-* Foundry resource, deployment names, quotas, and model pricing are unresolved.
-* The current production-safe evaluator is exact-reference. Requests without a
-  reference are rejected before paid work until a separately reviewed
-  natural-language evaluator is implemented.
+* Foundry resource, SMALL, STRONG, JUDGE, and embedding deployment names, quotas,
+  and model pricing are unresolved.
+* Reference-free `LLM_JUDGE` composition is implemented but not deployed. The
+  first live deployment still requires reviewed judge identity, pricing, access,
+  and JSON response-format validation.
 * The production price catalog is intentionally empty until reviewed deployment
   rates are supplied, so monetary cost remains unavailable rather than fabricated.
 * The stable Redis access policy grants the API identity full Redis data-plane

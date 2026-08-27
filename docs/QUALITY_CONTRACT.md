@@ -80,6 +80,7 @@ A final answer passes when:
 - the selected evaluator is valid for the task
 - its measured score is at or above the threshold
 - any mandatory deterministic checks pass
+- required grounding is supported by supplied context
 
 Contract status has three states:
 - `true` when valid final evidence passes
@@ -88,6 +89,12 @@ Contract status has three states:
 
 Unavailable evidence must fail closed and must not be reported as a measured
 contract failure.
+
+Quality scores use a finite inclusive scale from `0.0` to `1.0`. Invalid,
+negative, out-of-range, `NaN`, or infinite judge values are rejected rather than
+clamped. An evaluator timeout, provider failure, malformed response, unsupported
+schema, or missing grounding context produces no score and therefore leaves
+contract status unavailable.
 
 ## Quality evaluation is mandatory for normal OPTIMA runs
 
@@ -119,7 +126,20 @@ reasons, and recursively immutable metadata remain unchanged.
 
 ## Important limitation
 
-An LLM judge score is an estimate, not ground truth.
+`EXACT_REFERENCE` is deterministic benchmark measurement when an expected output
+exists. `LLM_JUDGE` is reference-free model-generated measurement. An LLM judge
+score is an estimate, not ground truth.
+
+LLM-judge evidence can reflect judge bias, model self-preference, prompt
+sensitivity, stochastic behavior, model-version changes, and correlation between
+related generator and judge models. Benchmarks must identify the evaluator mode
+and must not compare exact-reference and LLM-judge scores as though they were the
+same measurement method.
+
+LLM-judge evaluation sends the original task, candidate output, explicit criteria,
+and required supplied context to the configured judge model. It sends no unrelated
+caller metadata and performs no external factual lookup. Raw judge prompts,
+responses, task text, candidate text, and context are excluded from telemetry.
 
 Store with every evaluation:
 - evaluator type
@@ -128,3 +148,4 @@ Store with every evaluation:
 - pass/fail
 - explanation/reasons
 - evaluator metadata where safe
+- JUDGE model usage and pricing provenance where applicable

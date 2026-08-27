@@ -1,9 +1,9 @@
 """Deterministic fake quality evaluator for tests and local development."""
 
-from optima.domain.evaluation import EvaluationResult
 from optima.domain.quality_contract import QualityContract
 from optima.evaluation.contracts import (
     EvaluationEvidence,
+    EvaluationOutcome,
     EvaluationRequest,
     EvaluatorCall,
     QualityEvaluator,
@@ -36,7 +36,7 @@ class FakeEvaluator(QualityEvaluator):
         self,
         request: EvaluationRequest,
         quality_contract: QualityContract,
-    ) -> EvaluationResult:
+    ) -> EvaluationOutcome:
         """Return the next configured outcome using production threshold semantics."""
         evidence = self._responses[self._call_index % len(self._responses)]
         self._call_index += 1
@@ -52,4 +52,4 @@ class FakeEvaluator(QualityEvaluator):
                 result=result,
             )
         )
-        return result
+        return EvaluationOutcome(result=result)

@@ -8,7 +8,7 @@ from optima.comparison.models import (
     ComparisonArm,
     ExecutionMetrics,
 )
-from optima.domain.execution import ExecutionStatus, ExecutionStepType
+from optima.domain.execution import ExecutionStatus, ExecutionStepType, ModelRole
 from optima.domain.run import RunResult
 
 ONE_HUNDRED = Decimal("100")
@@ -74,6 +74,8 @@ class BaselineComparisonService:
             step.step_type is ExecutionStepType.MODEL_CALL
             and step.status is not ExecutionStatus.SKIPPED
             for step in run_result.steps
+        ) + sum(
+            usage.model_role is ModelRole.JUDGE for usage in run_result.model_usages
         )
         return ExecutionMetrics(
             arm=arm,

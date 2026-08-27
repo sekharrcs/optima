@@ -301,6 +301,36 @@ class OpenTelemetryStageObservation:
     def _set_evaluation_attributes(self, outcome: EvaluationStageOutcome) -> None:
         self._span.set_attribute("optima.model.role", outcome.model_role.value)
         self._span.set_attribute("optima.operation.duration_ms", outcome.latency_ms)
+        if outcome.evaluator_type is not None:
+            self._span.set_attribute(
+                "optima.evaluation.type",
+                outcome.evaluator_type,
+            )
+        if outcome.judge_model_role is not None:
+            self._span.set_attribute(
+                "optima.evaluation.judge.model_role",
+                outcome.judge_model_role.value,
+            )
+        if outcome.judge_deployment is not None:
+            self._span.set_attribute(
+                "optima.evaluation.judge.deployment",
+                outcome.judge_deployment,
+            )
+        _set_optional_measurement(
+            self._span,
+            "optima.evaluation.judge.input_tokens",
+            outcome.judge_input_tokens,
+        )
+        _set_optional_measurement(
+            self._span,
+            "optima.evaluation.judge.output_tokens",
+            outcome.judge_output_tokens,
+        )
+        _set_optional_measurement(
+            self._span,
+            "optima.evaluation.judge.cached_tokens",
+            outcome.judge_cached_tokens,
+        )
         self._span.set_attribute(
             "optima.measurement.evaluation.available",
             outcome.score is not None,
@@ -443,6 +473,9 @@ class OpenTelemetryRunObservation:
         model_attempt_count = sum(
             step.step_type is ExecutionStepType.MODEL_CALL for step in result.steps
         )
+        judge_attempt_count = sum(
+            usage.model_role is ModelRole.JUDGE for usage in result.model_usages
+        )
         self._span.set_attributes(
             {
                 "optima.plan.family": selected_plan_family.value,
@@ -453,6 +486,7 @@ class OpenTelemetryRunObservation:
                 "optima.contract.result": _contract_result(result),
                 "optima.escalated": result.escalated,
                 "optima.model.attempt_count": model_attempt_count,
+                "optima.evaluation.judge.attempt_count": judge_attempt_count,
                 "optima.measurement.total_input_tokens.available": (
                     result.total_input_tokens is not None
                 ),
@@ -496,6 +530,10 @@ class OpenTelemetryRunObservation:
             if cost_text is not None:
                 self._span.set_attribute("optima.run.total_cost_exact", cost_text)
         if result.final_evaluation is not None:
+            self._span.set_attribute(
+                "optima.evaluation.type",
+                result.final_evaluation.evaluator_type,
+            )
             self._span.set_attribute(
                 "optima.evaluation.final_score",
                 result.final_evaluation.score,

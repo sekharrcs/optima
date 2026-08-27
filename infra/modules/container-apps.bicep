@@ -67,6 +67,24 @@ param foundrySmallDeployment string
 @description('Foundry deployment mapped to the OPTIMA STRONG role.')
 param foundryStrongDeployment string
 
+@description('Production quality evaluator mode.')
+@allowed([
+  'EXACT_REFERENCE'
+  'LLM_JUDGE'
+])
+param productionEvaluatorMode string
+
+@description('Foundry deployment mapped to the OPTIMA JUDGE role in LLM_JUDGE mode.')
+param judgeDeployment string?
+
+@description('Provider model identity expected for the OPTIMA JUDGE role in LLM_JUDGE mode.')
+param judgeModel string?
+
+@description('Timeout in seconds for one JUDGE model request.')
+@minValue(1)
+@maxValue(120)
+param judgeTimeoutSeconds int
+
 @description('OAuth token scope accepted by the configured Foundry or APIM endpoint.')
 param foundryTokenScope string
 
@@ -78,6 +96,11 @@ param applicationInsightsSamplingRatio string
 
 @description('Common resource tags.')
 param tags object
+
+var judgeConfigurationIsDeployable = !empty(judgeDeployment) && !empty(judgeModel) && judgeDeployment != 'replace-judge-deployment' && judgeModel != 'replace-judge-model'
+var validatedEvaluatorMode = productionEvaluatorMode != 'LLM_JUDGE' || judgeConfigurationIsDeployable
+  ? productionEvaluatorMode
+  : fail('LLM_JUDGE Container Apps deployment requires deployable judge identities.')
 
 resource managedEnvironment 'Microsoft.App/managedEnvironments@2025-07-01' = {
   name: containerAppsEnvironmentName
@@ -138,11 +161,11 @@ resource api 'Microsoft.App/containerApps@2025-07-01' = {
             }
             {
               name: 'OPTIMA_PRODUCTION_EVALUATOR_MODE'
-              value: 'EXACT_REFERENCE'
+              value: validatedEvaluatorMode
             }
             {
               name: 'OPTIMA_PRODUCTION_REQUIRE_REFERENCE_OUTPUT'
-              value: 'true'
+              value: validatedEvaluatorMode == 'EXACT_REFERENCE' ? 'true' : 'false'
             }
             {
               name: 'OPTIMA_FOUNDRY_BASE_URL'
@@ -155,6 +178,18 @@ resource api 'Microsoft.App/containerApps@2025-07-01' = {
             {
               name: 'OPTIMA_FOUNDRY_STRONG_DEPLOYMENT'
               value: foundryStrongDeployment
+            }
+            {
+              name: 'OPTIMA_JUDGE_DEPLOYMENT'
+              value: validatedEvaluatorMode == 'LLM_JUDGE' ? judgeDeployment! : 'not-applicable'
+            }
+            {
+              name: 'OPTIMA_JUDGE_MODEL'
+              value: validatedEvaluatorMode == 'LLM_JUDGE' ? judgeModel! : 'not-applicable'
+            }
+            {
+              name: 'OPTIMA_JUDGE_TIMEOUT_SECONDS'
+              value: string(judgeTimeoutSeconds)
             }
             {
               name: 'OPTIMA_FOUNDRY_AUTH_MODE'
@@ -352,7 +387,7 @@ resource ui 'Microsoft.App/containerApps@2025-07-01' = {
             }
             {
               name: 'OPTIMA_REQUIRE_REFERENCE_OUTPUT'
-              value: 'true'
+              value: validatedEvaluatorMode == 'EXACT_REFERENCE' ? 'true' : 'false'
             }
             {
               name: 'OPTIMA_API_BASE_URL'

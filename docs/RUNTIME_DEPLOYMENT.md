@@ -1,6 +1,6 @@
 ---
 title: OPTIMA Runtime and Container Deployment Contract
-description: Slice 11B production composition, lifecycle, Redis bootstrap, container entrypoints, and Slice 11C handoff
+description: Production composition, evaluator modes, lifecycle, container entrypoints, and Slice 11C handoff
 ---
 
 ## Slice ownership
@@ -21,11 +21,15 @@ Slice 11C owns:
 * Azure preflight and Bicep execution
 * Runtime and external Foundry access application
 * First deployment and live smoke testing
-* Reviewed SMALL, STRONG, and embedding pricing inputs when monetary cost
+* Reviewed SMALL, STRONG, JUDGE, and embedding pricing inputs when monetary cost
   measurement is required
 
-A user-facing reference-free natural-language evaluator remains outside both
-slices and is owned by a dedicated future evaluation slice.
+Slice 11E owns:
+
+* Explicit `EXACT_REFERENCE` and `LLM_JUDGE` production modes
+* Versioned reference-free judge prompt and response contracts
+* Separately configured JUDGE role, timeout, lifecycle, usage, and pricing
+* Judge failure, grounding, telemetry, and prompt-injection behavior
 
 Neither slice may silently select another Azure region.
 
@@ -42,41 +46,35 @@ falls back to fake or demo dependencies. The lightweight
 `optima.api.app:app` and deterministic `optima.api.demo:app` remain explicit
 local entry points.
 
-Production selects the reviewed `EXACT_REFERENCE` evaluator. This is a
-deterministic **benchmark** evaluation mode: it can only verify a request whose
-caller already supplies the expected `reference_output`. The API rejects a
-missing reference with structured HTTP 422 before cache lookup, model calls, or
-evaluator calls. Container Apps also sets `OPTIMA_REQUIRE_REFERENCE_OUTPUT=true`
-for the Streamlit form.
+Production requires one explicit evaluator mode and never falls back between
+modes or to a fake evaluator:
 
-Normal user-facing requests, where the caller supplies a task but does not know
-the expected answer, are therefore **not yet servable** in production. Serving
-them requires a separately reviewed reference-free natural-language evaluator
-(the LLM-judge capability named in `docs/MVP_SCOPE`), which is a distinct future
-slice. Until it exists, the production runtime fails closed on reference-free
-requests rather than silently accepting unverifiable output.
+* `EXACT_REFERENCE` is deterministic benchmark measurement. It requires caller-
+  supplied `reference_output`; the API rejects a missing reference with HTTP 422
+  before cache lookup, model calls, or evaluator calls.
+* `LLM_JUDGE` is reference-free production measurement. It requires a dedicated
+  JUDGE deployment and model identity and rejects a configuration that requires
+  caller reference output.
 
-Readiness therefore separates into three explicit levels:
-
-* Container and runtime lifecycle readiness — delivered by Slice 11B.
-* Benchmark exact-reference evaluation readiness — delivered by Slice 11B.
-* User-facing reference-free evaluation capability — not delivered; a future
-  evaluation slice owns it. This slice must not be labelled ready for normal
-  production traffic while reference-free execution remains impossible.
+Container Apps derives both API and UI reference requirements from the selected
+mode. The checked-in hackathon parameter files select `LLM_JUDGE` but keep
+`deployContainerApps=false` and contain non-deployable judge placeholders.
 
 Construction proceeds in this order:
 
 1. Application Insights observability
 2. Shared Foundry SMALL and STRONG provider resources
-3. Foundry embedding resources
-4. Azure Managed Redis resources
-5. Redis index bootstrap
-6. Cosmos run-history resources
-7. Immutable execution dependencies
+3. Separately timed Foundry JUDGE resources in `LLM_JUDGE` mode
+4. Foundry embedding resources
+5. Azure Managed Redis resources
+6. Redis index bootstrap
+7. Cosmos run-history resources
+8. Immutable execution dependencies
 
-Shutdown proceeds in reverse resource order: Cosmos, Redis, embedding, Foundry,
-then telemetry. Each runtime closes once. Cleanup failures are recorded by type
-and do not skip later cleanup or mask an earlier startup failure.
+Shutdown proceeds in reverse resource order: Cosmos, Redis, embedding, optional
+JUDGE, shared Foundry, then telemetry. Each runtime closes once. Cleanup failures
+are recorded by type and do not skip later cleanup or mask an earlier startup
+failure.
 
 The API health endpoint is `/api/v1/health`. Uvicorn does not accept traffic
 until FastAPI lifespan yields, so an index or configuration failure prevents a
@@ -147,11 +145,23 @@ Cosmos resource values, Redis endpoint values, Application Insights values, and
 the UI API URL. The AI/model owner supplies the Foundry endpoint and deployment
 identities.
 
+Evaluator configuration is explicit:
+
+* `OPTIMA_PRODUCTION_EVALUATOR_MODE` is `EXACT_REFERENCE` or `LLM_JUDGE`
+* `OPTIMA_PRODUCTION_REQUIRE_REFERENCE_OUTPUT` is `true` only for
+  `EXACT_REFERENCE`
+* `OPTIMA_REQUIRE_REFERENCE_OUTPUT` gives the Streamlit UI the same mode-derived
+  requirement
+* `OPTIMA_JUDGE_DEPLOYMENT` identifies the JUDGE deployment in `LLM_JUDGE` mode
+* `OPTIMA_JUDGE_MODEL` records the reviewed provider model identity
+* `OPTIMA_JUDGE_TIMEOUT_SECONDS` sets a bounded JUDGE request timeout, default 30
+
 Required external Foundry values are:
 
 * HTTPS Azure OpenAI v1 root ending in `/openai/v1`
 * SMALL chat-completions deployment name
 * STRONG chat-completions deployment name
+* JUDGE chat-completions deployment and provider model identity
 * Embedding deployment name and provider-reported model identity
 * Exact embedding vector dimension
 * Token scope, normally `https://cognitiveservices.azure.com/.default`
@@ -164,6 +174,12 @@ ID as its AUTH username. Redis uses fixed Azure Managed Redis TLS port `10000`.
 Application Insights must be enabled with its connection string, service name,
 deployment environment, and sampling ratio. Live Metrics, performance counters,
 and offline storage remain disabled.
+
+LLM-judge evaluation sends the original task, candidate output, explicit
+criteria, and required supplied context through the configured Foundry/APIM
+security boundary. It does not send `reference_output` or unrelated caller
+metadata. Raw judge prompts, responses, user tasks, candidate answers, and context
+are not logged. The judge performs no external web or factual lookup.
 
 ## East US 2 preflight
 
@@ -180,12 +196,11 @@ Valid SKU metadata and quota do not guarantee regional allocation capacity.
 Allocation failure must stop deployment with a clear error. It must not place
 Redis in East US or another fallback region.
 
-## Remaining product inputs
+## Remaining Slice 11C inputs
 
-The current production-safe evaluator is exact-reference and benchmark-only.
-Reference-free requests are rejected before paid work. A separately reviewed
-natural-language evaluator is still required before the production contract can
-accept reference-free user-facing requests.
+Reference-free production evaluation is implemented but not deployed. Slice 11C
+must replace every image, endpoint, deployment, model, and pricing placeholder
+with reviewed live values before enabling Container Apps.
 
 The runtime central cost calculator assembles its versioned catalog from
 configured rates. When no rates are configured, it uses an explicit unpriced
@@ -195,8 +210,8 @@ rather than fabricated. OPTIMA never invents rates.
 Slice 11C must supply the following reviewed pricing inputs as deployment
 configuration, because the model deployments are not yet selected. All rates are
 per-million-token `Decimal` values in one shared currency, keyed inside the
-runtime to provider `microsoft-foundry-apim` and the exact SMALL, STRONG, and
-embedding deployment names already configured for the runtime:
+runtime to provider `microsoft-foundry-apim` and the exact SMALL, STRONG, JUDGE,
+and embedding deployment names already configured for the runtime:
 
 * `OPTIMA_PRICING_CATALOG_VERSION` — provenance/version identifier
 * `OPTIMA_PRICING_CURRENCY` — shared currency code, default `USD`
@@ -206,14 +221,34 @@ embedding deployment names already configured for the runtime:
 * `OPTIMA_PRICING_STRONG_INPUT_RATE_PER_MILLION_TOKENS`
 * `OPTIMA_PRICING_STRONG_OUTPUT_RATE_PER_MILLION_TOKENS`
 * `OPTIMA_PRICING_STRONG_CACHED_INPUT_RATE_PER_MILLION_TOKENS` — optional
+* `OPTIMA_PRICING_JUDGE_INPUT_RATE_PER_MILLION_TOKENS`
+* `OPTIMA_PRICING_JUDGE_OUTPUT_RATE_PER_MILLION_TOKENS`
+* `OPTIMA_PRICING_JUDGE_CACHED_INPUT_RATE_PER_MILLION_TOKENS`, optional
 * `OPTIMA_PRICING_EMBEDDING_INPUT_RATE_PER_MILLION_TOKENS`
 
 Partial pricing is rejected at settings construction so incomplete configuration
 cannot fabricate monetary evidence. When
 `OPTIMA_PRODUCTION_COST_MEASUREMENT_REQUIRED=true`, production startup fails
 clearly if the complete SMALL, STRONG, and embedding catalog is absent. When it
-is `false` and pricing is absent, monetary cost is reported as unavailable while
-token usage stays measured.
+is `false` and all pricing is absent, monetary cost is reported as unavailable
+while token usage stays measured. `LLM_JUDGE` rejects a configured catalog that
+omits JUDGE input or output rates, because generator-only cost is not a complete
+run cost.
+
+Slice 11C must also supply and verify:
+
+1. `productionEvaluatorMode = 'LLM_JUDGE'`
+2. A real `judgeDeployment` and `judgeModel` in both deployment parameter paths
+3. A reviewed `judgeTimeoutSeconds` between 1 and 120
+4. JSON-object response-format support on the selected JUDGE deployment
+5. Managed-identity inference permission for the JUDGE deployment
+6. Live SMALL, STRONG, JUDGE, and embedding rates under one catalog version and
+  currency when cost measurement is required
+7. Immutable API and UI image digests and all existing Redis, Cosmos,
+  Application Insights, and Foundry inputs
+
+Actual model names, deployment names, and rates remain deployment inputs. This
+repository does not fabricate them.
 
 ## Slice 11C container validation gate
 

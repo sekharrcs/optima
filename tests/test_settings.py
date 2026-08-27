@@ -37,6 +37,9 @@ def isolate_settings_sources(
         "OPTIMA_PRICING_STRONG_INPUT_RATE_PER_MILLION_TOKENS",
         "OPTIMA_PRICING_STRONG_OUTPUT_RATE_PER_MILLION_TOKENS",
         "OPTIMA_PRICING_STRONG_CACHED_INPUT_RATE_PER_MILLION_TOKENS",
+        "OPTIMA_PRICING_JUDGE_INPUT_RATE_PER_MILLION_TOKENS",
+        "OPTIMA_PRICING_JUDGE_OUTPUT_RATE_PER_MILLION_TOKENS",
+        "OPTIMA_PRICING_JUDGE_CACHED_INPUT_RATE_PER_MILLION_TOKENS",
         "OPTIMA_PRICING_EMBEDDING_INPUT_RATE_PER_MILLION_TOKENS",
         "OPTIMA_SEMANTIC_CACHE_ENABLED",
         "OPTIMA_CONTEXT_REDUCTION_ENABLED",
@@ -59,6 +62,9 @@ def isolate_settings_sources(
         "OPTIMA_FOUNDRY_TOKEN_SCOPE",
         "OPTIMA_FOUNDRY_MANAGED_IDENTITY_CLIENT_ID",
         "OPTIMA_FOUNDRY_TIMEOUT_SECONDS",
+        "OPTIMA_JUDGE_DEPLOYMENT",
+        "OPTIMA_JUDGE_MODEL",
+        "OPTIMA_JUDGE_TIMEOUT_SECONDS",
         "OPTIMA_COSMOS_ENDPOINT",
         "OPTIMA_COSMOS_DATABASE_NAME",
         "OPTIMA_COSMOS_CONTAINER_NAME",
@@ -165,6 +171,9 @@ def test_settings_accept_explicit_injection() -> None:
         "pricing_strong_input_rate_per_million_tokens": None,
         "pricing_strong_output_rate_per_million_tokens": None,
         "pricing_strong_cached_input_rate_per_million_tokens": None,
+        "pricing_judge_input_rate_per_million_tokens": None,
+        "pricing_judge_output_rate_per_million_tokens": None,
+        "pricing_judge_cached_input_rate_per_million_tokens": None,
         "pricing_embedding_input_rate_per_million_tokens": None,
         "semantic_cache_enabled": False,
         "context_reduction_enabled": False,
@@ -187,6 +196,9 @@ def test_settings_accept_explicit_injection() -> None:
         "foundry_token_scope": None,
         "foundry_managed_identity_client_id": None,
         "foundry_timeout_seconds": 30.0,
+        "judge_deployment": None,
+        "judge_model": None,
+        "judge_timeout_seconds": 30.0,
         "cosmos_endpoint": None,
         "cosmos_database_name": None,
         "cosmos_container_name": None,
@@ -270,6 +282,24 @@ def test_production_runtime_accepts_complete_azure_configuration() -> None:
     assert settings.validate_production_runtime() is settings
 
 
+def test_production_runtime_accepts_reference_free_llm_judge_configuration() -> None:
+    """Accept an explicit judge role without requiring caller reference output."""
+    settings = production_settings(
+        production_evaluator_mode=ProductionEvaluatorMode.LLM_JUDGE,
+        production_require_reference_output=False,
+        judge_deployment="judge-deployment",
+        judge_model="judge-model-v1",
+        judge_timeout_seconds=12.5,
+    )
+
+    assert settings.validate_production_runtime() is settings
+    judge = settings.judge_provider_configuration()
+    assert judge is not None
+    assert judge.deployment == "judge-deployment"
+    assert judge.model == "judge-model-v1"
+    assert judge.timeout_seconds == 12.5
+
+
 @pytest.mark.parametrize(
     ("updates", "message"),
     [
@@ -288,6 +318,45 @@ def test_production_runtime_rejects_unsupported_evaluator_configuration(
     message: str,
 ) -> None:
     """Fail startup before Azure construction when evaluation is unsupported."""
+    with pytest.raises(ValueError, match=message):
+        production_settings(**updates).validate_production_runtime()
+
+
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        (
+            {
+                "production_evaluator_mode": ProductionEvaluatorMode.LLM_JUDGE,
+                "production_require_reference_output": True,
+                "judge_deployment": "judge-deployment",
+                "judge_model": "judge-model-v1",
+            },
+            "must not require reference output",
+        ),
+        (
+            {
+                "production_evaluator_mode": ProductionEvaluatorMode.LLM_JUDGE,
+                "production_require_reference_output": False,
+            },
+            "requires judge deployment and model",
+        ),
+        (
+            {
+                "production_evaluator_mode": ProductionEvaluatorMode.LLM_JUDGE,
+                "production_require_reference_output": False,
+                "judge_deployment": "judge-deployment",
+            },
+            "requires both deployment and model",
+        ),
+    ],
+    ids=["reference-gate", "missing-judge", "partial-judge"],
+)
+def test_production_runtime_rejects_invalid_llm_judge_configuration(
+    updates: dict[str, object],
+    message: str,
+) -> None:
+    """Fail startup instead of changing evaluator mode or reusing another role."""
     with pytest.raises(ValueError, match=message):
         production_settings(**updates).validate_production_runtime()
 
@@ -403,6 +472,63 @@ def test_production_pricing_builds_complete_reviewed_inputs() -> None:
         ),
         embedding_input_rate_per_million_tokens=Decimal("0.02"),
     )
+
+
+def test_llm_judge_pricing_builds_separate_role_rates() -> None:
+    """Preserve exact Decimal judge pricing under the configured deployment role."""
+    settings = production_settings(
+        production_evaluator_mode=ProductionEvaluatorMode.LLM_JUDGE,
+        production_require_reference_output=False,
+        judge_deployment="judge-deployment",
+        judge_model="judge-model-v1",
+        pricing_catalog_version="foundry-apim-2026-01-01",
+        pricing_small_input_rate_per_million_tokens=Decimal("0.15"),
+        pricing_small_output_rate_per_million_tokens=Decimal("0.60"),
+        pricing_strong_input_rate_per_million_tokens=Decimal("2.50"),
+        pricing_strong_output_rate_per_million_tokens=Decimal("10.00"),
+        pricing_judge_input_rate_per_million_tokens=Decimal("0.25"),
+        pricing_judge_output_rate_per_million_tokens=Decimal("1.25"),
+        pricing_embedding_input_rate_per_million_tokens=Decimal("0.02"),
+    )
+
+    pricing = settings.production_pricing_inputs()
+    assert pricing is not None
+    assert pricing.judge == ProductionModelRoleRate(
+        input_rate_per_million_tokens=Decimal("0.25"),
+        output_rate_per_million_tokens=Decimal("1.25"),
+    )
+    assert settings.validate_production_runtime() is settings
+
+
+def test_llm_judge_rejects_catalog_without_judge_rates() -> None:
+    """Do not accept a catalog that would hide evaluator cost from run totals."""
+    with pytest.raises(ValueError, match="requires reviewed JUDGE token rates"):
+        production_settings(
+            production_evaluator_mode=ProductionEvaluatorMode.LLM_JUDGE,
+            production_require_reference_output=False,
+            judge_deployment="judge-deployment",
+            judge_model="judge-model-v1",
+            pricing_catalog_version="foundry-apim-2026-01-01",
+            pricing_small_input_rate_per_million_tokens=Decimal("0.15"),
+            pricing_small_output_rate_per_million_tokens=Decimal("0.60"),
+            pricing_strong_input_rate_per_million_tokens=Decimal("2.50"),
+            pricing_strong_output_rate_per_million_tokens=Decimal("10.00"),
+            pricing_embedding_input_rate_per_million_tokens=Decimal("0.02"),
+        ).validate_production_runtime()
+
+
+def test_production_pricing_rejects_partial_judge_rates() -> None:
+    """Require both judge directions whenever either judge rate is supplied."""
+    with pytest.raises(ValidationError, match="JUDGE pricing requires both"):
+        production_settings(
+            pricing_catalog_version="foundry-apim-2026-01-01",
+            pricing_small_input_rate_per_million_tokens=Decimal("0.15"),
+            pricing_small_output_rate_per_million_tokens=Decimal("0.60"),
+            pricing_strong_input_rate_per_million_tokens=Decimal("2.50"),
+            pricing_strong_output_rate_per_million_tokens=Decimal("10.00"),
+            pricing_judge_input_rate_per_million_tokens=Decimal("0.25"),
+            pricing_embedding_input_rate_per_million_tokens=Decimal("0.02"),
+        )
 
 
 def test_production_runtime_requires_pricing_when_cost_measurement_required() -> None:

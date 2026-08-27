@@ -1,10 +1,12 @@
 """Deterministic quality evaluator implementation."""
 
-from optima.domain.evaluation import EvaluationResult
 from optima.domain.quality_contract import QualityContract
 from optima.evaluation.contracts import (
     DeterministicMeasurement,
     EvaluationEvidence,
+    EvaluationFailure,
+    EvaluationFailureCode,
+    EvaluationOutcome,
     EvaluationRequest,
     QualityEvaluator,
 )
@@ -46,10 +48,21 @@ class DeterministicEvaluator(QualityEvaluator):
         self,
         request: EvaluationRequest,
         quality_contract: QualityContract,
-    ) -> EvaluationResult:
+    ) -> EvaluationOutcome:
         """Measure the candidate, then apply the explicit contract threshold."""
+        if quality_contract.grounding_required and isinstance(
+            self._measurement, ExactReferenceMeasurement
+        ):
+            return EvaluationOutcome(
+                failure=EvaluationFailure(
+                    evaluator_type="exact_reference",
+                    code=EvaluationFailureCode.GROUNDING_NOT_SUPPORTED,
+                )
+            )
         evidence = self._measurement.measure(request)
-        return self._threshold_engine.evaluate(
-            evidence=evidence,
-            quality_contract=quality_contract,
+        return EvaluationOutcome(
+            result=self._threshold_engine.evaluate(
+                evidence=evidence,
+                quality_contract=quality_contract,
+            )
         )

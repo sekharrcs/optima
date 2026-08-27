@@ -191,6 +191,7 @@ def contract(
     profile_value: QualityProfile = QualityProfile.STANDARD,
     mode: OptimizationMode = OptimizationMode.COST,
     threshold: float = 0.80,
+    grounding_required: bool = False,
 ) -> QualityContract:
     """Build a Quality Contract with an explicit current threshold."""
     return QualityContract(
@@ -198,6 +199,7 @@ def contract(
         minimum_quality_score=threshold,
         optimization_mode=mode,
         risk_tier=RiskTier.LOW,
+        grounding_required=grounding_required,
     )
 
 
@@ -361,6 +363,36 @@ def test_cache_rejection_taxonomy(
     assert decision.policy is CachePolicy.SKIP
     assert decision.reason_code is expected_reason
     assert decision.candidate_assessed is assessed
+
+
+def test_grounding_required_rejects_cache_without_grounding_evidence() -> None:
+    """Do not let generic compatibility bypass a current grounding requirement."""
+    decision = evaluate_cache_policy(
+        enabled=True,
+        profile=profile(cache_eligible=True),
+        request_binding=request_binding(),
+        candidate=candidate(),
+        contract=contract(grounding_required=True),
+        thresholds=PlannerThresholds(),
+    )
+
+    assert decision.policy is CachePolicy.SKIP
+    assert decision.reason_code is PlannerReasonCode.CACHE_CONTRACT_INCOMPATIBLE
+
+
+def test_grounding_required_accepts_cache_with_supported_prior_evidence() -> None:
+    """Reuse only when prior valid evidence explicitly supports grounding."""
+    decision = evaluate_cache_policy(
+        enabled=True,
+        profile=profile(cache_eligible=True),
+        request_binding=request_binding(),
+        candidate=candidate(prior_evaluation=evaluation(metadata={"grounded": True})),
+        contract=contract(grounding_required=True),
+        thresholds=PlannerThresholds(),
+    )
+
+    assert decision.policy is CachePolicy.USE_CACHED_RESULT
+    assert decision.reason_code is PlannerReasonCode.CACHE_HIGH_CONFIDENCE_MATCH
 
 
 @pytest.mark.parametrize("similarity", [0.95, 1.0])

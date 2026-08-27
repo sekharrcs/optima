@@ -58,6 +58,7 @@ class ModelRole(StrEnum):
 
     SMALL = "SMALL"
     STRONG = "STRONG"
+    JUDGE = "JUDGE"
 
 
 class PlannerReasonCode(StrEnum):

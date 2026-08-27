@@ -368,6 +368,86 @@ def test_production_exact_reference_rejects_missing_reference_before_model_calls
     assert evaluator.calls == ()
 
 
+def test_production_llm_judge_allows_reference_free_request() -> None:
+    """Let explicit reference-free mode reach normal execution without a reference."""
+    configured, small, strong, evaluator = dependencies(0.93)
+    production = replace(
+        configured,
+        settings=configured.settings.model_copy(
+            update={
+                "production_evaluator_mode": ProductionEvaluatorMode.LLM_JUDGE,
+                "production_require_reference_output": False,
+                "judge_deployment": "judge",
+                "judge_model": "judge-model-v1",
+            }
+        ),
+    )
+
+    response = TestClient(create_app(execution_dependencies=production)).post(
+        "/api/v1/runs",
+        json=request_payload(reference_output=None),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["final_output"] == "small output"
+    assert len(small.calls) == 1
+    assert len(strong.calls) == 0
+    assert len(evaluator.calls) == 1
+
+
+def test_grounding_required_without_context_rejects_before_model_calls() -> None:
+    """Fail a context-less grounding contract before cache, generation, or judging."""
+    configured, small, strong, evaluator = dependencies(0.93)
+
+    response = TestClient(create_app(execution_dependencies=configured)).post(
+        "/api/v1/runs",
+        json=request_payload(
+            context=None,
+            reference_output=None,
+            grounding_required=True,
+        ),
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == {
+        "code": "GROUNDING_CONTEXT_REQUIRED",
+        "message": "The Quality Contract requires supplied grounding context",
+        "facts": {},
+    }
+    assert small.calls == ()
+    assert strong.calls == ()
+    assert evaluator.calls == ()
+
+
+def test_exact_reference_rejects_grounding_before_model_calls() -> None:
+    """Never let deterministic equality satisfy an unmeasured grounding contract."""
+    configured, small, strong, evaluator = dependencies(0.93)
+    production = replace(
+        configured,
+        settings=configured.settings.model_copy(
+            update={
+                "production_evaluator_mode": ProductionEvaluatorMode.EXACT_REFERENCE,
+                "production_require_reference_output": True,
+            }
+        ),
+    )
+
+    response = TestClient(create_app(execution_dependencies=production)).post(
+        "/api/v1/runs",
+        json=request_payload(grounding_required=True),
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == {
+        "code": "GROUNDING_NOT_SUPPORTED",
+        "message": "EXACT_REFERENCE cannot establish grounding",
+        "facts": {},
+    }
+    assert small.calls == ()
+    assert strong.calls == ()
+    assert evaluator.calls == ()
+
+
 def test_run_endpoint_serializes_measured_reduction_evidence() -> None:
     """Return canonical runtime evidence and send measured reduced context to SMALL."""
     original_context = (
