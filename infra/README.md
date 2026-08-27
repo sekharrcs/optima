@@ -6,7 +6,7 @@ description: Offline validation and deployment boundaries for the Slice 11A Bice
 # OPTIMA Azure Infrastructure
 
 > [!IMPORTANT]
-> Slice 11A does not perform an Azure deployment. Do not run deployment commands
+> Slices 11A and 11B do not perform an Azure deployment. Do not run deployment commands
 > until the architecture, costs, identity bootstrap, and application blockers in
 > [the Azure infrastructure design](../docs/AZURE_INFRASTRUCTURE.md) are reviewed.
 
@@ -23,6 +23,12 @@ description: Offline validation and deployment boundaries for the Slice 11A Bice
 Both parameter files contain non-deployable model and image placeholders. Both
 keep `deployContainerApps=false` and `deployRuntimeAccess=false`. These values
 are deliberate deployment gates.
+
+Application resources target East US 2 (`eastus2`). The existing bootstrap
+resource group and deployment identity may remain in East US because they are
+outside the application resource group template. API and UI image parameters
+are separate manifest digests. Slice 11C must replace the all-zero digest
+placeholders only after the corresponding ACR manifests exist.
 
 ## Modules
 
@@ -62,3 +68,9 @@ bicep build-params infra/environments/hackathon.runtime.bicepparam --stdout | Ou
 Compilation reads local files only. It does not prove regional SKU availability,
 subscription quota, provider registration, RBAC, data-plane access, image
 availability, or model availability.
+
+Slice 11C must preflight `Microsoft.Cache` registration, Azure Managed Redis
+availability in `eastus2`, Balanced B0 SKU support, and relevant subscription
+quota before deployment. Regional allocation can still fail after metadata and
+quota checks pass. That failure must stop deployment; no automatic fallback to
+East US or another region is allowed.

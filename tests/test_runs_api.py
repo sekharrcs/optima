@@ -18,7 +18,7 @@ from optima.cache import (
     SemanticCacheLookupRequest,
     SemanticCacheLookupResult,
 )
-from optima.config import AppSettings
+from optima.config import AppSettings, ProductionEvaluatorMode
 from optima.context import (
     ContextPreservationEvidence,
     ContextReductionResult,
@@ -335,6 +335,37 @@ def test_run_endpoint_returns_small_pass_with_plan_and_runtime_facts() -> None:
     assert len(small.calls) == 1
     assert len(strong.calls) == 0
     assert len(evaluator.calls) == 1
+
+
+def test_production_exact_reference_rejects_missing_reference_before_model_calls() -> (
+    None
+):
+    """Prevent unsupported production requests from consuming model capacity."""
+    configured, small, strong, evaluator = dependencies(0.93)
+    production = replace(
+        configured,
+        settings=configured.settings.model_copy(
+            update={
+                "production_evaluator_mode": ProductionEvaluatorMode.EXACT_REFERENCE,
+                "production_require_reference_output": True,
+            }
+        ),
+    )
+
+    response = TestClient(create_app(execution_dependencies=production)).post(
+        "/api/v1/runs",
+        json=request_payload(reference_output=None),
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == {
+        "code": "REFERENCE_OUTPUT_REQUIRED",
+        "message": "The configured production evaluator requires reference output",
+        "facts": {},
+    }
+    assert small.calls == ()
+    assert strong.calls == ()
+    assert evaluator.calls == ()
 
 
 def test_run_endpoint_serializes_measured_reduction_evidence() -> None:

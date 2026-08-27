@@ -8,6 +8,12 @@ from optima.cache.azure_redis import (
     RedisSemanticCacheResources,
     build_redis_semantic_cache_resources,
 )
+from optima.cache.bootstrap import (
+    RedisIndexCompatibilityError,
+    ensure_redis_semantic_cache_index,
+    redis_index_bootstrap_lock_key,
+    redis_index_contract_key,
+)
 from optima.cache.contracts import (
     EmbeddingProviderError,
     EmbeddingProviderResult,
@@ -42,6 +48,7 @@ __all__ = [
     "InMemoryCacheEntry",
     "InMemorySemanticCache",
     "RedisSearchClient",
+    "RedisIndexCompatibilityError",
     "RedisSemanticCache",
     "RedisSemanticCacheInvalidResponseError",
     "RedisSemanticCacheResources",
@@ -52,4 +59,7 @@ __all__ = [
     "SemanticCacheLookupResult",
     "SemanticCacheLookupTimeout",
     "build_redis_semantic_cache_resources",
+    "ensure_redis_semantic_cache_index",
+    "redis_index_bootstrap_lock_key",
+    "redis_index_contract_key",
 ]

@@ -97,6 +97,11 @@ def execute_page() -> None:
             height=110,
             placeholder="Add evidence or context required for the answer.",
         )
+        reference_output = st.text_area(
+            "Reference output",
+            height=90,
+            placeholder="Provide the expected output for quality verification.",
+        )
         quality_profile = _enum_selectbox(
             "Quality Profile",
             tuple(QualityProfile),
@@ -156,12 +161,18 @@ def execute_page() -> None:
         )
 
     if submitted:
+        reference_required = (
+            os.getenv("OPTIMA_REQUIRE_REFERENCE_OUTPUT", "false").casefold() == "true"
+        )
         if not input_text.strip():
             st.error("Enter a task or request before running OPTIMA.")
+        elif reference_required and not reference_output.strip():
+            st.error("Enter a reference output before running OPTIMA.")
         else:
             request = ExecuteInputs(
                 input_text=input_text.strip(),
                 context=context.strip() or None,
+                reference_output=reference_output.strip() or None,
                 quality_profile=quality_profile,
                 optimization_mode=optimization_mode,
                 task_type=task_type,

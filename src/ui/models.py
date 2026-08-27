@@ -14,6 +14,7 @@ class ExecuteInputs(BaseModel):
 
     input_text: str = Field(min_length=1)
     context: str | None = None
+    reference_output: str | None = None
     quality_profile: QualityProfile = QualityProfile.HIGH
     optimization_mode: OptimizationMode = OptimizationMode.COST
     task_type: TaskType = TaskType.SUMMARIZATION
@@ -30,6 +31,7 @@ class ExecuteInputs(BaseModel):
         return RunRequest(
             input_text=self.input_text,
             context=self.context,
+            reference_output=self.reference_output,
             request_profile=RequestProfile(
                 task_type=self.task_type,
                 complexity=self.complexity,

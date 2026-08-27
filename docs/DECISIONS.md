@@ -258,7 +258,7 @@ fallback), issues exactly one non-retried HTTPS request per lookup, and strictly
 validates the response: exactly one embedding at the expected index, exact
 dimension, finite non-boolean values, and non-fabricated usage. Errors expose no
 endpoint, token, prompt, or response body. A deterministic fake provider serves
-offline tests. Production FastAPI lifespan ownership remains Slice 11.
+offline tests. The production FastAPI lifespan now owns these resources.
 
 Because a lookup against a paid embeddings deployment consumes tokens and cost
 even on a hit, the lookup returns a dedicated `EmbeddingUsage` (never forced into
@@ -458,7 +458,7 @@ This is a cost and delivery decision, not the production security target.
 
 Status: Accepted
 
-Cosmos DB for NoSQL uses serverless request-unit billing, one East US region,
+Cosmos DB for NoSQL uses serverless request-unit billing, one East US 2 region,
 Session consistency, database `optima`, container `runs`, and `/id` partitioning.
 Azure Managed Redis uses Balanced B0, disabled high availability, RediSearch,
 Enterprise clustering, NoEviction, TLS port `10000`, and no persistence. Cache
@@ -487,3 +487,50 @@ the resource group and Role Based Access Control Administrator on the exact
 registry, then disable the gate again. Foundry inference access and image
 publisher access remain with the external resource owners because OPTIMA does
 not own those principals or resources.
+
+## ADR-031: Own production composition through FastAPI lifespan
+
+Status: Accepted
+
+Use a dedicated production factory instead of changing the explicit local and
+demo entry points. The factory validates complete Azure settings, constructs one
+app-local dependency graph, and exposes it to routes through an application
+resolver rather than process-global mutable state. Foundry, embedding, Redis,
+Cosmos, and telemetry resources close once in reverse ownership order. Partial
+startup closes every resource already acquired and preserves the original
+startup exception. Health cannot report ready before lifespan construction and
+Redis bootstrap complete.
+
+## ADR-032: Bootstrap the Redis search index at application startup
+
+Status: Accepted
+
+The production API managed identity owns idempotent RediSearch bootstrap because
+the index is an application schema rather than an ARM resource. Startup creates
+`optima-cache-v1` only when both the index and its companion immutable contract
+are absent. Existing indexes must exactly match the HASH prefix, TAG fields,
+FLOAT32 FLAT vector dimension, COSINE metric, cache schema, semantic-input
+policy, and embedding profile. Incompatibility fails closed. OPTIMA never drops
+or replaces an index and never deletes cache data automatically.
+
+## ADR-033: Target East US 2 and require image digests
+
+Status: Accepted
+
+Application resources target East US 2 (`eastus2`). The existing bootstrap
+resource group and deployment identity may remain in East US. Container Apps
+remain disabled by default and accept separate API and UI manifest digests,
+never a shared mutable tag. Slice 11C must preflight Managed Redis registration,
+Balanced B0 support, quota, and service availability in East US 2. Allocation
+failure stops deployment; no fallback region is selected automatically.
+
+## ADR-034: Require reference evidence for the current production evaluator
+
+Status: Accepted
+
+The only reviewed production evaluator currently available is exact-reference.
+Production configuration must select `EXACT_REFERENCE` and require a reference
+output. The API rejects a missing reference before cache lookup or model
+generation, preventing paid execution that cannot produce valid evaluator
+evidence. Reference-free production requests remain unsupported until a
+separately reviewed evaluator includes truthful quality and cost accounting.

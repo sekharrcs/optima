@@ -56,6 +56,16 @@ def test_execute_inputs_build_exact_advanced_profile_request() -> None:
     assert request.metadata == {"request_profile_source": "user_supplied_demo_input"}
 
 
+def test_execute_inputs_preserve_reference_output() -> None:
+    """Carry the production evaluator reference into the strict API request."""
+    request = ExecuteInputs(
+        input_text="Summarize this",
+        reference_output="Expected summary",
+    ).to_run_request()
+
+    assert request.reference_output == "Expected summary"
+
+
 def test_api_client_serializes_request_and_parses_run_result() -> None:
     """Parse the actual demo API response through the strict client boundary."""
     with TestClient(demo_app) as test_client:

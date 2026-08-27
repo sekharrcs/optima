@@ -1,6 +1,7 @@
 """Typed application settings for OPTIMA capabilities and thresholds."""
 
 import re
+from decimal import Decimal
 from enum import StrEnum
 from typing import Annotated
 from urllib.parse import urlparse
@@ -36,6 +37,10 @@ BoundedSamplingRatio = Annotated[
     float,
     Field(ge=0.0, le=1.0, allow_inf_nan=False),
 ]
+NonNegativeRate = Annotated[
+    Decimal,
+    Field(ge=Decimal("0"), allow_inf_nan=False),
+]
 NonEmptyString = Annotated[str, Field(strict=True, min_length=1)]
 TelemetryResourceName = Annotated[
     str,
@@ -70,6 +75,39 @@ class RedisAuthMode(StrEnum):
     ACCESS_KEY = "ACCESS_KEY"
     AZURE_CLI = "AZURE_CLI"
     MANAGED_IDENTITY = "MANAGED_IDENTITY"
+
+
+class ProductionEvaluatorMode(StrEnum):
+    """Reviewed evaluator implementations available to production composition.
+
+    ``EXACT_REFERENCE`` is a deterministic benchmark/evaluation mode: it can only
+    verify a request whose caller already supplies the expected ``reference_output``.
+    It is not a general user-facing runtime path. Serving normal requests where the
+    caller does not know the answer requires a separately reviewed reference-free
+    natural-language evaluator (the LLM-judge capability named in ``docs/MVP_SCOPE``),
+    which is a distinct future slice and is intentionally absent here so unverifiable
+    output can never be silently accepted.
+    """
+
+    EXACT_REFERENCE = "EXACT_REFERENCE"
+
+
+class ProductionModelRoleRate(ImmutableModel):
+    """Reviewed per-million-token rates for one production model deployment."""
+
+    input_rate_per_million_tokens: NonNegativeRate
+    output_rate_per_million_tokens: NonNegativeRate
+    cached_input_rate_per_million_tokens: NonNegativeRate | None = None
+
+
+class ProductionPricingInputs(ImmutableModel):
+    """Complete reviewed pricing inputs for production monetary cost measurement."""
+
+    catalog_version: NonEmptyString
+    currency: NonEmptyString
+    small: ProductionModelRoleRate
+    strong: ProductionModelRoleRate
+    embedding_input_rate_per_million_tokens: NonNegativeRate
 
 
 class RedisSemanticCacheConfiguration(ImmutableModel):
@@ -397,6 +435,19 @@ class AppSettings(BaseSettings):
         extra="ignore",
     )
 
+    deployment_environment: TelemetryResourceName = "local"
+    production_evaluator_mode: ProductionEvaluatorMode | None = None
+    production_require_reference_output: bool = False
+    production_cost_measurement_required: bool = False
+    pricing_catalog_version: str | None = None
+    pricing_currency: NonEmptyString = "USD"
+    pricing_small_input_rate_per_million_tokens: Decimal | None = None
+    pricing_small_output_rate_per_million_tokens: Decimal | None = None
+    pricing_small_cached_input_rate_per_million_tokens: Decimal | None = None
+    pricing_strong_input_rate_per_million_tokens: Decimal | None = None
+    pricing_strong_output_rate_per_million_tokens: Decimal | None = None
+    pricing_strong_cached_input_rate_per_million_tokens: Decimal | None = None
+    pricing_embedding_input_rate_per_million_tokens: Decimal | None = None
     semantic_cache_enabled: bool = True
     context_reduction_enabled: bool = True
     historical_policy_enabled: bool = True
@@ -465,6 +516,7 @@ class AppSettings(BaseSettings):
         self.cosmos_run_history_configuration()
         self.redis_semantic_cache_configuration()
         self.application_insights_configuration()
+        self.production_pricing_inputs()
         return self
 
     def quality_thresholds(self) -> QualityThresholds:
@@ -647,3 +699,129 @@ class AppSettings(BaseSettings):
             ),
             exclude_health_routes=(self.application_insights_exclude_health_routes),
         )
+
+    def production_pricing_inputs(self) -> ProductionPricingInputs | None:
+        """Build reviewed pricing inputs, or None when pricing is unconfigured.
+
+        Partial pricing is rejected so incomplete configuration can never fabricate
+        monetary evidence. Absent pricing keeps monetary cost unavailable unless the
+        production runtime explicitly requires cost measurement.
+        """
+        version = self.pricing_catalog_version
+        small_input = self.pricing_small_input_rate_per_million_tokens
+        small_output = self.pricing_small_output_rate_per_million_tokens
+        small_cached = self.pricing_small_cached_input_rate_per_million_tokens
+        strong_input = self.pricing_strong_input_rate_per_million_tokens
+        strong_output = self.pricing_strong_output_rate_per_million_tokens
+        strong_cached = self.pricing_strong_cached_input_rate_per_million_tokens
+        embedding_input = self.pricing_embedding_input_rate_per_million_tokens
+        if all(
+            value is None
+            for value in (
+                version,
+                small_input,
+                small_output,
+                small_cached,
+                strong_input,
+                strong_output,
+                strong_cached,
+                embedding_input,
+            )
+        ):
+            return None
+        if (
+            version is None
+            or small_input is None
+            or small_output is None
+            or strong_input is None
+            or strong_output is None
+            or embedding_input is None
+        ):
+            raise ValueError(
+                "Production pricing requires a catalog version and SMALL, STRONG, "
+                "and embedding token rates; partial pricing cannot fabricate "
+                "monetary evidence"
+            )
+        return ProductionPricingInputs(
+            catalog_version=version,
+            currency=self.pricing_currency,
+            small=ProductionModelRoleRate(
+                input_rate_per_million_tokens=small_input,
+                output_rate_per_million_tokens=small_output,
+                cached_input_rate_per_million_tokens=small_cached,
+            ),
+            strong=ProductionModelRoleRate(
+                input_rate_per_million_tokens=strong_input,
+                output_rate_per_million_tokens=strong_output,
+                cached_input_rate_per_million_tokens=strong_cached,
+            ),
+            embedding_input_rate_per_million_tokens=embedding_input,
+        )
+
+    def validate_production_runtime(self) -> "AppSettings":
+        """Require every dependency owned by the production API lifespan."""
+        if (
+            self.production_evaluator_mode
+            is not ProductionEvaluatorMode.EXACT_REFERENCE
+        ):
+            raise ValueError(
+                "Production runtime requires an explicit supported evaluator mode; "
+                "EXACT_REFERENCE is the only reviewed mode and serves benchmark "
+                "requests that already supply reference output"
+            )
+        if not self.production_require_reference_output:
+            raise ValueError(
+                "EXACT_REFERENCE production evaluation requires reference output; "
+                "reference-free requests need a separately reviewed natural-language "
+                "evaluator that is not yet available"
+            )
+        foundry = self.foundry_provider_configuration()
+        if foundry is None:
+            raise ValueError("Production runtime requires Foundry configuration")
+        cosmos = self.cosmos_run_history_configuration()
+        if cosmos is None:
+            raise ValueError("Production runtime requires Cosmos configuration")
+        redis = self.redis_semantic_cache_configuration()
+        if redis is None:
+            raise ValueError("Production runtime requires Redis configuration")
+        if self.application_insights_configuration() is None:
+            raise ValueError(
+                "Production runtime requires Application Insights configuration"
+            )
+        if (
+            self.production_cost_measurement_required
+            and self.production_pricing_inputs() is None
+        ):
+            raise ValueError(
+                "Production cost measurement requires reviewed SMALL, STRONG, and "
+                "embedding pricing rates; configure the price catalog or disable "
+                "production_cost_measurement_required"
+            )
+
+        managed_identity_client_ids = (
+            (
+                foundry.auth_mode is FoundryAuthMode.MANAGED_IDENTITY,
+                foundry.managed_identity_client_id,
+                "Foundry",
+            ),
+            (
+                cosmos.auth_mode is CosmosAuthMode.MANAGED_IDENTITY,
+                cosmos.managed_identity_client_id,
+                "Cosmos",
+            ),
+            (
+                redis.auth_mode is RedisAuthMode.MANAGED_IDENTITY,
+                redis.managed_identity_client_id,
+                "Redis",
+            ),
+        )
+        for (
+            managed_identity_selected,
+            client_id,
+            service_name,
+        ) in managed_identity_client_ids:
+            if managed_identity_selected and client_id is None:
+                raise ValueError(
+                    f"Production {service_name} Managed Identity requires a client ID"
+                )
+        return self

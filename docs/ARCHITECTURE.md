@@ -103,7 +103,7 @@ Subscription-scope Bicep
 OPTIMA API --> Foundry or APIM Azure OpenAI v1 endpoint
 ```
 
-Slice 11A omits Key Vault because runtime service authentication uses managed
+Slices 11A and 11B omit Key Vault because runtime service authentication uses managed
 identity. The generated Application Insights connection string identifies the
 telemetry destination and is not a security token. APIM and Foundry resources
 remain external reviewed inputs because the current provider supports either
@@ -245,9 +245,11 @@ authoritative cost catalog) that distinguishes measured usage from a
 possibly-billed attempt with no usage; `RunResult` includes measured embedding
 consumption and reports input/token/cost totals as unavailable when an attempt
 was possibly billed but unmeasured, so a cache hit is never reported as free.
-Production index provisioning, role assignment, cache population, and FastAPI
-lifespan ownership of the Redis and embedding resources remain Slice 11
-responsibilities.
+The production FastAPI lifespan owns Redis and embedding resources. Startup
+inspects `FT.INFO`, validates an immutable companion profile contract, and
+creates the index only when absent. Incompatible indexes fail startup without
+replacement or data deletion. Role assignment, cache population, and live
+deployment remain Slice 11C responsibilities.
 
 ### Run-history persistence boundary
 
@@ -305,9 +307,10 @@ run. Application Insights in Slice 10D and lifecycle and infrastructure in Slice
 Cosmos configuration explicitly selects account key, Azure CLI credential, or
 managed identity. `DefaultAzureCredential` and implicit credential fallback are
 not used. One closeable resource owner holds the application-lifetime async
-Cosmos client and any selected async Azure Identity credential. Slice 11 retains
-responsibility for production FastAPI lifespan wiring, Cosmos provisioning,
-indexing policy, and role assignments.
+Cosmos client and any selected async Azure Identity credential. The production
+FastAPI lifespan closes that owner in reverse construction order. Cosmos
+provisioning, indexing policy, and role assignments remain infrastructure and
+Slice 11C responsibilities.
 
 ### Provider abstraction
 Hides Microsoft Foundry/APIM request details from planner and execution-policy logic.
@@ -447,8 +450,23 @@ replaced, or shut down. Partially created owned exporters, processors, readers,
 and providers are shut down best effort. Runtime initialization failures are
 cached as an unavailable observer and are not retried; one redacted warning and
 `force_flush() == false` make the failure detectable without changing a run
-result. Slice 11 retains production FastAPI lifespan ownership for flush and
-shutdown.
+result. The production FastAPI lifespan closes the telemetry lease after all
+other owned resources, allowing cleanup failures to remain observable.
+
+### Production runtime composition
+
+`create_production_app()` validates complete Foundry, Cosmos, Redis, managed
+identity, and Application Insights settings before resource construction. It
+creates one app-local dependency graph with no fake fallback. The graph contains
+Foundry SMALL and STRONG providers, the Foundry embedding provider, semantic
+cache, Cosmos run history, deterministic context reduction, exact-reference
+evaluation, centralized pricing, and observability.
+
+Construction order is telemetry, Foundry, embedding, Redis, Redis index
+bootstrap, and Cosmos. Shutdown closes Cosmos, Redis, embedding, Foundry, and
+telemetry. Partial startup uses the same reverse cleanup, suppresses cleanup
+errors after recording their type, and re-raises the original startup error.
+Uvicorn does not serve health or run routes until the lifespan yields.
 
 ## Module configuration
 

@@ -1,11 +1,20 @@
 """Tests for typed application module settings."""
 
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
 from pydantic import SecretStr, ValidationError
 
-from optima.config import AppSettings, FoundryAuthMode, RedisAuthMode
+from optima.config import (
+    AppSettings,
+    CosmosAuthMode,
+    FoundryAuthMode,
+    ProductionEvaluatorMode,
+    ProductionModelRoleRate,
+    ProductionPricingInputs,
+    RedisAuthMode,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -16,6 +25,19 @@ def isolate_settings_sources(
     """Isolate tests from developer dotenv files and module environment values."""
     monkeypatch.chdir(tmp_path)
     for variable in (
+        "OPTIMA_DEPLOYMENT_ENVIRONMENT",
+        "OPTIMA_PRODUCTION_EVALUATOR_MODE",
+        "OPTIMA_PRODUCTION_REQUIRE_REFERENCE_OUTPUT",
+        "OPTIMA_PRODUCTION_COST_MEASUREMENT_REQUIRED",
+        "OPTIMA_PRICING_CATALOG_VERSION",
+        "OPTIMA_PRICING_CURRENCY",
+        "OPTIMA_PRICING_SMALL_INPUT_RATE_PER_MILLION_TOKENS",
+        "OPTIMA_PRICING_SMALL_OUTPUT_RATE_PER_MILLION_TOKENS",
+        "OPTIMA_PRICING_SMALL_CACHED_INPUT_RATE_PER_MILLION_TOKENS",
+        "OPTIMA_PRICING_STRONG_INPUT_RATE_PER_MILLION_TOKENS",
+        "OPTIMA_PRICING_STRONG_OUTPUT_RATE_PER_MILLION_TOKENS",
+        "OPTIMA_PRICING_STRONG_CACHED_INPUT_RATE_PER_MILLION_TOKENS",
+        "OPTIMA_PRICING_EMBEDDING_INPUT_RATE_PER_MILLION_TOKENS",
         "OPTIMA_SEMANTIC_CACHE_ENABLED",
         "OPTIMA_CONTEXT_REDUCTION_ENABLED",
         "OPTIMA_HISTORICAL_POLICY_ENABLED",
@@ -76,6 +98,7 @@ def test_settings_defaults_match_mvp_module_configuration() -> None:
     """Use the documented MVP defaults when no source overrides them."""
     settings = AppSettings()
 
+    assert settings.deployment_environment == "local"
     assert settings.semantic_cache_enabled is True
     assert settings.context_reduction_enabled is True
     assert settings.historical_policy_enabled is True
@@ -130,6 +153,19 @@ def test_settings_accept_explicit_injection() -> None:
     )
 
     assert settings.model_dump() == {
+        "deployment_environment": "local",
+        "production_evaluator_mode": None,
+        "production_require_reference_output": False,
+        "production_cost_measurement_required": False,
+        "pricing_catalog_version": None,
+        "pricing_currency": "USD",
+        "pricing_small_input_rate_per_million_tokens": None,
+        "pricing_small_output_rate_per_million_tokens": None,
+        "pricing_small_cached_input_rate_per_million_tokens": None,
+        "pricing_strong_input_rate_per_million_tokens": None,
+        "pricing_strong_output_rate_per_million_tokens": None,
+        "pricing_strong_cached_input_rate_per_million_tokens": None,
+        "pricing_embedding_input_rate_per_million_tokens": None,
         "semantic_cache_enabled": False,
         "context_reduction_enabled": False,
         "historical_policy_enabled": False,
@@ -189,6 +225,207 @@ def test_settings_accept_explicit_injection() -> None:
         "application_insights_fastapi_instrumentation_enabled": True,
         "application_insights_exclude_health_routes": True,
     }
+
+
+def production_settings(**updates: object) -> AppSettings:
+    """Build complete production settings with user-assigned identities."""
+    values: dict[str, object] = {
+        "deployment_environment": "hackathon",
+        "production_evaluator_mode": ProductionEvaluatorMode.EXACT_REFERENCE,
+        "production_require_reference_output": True,
+        "foundry_base_url": "https://optima.openai.azure.com/openai/v1",
+        "foundry_small_deployment": "small",
+        "foundry_strong_deployment": "strong",
+        "foundry_auth_mode": FoundryAuthMode.MANAGED_IDENTITY,
+        "foundry_token_scope": "https://cognitiveservices.azure.com/.default",
+        "foundry_managed_identity_client_id": "api-client-id",
+        "cosmos_endpoint": "https://optima.documents.azure.com:443/",
+        "cosmos_database_name": "optima",
+        "cosmos_container_name": "runs",
+        "cosmos_auth_mode": CosmosAuthMode.MANAGED_IDENTITY,
+        "cosmos_managed_identity_client_id": "api-client-id",
+        "redis_host": "optima.eastus2.redis.azure.net",
+        "redis_index_name": "optima-cache-v1",
+        "redis_embedding_dimension": 1536,
+        "redis_embedding_model": "text-embedding-3-small",
+        "redis_embedding_deployment": "embedding",
+        "redis_auth_mode": RedisAuthMode.MANAGED_IDENTITY,
+        "redis_object_id": "api-object-id",
+        "redis_managed_identity_client_id": "api-client-id",
+        "application_insights_enabled": True,
+        "application_insights_connection_string": (
+            "InstrumentationKey=00000000-0000-0000-0000-000000000001;"
+            "IngestionEndpoint=https://eastus2-1.in.applicationinsights.azure.com/"
+        ),
+        "application_insights_deployment_environment": "hackathon",
+    }
+    values.update(updates)
+    return AppSettings.model_validate(values)
+
+
+def test_production_runtime_accepts_complete_azure_configuration() -> None:
+    """Accept one complete production graph without changing its settings."""
+    settings = production_settings()
+
+    assert settings.validate_production_runtime() is settings
+
+
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        (
+            {"production_evaluator_mode": None},
+            "explicit supported evaluator mode",
+        ),
+        (
+            {"production_require_reference_output": False},
+            "requires reference output",
+        ),
+    ],
+)
+def test_production_runtime_rejects_unsupported_evaluator_configuration(
+    updates: dict[str, object],
+    message: str,
+) -> None:
+    """Fail startup before Azure construction when evaluation is unsupported."""
+    with pytest.raises(ValueError, match=message):
+        production_settings(**updates).validate_production_runtime()
+
+
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        (
+            {
+                "foundry_base_url": None,
+                "foundry_small_deployment": None,
+                "foundry_strong_deployment": None,
+                "foundry_auth_mode": None,
+                "foundry_token_scope": None,
+                "foundry_managed_identity_client_id": None,
+            },
+            "Production runtime requires Foundry configuration",
+        ),
+        (
+            {
+                "cosmos_endpoint": None,
+                "cosmos_database_name": None,
+                "cosmos_container_name": None,
+                "cosmos_auth_mode": None,
+                "cosmos_managed_identity_client_id": None,
+            },
+            "Production runtime requires Cosmos configuration",
+        ),
+        (
+            {
+                "redis_host": None,
+                "redis_index_name": None,
+                "redis_embedding_dimension": None,
+                "redis_embedding_model": None,
+                "redis_embedding_deployment": None,
+                "redis_auth_mode": None,
+                "redis_object_id": None,
+                "redis_managed_identity_client_id": None,
+            },
+            "Production runtime requires Redis configuration",
+        ),
+        (
+            {"application_insights_enabled": False},
+            "Production runtime requires Application Insights configuration",
+        ),
+    ],
+)
+def test_production_runtime_rejects_missing_service_configuration(
+    updates: dict[str, object],
+    message: str,
+) -> None:
+    """Fail before resource construction when one production service is absent."""
+    with pytest.raises(ValueError, match=message):
+        production_settings(**updates).validate_production_runtime()
+
+
+@pytest.mark.parametrize(
+    ("field", "service_name"),
+    [
+        ("foundry_managed_identity_client_id", "Foundry"),
+        ("cosmos_managed_identity_client_id", "Cosmos"),
+        ("redis_managed_identity_client_id", "Redis"),
+    ],
+)
+def test_production_runtime_requires_user_assigned_identity_client_ids(
+    field: str,
+    service_name: str,
+) -> None:
+    """Reject ambiguous system-assigned authentication in the production target."""
+    with pytest.raises(
+        ValueError,
+        match=f"Production {service_name} Managed Identity requires a client ID",
+    ):
+        production_settings(**{field: None}).validate_production_runtime()
+
+
+def test_production_pricing_absent_keeps_cost_unavailable_not_fabricated() -> None:
+    """Keep pricing optional so monetary cost stays unavailable, not invented."""
+    assert production_settings().production_pricing_inputs() is None
+
+
+def test_production_pricing_rejects_partial_configuration() -> None:
+    """Reject partial pricing so incomplete rates cannot fabricate cost evidence."""
+    with pytest.raises(ValidationError, match="partial pricing cannot fabricate"):
+        production_settings(
+            pricing_catalog_version="foundry-apim-2026-01-01",
+            pricing_small_input_rate_per_million_tokens=Decimal("0.15"),
+        )
+
+
+def test_production_pricing_builds_complete_reviewed_inputs() -> None:
+    """Return every reviewed rate without altering decimal precision."""
+    settings = production_settings(
+        pricing_catalog_version="foundry-apim-2026-01-01",
+        pricing_currency="USD",
+        pricing_small_input_rate_per_million_tokens=Decimal("0.15"),
+        pricing_small_output_rate_per_million_tokens=Decimal("0.60"),
+        pricing_strong_input_rate_per_million_tokens=Decimal("2.50"),
+        pricing_strong_output_rate_per_million_tokens=Decimal("10.00"),
+        pricing_embedding_input_rate_per_million_tokens=Decimal("0.02"),
+    )
+
+    assert settings.production_pricing_inputs() == ProductionPricingInputs(
+        catalog_version="foundry-apim-2026-01-01",
+        currency="USD",
+        small=ProductionModelRoleRate(
+            input_rate_per_million_tokens=Decimal("0.15"),
+            output_rate_per_million_tokens=Decimal("0.60"),
+        ),
+        strong=ProductionModelRoleRate(
+            input_rate_per_million_tokens=Decimal("2.50"),
+            output_rate_per_million_tokens=Decimal("10.00"),
+        ),
+        embedding_input_rate_per_million_tokens=Decimal("0.02"),
+    )
+
+
+def test_production_runtime_requires_pricing_when_cost_measurement_required() -> None:
+    """Fail startup when cost measurement is required but pricing is absent."""
+    with pytest.raises(ValueError, match="Production cost measurement requires"):
+        production_settings(
+            production_cost_measurement_required=True,
+        ).validate_production_runtime()
+
+
+def test_production_runtime_accepts_required_cost_measurement_with_pricing() -> None:
+    """Accept required cost measurement once a complete catalog is configured."""
+    settings = production_settings(
+        production_cost_measurement_required=True,
+        pricing_catalog_version="foundry-apim-2026-01-01",
+        pricing_small_input_rate_per_million_tokens=Decimal("0.15"),
+        pricing_small_output_rate_per_million_tokens=Decimal("0.60"),
+        pricing_strong_input_rate_per_million_tokens=Decimal("2.50"),
+        pricing_strong_output_rate_per_million_tokens=Decimal("10.00"),
+        pricing_embedding_input_rate_per_million_tokens=Decimal("0.02"),
+    )
+
+    assert settings.validate_production_runtime() is settings
 
 
 def test_settings_read_prefixed_environment_variables(
