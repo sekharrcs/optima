@@ -6,6 +6,9 @@ from typing import Annotated, Literal
 
 from pydantic import Field, ValidationError, model_validator
 
+from optima.domain.evaluation import (
+    LLM_JUDGE_EVALUATOR_TYPE as LLM_JUDGE_EVALUATOR_TYPE,
+)
 from optima.domain.execution import ModelRole
 from optima.domain.quality_contract import QualityContract, QualityScore
 from optima.domain.run import ModelUsage
@@ -28,7 +31,6 @@ from optima.providers import (
 )
 from optima.providers.contracts import system_monotonic_time
 
-LLM_JUDGE_EVALUATOR_TYPE = "llm_judge"
 LLM_JUDGE_PROMPT_VERSION = "optima-llm-judge-prompt-v1"
 LLM_JUDGE_REQUEST_SCHEMA_VERSION = "optima-llm-judge-request-v1"
 LLM_JUDGE_RESPONSE_SCHEMA_VERSION = "optima-llm-judge-response-v1"
@@ -132,6 +134,18 @@ class LLMJudgeEvaluator(QualityEvaluator):
         self._threshold_engine = threshold_engine or ThresholdEngine()
         self._clock = monotonic_clock
 
+    @property
+    def evaluator_identity(self) -> tuple[str, ...]:
+        """Return the versioned judge identity used for cache compatibility."""
+        return (
+            LLM_JUDGE_EVALUATOR_TYPE,
+            LLM_JUDGE_PROMPT_VERSION,
+            LLM_JUDGE_REQUEST_SCHEMA_VERSION,
+            LLM_JUDGE_RESPONSE_SCHEMA_VERSION,
+            self._judge_model,
+            self._provider.deployment_name,
+        )
+
     async def evaluate(
         self,
         request: EvaluationRequest,
@@ -231,6 +245,7 @@ class LLMJudgeEvaluator(QualityEvaluator):
             mandatory_checks=mandatory_checks,
             metadata={
                 "prompt_version": LLM_JUDGE_PROMPT_VERSION,
+                "request_schema_version": LLM_JUDGE_REQUEST_SCHEMA_VERSION,
                 "schema_version": LLM_JUDGE_RESPONSE_SCHEMA_VERSION,
                 "reason_code": response.reason_code.value,
                 "criteria_count": len(response.criteria),

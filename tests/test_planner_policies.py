@@ -395,6 +395,22 @@ def test_grounding_required_accepts_cache_with_supported_prior_evidence() -> Non
     assert decision.reason_code is PlannerReasonCode.CACHE_HIGH_CONFIDENCE_MATCH
 
 
+def test_incompatible_evaluator_rejects_cache_reuse() -> None:
+    """Refuse reuse when the current evaluator cannot consume prior evidence."""
+    decision = evaluate_cache_policy(
+        enabled=True,
+        profile=profile(cache_eligible=True),
+        request_binding=request_binding(),
+        candidate=candidate(),
+        contract=contract(),
+        thresholds=PlannerThresholds(),
+        evaluator_compatible=False,
+    )
+
+    assert decision.policy is CachePolicy.SKIP
+    assert decision.reason_code is PlannerReasonCode.CACHE_CONTRACT_INCOMPATIBLE
+
+
 @pytest.mark.parametrize("similarity", [0.95, 1.0])
 @pytest.mark.parametrize("quality", [0.90, 1.0])
 def test_cache_accepts_inclusive_similarity_and_quality_thresholds(

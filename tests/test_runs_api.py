@@ -176,7 +176,7 @@ def cache_candidate(
         "request_binding": request_binding(source_payload),
         "similarity": 0.97,
         "prior_evaluation": EvaluationResult(
-            evaluator_type="source-deterministic",
+            evaluator_type="fake-deterministic",
             evaluator_valid=True,
             score=0.95,
             threshold=0.80,
@@ -1151,6 +1151,37 @@ def test_disabled_semantic_cache_bypasses_dependency_completely() -> None:
     assert all(step["step_type"] != "SEMANTIC_CACHE" for step in body["steps"])
     assert cache.calls == ()
     assert len(small.calls) == 1
+
+
+def test_grounding_required_skips_non_grounded_cache_without_crashing() -> None:
+    """Bypass a non-grounded candidate cleanly and execute the model path."""
+    configured, small, strong, evaluator = dependencies(0.93)
+    payload = request_payload(
+        request_profile=cache_eligible_profile(),
+        grounding_required=True,
+    )
+    configured = with_semantic_cache(
+        configured,
+        FakeSemanticCache((cache_candidate(source_payload=payload),)),
+    )
+
+    response = TestClient(create_app(execution_dependencies=configured)).post(
+        "/api/v1/runs",
+        json=payload,
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["semantic_cache"]["outcome"] == SemanticCacheOutcome.MATCH_REJECTED
+    assert (
+        body["semantic_cache"]["planner_reason_code"]
+        == PlannerReasonCode.CACHE_CONTRACT_INCOMPATIBLE
+    )
+    assert body["status"] == "COMPLETED"
+    assert body["final_output"] == "small output"
+    assert body["contract_met"] is True
+    assert len(small.calls) == 1
+    assert any(step["step_type"] == "MODEL_CALL" for step in body["steps"])
 
 
 def test_cache_hit_returns_exact_bound_output_and_preserves_source_evidence() -> None:

@@ -5,7 +5,11 @@ import asyncio
 import pytest
 from pydantic import ValidationError
 
-from optima.domain.evaluation import EvaluationResult
+from optima.domain.evaluation import (
+    EvaluationResult,
+    evaluator_identities_compatible,
+    evaluator_identity_of,
+)
 from optima.domain.quality_contract import (
     OptimizationMode,
     QualityContract,
@@ -42,6 +46,86 @@ def evaluation_result(**updates: object) -> EvaluationResult:
     }
     values.update(updates)
     return EvaluationResult.model_validate(values)
+
+
+def _judge_evaluation(**metadata_updates: object) -> EvaluationResult:
+    """Build a prior llm_judge evaluation with complete identity metadata."""
+    metadata: dict[str, object] = {
+        "prompt_version": "optima-llm-judge-prompt-v1",
+        "request_schema_version": "optima-llm-judge-request-v1",
+        "schema_version": "optima-llm-judge-response-v1",
+        "judge_model": "judge-model-v1",
+        "judge_deployment": "judge-deployment",
+    }
+    metadata.update(metadata_updates)
+    return evaluation_result(evaluator_type="llm_judge", metadata=metadata)
+
+
+_JUDGE_IDENTITY = (
+    "llm_judge",
+    "optima-llm-judge-prompt-v1",
+    "optima-llm-judge-request-v1",
+    "optima-llm-judge-response-v1",
+    "judge-model-v1",
+    "judge-deployment",
+)
+
+
+def test_evaluator_identity_of_returns_type_for_non_judge() -> None:
+    """Identify deterministic evaluators by evaluator_type alone."""
+    assert evaluator_identity_of(
+        evaluation_result(evaluator_type="exact_reference")
+    ) == ("exact_reference",)
+
+
+def test_evaluator_identity_of_binds_full_judge_identity() -> None:
+    """Bind prompt, request/response schema, and judge deployment for reuse."""
+    assert evaluator_identity_of(_judge_evaluation()) == _JUDGE_IDENTITY
+
+
+def test_evaluator_identity_of_incomplete_judge_is_none() -> None:
+    """Return no identity when judge metadata cannot be trusted."""
+    assert evaluator_identity_of(_judge_evaluation(judge_model=None)) is None
+
+
+def test_llm_judge_prior_incompatible_with_exact_reference_current() -> None:
+    """Never reuse model-judged quality to satisfy an exact-reference request."""
+    assert (
+        evaluator_identities_compatible(("exact_reference",), _judge_evaluation())
+        is False
+    )
+
+
+def test_exact_reference_prior_incompatible_with_llm_judge_current() -> None:
+    """Never reuse exact-reference quality to satisfy a reference-free judge."""
+    assert (
+        evaluator_identities_compatible(
+            _JUDGE_IDENTITY,
+            evaluation_result(evaluator_type="exact_reference"),
+        )
+        is False
+    )
+
+
+def test_matching_identity_is_compatible() -> None:
+    """Reuse only when the current evaluator identity matches the prior one."""
+    assert evaluator_identities_compatible(_JUDGE_IDENTITY, _judge_evaluation()) is True
+
+
+def test_missing_current_identity_disables_compatibility_check() -> None:
+    """Preserve legacy behavior when no current evaluator identity is supplied."""
+    assert evaluator_identities_compatible(None, _judge_evaluation()) is True
+
+
+def test_incomplete_prior_identity_is_incompatible() -> None:
+    """Refuse reuse when the prior judge identity is incomplete."""
+    assert (
+        evaluator_identities_compatible(
+            _JUDGE_IDENTITY,
+            _judge_evaluation(judge_deployment=None),
+        )
+        is False
+    )
 
 
 @pytest.mark.parametrize(
@@ -142,6 +226,11 @@ class RecordingMeasurement:
         self._measured_evidence = measured_evidence
         self.calls: list[EvaluationRequest] = []
 
+    @property
+    def evaluator_type(self) -> str:
+        """Return the evaluator_type of the configured measured evidence."""
+        return self._measured_evidence.evaluator_type
+
     def measure(self, request: EvaluationRequest) -> EvaluationEvidence:
         """Record the request and return evaluator-owned measured facts."""
         self.calls.append(request)
@@ -150,6 +239,8 @@ class RecordingMeasurement:
 
 class InputAwareMeasurement:
     """Test measurement whose score depends on source and candidate text."""
+
+    evaluator_type = "input_aware"
 
     def measure(self, request: EvaluationRequest) -> EvaluationEvidence:
         """Use both sides of the evaluation boundary to derive evidence."""

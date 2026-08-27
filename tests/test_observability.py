@@ -310,7 +310,7 @@ def cache_candidate(payload: dict[str, object]) -> CacheCandidate:
         request_binding=binding,
         similarity=0.99,
         prior_evaluation=EvaluationResult(
-            evaluator_type="source-evaluator",
+            evaluator_type="fake-deterministic",
             evaluator_valid=True,
             score=0.96,
             threshold=0.80,

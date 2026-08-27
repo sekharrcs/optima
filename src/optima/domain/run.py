@@ -831,6 +831,7 @@ class RunResult(ImmutableModel):
             run_id=self.run_id,
             minimum_quality_score=self.quality_contract.minimum_quality_score,
             request_binding=self.request_binding,
+            grounding_required=self.quality_contract.grounding_required,
         )
         if cache_contract is None:
             if cache_steps:

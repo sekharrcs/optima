@@ -380,6 +380,7 @@ async def _execute_observed_run(
                         evaluator_configured=True,
                     ),
                     cache_candidate=cache_candidate,
+                    current_evaluator_identity=dependencies.evaluator.evaluator_identity,
                 )
             )
             if isinstance(planner_result, PlanningFailure):

@@ -597,6 +597,34 @@ def test_production_runtime_prices_judge_from_its_configured_deployment() -> Non
     assert calculated.provenance.currency == "USD"
 
 
+def test_production_pricing_names_colliding_role_deployments() -> None:
+    """Fail closed with the exact roles when a deployment is shared across keys."""
+    events: list[str] = []
+    settings = llm_judge_settings(
+        judge_deployment="small",
+        pricing_catalog_version="foundry-apim-2026-01-01",
+        pricing_small_input_rate_per_million_tokens=Decimal("0.15"),
+        pricing_small_output_rate_per_million_tokens=Decimal("0.60"),
+        pricing_strong_input_rate_per_million_tokens=Decimal("2.50"),
+        pricing_strong_output_rate_per_million_tokens=Decimal("10.00"),
+        pricing_judge_input_rate_per_million_tokens=Decimal("0.25"),
+        pricing_judge_output_rate_per_million_tokens=Decimal("1.25"),
+        pricing_embedding_input_rate_per_million_tokens=Decimal("0.02"),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="SMALL and JUDGE roles both use deployment 'small'",
+    ):
+        asyncio.run(
+            build_production_runtime(
+                settings,
+                observability=RecordingObservability(events),
+                builders=component_builders(events),
+            )
+        )
+
+
 def test_production_runtime_requires_pricing_when_cost_measurement_required() -> None:
     """Fail production startup before construction when required pricing is absent."""
     events: list[str] = []

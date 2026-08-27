@@ -227,12 +227,14 @@ def _build_price_catalog(settings: AppSettings) -> PriceCatalog:
             output_rate_per_million_tokens=Decimal("0"),
         ),
     ]
+    judge_deployment: str | None = None
     if inputs.judge is not None:
         judge = settings.judge_provider_configuration()
         if judge is None:
             raise ValueError(
                 "Production JUDGE pricing requires configured judge deployment"
             )
+        judge_deployment = judge.deployment
         entries.append(
             PriceCatalogEntry(
                 provider=FOUNDRY_PROVIDER_NAME,
@@ -248,11 +250,49 @@ def _build_price_catalog(settings: AppSettings) -> PriceCatalog:
                 ),
             )
         )
+    _reject_shared_role_deployments(
+        small=foundry.small_deployment,
+        strong=foundry.strong_deployment,
+        embedding=redis.embedding_deployment,
+        judge=judge_deployment,
+    )
     return PriceCatalog(
         version=inputs.catalog_version,
         currency=inputs.currency,
         entries=tuple(entries),
     )
+
+
+def _reject_shared_role_deployments(
+    *,
+    small: str,
+    strong: str,
+    embedding: str,
+    judge: str | None,
+) -> None:
+    """Fail closed with the exact colliding roles when deployments are shared.
+
+    The price catalog requires a distinct provider/deployment key per role so each
+    role's monetary cost is billed separately; a shared deployment would otherwise
+    surface only as an opaque uniqueness error during catalog construction.
+    """
+    role_deployments = [
+        ("SMALL", small),
+        ("STRONG", strong),
+        ("embedding", embedding),
+    ]
+    if judge is not None:
+        role_deployments.append(("JUDGE", judge))
+    seen: dict[str, str] = {}
+    for role, deployment in role_deployments:
+        existing = seen.get(deployment)
+        if existing is not None:
+            raise ValueError(
+                "Production pricing requires a distinct Foundry deployment per role; "
+                f"the {existing} and {role} roles both use deployment "
+                f"'{deployment}', which the price catalog cannot bill separately"
+            )
+        seen[deployment] = role
 
 
 async def build_production_runtime(

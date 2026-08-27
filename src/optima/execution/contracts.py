@@ -67,6 +67,7 @@ class ExecutionRequest(ImmutableModel):
             run_id=self.run_id,
             minimum_quality_score=self.quality_contract.minimum_quality_score,
             request_binding=current_binding,
+            grounding_required=self.quality_contract.grounding_required,
         )
         return self
 

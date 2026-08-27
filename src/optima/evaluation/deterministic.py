@@ -16,11 +16,13 @@ from optima.evaluation.thresholds import ThresholdEngine
 class ExactReferenceMeasurement(DeterministicMeasurement):
     """Measure candidate equality against an optional reference output."""
 
+    evaluator_type = "exact_reference"
+
     def measure(self, request: EvaluationRequest) -> EvaluationEvidence:
         """Return exact-reference evidence without model or network calls."""
         reference_supplied = request.reference_output is not None
         return EvaluationEvidence(
-            evaluator_type="exact_reference",
+            evaluator_type=self.evaluator_type,
             evaluator_valid=reference_supplied,
             score=float(
                 reference_supplied and request.output_text == request.reference_output
@@ -43,6 +45,11 @@ class DeterministicEvaluator(QualityEvaluator):
     ) -> None:
         self._measurement = measurement
         self._threshold_engine = threshold_engine or ThresholdEngine()
+
+    @property
+    def evaluator_identity(self) -> tuple[str, ...]:
+        """Return the deterministic measurement identity for cache compatibility."""
+        return (self._measurement.evaluator_type,)
 
     async def evaluate(
         self,

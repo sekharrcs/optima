@@ -6,7 +6,7 @@ from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from optima.domain.evaluation import EvaluationResult
+from optima.domain.evaluation import EvaluationResult, evaluator_identity_of
 from optima.domain.quality_contract import QualityScore
 from optima.domain.run import PricingProvenance, RunResult
 
@@ -18,12 +18,6 @@ NonNegativeDecimal = Annotated[
 ]
 FiniteDecimal = Annotated[Decimal, Field(allow_inf_nan=False)]
 StrictBoolean = Annotated[bool, Field(strict=True)]
-LLM_JUDGE_IDENTITY_KEYS = (
-    "prompt_version",
-    "schema_version",
-    "judge_model",
-    "judge_deployment",
-)
 
 
 class ComparisonArm(StrEnum):
@@ -111,18 +105,12 @@ class BaselineComparisonRequest(BaseModel):
 
 def _evaluator_identity(evaluation: EvaluationResult) -> tuple[str, ...]:
     """Return complete measurement identity for comparison compatibility."""
-    evaluator_type = evaluation.evaluator_type
-    if evaluator_type != "llm_judge":
-        return (evaluator_type,)
-    identity_values: list[str] = []
-    for key in LLM_JUDGE_IDENTITY_KEYS:
-        value = evaluation.metadata.get(key)
-        if not isinstance(value, str) or not value:
-            raise ValueError(
-                "valid llm_judge evaluations require complete evaluator identity"
-            )
-        identity_values.append(value)
-    return (evaluator_type, *identity_values)
+    identity = evaluator_identity_of(evaluation)
+    if identity is None:
+        raise ValueError(
+            "valid llm_judge evaluations require complete evaluator identity"
+        )
+    return identity
 
 
 class ExecutionMetrics(BaseModel):

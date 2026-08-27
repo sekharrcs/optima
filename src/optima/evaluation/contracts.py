@@ -94,6 +94,11 @@ class EvaluationFailure(ImmutableModel):
 class DeterministicMeasurement(Protocol):
     """Synchronous boundary for measuring explicit deterministic evidence."""
 
+    @property
+    def evaluator_type(self) -> str:
+        """Return the evaluator_type this measurement records."""
+        ...
+
     def measure(self, request: EvaluationRequest) -> EvaluationEvidence:
         """Inspect a complete evaluation request and return measured facts."""
 
@@ -110,6 +115,11 @@ class EvaluatorCall(ImmutableModel):
 @runtime_checkable
 class QualityEvaluator(Protocol):
     """Asynchronous boundary for provider-independent quality evaluation."""
+
+    @property
+    def evaluator_identity(self) -> tuple[str, ...]:
+        """Return the canonical evaluator identity used for cache compatibility."""
+        ...
 
     async def evaluate(
         self,

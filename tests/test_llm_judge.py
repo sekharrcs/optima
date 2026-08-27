@@ -16,6 +16,7 @@ from optima.domain.quality_contract import (
 from optima.domain.run import ModelUsage
 from optima.evaluation import (
     LLM_JUDGE_PROMPT_VERSION,
+    LLM_JUDGE_REQUEST_SCHEMA_VERSION,
     LLM_JUDGE_RESPONSE_SCHEMA_VERSION,
     LLM_JUDGE_SYSTEM_INSTRUCTION,
     EvaluationFailureCode,
@@ -118,6 +119,7 @@ def test_reference_free_candidate_passes_through_threshold_engine() -> None:
     assert outcome.result.evaluator_type == "llm_judge"
     assert outcome.result.metadata == {
         "prompt_version": LLM_JUDGE_PROMPT_VERSION,
+        "request_schema_version": LLM_JUDGE_REQUEST_SCHEMA_VERSION,
         "schema_version": LLM_JUDGE_RESPONSE_SCHEMA_VERSION,
         "reason_code": "CORRECTNESS_OR_RELEVANCE_CONCERN",
         "criteria_count": 0,
@@ -250,6 +252,23 @@ def test_missing_required_response_field_fails_closed() -> None:
     assert outcome.result is None
     assert outcome.failure is not None
     assert outcome.failure.code is EvaluationFailureCode.INVALID_RESPONSE
+
+
+def test_overflow_score_fails_closed_without_clamping() -> None:
+    """Reject an overflowing numeric score rather than clamping it into range."""
+    body = (
+        '{"schema_version":"optima-llm-judge-response-v1",'
+        '"score":1e400,"criteria":[],"grounded":null,'
+        '"reason_code":"NO_SPECIFIC_DEFECT","explanation":"overflow"}'
+    )
+    evaluator, _ = build_evaluator(body)
+
+    outcome = asyncio.run(evaluator.evaluate(evaluation_request(), quality_contract()))
+
+    assert outcome.result is None
+    assert outcome.failure is not None
+    assert outcome.failure.code is EvaluationFailureCode.INVALID_RESPONSE
+    assert len(outcome.model_usages) == 1
 
 
 @pytest.mark.parametrize(

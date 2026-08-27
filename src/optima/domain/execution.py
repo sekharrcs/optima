@@ -651,6 +651,7 @@ def validate_semantic_cache_binding(
     run_id: str,
     minimum_quality_score: float,
     request_binding: RequestBinding | None = None,
+    grounding_required: bool = False,
 ) -> SemanticCacheOutcomeContract | None:
     """Validate one plan/profile/cache-evidence boundary consistently."""
     plan_evidence = plan.decision_evidence
@@ -692,6 +693,7 @@ def validate_semantic_cache_binding(
             request_binding=request_binding,
             similarity_threshold=plan_evidence.cache_similarity_threshold,
             minimum_quality_score=minimum_quality_score,
+            grounding_required=grounding_required,
         )
         if evidence.planner_reason_code is not expected_reason:
             raise ValueError("cache evidence must match candidate assessment outcome")
@@ -720,17 +722,63 @@ def validate_semantic_cache_binding(
     ):
         raise ValueError("cache evidence must match the bound candidate")
     source = candidate.prior_evaluation
+    grounding_supported = (not grounding_required) or (
+        source.metadata.get("grounded") is True
+    )
+    evaluator_compatible = assessment is None or assessment.evaluator_compatible
     if not (
         source.evaluator_valid
         and source.passed
         and source.mandatory_checks_passed
         and candidate.similarity >= plan_evidence.cache_similarity_threshold
         and source.score >= minimum_quality_score
+        and grounding_supported
+        and evaluator_compatible
         and candidate.contract_compatible
         and candidate.safe_to_reuse
     ):
         raise ValueError("bound cache candidate does not satisfy reuse gates")
     return contract
+
+
+def derive_cache_reuse_reason(
+    *,
+    candidate_binding: RequestBinding,
+    request_binding: RequestBinding,
+    similarity: float,
+    similarity_threshold: float,
+    prior_evaluation: EvaluationResult,
+    minimum_quality_score: float,
+    grounding_required: bool,
+    evaluator_compatible: bool,
+    contract_compatible: bool,
+    safe_to_reuse: bool,
+) -> PlannerReasonCode:
+    """Return the single controlling cache-reuse reason for one candidate.
+
+    Planner cache assessment and domain cache re-validation share this predicate so a
+    grounding- or evaluator-incompatible candidate is rejected identically on both
+    sides instead of diverging into a run-construction failure.
+    """
+    if candidate_binding != request_binding:
+        return PlannerReasonCode.CACHE_REQUEST_BINDING_MISMATCH
+    if similarity < similarity_threshold:
+        return PlannerReasonCode.CACHE_SIMILARITY_BELOW_THRESHOLD
+    if not prior_evaluation.evaluator_valid:
+        return PlannerReasonCode.CACHE_PRIOR_EVALUATOR_INVALID
+    if not prior_evaluation.passed:
+        return PlannerReasonCode.CACHE_PRIOR_EVALUATION_FAILED
+    if prior_evaluation.score < minimum_quality_score:
+        return PlannerReasonCode.CACHE_QUALITY_BELOW_CONTRACT_THRESHOLD
+    if grounding_required and prior_evaluation.metadata.get("grounded") is not True:
+        return PlannerReasonCode.CACHE_CONTRACT_INCOMPATIBLE
+    if not evaluator_compatible:
+        return PlannerReasonCode.CACHE_CONTRACT_INCOMPATIBLE
+    if not contract_compatible:
+        return PlannerReasonCode.CACHE_CONTRACT_INCOMPATIBLE
+    if not safe_to_reuse:
+        return PlannerReasonCode.CACHE_REUSE_UNSAFE
+    return PlannerReasonCode.CACHE_HIGH_CONFIDENCE_MATCH
 
 
 def _cache_assessment_reason(
@@ -739,21 +787,18 @@ def _cache_assessment_reason(
     request_binding: RequestBinding,
     similarity_threshold: float,
     minimum_quality_score: float,
+    grounding_required: bool,
 ) -> PlannerReasonCode:
     """Return the first controlling Planner V1 cache-assessment reason."""
-    source = assessment.prior_evaluation
-    if assessment.request_binding != request_binding:
-        return PlannerReasonCode.CACHE_REQUEST_BINDING_MISMATCH
-    if assessment.similarity < similarity_threshold:
-        return PlannerReasonCode.CACHE_SIMILARITY_BELOW_THRESHOLD
-    if not source.evaluator_valid:
-        return PlannerReasonCode.CACHE_PRIOR_EVALUATOR_INVALID
-    if not source.passed:
-        return PlannerReasonCode.CACHE_PRIOR_EVALUATION_FAILED
-    if source.score < minimum_quality_score:
-        return PlannerReasonCode.CACHE_QUALITY_BELOW_CONTRACT_THRESHOLD
-    if not assessment.contract_compatible:
-        return PlannerReasonCode.CACHE_CONTRACT_INCOMPATIBLE
-    if not assessment.safe_to_reuse:
-        return PlannerReasonCode.CACHE_REUSE_UNSAFE
-    return PlannerReasonCode.CACHE_HIGH_CONFIDENCE_MATCH
+    return derive_cache_reuse_reason(
+        candidate_binding=assessment.request_binding,
+        request_binding=request_binding,
+        similarity=assessment.similarity,
+        similarity_threshold=similarity_threshold,
+        prior_evaluation=assessment.prior_evaluation,
+        minimum_quality_score=minimum_quality_score,
+        grounding_required=grounding_required,
+        evaluator_compatible=assessment.evaluator_compatible,
+        contract_compatible=assessment.contract_compatible,
+        safe_to_reuse=assessment.safe_to_reuse,
+    )

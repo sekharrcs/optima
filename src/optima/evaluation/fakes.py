@@ -19,13 +19,20 @@ class FakeEvaluator(QualityEvaluator):
         *,
         responses: tuple[EvaluationEvidence, ...],
         threshold_engine: ThresholdEngine | None = None,
+        identity: tuple[str, ...] | None = None,
     ) -> None:
         if not responses:
             raise ValueError("fake evaluators require at least one configured response")
         self._responses = responses
         self._threshold_engine = threshold_engine or ThresholdEngine()
+        self._identity = identity or (responses[0].evaluator_type,)
         self._call_index = 0
         self._calls: list[EvaluatorCall] = []
+
+    @property
+    def evaluator_identity(self) -> tuple[str, ...]:
+        """Return the configured fake evaluator identity for cache compatibility."""
+        return self._identity
 
     @property
     def calls(self) -> tuple[EvaluatorCall, ...]:

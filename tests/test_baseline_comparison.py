@@ -636,6 +636,7 @@ def judge_identity(**updates: JsonValue) -> dict[str, JsonValue]:
     """Build complete versioned LLM-judge comparison identity."""
     values: dict[str, JsonValue] = {
         "prompt_version": "optima-llm-judge-prompt-v1",
+        "request_schema_version": "optima-llm-judge-request-v1",
         "schema_version": "optima-llm-judge-response-v1",
         "judge_model": "judge-model-v1",
         "judge_deployment": "judge-deployment",
@@ -1000,9 +1001,13 @@ def test_request_rejects_different_valid_evaluator_types() -> None:
         ({"judge_deployment": "different-deployment"}, "same evaluator identity"),
         ({"prompt_version": "different-prompt"}, "same evaluator identity"),
         ({"schema_version": "different-schema"}, "same evaluator identity"),
+        (
+            {"request_schema_version": "different-request-schema"},
+            "same evaluator identity",
+        ),
         ({"judge_model": None}, "complete evaluator identity"),
     ],
-    ids=["model", "deployment", "prompt", "schema", "incomplete"],
+    ids=["model", "deployment", "prompt", "schema", "request-schema", "incomplete"],
 )
 def test_request_rejects_incompatible_llm_judge_identity(
     identity_update: dict[str, JsonValue],

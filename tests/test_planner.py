@@ -183,6 +183,105 @@ def test_planner_normalizes_provider_candidate_before_detachment() -> None:
     assert plan.cache_candidate.output_text == "cached output"
 
 
+_JUDGE_IDENTITY = (
+    "llm_judge",
+    "optima-llm-judge-prompt-v1",
+    "optima-llm-judge-request-v1",
+    "optima-llm-judge-response-v1",
+    "judge-model-v1",
+    "judge-deployment",
+)
+
+
+def _judge_prior_evaluation() -> EvaluationResult:
+    """Build a prior llm_judge evaluation with complete identity metadata."""
+    return EvaluationResult(
+        evaluator_type="llm_judge",
+        evaluator_valid=True,
+        score=0.90,
+        threshold=0.80,
+        mandatory_checks_passed=True,
+        passed=True,
+        reasons=("Accepted",),
+        metadata={
+            "prompt_version": "optima-llm-judge-prompt-v1",
+            "request_schema_version": "optima-llm-judge-request-v1",
+            "schema_version": "optima-llm-judge-response-v1",
+            "judge_model": "judge-model-v1",
+            "judge_deployment": "judge-deployment",
+        },
+    )
+
+
+def _exact_prior_evaluation() -> EvaluationResult:
+    """Build a prior exact-reference evaluation."""
+    return EvaluationResult(
+        evaluator_type="exact_reference",
+        evaluator_valid=True,
+        score=0.90,
+        threshold=0.80,
+        mandatory_checks_passed=True,
+        passed=True,
+        reasons=("Accepted",),
+    )
+
+
+def test_cache_rejects_prior_llm_judge_for_current_exact_reference() -> None:
+    """Never reuse model-judged quality to satisfy an exact-reference request."""
+    plan = require_plan(
+        select_plan(
+            planner_input(
+                cache_candidate=cache_candidate(
+                    prior_evaluation=_judge_prior_evaluation()
+                ),
+                current_evaluator_identity=("exact_reference",),
+            )
+        )
+    )
+
+    assert plan.cache_policy is CachePolicy.SKIP
+    assert PlannerReasonCode.CACHE_CONTRACT_INCOMPATIBLE in plan.reason_codes
+    assert plan.cache_candidate_assessment is not None
+    assert plan.cache_candidate_assessment.evaluator_compatible is False
+
+
+def test_cache_rejects_prior_exact_reference_for_current_llm_judge() -> None:
+    """Never reuse exact-reference quality to satisfy a reference-free judge request."""
+    plan = require_plan(
+        select_plan(
+            planner_input(
+                cache_candidate=cache_candidate(
+                    prior_evaluation=_exact_prior_evaluation()
+                ),
+                current_evaluator_identity=_JUDGE_IDENTITY,
+            )
+        )
+    )
+
+    assert plan.cache_policy is CachePolicy.SKIP
+    assert PlannerReasonCode.CACHE_CONTRACT_INCOMPATIBLE in plan.reason_codes
+    assert plan.cache_candidate_assessment is not None
+    assert plan.cache_candidate_assessment.evaluator_compatible is False
+
+
+def test_cache_reuses_prior_llm_judge_under_matching_identity() -> None:
+    """Reuse only when the current evaluator identity matches the prior judge."""
+    plan = require_plan(
+        select_plan(
+            planner_input(
+                cache_candidate=cache_candidate(
+                    prior_evaluation=_judge_prior_evaluation()
+                ),
+                current_evaluator_identity=_JUDGE_IDENTITY,
+            )
+        )
+    )
+
+    assert plan.cache_policy is CachePolicy.USE_CACHED_RESULT
+    assert plan.cache_candidate_assessment is not None
+    assert plan.cache_candidate_assessment.evaluator_compatible is True
+
+
 def test_planner_input_revalidates_constructed_candidate_evidence() -> None:
     """Reject unchecked nested evaluator evidence at the provider boundary."""
     accepted = accepted_evaluation()
