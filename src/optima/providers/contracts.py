@@ -1,6 +1,7 @@
 """Provider-independent model request and response contracts."""
 
 from collections.abc import Mapping
+from enum import StrEnum
 from time import perf_counter
 from typing import Annotated, Protocol, runtime_checkable
 
@@ -11,6 +12,13 @@ from optima.domain.run import ModelUsage
 
 NonEmptyString = Annotated[str, Field(strict=True, min_length=1)]
 NonNegativeCount = Annotated[int, Field(strict=True, ge=0)]
+
+
+class ModelResponseFormat(StrEnum):
+    """Provider-independent response representations requested from a model."""
+
+    TEXT = "TEXT"
+    JSON_OBJECT = "JSON_OBJECT"
 
 
 @runtime_checkable
@@ -33,8 +41,10 @@ class ModelProviderRequest(BaseModel):
 
     run_id: NonEmptyString
     model_role: ModelRole
+    system_instruction: NonEmptyString | None = None
     input_text: NonEmptyString
     context: NonEmptyString | None = None
+    response_format: ModelResponseFormat = ModelResponseFormat.TEXT
     metadata: Mapping[str, str] = Field(default_factory=dict)
 
 

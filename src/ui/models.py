@@ -22,6 +22,7 @@ class ExecuteInputs(BaseModel):
     input_tokens: int = Field(default=500, ge=0)
     profile_risk_tier: RiskTier = RiskTier.LOW
     contract_risk_tier: RiskTier = RiskTier.LOW
+    grounding_required: bool = False
     cache_eligible: bool = False
     has_large_context: bool = False
     max_latency_ms: int | None = Field(default=None, gt=0)
@@ -43,6 +44,7 @@ class ExecuteInputs(BaseModel):
             quality_profile=self.quality_profile,
             optimization_mode=self.optimization_mode,
             risk_tier=self.contract_risk_tier,
+            grounding_required=self.grounding_required,
             max_latency_ms=self.max_latency_ms,
             metadata={"request_profile_source": "user_supplied_demo_input"},
         )

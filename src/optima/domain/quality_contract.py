@@ -70,6 +70,7 @@ class QualityContract(ImmutableModel):
     minimum_quality_score: QualityScore
     optimization_mode: OptimizationMode
     risk_tier: RiskTier
+    grounding_required: Annotated[bool, Field(strict=True)] = False
     max_latency_ms: PositiveMilliseconds | None = None
 
 
@@ -78,6 +79,7 @@ def build_quality_contract(
     quality_profile: QualityProfile,
     optimization_mode: OptimizationMode,
     risk_tier: RiskTier,
+    grounding_required: bool = False,
     max_latency_ms: int | None = None,
     thresholds: QualityThresholds | None = None,
 ) -> QualityContract:
@@ -88,5 +90,6 @@ def build_quality_contract(
         minimum_quality_score=configured_thresholds.for_profile(quality_profile),
         optimization_mode=optimization_mode,
         risk_tier=risk_tier,
+        grounding_required=grounding_required,
         max_latency_ms=max_latency_ms,
     )

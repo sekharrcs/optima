@@ -30,6 +30,7 @@ from optima.evaluation import (
     DeterministicEvaluator,
     ExactReferenceMeasurement,
     FakeEvaluator,
+    LLMJudgeEvaluator,
 )
 from optima.observability.noop import NO_OP_RUN, NoOpRunObservation
 from optima.providers import (
@@ -159,6 +160,34 @@ class EmbeddingResources:
             raise RuntimeError("embedding close failed")
 
 
+@dataclass
+class JudgeResources:
+    """Fake judge resources with one close boundary."""
+
+    events: list[str]
+    fail_close: bool = False
+    provider: FakeModelProvider = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.provider = FakeModelProvider(
+            provider_name="foundry",
+            deployment_name="judge",
+            model_role=ModelRole.JUDGE,
+            responses=(
+                FakeProviderResponse(
+                    output_text="{}",
+                    input_tokens=1,
+                    output_tokens=1,
+                ),
+            ),
+        )
+
+    async def aclose(self) -> None:
+        self.events.append("close:judge")
+        if self.fail_close:
+            raise RuntimeError("judge close failed")
+
+
 class RedisClient:
     """Unused command boundary supplied to the injected bootstrap."""
 
@@ -206,7 +235,9 @@ def component_builders(
     events: list[str],
     *,
     bootstrap_error: Exception | None = None,
+    embedding_build_error: Exception | None = None,
     embedding_close_error: bool = False,
+    judge_close_error: bool = False,
     cosmos_close_error: bool = False,
 ) -> ProductionComponentBuilders:
     """Build an injectable production component graph with event recording."""
@@ -222,11 +253,17 @@ def component_builders(
 
     def build_embedding(settings: AppSettings) -> EmbeddingResources:
         events.append("build:embedding")
+        if embedding_build_error is not None:
+            raise embedding_build_error
         return EmbeddingResources(
             events,
             profile,
             fail_close=embedding_close_error,
         )
+
+    def build_judge(settings: AppSettings) -> JudgeResources:
+        events.append("build:judge")
+        return JudgeResources(events, fail_close=judge_close_error)
 
     def build_redis(
         settings: AppSettings,
@@ -253,11 +290,24 @@ def component_builders(
 
     return ProductionComponentBuilders(
         foundry=build_foundry,
+        judge=build_judge,
         embedding=build_embedding,
         redis=build_redis,
         cosmos=build_cosmos,
         bootstrap_index=bootstrap_index,
     )
+
+
+def llm_judge_settings(**updates: object) -> AppSettings:
+    """Build complete reference-free production settings."""
+    values: dict[str, object] = {
+        "production_evaluator_mode": ProductionEvaluatorMode.LLM_JUDGE,
+        "production_require_reference_output": False,
+        "judge_deployment": "judge",
+        "judge_model": "judge-model-v1",
+    }
+    values.update(updates)
+    return production_settings().model_copy(update=values)
 
 
 def test_production_runtime_constructs_expected_graph_and_closes_once() -> None:
@@ -384,6 +434,64 @@ def test_production_runtime_uses_reviewed_deterministic_evaluator() -> None:
     assert isinstance(evaluator._measurement, ExactReferenceMeasurement)
 
 
+def test_production_runtime_builds_and_closes_llm_judge_once() -> None:
+    """Own one explicit judge resource for the entire application lifetime."""
+    events: list[str] = []
+    runtime = asyncio.run(
+        build_production_runtime(
+            llm_judge_settings(),
+            observability=RecordingObservability(events),
+            builders=component_builders(events),
+        )
+    )
+    evaluator = runtime.dependencies.evaluator
+
+    asyncio.run(runtime.aclose())
+    asyncio.run(runtime.aclose())
+
+    assert not isinstance(evaluator, FakeEvaluator)
+    assert isinstance(evaluator, LLMJudgeEvaluator)
+    assert events.count("build:judge") == 1
+    assert events.count("close:judge") == 1
+    assert events[-6:] == [
+        "close:cosmos",
+        "close:redis",
+        "close:embedding",
+        "close:judge",
+        "close:foundry",
+        "close:telemetry",
+    ]
+
+
+def test_partial_startup_failure_closes_owned_judge_resource() -> None:
+    """Release judge transport when a later production component fails to build."""
+    events: list[str] = []
+    startup_error = RuntimeError("embedding build failed")
+
+    with pytest.raises(RuntimeError, match="embedding build failed") as captured:
+        asyncio.run(
+            build_production_runtime(
+                llm_judge_settings(),
+                observability=RecordingObservability(events),
+                builders=component_builders(
+                    events,
+                    embedding_build_error=startup_error,
+                    judge_close_error=True,
+                ),
+            )
+        )
+
+    assert captured.value is startup_error
+    assert events == [
+        "build:foundry",
+        "build:judge",
+        "build:embedding",
+        "close:judge",
+        "close:foundry",
+        "close:telemetry",
+    ]
+
+
 def test_production_runtime_unpriced_catalog_keeps_cost_unavailable() -> None:
     """Keep monetary cost unavailable when no reviewed rates are configured."""
     events: list[str] = []
@@ -447,6 +555,74 @@ def test_production_runtime_prices_usage_from_configured_catalog() -> None:
     assert calculated.amount == Decimal("0.75")
     assert calculated.provenance.catalog_version == "foundry-apim-2026-01-01"
     assert calculated.provenance.currency == "USD"
+
+
+def test_production_runtime_prices_judge_from_its_configured_deployment() -> None:
+    """Key evaluator economics to explicit judge identity and catalog provenance."""
+    events: list[str] = []
+    settings = llm_judge_settings(
+        pricing_catalog_version="foundry-apim-2026-01-01",
+        pricing_small_input_rate_per_million_tokens=Decimal("0.15"),
+        pricing_small_output_rate_per_million_tokens=Decimal("0.60"),
+        pricing_strong_input_rate_per_million_tokens=Decimal("2.50"),
+        pricing_strong_output_rate_per_million_tokens=Decimal("10.00"),
+        pricing_judge_input_rate_per_million_tokens=Decimal("0.25"),
+        pricing_judge_output_rate_per_million_tokens=Decimal("1.25"),
+        pricing_embedding_input_rate_per_million_tokens=Decimal("0.02"),
+    )
+    runtime = asyncio.run(
+        build_production_runtime(
+            settings,
+            observability=RecordingObservability(events),
+            builders=component_builders(events),
+        )
+    )
+
+    calculated = runtime.dependencies.cost_calculator.calculate(
+        ModelUsage(
+            run_id="run-cost",
+            provider=FOUNDRY_PROVIDER_NAME,
+            deployment="judge",
+            model_role=ModelRole.JUDGE,
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+            latency_ms=5,
+        )
+    )
+    asyncio.run(runtime.aclose())
+
+    assert calculated is not None
+    assert calculated.amount == Decimal("1.50")
+    assert calculated.provenance.catalog_version == "foundry-apim-2026-01-01"
+    assert calculated.provenance.currency == "USD"
+
+
+def test_production_pricing_names_colliding_role_deployments() -> None:
+    """Fail closed with the exact roles when a deployment is shared across keys."""
+    events: list[str] = []
+    settings = llm_judge_settings(
+        judge_deployment="small",
+        pricing_catalog_version="foundry-apim-2026-01-01",
+        pricing_small_input_rate_per_million_tokens=Decimal("0.15"),
+        pricing_small_output_rate_per_million_tokens=Decimal("0.60"),
+        pricing_strong_input_rate_per_million_tokens=Decimal("2.50"),
+        pricing_strong_output_rate_per_million_tokens=Decimal("10.00"),
+        pricing_judge_input_rate_per_million_tokens=Decimal("0.25"),
+        pricing_judge_output_rate_per_million_tokens=Decimal("1.25"),
+        pricing_embedding_input_rate_per_million_tokens=Decimal("0.02"),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="SMALL and JUDGE roles both use deployment 'small'",
+    ):
+        asyncio.run(
+            build_production_runtime(
+                settings,
+                observability=RecordingObservability(events),
+                builders=component_builders(events),
+            )
+        )
 
 
 def test_production_runtime_requires_pricing_when_cost_measurement_required() -> None:

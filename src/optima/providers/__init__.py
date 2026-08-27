@@ -5,6 +5,7 @@ from optima.providers.contracts import (
     ModelProviderCall,
     ModelProviderRequest,
     ModelProviderResult,
+    ModelResponseFormat,
     MonotonicClock,
 )
 from optima.providers.fakes import (
@@ -39,6 +40,7 @@ __all__ = [
     "ModelProviderCall",
     "ModelProviderRequest",
     "ModelProviderResult",
+    "ModelResponseFormat",
     "MonotonicClock",
     "build_fake_small_provider",
     "build_fake_strong_provider",

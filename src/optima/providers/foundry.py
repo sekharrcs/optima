@@ -22,6 +22,7 @@ from optima.providers.contracts import (
     ModelProvider,
     ModelProviderRequest,
     ModelProviderResult,
+    ModelResponseFormat,
     MonotonicClock,
     system_monotonic_time,
     validate_usage_alignment,
@@ -40,11 +41,13 @@ class FoundryProviderError(RuntimeError):
         message: str,
         status_code: int | None = None,
         retry_after_ms: int | None = None,
+        outbound_attempted: bool = True,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.status_code = status_code
         self.retry_after_ms = retry_after_ms
+        self.outbound_attempted = outbound_attempted
 
 
 class FoundryAuthentication(Protocol):
@@ -87,6 +90,7 @@ class EntraTokenAuthentication:
             raise FoundryProviderError(
                 code="AUTHENTICATION_FAILED",
                 message="Microsoft Entra authentication failed.",
+                outbound_attempted=False,
             ) from error
         return {"Authorization": f"Bearer {access_token.token}"}
 
@@ -107,6 +111,7 @@ class FoundryModelProvider(ModelProvider):
         authentication: FoundryAuthentication,
         client: httpx.AsyncClient,
         provider_name: str = FOUNDRY_PROVIDER_NAME,
+        expected_response_model: str | None = None,
         clock: MonotonicClock | None = None,
     ) -> None:
         self._base_url = _normalize_base_url(base_url)
@@ -117,6 +122,9 @@ class FoundryModelProvider(ModelProvider):
         self.deployment_name = deployment_name
         self.model_role = model_role
         self.provider_name = provider_name
+        if expected_response_model is not None and not expected_response_model:
+            raise ValueError("expected_response_model must not be empty")
+        self._expected_response_model = expected_response_model
         self._authentication = authentication
         self._client = client
         self._clock = clock
@@ -135,13 +143,16 @@ class FoundryModelProvider(ModelProvider):
         started_at = clock_now()
         headers = await self._authentication.headers()
         try:
+            body: dict[str, object] = {
+                "model": self.deployment_name,
+                "messages": _messages(request),
+            }
+            if request.response_format is ModelResponseFormat.JSON_OBJECT:
+                body["response_format"] = {"type": "json_object"}
             response = await self._client.post(
                 f"{self._base_url}/chat/completions",
                 headers=headers,
-                json={
-                    "model": self.deployment_name,
-                    "messages": _messages(request),
-                },
+                json=body,
             )
         except httpx.TimeoutException as error:
             raise TimeoutError("Foundry model request timed out.") from error
@@ -157,7 +168,10 @@ class FoundryModelProvider(ModelProvider):
             raise _status_error(response)
 
         latency_ms = max(0, int(round((clock_now() - started_at) * 1000)))
-        output_text, request_id, usage_values = _parse_response(response)
+        output_text, request_id, usage_values = _parse_response(
+            response,
+            expected_model=self._expected_response_model,
+        )
         usage = ModelUsage(
             request_id=request_id,
             run_id=request.run_id,
@@ -393,6 +407,8 @@ def _is_forbidden_url_control(character: str) -> bool:
 
 def _messages(request: ModelProviderRequest) -> list[dict[str, str]]:
     messages: list[dict[str, str]] = []
+    if request.system_instruction is not None:
+        messages.append({"role": "system", "content": request.system_instruction})
     if request.context is not None:
         messages.append({"role": "user", "content": request.context})
     messages.append({"role": "user", "content": request.input_text})
@@ -433,12 +449,16 @@ def _retry_after_ms(headers: httpx.Headers) -> int | None:
 
 def _parse_response(
     response: httpx.Response,
+    *,
+    expected_model: str | None = None,
 ) -> tuple[str, str | None, tuple[int | None, int | None, int | None, int | None]]:
     try:
         body = response.json()
     except ValueError as error:
         raise _invalid_response() from error
     if not isinstance(body, dict):
+        raise _invalid_response()
+    if expected_model is not None and body.get("model") != expected_model:
         raise _invalid_response()
 
     choices = body.get("choices")

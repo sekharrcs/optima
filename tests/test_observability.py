@@ -60,6 +60,7 @@ from optima.observability import (
     CacheLookupResult,
     CacheStageOutcome,
     ContextStageOutcome,
+    EvaluationStageOutcome,
     FailureCategory,
     InMemoryObservability,
     ModelStageOutcome,
@@ -309,7 +310,7 @@ def cache_candidate(payload: dict[str, object]) -> CacheCandidate:
         request_binding=binding,
         similarity=0.99,
         prior_evaluation=EvaluationResult(
-            evaluator_type="source-evaluator",
+            evaluator_type="fake-deterministic",
             evaluator_valid=True,
             score=0.96,
             threshold=0.80,
@@ -2146,6 +2147,51 @@ def test_concurrent_runs_keep_isolated_span_parentage() -> None:
             child.parent is not None and child.parent.span_id not in other_span_ids
             for child in children
         )
+
+
+def test_evaluation_span_records_bounded_judge_usage_without_content() -> None:
+    """Expose evaluator identity and usage without prompts, answers, or context."""
+    observer, exporter, _, _, _ = local_otel_observer()
+
+    with observer.start_run(
+        run_id="run-judge-observation",
+        correlation_id="correlation-judge-observation",
+    ) as run:
+        with run.start_stage(ObservationStage.EVALUATION_EVALUATE) as stage:
+            stage.finish(
+                EvaluationStageOutcome(
+                    status=ObservationStatus.SUCCEEDED,
+                    model_role=ModelRole.SMALL,
+                    latency_ms=12,
+                    evaluator_type="llm_judge",
+                    judge_model_role=ModelRole.JUDGE,
+                    judge_deployment="judge-deployment",
+                    judge_input_tokens=101,
+                    judge_output_tokens=19,
+                    judge_cached_tokens=0,
+                    evaluator_valid=True,
+                    score=0.93,
+                    passed=True,
+                )
+            )
+
+    span = next(
+        item
+        for item in exporter.get_finished_spans()
+        if item.name == ObservationStage.EVALUATION_EVALUATE.value
+    )
+    attributes = dict(span.attributes or {})
+    assert attributes["optima.evaluation.type"] == "llm_judge"
+    assert attributes["optima.evaluation.judge.model_role"] == "JUDGE"
+    assert attributes["optima.evaluation.judge.deployment"] == "judge-deployment"
+    assert attributes["optima.evaluation.judge.input_tokens"] == 101
+    assert attributes["optima.evaluation.judge.output_tokens"] == 19
+    assert attributes["optima.evaluation.judge.cached_tokens"] == 0
+    serialized = repr(attributes)
+    assert "SECRET_PROMPT" not in serialized
+    assert "SECRET_CONTEXT" not in serialized
+    assert "SECRET_MODEL_OUTPUT" not in serialized
+    assert "SECRET_REFERENCE" not in serialized
 
 
 def test_concurrent_http_requests_have_distinct_trace_trees() -> None:

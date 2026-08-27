@@ -6,6 +6,7 @@ from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from optima.domain.evaluation import EvaluationResult, evaluator_identity_of
 from optima.domain.quality_contract import QualityScore
 from optima.domain.run import PricingProvenance, RunResult
 
@@ -93,10 +94,23 @@ class BaselineComparisonRequest(BaseModel):
             and baseline_evaluation.evaluator_valid
             and optima_evaluation is not None
             and optima_evaluation.evaluator_valid
-            and baseline_evaluation.evaluator_type != optima_evaluation.evaluator_type
+            and _evaluator_identity(baseline_evaluation)
+            != _evaluator_identity(optima_evaluation)
         ):
-            raise ValueError("valid final evaluations must use the same evaluator type")
+            raise ValueError(
+                "valid final evaluations must use the same evaluator identity"
+            )
         return self
+
+
+def _evaluator_identity(evaluation: EvaluationResult) -> tuple[str, ...]:
+    """Return complete measurement identity for comparison compatibility."""
+    identity = evaluator_identity_of(evaluation)
+    if identity is None:
+        raise ValueError(
+            "valid llm_judge evaluations require complete evaluator identity"
+        )
+    return identity
 
 
 class ExecutionMetrics(BaseModel):

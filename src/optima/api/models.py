@@ -22,6 +22,7 @@ class RunRequest(BaseModel):
     quality_profile: QualityProfile
     optimization_mode: OptimizationMode
     risk_tier: RiskTier
+    grounding_required: Annotated[bool, Field(strict=True)] = False
     max_latency_ms: PositiveMilliseconds | None = None
     reference_output: NonEmptyString | None = None
     criteria: tuple[NonEmptyString, ...] = ()

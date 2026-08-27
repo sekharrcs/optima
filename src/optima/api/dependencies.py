@@ -81,6 +81,25 @@ class FoundryProviderPair:
                     close()
 
 
+@dataclass(frozen=True)
+class FoundryJudgeResources:
+    """One explicit JUDGE-role provider with owned transport and credential."""
+
+    provider: FoundryModelProvider
+    http_client: httpx.AsyncClient = field(repr=False)
+    credential: TokenCredential | None = field(default=None, repr=False)
+
+    async def aclose(self) -> None:
+        """Close judge transport and any selected Azure Identity credential."""
+        try:
+            await self.http_client.aclose()
+        finally:
+            if self.credential is not None:
+                close = getattr(self.credential, "close", None)
+                if callable(close):
+                    close()
+
+
 def build_foundry_provider_pair(
     settings: AppSettings,
     *,
@@ -131,6 +150,59 @@ def build_foundry_provider_pair(
             model_role=ModelRole.STRONG,
             authentication=authentication,
             client=client,
+            clock=monotonic_clock,
+        ),
+        http_client=client,
+        credential=credential,
+    )
+
+
+def build_foundry_judge_provider(
+    settings: AppSettings,
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
+    monotonic_clock: MonotonicClock | None = None,
+) -> FoundryJudgeResources:
+    """Create one separately configured JUDGE-role Foundry adapter."""
+    configuration = settings.foundry_provider_configuration()
+    if configuration is None:
+        raise ValueError("Foundry provider settings are not configured")
+    judge = settings.judge_provider_configuration()
+    if judge is None:
+        raise ValueError("LLM judge provider settings are not configured")
+
+    credential: TokenCredential | None = None
+    authentication: FoundryAuthentication
+    if configuration.auth_mode is FoundryAuthMode.API_KEY:
+        if configuration.api_key is None:
+            raise AssertionError("validated API-key configuration requires a key")
+        authentication = ApiKeyAuthentication(configuration.api_key.get_secret_value())
+    else:
+        if configuration.token_scope is None:
+            raise AssertionError("validated Entra configuration requires a scope")
+        if configuration.auth_mode is FoundryAuthMode.AZURE_CLI:
+            credential = AzureCliCredential()
+        else:
+            credential = ManagedIdentityCredential(
+                client_id=configuration.managed_identity_client_id
+            )
+        authentication = EntraTokenAuthentication(
+            credential,
+            configuration.token_scope,
+        )
+
+    client = httpx.AsyncClient(
+        timeout=httpx.Timeout(judge.timeout_seconds),
+        transport=transport,
+    )
+    return FoundryJudgeResources(
+        provider=FoundryModelProvider(
+            base_url=configuration.base_url,
+            deployment_name=judge.deployment,
+            model_role=ModelRole.JUDGE,
+            authentication=authentication,
+            client=client,
+            expected_response_model=judge.model,
             clock=monotonic_clock,
         ),
         http_client=client,

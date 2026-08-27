@@ -524,13 +524,34 @@ never a shared mutable tag. Slice 11C must preflight Managed Redis registration,
 Balanced B0 support, quota, and service availability in East US 2. Allocation
 failure stops deployment; no fallback region is selected automatically.
 
-## ADR-034: Require reference evidence for the current production evaluator
+## ADR-034: Require reference evidence for the initial production evaluator
+
+Status: Superseded by ADR-035
+
+Slice 11B initially allowed only exact-reference production evaluation. The API
+rejected missing reference evidence before paid work. ADR-035 preserves this
+benchmark mode and adds the separately reviewed reference-free path.
+
+## ADR-035: Add an explicit reference-free LLM judge mode
 
 Status: Accepted
 
-The only reviewed production evaluator currently available is exact-reference.
-Production configuration must select `EXACT_REFERENCE` and require a reference
-output. The API rejects a missing reference before cache lookup or model
-generation, preventing paid execution that cannot produce valid evaluator
-evidence. Reference-free production requests remain unsupported until a
-separately reviewed evaluator includes truthful quality and cost accounting.
+Production configuration selects exactly one evaluator mode. `EXACT_REFERENCE`
+remains deterministic benchmark measurement and requires `reference_output`.
+`LLM_JUDGE` requires a separately configured JUDGE deployment, model identity,
+and timeout, and must not require or consume `reference_output`. Production never
+falls back between modes or to a fake evaluator.
+
+The judge emits strict `optima-llm-judge-response-v1` measurement evidence under
+prompt `optima-llm-judge-prompt-v1`. `ThresholdEngine` applies the existing Quality
+Contract threshold and mandatory checks. Invalid output, provider failure,
+timeout, missing required grounding context, and contradictory evidence fail
+closed without a fabricated score. No evaluator-level retry is configured.
+
+JUDGE calls use an explicit model role and appear in run usage, token totals,
+central Decimal cost calculation, pricing provenance, traces, and metrics. Missing
+or indeterminate judge pricing makes total cost unavailable. The candidate and
+required context cross the configured judge-model data boundary, but raw judged
+content and responses are not logged. LLM-judge scores remain estimates subject
+to bias, self-preference, prompt sensitivity, stochastic and model-version effects,
+and generator-judge correlation.

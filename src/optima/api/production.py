@@ -14,6 +14,7 @@ from optima.api.app import create_app
 from optima.api.dependencies import (
     ExecutionDependencies,
     build_foundry_embedding_provider,
+    build_foundry_judge_provider,
     build_foundry_provider_pair,
 )
 from optima.cache import (
@@ -27,7 +28,12 @@ from optima.config import AppSettings, ProductionEvaluatorMode
 from optima.context import DeterministicExtractiveReducer, RegexTokenCounter
 from optima.context.safety import DeterministicExtractiveSafetyPolicy
 from optima.cost import CostCalculator, PriceCatalog, PriceCatalogEntry
-from optima.evaluation import DeterministicEvaluator, ExactReferenceMeasurement
+from optima.evaluation import (
+    DeterministicEvaluator,
+    ExactReferenceMeasurement,
+    LLMJudgeEvaluator,
+    QualityEvaluator,
+)
 from optima.observability import Observability
 from optima.observability.azure_monitor import build_observability
 from optima.providers import FOUNDRY_PROVIDER_NAME, ModelProvider
@@ -73,6 +79,19 @@ class EmbeddingResources(Protocol):
         ...
 
 
+class JudgeResources(Protocol):
+    """JUDGE-role provider and close boundary required by LLM evaluation."""
+
+    @property
+    def provider(self) -> ModelProvider:
+        """Return the separately configured JUDGE role provider."""
+        ...
+
+    async def aclose(self) -> None:
+        """Close judge transport and credential."""
+        ...
+
+
 class RedisResources(Protocol):
     """Cache, client, and close boundary required by production composition."""
 
@@ -109,6 +128,7 @@ class ProductionComponentBuilders:
     """Injectable constructors for independently testing lifecycle ownership."""
 
     foundry: Callable[[AppSettings], FoundryResources]
+    judge: Callable[[AppSettings], JudgeResources]
     embedding: Callable[[AppSettings], EmbeddingResources]
     redis: Callable[
         [AppSettings, SemanticCacheEmbeddingProvider],
@@ -120,6 +140,7 @@ class ProductionComponentBuilders:
 
 DEFAULT_PRODUCTION_BUILDERS = ProductionComponentBuilders(
     foundry=build_foundry_provider_pair,
+    judge=build_foundry_judge_provider,
     embedding=build_foundry_embedding_provider,
     redis=build_redis_semantic_cache_resources,
     cosmos=build_cosmos_run_history_resources,
@@ -174,46 +195,104 @@ def _build_price_catalog(settings: AppSettings) -> PriceCatalog:
         raise AssertionError(
             "validated production settings require Foundry and Redis for pricing"
         )
+    entries = [
+        PriceCatalogEntry(
+            provider=FOUNDRY_PROVIDER_NAME,
+            deployment=foundry.small_deployment,
+            input_rate_per_million_tokens=(inputs.small.input_rate_per_million_tokens),
+            output_rate_per_million_tokens=(
+                inputs.small.output_rate_per_million_tokens
+            ),
+            cached_input_rate_per_million_tokens=(
+                inputs.small.cached_input_rate_per_million_tokens
+            ),
+        ),
+        PriceCatalogEntry(
+            provider=FOUNDRY_PROVIDER_NAME,
+            deployment=foundry.strong_deployment,
+            input_rate_per_million_tokens=(inputs.strong.input_rate_per_million_tokens),
+            output_rate_per_million_tokens=(
+                inputs.strong.output_rate_per_million_tokens
+            ),
+            cached_input_rate_per_million_tokens=(
+                inputs.strong.cached_input_rate_per_million_tokens
+            ),
+        ),
+        PriceCatalogEntry(
+            provider=FOUNDRY_PROVIDER_NAME,
+            deployment=redis.embedding_deployment,
+            input_rate_per_million_tokens=(
+                inputs.embedding_input_rate_per_million_tokens
+            ),
+            output_rate_per_million_tokens=Decimal("0"),
+        ),
+    ]
+    judge_deployment: str | None = None
+    if inputs.judge is not None:
+        judge = settings.judge_provider_configuration()
+        if judge is None:
+            raise ValueError(
+                "Production JUDGE pricing requires configured judge deployment"
+            )
+        judge_deployment = judge.deployment
+        entries.append(
+            PriceCatalogEntry(
+                provider=FOUNDRY_PROVIDER_NAME,
+                deployment=judge.deployment,
+                input_rate_per_million_tokens=(
+                    inputs.judge.input_rate_per_million_tokens
+                ),
+                output_rate_per_million_tokens=(
+                    inputs.judge.output_rate_per_million_tokens
+                ),
+                cached_input_rate_per_million_tokens=(
+                    inputs.judge.cached_input_rate_per_million_tokens
+                ),
+            )
+        )
+    _reject_shared_role_deployments(
+        small=foundry.small_deployment,
+        strong=foundry.strong_deployment,
+        embedding=redis.embedding_deployment,
+        judge=judge_deployment,
+    )
     return PriceCatalog(
         version=inputs.catalog_version,
         currency=inputs.currency,
-        entries=(
-            PriceCatalogEntry(
-                provider=FOUNDRY_PROVIDER_NAME,
-                deployment=foundry.small_deployment,
-                input_rate_per_million_tokens=(
-                    inputs.small.input_rate_per_million_tokens
-                ),
-                output_rate_per_million_tokens=(
-                    inputs.small.output_rate_per_million_tokens
-                ),
-                cached_input_rate_per_million_tokens=(
-                    inputs.small.cached_input_rate_per_million_tokens
-                ),
-            ),
-            PriceCatalogEntry(
-                provider=FOUNDRY_PROVIDER_NAME,
-                deployment=foundry.strong_deployment,
-                input_rate_per_million_tokens=(
-                    inputs.strong.input_rate_per_million_tokens
-                ),
-                output_rate_per_million_tokens=(
-                    inputs.strong.output_rate_per_million_tokens
-                ),
-                cached_input_rate_per_million_tokens=(
-                    inputs.strong.cached_input_rate_per_million_tokens
-                ),
-            ),
-            PriceCatalogEntry(
-                provider=FOUNDRY_PROVIDER_NAME,
-                deployment=redis.embedding_deployment,
-                input_rate_per_million_tokens=(
-                    inputs.embedding_input_rate_per_million_tokens
-                ),
-                output_rate_per_million_tokens=Decimal("0"),
-            ),
-        ),
+        entries=tuple(entries),
     )
+
+
+def _reject_shared_role_deployments(
+    *,
+    small: str,
+    strong: str,
+    embedding: str,
+    judge: str | None,
+) -> None:
+    """Fail closed with the exact colliding roles when deployments are shared.
+
+    The price catalog requires a distinct provider/deployment key per role so each
+    role's monetary cost is billed separately; a shared deployment would otherwise
+    surface only as an opaque uniqueness error during catalog construction.
+    """
+    role_deployments = [
+        ("SMALL", small),
+        ("STRONG", strong),
+        ("embedding", embedding),
+    ]
+    if judge is not None:
+        role_deployments.append(("JUDGE", judge))
+    seen: dict[str, str] = {}
+    for role, deployment in role_deployments:
+        existing = seen.get(deployment)
+        if existing is not None:
+            raise ValueError(
+                "Production pricing requires a distinct Foundry deployment per role; "
+                f"the {existing} and {role} roles both use deployment "
+                f"'{deployment}', which the price catalog cannot bill separately"
+            )
+        seen[deployment] = role
 
 
 async def build_production_runtime(
@@ -228,6 +307,10 @@ async def build_production_runtime(
     try:
         foundry = builders.foundry(settings)
         closers.append(foundry.aclose)
+        judge_resources: JudgeResources | None = None
+        if settings.production_evaluator_mode is ProductionEvaluatorMode.LLM_JUDGE:
+            judge_resources = builders.judge(settings)
+            closers.append(judge_resources.aclose)
         embedding = builders.embedding(settings)
         closers.append(embedding.aclose)
         redis = builders.redis(settings, embedding.provider)
@@ -243,19 +326,30 @@ async def build_production_runtime(
         cosmos = builders.cosmos(settings)
         closers.append(cosmos.aclose)
 
+        evaluator: QualityEvaluator
         if (
             settings.production_evaluator_mode
-            is not ProductionEvaluatorMode.EXACT_REFERENCE
+            is ProductionEvaluatorMode.EXACT_REFERENCE
         ):
-            raise AssertionError("validated production settings require an evaluator")
+            evaluator = DeterministicEvaluator(
+                measurement=ExactReferenceMeasurement(),
+            )
+        else:
+            judge_configuration = settings.judge_provider_configuration()
+            if judge_resources is None or judge_configuration is None:
+                raise AssertionError(
+                    "validated LLM_JUDGE settings require judge resources"
+                )
+            evaluator = LLMJudgeEvaluator(
+                provider=judge_resources.provider,
+                judge_model=judge_configuration.model,
+            )
         token_counter = RegexTokenCounter()
         dependencies = ExecutionDependencies(
             settings=settings,
             small_provider=foundry.small_provider,
             strong_provider=foundry.strong_provider,
-            evaluator=DeterministicEvaluator(
-                measurement=ExactReferenceMeasurement(),
-            ),
+            evaluator=evaluator,
             cost_calculator=CostCalculator(_build_price_catalog(settings)),
             run_history_store=cosmos.store,
             semantic_cache=redis.cache,

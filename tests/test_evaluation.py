@@ -5,7 +5,11 @@ import asyncio
 import pytest
 from pydantic import ValidationError
 
-from optima.domain.evaluation import EvaluationResult
+from optima.domain.evaluation import (
+    EvaluationResult,
+    evaluator_identities_compatible,
+    evaluator_identity_of,
+)
 from optima.domain.quality_contract import (
     OptimizationMode,
     QualityContract,
@@ -18,6 +22,7 @@ from optima.evaluation import (
     DeterministicEvaluator,
     DeterministicMeasurement,
     EvaluationEvidence,
+    EvaluationFailureCode,
     EvaluationReasonCode,
     EvaluationRequest,
     ExactReferenceMeasurement,
@@ -41,6 +46,86 @@ def evaluation_result(**updates: object) -> EvaluationResult:
     }
     values.update(updates)
     return EvaluationResult.model_validate(values)
+
+
+def _judge_evaluation(**metadata_updates: object) -> EvaluationResult:
+    """Build a prior llm_judge evaluation with complete identity metadata."""
+    metadata: dict[str, object] = {
+        "prompt_version": "optima-llm-judge-prompt-v1",
+        "request_schema_version": "optima-llm-judge-request-v1",
+        "schema_version": "optima-llm-judge-response-v1",
+        "judge_model": "judge-model-v1",
+        "judge_deployment": "judge-deployment",
+    }
+    metadata.update(metadata_updates)
+    return evaluation_result(evaluator_type="llm_judge", metadata=metadata)
+
+
+_JUDGE_IDENTITY = (
+    "llm_judge",
+    "optima-llm-judge-prompt-v1",
+    "optima-llm-judge-request-v1",
+    "optima-llm-judge-response-v1",
+    "judge-model-v1",
+    "judge-deployment",
+)
+
+
+def test_evaluator_identity_of_returns_type_for_non_judge() -> None:
+    """Identify deterministic evaluators by evaluator_type alone."""
+    assert evaluator_identity_of(
+        evaluation_result(evaluator_type="exact_reference")
+    ) == ("exact_reference",)
+
+
+def test_evaluator_identity_of_binds_full_judge_identity() -> None:
+    """Bind prompt, request/response schema, and judge deployment for reuse."""
+    assert evaluator_identity_of(_judge_evaluation()) == _JUDGE_IDENTITY
+
+
+def test_evaluator_identity_of_incomplete_judge_is_none() -> None:
+    """Return no identity when judge metadata cannot be trusted."""
+    assert evaluator_identity_of(_judge_evaluation(judge_model=None)) is None
+
+
+def test_llm_judge_prior_incompatible_with_exact_reference_current() -> None:
+    """Never reuse model-judged quality to satisfy an exact-reference request."""
+    assert (
+        evaluator_identities_compatible(("exact_reference",), _judge_evaluation())
+        is False
+    )
+
+
+def test_exact_reference_prior_incompatible_with_llm_judge_current() -> None:
+    """Never reuse exact-reference quality to satisfy a reference-free judge."""
+    assert (
+        evaluator_identities_compatible(
+            _JUDGE_IDENTITY,
+            evaluation_result(evaluator_type="exact_reference"),
+        )
+        is False
+    )
+
+
+def test_matching_identity_is_compatible() -> None:
+    """Reuse only when the current evaluator identity matches the prior one."""
+    assert evaluator_identities_compatible(_JUDGE_IDENTITY, _judge_evaluation()) is True
+
+
+def test_missing_current_identity_disables_compatibility_check() -> None:
+    """Preserve legacy behavior when no current evaluator identity is supplied."""
+    assert evaluator_identities_compatible(None, _judge_evaluation()) is True
+
+
+def test_incomplete_prior_identity_is_incompatible() -> None:
+    """Refuse reuse when the prior judge identity is incomplete."""
+    assert (
+        evaluator_identities_compatible(
+            _JUDGE_IDENTITY,
+            _judge_evaluation(judge_deployment=None),
+        )
+        is False
+    )
 
 
 @pytest.mark.parametrize(
@@ -141,6 +226,11 @@ class RecordingMeasurement:
         self._measured_evidence = measured_evidence
         self.calls: list[EvaluationRequest] = []
 
+    @property
+    def evaluator_type(self) -> str:
+        """Return the evaluator_type of the configured measured evidence."""
+        return self._measured_evidence.evaluator_type
+
     def measure(self, request: EvaluationRequest) -> EvaluationEvidence:
         """Record the request and return evaluator-owned measured facts."""
         self.calls.append(request)
@@ -149,6 +239,8 @@ class RecordingMeasurement:
 
 class InputAwareMeasurement:
     """Test measurement whose score depends on source and candidate text."""
+
+    evaluator_type = "input_aware"
 
     def measure(self, request: EvaluationRequest) -> EvaluationEvidence:
         """Use both sides of the evaluation boundary to derive evidence."""
@@ -323,12 +415,14 @@ def test_deterministic_evaluator_passes_complete_request_to_measurement() -> Non
         metadata={"request_kind": "fixture"},
     )
 
-    result = asyncio.run(
+    outcome = asyncio.run(
         evaluator.evaluate(
             request,
             quality_contract(threshold=0.9),
         )
     )
+    result = outcome.result
+    assert result is not None
 
     assert measurement.calls == [request]
     assert result.evaluator_type == "deterministic"
@@ -350,9 +444,13 @@ def test_measurement_derives_evidence_from_original_input_and_candidate() -> Non
         update={"output_text": "Unrelated answer"}
     )
 
-    matching = asyncio.run(evaluator.evaluate(matching_request, contract))
-    nonmatching = asyncio.run(evaluator.evaluate(nonmatching_request, contract))
+    matching_outcome = asyncio.run(evaluator.evaluate(matching_request, contract))
+    nonmatching_outcome = asyncio.run(evaluator.evaluate(nonmatching_request, contract))
+    matching = matching_outcome.result
+    nonmatching = nonmatching_outcome.result
 
+    assert matching is not None
+    assert nonmatching is not None
     assert matching.passed is True
     assert nonmatching.passed is False
     assert matching.evaluator_type == "input_aware"
@@ -375,7 +473,7 @@ def test_exact_reference_measurement_obtains_evidence_internally(
     """Measure exact-reference evidence from request inputs without caller facts."""
     evaluator = DeterministicEvaluator(measurement=ExactReferenceMeasurement())
 
-    result = asyncio.run(
+    outcome = asyncio.run(
         evaluator.evaluate(
             evaluation_request(
                 output_text=output_text,
@@ -384,7 +482,9 @@ def test_exact_reference_measurement_obtains_evidence_internally(
             quality_contract(threshold=1.0),
         )
     )
+    result = outcome.result
 
+    assert result is not None
     assert result.evaluator_valid is expected_valid
     assert result.score == expected_score
     assert result.passed is (expected_valid and expected_score == 1.0)
@@ -394,6 +494,33 @@ def test_exact_reference_measurement_obtains_evidence_internally(
     }
 
 
+def test_exact_reference_cannot_claim_required_grounding() -> None:
+    """Return no score when exact equality cannot establish supplied grounding."""
+    evaluator = DeterministicEvaluator(measurement=ExactReferenceMeasurement())
+    grounded_contract = quality_contract(threshold=1.0).model_copy(
+        update={"grounding_required": True}
+    )
+
+    outcome = asyncio.run(
+        evaluator.evaluate(
+            evaluation_request(context="Supplied context"),
+            grounded_contract,
+        )
+    )
+
+    assert outcome.result is None
+    assert outcome.failure is not None
+    assert outcome.failure.code is EvaluationFailureCode.GROUNDING_NOT_SUPPORTED
+    assert outcome.model_usages == ()
+
+
+def test_evaluation_request_preserves_duplicate_criteria_by_position() -> None:
+    """Retain authoritative request identity until indexed judge checks bind it."""
+    request = evaluation_request(criteria=("Be concise", "Be concise"))
+
+    assert request.criteria == ("Be concise", "Be concise")
+
+
 def test_request_metadata_is_json_safe_and_does_not_affect_measurement() -> None:
     """Validate request metadata without letting it alter exact-match semantics."""
     evaluator = DeterministicEvaluator(measurement=ExactReferenceMeasurement())
@@ -401,10 +528,10 @@ def test_request_metadata_is_json_safe_and_does_not_affect_measurement() -> None
     first = evaluation_request(metadata={"attempt": 1, "tags": ["a"]})
     second = evaluation_request(metadata={"attempt": 2, "tags": ["b"]})
 
-    first_result = asyncio.run(evaluator.evaluate(first, contract))
-    second_result = asyncio.run(evaluator.evaluate(second, contract))
+    first_outcome = asyncio.run(evaluator.evaluate(first, contract))
+    second_outcome = asyncio.run(evaluator.evaluate(second, contract))
 
-    assert first_result == second_result
+    assert first_outcome.result == second_outcome.result
     with pytest.raises(ValidationError):
         evaluation_request(metadata={"unsafe": object()})
 
@@ -424,11 +551,17 @@ def test_fake_evaluator_cycles_configured_results_and_records_calls() -> None:
         evaluation_request(run_id="run-3"),
     )
 
-    results = tuple(
+    outcomes = tuple(
         asyncio.run(fake.evaluate(request, contract)) for request in requests
     )
+    results = tuple(outcome.result for outcome in outcomes)
 
-    assert tuple(result.passed for result in results) == (True, False, True)
+    assert all(result is not None for result in results)
+    assert tuple(result.passed for result in results if result is not None) == (
+        True,
+        False,
+        True,
+    )
     assert tuple(call.sequence for call in fake.calls) == (0, 1, 2)
     assert tuple(call.request.run_id for call in fake.calls) == (
         "run-1",
@@ -436,7 +569,7 @@ def test_fake_evaluator_cycles_configured_results_and_records_calls() -> None:
         "run-3",
     )
     assert fake.calls[0].quality_contract == contract
-    assert fake.calls[0].result == results[0]
+    assert fake.calls[0].result == outcomes[0].result
     assert fake.calls[0].request == requests[0]
     assert "evidence" not in EvaluationRequest.model_fields
 
@@ -454,10 +587,12 @@ def test_fake_evaluator_supports_mandatory_check_failure() -> None:
         )
     )
 
-    result = asyncio.run(
+    outcome = asyncio.run(
         fake.evaluate(evaluation_request(), quality_contract(threshold=0.8))
     )
+    result = outcome.result
 
+    assert result is not None
     assert result.passed is False
     assert result.mandatory_checks_passed is False
 
@@ -519,13 +654,15 @@ def test_evaluators_implement_async_protocol() -> None:
 def test_deterministic_evaluator_applies_threshold_to_measured_evidence() -> None:
     """Compose measurement and thresholding without routing or escalation behavior."""
     measurement = RecordingMeasurement(evidence(score=0.89))
-    result = asyncio.run(
+    outcome = asyncio.run(
         DeterministicEvaluator(measurement=measurement).evaluate(
             evaluation_request(),
             quality_contract(threshold=0.9),
         )
     )
+    result = outcome.result
 
+    assert result is not None
     assert result.passed is False
     assert result.threshold == 0.9
     assert result.reasons[-1] == EvaluationReasonCode.QUALITY_CONTRACT_NOT_MET

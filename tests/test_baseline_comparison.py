@@ -136,6 +136,7 @@ def evaluation(
     evaluator_type: str = "deterministic",
     evaluator_valid: bool = True,
     passed: bool = True,
+    metadata: dict[str, JsonValue] | None = None,
 ) -> EvaluationResult:
     """Build final quality evidence for a measured run."""
     return EvaluationResult(
@@ -146,6 +147,7 @@ def evaluation(
         mandatory_checks_passed=True,
         passed=passed,
         reasons=("Measured benchmark quality",),
+        metadata=metadata or {},
     )
 
 
@@ -267,6 +269,7 @@ def completed_run(
     score: float = 0.95,
     contract_met: bool = True,
     evaluator_type: str = "deterministic",
+    evaluator_metadata: dict[str, JsonValue] | None = None,
     contract: QualityContract | None = None,
     profile: RequestProfile | None = None,
     model_calls: int = 1,
@@ -280,7 +283,9 @@ def completed_run(
         score=score,
         evaluator_type=evaluator_type,
         passed=contract_met,
+        metadata=evaluator_metadata,
     )
+    uses_llm_judge = evaluator_type == "llm_judge"
     steps: tuple[ExecutionStep, ...]
     usages: tuple[ModelUsage, ...]
     evaluations: tuple[EvaluationResult, ...]
@@ -306,6 +311,19 @@ def completed_run(
             ),
             step(2, ExecutionStepType.RETURN, contract_met=contract_met),
         )
+        if uses_llm_judge:
+            steps = (
+                steps[0],
+                steps[1].model_copy(
+                    update={
+                        "facts": {
+                            **steps[1].facts,
+                            "judge_call_recorded": True,
+                        }
+                    }
+                ),
+                steps[2],
+            )
         usages = (
             usage(
                 run_id=run_id,
@@ -316,10 +334,27 @@ def completed_run(
                 provenance=provenance,
             ),
         )
+        if uses_llm_judge:
+            usages += (
+                usage(
+                    run_id=run_id,
+                    request_id=f"{run_id}-judge-request-1",
+                    input_tokens=0,
+                    output_tokens=0,
+                    cost=Decimal("0") if cost is not None else None,
+                    provenance=provenance,
+                    model_role=ModelRole.JUDGE,
+                ),
+            )
         evaluations = (final_evaluation,)
         escalated = False
     else:
-        first_evaluation = evaluation(score=0.50, passed=False)
+        first_evaluation = evaluation(
+            score=0.50,
+            evaluator_type=evaluator_type,
+            passed=False,
+            metadata=evaluator_metadata,
+        )
         if cost is None:
             first_cost = None
             second_cost = None
@@ -357,6 +392,20 @@ def completed_run(
                 contract_met=contract_met,
             ),
         )
+        if uses_llm_judge:
+            steps = tuple(
+                step_value.model_copy(
+                    update={
+                        "facts": {
+                            **step_value.facts,
+                            "judge_call_recorded": True,
+                        }
+                    }
+                )
+                if step_value.step_type is ExecutionStepType.QUALITY_EVALUATION
+                else step_value
+                for step_value in steps
+            )
         usages = (
             usage(
                 run_id=run_id,
@@ -376,6 +425,30 @@ def completed_run(
                 model_role=ModelRole.STRONG,
             ),
         )
+        if uses_llm_judge:
+            judge_cost = Decimal("0") if cost is not None else None
+            usages = (
+                usages[0],
+                usage(
+                    run_id=run_id,
+                    request_id=f"{run_id}-judge-request-1",
+                    input_tokens=0,
+                    output_tokens=0,
+                    cost=judge_cost,
+                    provenance=provenance,
+                    model_role=ModelRole.JUDGE,
+                ),
+                usages[1],
+                usage(
+                    run_id=run_id,
+                    request_id=f"{run_id}-judge-request-2",
+                    input_tokens=0,
+                    output_tokens=0,
+                    cost=judge_cost,
+                    provenance=provenance,
+                    model_role=ModelRole.JUDGE,
+                ),
+            )
         evaluations = (first_evaluation, final_evaluation)
         escalated = True
 
@@ -557,6 +630,41 @@ def test_comparison_preserves_metrics_and_computes_positive_savings() -> None:
     assert result.token_reduction_percentage == Decimal("50")
     assert result.cost_reduction_percentage == Decimal("75")
     assert result.latency_percentage_change == Decimal("-20")
+
+
+def judge_identity(**updates: JsonValue) -> dict[str, JsonValue]:
+    """Build complete versioned LLM-judge comparison identity."""
+    values: dict[str, JsonValue] = {
+        "prompt_version": "optima-llm-judge-prompt-v1",
+        "request_schema_version": "optima-llm-judge-request-v1",
+        "schema_version": "optima-llm-judge-response-v1",
+        "judge_model": "judge-model-v1",
+        "judge_deployment": "judge-deployment",
+    }
+    values.update(updates)
+    return values
+
+
+def test_comparison_model_calls_include_judge_inference() -> None:
+    """Count all paid generator and evaluator model calls in both arms."""
+    baseline = completed_run(
+        run_id="baseline",
+        model_calls=2,
+        evaluator_type="llm_judge",
+        evaluator_metadata=judge_identity(),
+    )
+    optima = completed_run(
+        run_id="optima",
+        model_calls=1,
+        evaluator_type="llm_judge",
+        evaluator_metadata=judge_identity(),
+    )
+
+    result = BaselineComparisonService().compare(comparison_request(baseline, optima))
+
+    assert result.baseline.model_calls == 4
+    assert result.optima.model_calls == 2
+    assert result.model_calls_delta == -2
 
 
 def test_equal_measurements_produce_zero_deltas_and_percentages() -> None:
@@ -873,7 +981,7 @@ def test_request_rejects_different_quality_contracts() -> None:
 
 def test_request_rejects_different_valid_evaluator_types() -> None:
     """Compare quality only when both valid final evaluations use one evaluator type."""
-    with pytest.raises(ValidationError, match="same evaluator type"):
+    with pytest.raises(ValidationError, match="same evaluator identity"):
         comparison_request(
             completed_run(
                 run_id="baseline",
@@ -882,6 +990,41 @@ def test_request_rejects_different_valid_evaluator_types() -> None:
             completed_run(
                 run_id="optima",
                 evaluator_type="llm-judge",
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    ("identity_update", "message"),
+    [
+        ({"judge_model": "different-model"}, "same evaluator identity"),
+        ({"judge_deployment": "different-deployment"}, "same evaluator identity"),
+        ({"prompt_version": "different-prompt"}, "same evaluator identity"),
+        ({"schema_version": "different-schema"}, "same evaluator identity"),
+        (
+            {"request_schema_version": "different-request-schema"},
+            "same evaluator identity",
+        ),
+        ({"judge_model": None}, "complete evaluator identity"),
+    ],
+    ids=["model", "deployment", "prompt", "schema", "request-schema", "incomplete"],
+)
+def test_request_rejects_incompatible_llm_judge_identity(
+    identity_update: dict[str, JsonValue],
+    message: str,
+) -> None:
+    """Compare model-generated quality only under one complete judge identity."""
+    with pytest.raises(ValidationError, match=message):
+        comparison_request(
+            completed_run(
+                run_id="baseline",
+                evaluator_type="llm_judge",
+                evaluator_metadata=judge_identity(),
+            ),
+            completed_run(
+                run_id="optima",
+                evaluator_type="llm_judge",
+                evaluator_metadata=judge_identity(**identity_update),
             ),
         )
 

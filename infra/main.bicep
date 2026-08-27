@@ -37,6 +37,24 @@ param foundrySmallDeployment string
 @description('Foundry deployment mapped to the OPTIMA STRONG role.')
 param foundryStrongDeployment string
 
+@description('Production quality evaluator mode.')
+@allowed([
+  'EXACT_REFERENCE'
+  'LLM_JUDGE'
+])
+param productionEvaluatorMode string
+
+@description('Foundry deployment mapped to the OPTIMA JUDGE role in LLM_JUDGE mode.')
+param judgeDeployment string?
+
+@description('Provider model identity expected for the OPTIMA JUDGE role in LLM_JUDGE mode.')
+param judgeModel string?
+
+@description('Timeout in seconds for one JUDGE model request.')
+@minValue(1)
+@maxValue(120)
+param judgeTimeoutSeconds int = 30
+
 @description('OAuth token scope accepted by the configured Foundry or APIM endpoint.')
 param foundryTokenScope string = 'https://cognitiveservices.azure.com/.default'
 
@@ -194,7 +212,11 @@ module resources 'resource-group.bicep' = {
     foundrySmallDeployment: foundrySmallDeployment
     foundryStrongDeployment: foundryStrongDeployment
     foundryTokenScope: foundryTokenScope
+    judgeDeployment: judgeDeployment
+    judgeModel: judgeModel
+    judgeTimeoutSeconds: judgeTimeoutSeconds
     location: location
+    productionEvaluatorMode: productionEvaluatorMode
     redisEmbeddingDeployment: redisEmbeddingDeployment
     redisEmbeddingDimension: redisEmbeddingDimension
     redisEmbeddingModel: redisEmbeddingModel

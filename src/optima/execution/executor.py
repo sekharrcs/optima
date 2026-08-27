@@ -29,7 +29,7 @@ from optima.domain.execution import (
 )
 from optima.domain.request_binding import RequestBinding, build_request_binding
 from optima.domain.run import ModelUsage, RunResult, RunStatus
-from optima.evaluation import EvaluationRequest, QualityEvaluator
+from optima.evaluation import EvaluationOutcome, EvaluationRequest, QualityEvaluator
 from optima.execution.contracts import (
     ContextReductionDependencyError,
     ExecutionRequest,
@@ -292,6 +292,7 @@ class PlanExecutor:
             output_text=result.output_text,
             role=role,
             steps=steps,
+            usages=usages,
             observation=observation,
         )
         if isinstance(evaluation, RunStatus):
@@ -614,9 +615,15 @@ class PlanExecutor:
         self,
         result: ModelProviderResult,
     ) -> ModelProviderResult:
-        usage = result.usage
+        return ModelProviderResult(
+            output_text=result.output_text,
+            usage=self._with_authoritative_usage_cost(result.usage),
+        )
+
+    def _with_authoritative_usage_cost(self, usage: ModelUsage) -> ModelUsage:
+        """Replace provider-supplied monetary facts with catalog calculation."""
         calculation = self._cost_calculator.calculate(usage)
-        priced_usage = ModelUsage(
+        return ModelUsage(
             request_id=usage.request_id,
             run_id=usage.run_id,
             provider=usage.provider,
@@ -632,10 +639,6 @@ class PlanExecutor:
                 calculation.provenance if calculation is not None else None
             ),
         )
-        return ModelProviderResult(
-            output_text=result.output_text,
-            usage=priced_usage,
-        )
 
     async def _evaluate_candidate(
         self,
@@ -644,29 +647,117 @@ class PlanExecutor:
         output_text: str,
         role: ModelRole,
         steps: list[ExecutionStep],
+        usages: list[ModelUsage],
         observation: RunObservation,
     ) -> EvaluationResult | RunStatus:
         with observation.start_stage(ObservationStage.EVALUATION_EVALUATE) as observed:
             started_at = self._clock.now()
             try:
-                result = await self._evaluator.evaluate(
-                    EvaluationRequest(
-                        run_id=request.run_id,
-                        input_text=request.input_text,
-                        output_text=output_text,
-                        context=request.context,
-                        reference_output=request.reference_output,
-                        criteria=request.criteria,
-                        metadata={
-                            **request.metadata,
-                            "model_role": role.value,
-                            "task_type": request.request_profile.task_type.value,
-                            "complexity": request.request_profile.complexity.value,
-                        },
-                    ),
-                    request.quality_contract,
+                outcome = EvaluationOutcome.model_validate(
+                    await self._evaluator.evaluate(
+                        EvaluationRequest(
+                            run_id=request.run_id,
+                            input_text=request.input_text,
+                            output_text=output_text,
+                            context=request.context,
+                            reference_output=request.reference_output,
+                            criteria=request.criteria,
+                            metadata={
+                                **request.metadata,
+                                "model_role": role.value,
+                                "task_type": request.request_profile.task_type.value,
+                                "complexity": request.request_profile.complexity.value,
+                            },
+                        ),
+                        request.quality_contract,
+                    )
                 )
-                result = EvaluationResult.model_validate(result)
+                priced_judge_usages = tuple(
+                    self._with_authoritative_usage_cost(usage)
+                    for usage in outcome.model_usages
+                )
+                if any(usage.run_id != request.run_id for usage in priced_judge_usages):
+                    raise ValueError("judge usage run_id does not match the request")
+                usages.extend(priced_judge_usages)
+                if outcome.failure is not None:
+                    judge_usage = (
+                        priced_judge_usages[0] if priced_judge_usages else None
+                    )
+                    step_status = (
+                        ExecutionStatus.TIMED_OUT
+                        if outcome.failure.timed_out
+                        else ExecutionStatus.FAILED
+                    )
+                    run_status = (
+                        RunStatus.TIMED_OUT
+                        if outcome.failure.timed_out
+                        else RunStatus.FAILED
+                    )
+                    steps.append(
+                        ExecutionStep(
+                            sequence=len(steps),
+                            step_type=ExecutionStepType.QUALITY_EVALUATION,
+                            status=step_status,
+                            latency_ms=self._elapsed_ms(started_at),
+                            facts={
+                                "model_role": role.value,
+                                "evaluator_type": outcome.failure.evaluator_type,
+                                "judge_call_recorded": bool(priced_judge_usages),
+                            },
+                            error=(
+                                f"{role.value} quality evaluation "
+                                f"{outcome.failure.code.value}"
+                            ),
+                        )
+                    )
+                    observed.finish(
+                        EvaluationStageOutcome(
+                            status=(
+                                ObservationStatus.TIMED_OUT
+                                if outcome.failure.timed_out
+                                else ObservationStatus.FAILED
+                            ),
+                            model_role=role,
+                            latency_ms=steps[-1].latency_ms,
+                            evaluator_type=outcome.failure.evaluator_type,
+                            judge_model_role=(
+                                judge_usage.model_role
+                                if judge_usage is not None
+                                else None
+                            ),
+                            judge_deployment=(
+                                judge_usage.deployment
+                                if judge_usage is not None
+                                else None
+                            ),
+                            judge_input_tokens=(
+                                judge_usage.input_tokens
+                                if judge_usage is not None
+                                else None
+                            ),
+                            judge_output_tokens=(
+                                judge_usage.output_tokens
+                                if judge_usage is not None
+                                else None
+                            ),
+                            judge_cached_tokens=(
+                                judge_usage.cached_tokens
+                                if judge_usage is not None
+                                else None
+                            ),
+                            failure_category=(
+                                FailureCategory.TIMEOUT
+                                if outcome.failure.timed_out
+                                else FailureCategory.EVALUATOR
+                            ),
+                        )
+                    )
+                    return run_status
+                if outcome.result is None:
+                    raise AssertionError(
+                        "validated evaluation outcome requires a result"
+                    )
+                result = EvaluationResult.model_validate(outcome.result)
                 if result.threshold != request.quality_contract.minimum_quality_score:
                     raise ValueError(
                         "evaluation threshold does not match the Quality Contract"
@@ -730,6 +821,9 @@ class PlanExecutor:
                         "score": result.score,
                         "threshold": result.threshold,
                         "passed": result.passed,
+                        **(
+                            {"judge_call_recorded": True} if priced_judge_usages else {}
+                        ),
                     },
                 )
             )
@@ -738,6 +832,32 @@ class PlanExecutor:
                     status=ObservationStatus.SUCCEEDED,
                     model_role=role,
                     latency_ms=steps[-1].latency_ms,
+                    evaluator_type=result.evaluator_type,
+                    judge_model_role=(
+                        priced_judge_usages[0].model_role
+                        if priced_judge_usages
+                        else None
+                    ),
+                    judge_deployment=(
+                        priced_judge_usages[0].deployment
+                        if priced_judge_usages
+                        else None
+                    ),
+                    judge_input_tokens=(
+                        priced_judge_usages[0].input_tokens
+                        if priced_judge_usages
+                        else None
+                    ),
+                    judge_output_tokens=(
+                        priced_judge_usages[0].output_tokens
+                        if priced_judge_usages
+                        else None
+                    ),
+                    judge_cached_tokens=(
+                        priced_judge_usages[0].cached_tokens
+                        if priced_judge_usages
+                        else None
+                    ),
                     evaluator_valid=result.evaluator_valid,
                     score=result.score,
                     passed=result.passed,

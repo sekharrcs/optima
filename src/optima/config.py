@@ -80,16 +80,14 @@ class RedisAuthMode(StrEnum):
 class ProductionEvaluatorMode(StrEnum):
     """Reviewed evaluator implementations available to production composition.
 
-    ``EXACT_REFERENCE`` is a deterministic benchmark/evaluation mode: it can only
-    verify a request whose caller already supplies the expected ``reference_output``.
-    It is not a general user-facing runtime path. Serving normal requests where the
-    caller does not know the answer requires a separately reviewed reference-free
-    natural-language evaluator (the LLM-judge capability named in ``docs/MVP_SCOPE``),
-    which is a distinct future slice and is intentionally absent here so unverifiable
-    output can never be silently accepted.
+    ``EXACT_REFERENCE`` is deterministic benchmark measurement and requires caller-
+    supplied ``reference_output``. ``LLM_JUDGE`` is reference-free model-generated
+    measurement for normal user-facing requests. Production never switches between
+    these modes implicitly.
     """
 
     EXACT_REFERENCE = "EXACT_REFERENCE"
+    LLM_JUDGE = "LLM_JUDGE"
 
 
 class ProductionModelRoleRate(ImmutableModel):
@@ -107,7 +105,16 @@ class ProductionPricingInputs(ImmutableModel):
     currency: NonEmptyString
     small: ProductionModelRoleRate
     strong: ProductionModelRoleRate
+    judge: ProductionModelRoleRate | None = None
     embedding_input_rate_per_million_tokens: NonNegativeRate
+
+
+class JudgeProviderConfiguration(ImmutableModel):
+    """Explicit Foundry deployment identity and timeout for the evaluator role."""
+
+    deployment: NonEmptyString
+    model: NonEmptyString
+    timeout_seconds: BoundedTimeoutSeconds = 30.0
 
 
 class RedisSemanticCacheConfiguration(ImmutableModel):
@@ -447,6 +454,9 @@ class AppSettings(BaseSettings):
     pricing_strong_input_rate_per_million_tokens: Decimal | None = None
     pricing_strong_output_rate_per_million_tokens: Decimal | None = None
     pricing_strong_cached_input_rate_per_million_tokens: Decimal | None = None
+    pricing_judge_input_rate_per_million_tokens: Decimal | None = None
+    pricing_judge_output_rate_per_million_tokens: Decimal | None = None
+    pricing_judge_cached_input_rate_per_million_tokens: Decimal | None = None
     pricing_embedding_input_rate_per_million_tokens: Decimal | None = None
     semantic_cache_enabled: bool = True
     context_reduction_enabled: bool = True
@@ -469,6 +479,9 @@ class AppSettings(BaseSettings):
     foundry_token_scope: str | None = None
     foundry_managed_identity_client_id: str | None = None
     foundry_timeout_seconds: PositiveSeconds = 30.0
+    judge_deployment: str | None = None
+    judge_model: str | None = None
+    judge_timeout_seconds: BoundedTimeoutSeconds = 30.0
     cosmos_endpoint: str | None = None
     cosmos_database_name: str | None = None
     cosmos_container_name: str | None = None
@@ -513,6 +526,7 @@ class AppSettings(BaseSettings):
         self.quality_thresholds()
         self.planner_thresholds()
         self.foundry_provider_configuration()
+        self.judge_provider_configuration()
         self.cosmos_run_history_configuration()
         self.redis_semantic_cache_configuration()
         self.application_insights_configuration()
@@ -580,6 +594,18 @@ class AppSettings(BaseSettings):
             token_scope=self.foundry_token_scope,
             managed_identity_client_id=self.foundry_managed_identity_client_id,
             timeout_seconds=self.foundry_timeout_seconds,
+        )
+
+    def judge_provider_configuration(self) -> JudgeProviderConfiguration | None:
+        """Build the explicit JUDGE role settings when they are configured."""
+        if self.judge_deployment is None and self.judge_model is None:
+            return None
+        if self.judge_deployment is None or self.judge_model is None:
+            raise ValueError("LLM judge composition requires both deployment and model")
+        return JudgeProviderConfiguration(
+            deployment=self.judge_deployment,
+            model=self.judge_model,
+            timeout_seconds=self.judge_timeout_seconds,
         )
 
     def cosmos_run_history_configuration(
@@ -714,6 +740,9 @@ class AppSettings(BaseSettings):
         strong_input = self.pricing_strong_input_rate_per_million_tokens
         strong_output = self.pricing_strong_output_rate_per_million_tokens
         strong_cached = self.pricing_strong_cached_input_rate_per_million_tokens
+        judge_input = self.pricing_judge_input_rate_per_million_tokens
+        judge_output = self.pricing_judge_output_rate_per_million_tokens
+        judge_cached = self.pricing_judge_cached_input_rate_per_million_tokens
         embedding_input = self.pricing_embedding_input_rate_per_million_tokens
         if all(
             value is None
@@ -725,6 +754,9 @@ class AppSettings(BaseSettings):
                 strong_input,
                 strong_output,
                 strong_cached,
+                judge_input,
+                judge_output,
+                judge_cached,
                 embedding_input,
             )
         ):
@@ -742,6 +774,11 @@ class AppSettings(BaseSettings):
                 "and embedding token rates; partial pricing cannot fabricate "
                 "monetary evidence"
             )
+        if (judge_input is None) is not (judge_output is None):
+            raise ValueError(
+                "Production JUDGE pricing requires both input and output rates; "
+                "partial pricing cannot fabricate monetary evidence"
+            )
         return ProductionPricingInputs(
             catalog_version=version,
             currency=self.pricing_currency,
@@ -755,26 +792,44 @@ class AppSettings(BaseSettings):
                 output_rate_per_million_tokens=strong_output,
                 cached_input_rate_per_million_tokens=strong_cached,
             ),
+            judge=(
+                ProductionModelRoleRate(
+                    input_rate_per_million_tokens=judge_input,
+                    output_rate_per_million_tokens=judge_output,
+                    cached_input_rate_per_million_tokens=judge_cached,
+                )
+                if judge_input is not None and judge_output is not None
+                else None
+            ),
             embedding_input_rate_per_million_tokens=embedding_input,
         )
 
     def validate_production_runtime(self) -> "AppSettings":
         """Require every dependency owned by the production API lifespan."""
-        if (
-            self.production_evaluator_mode
-            is not ProductionEvaluatorMode.EXACT_REFERENCE
-        ):
+        mode = self.production_evaluator_mode
+        if mode is None:
             raise ValueError(
                 "Production runtime requires an explicit supported evaluator mode; "
-                "EXACT_REFERENCE is the only reviewed mode and serves benchmark "
-                "requests that already supply reference output"
+                "configure EXACT_REFERENCE or LLM_JUDGE"
             )
-        if not self.production_require_reference_output:
+        if (
+            mode is ProductionEvaluatorMode.EXACT_REFERENCE
+            and not self.production_require_reference_output
+        ):
             raise ValueError(
-                "EXACT_REFERENCE production evaluation requires reference output; "
-                "reference-free requests need a separately reviewed natural-language "
-                "evaluator that is not yet available"
+                "EXACT_REFERENCE production evaluation requires reference output"
             )
+        judge = self.judge_provider_configuration()
+        if mode is ProductionEvaluatorMode.LLM_JUDGE:
+            if self.production_require_reference_output:
+                raise ValueError(
+                    "LLM_JUDGE production evaluation must not require reference output"
+                )
+            if judge is None:
+                raise ValueError(
+                    "LLM_JUDGE production evaluation requires judge deployment "
+                    "and model"
+                )
         foundry = self.foundry_provider_configuration()
         if foundry is None:
             raise ValueError("Production runtime requires Foundry configuration")
@@ -788,13 +843,23 @@ class AppSettings(BaseSettings):
             raise ValueError(
                 "Production runtime requires Application Insights configuration"
             )
-        if (
-            self.production_cost_measurement_required
-            and self.production_pricing_inputs() is None
+        pricing = self.production_pricing_inputs()
+        if mode is ProductionEvaluatorMode.LLM_JUDGE and (
+            pricing is not None and pricing.judge is None
         ):
             raise ValueError(
+                "LLM_JUDGE production pricing requires reviewed JUDGE token rates; "
+                "partial pricing cannot fabricate monetary evidence"
+            )
+        if pricing is not None and pricing.judge is not None and judge is None:
+            raise ValueError(
+                "Production JUDGE pricing requires configured judge deployment"
+            )
+        if self.production_cost_measurement_required and pricing is None:
+            raise ValueError(
                 "Production cost measurement requires reviewed SMALL, STRONG, and "
-                "embedding pricing rates; configure the price catalog or disable "
+                "embedding pricing rates, plus JUDGE rates in LLM_JUDGE mode; "
+                "configure the price catalog or disable "
                 "production_cost_measurement_required"
             )
 

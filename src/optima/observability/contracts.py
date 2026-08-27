@@ -142,6 +142,12 @@ class EvaluationStageOutcome:
     status: ObservationStatus
     model_role: ModelRole
     latency_ms: int
+    evaluator_type: str | None = None
+    judge_model_role: ModelRole | None = None
+    judge_deployment: str | None = None
+    judge_input_tokens: int | None = None
+    judge_output_tokens: int | None = None
+    judge_cached_tokens: int | None = None
     evaluator_valid: bool | None = None
     score: float | None = None
     passed: bool | None = None

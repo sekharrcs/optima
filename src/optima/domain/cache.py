@@ -38,9 +38,15 @@ class CacheCandidateAssessment(ImmutableModel):
     prior_evaluation: EvaluationResult
     contract_compatible: StrictBoolean
     safe_to_reuse: StrictBoolean
+    evaluator_compatible: StrictBoolean = True
 
     @classmethod
-    def from_candidate(cls, candidate: CacheCandidate) -> "CacheCandidateAssessment":
+    def from_candidate(
+        cls,
+        candidate: CacheCandidate,
+        *,
+        evaluator_compatible: bool = True,
+    ) -> "CacheCandidateAssessment":
         """Detach the exact candidate facts used by Planner V1."""
         return cls(
             source_run_id=candidate.source_run_id,
@@ -49,4 +55,5 @@ class CacheCandidateAssessment(ImmutableModel):
             prior_evaluation=candidate.prior_evaluation,
             contract_compatible=candidate.contract_compatible,
             safe_to_reuse=candidate.safe_to_reuse,
+            evaluator_compatible=evaluator_compatible,
         )

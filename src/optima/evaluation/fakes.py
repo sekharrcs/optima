@@ -1,9 +1,9 @@
 """Deterministic fake quality evaluator for tests and local development."""
 
-from optima.domain.evaluation import EvaluationResult
 from optima.domain.quality_contract import QualityContract
 from optima.evaluation.contracts import (
     EvaluationEvidence,
+    EvaluationOutcome,
     EvaluationRequest,
     EvaluatorCall,
     QualityEvaluator,
@@ -19,13 +19,20 @@ class FakeEvaluator(QualityEvaluator):
         *,
         responses: tuple[EvaluationEvidence, ...],
         threshold_engine: ThresholdEngine | None = None,
+        identity: tuple[str, ...] | None = None,
     ) -> None:
         if not responses:
             raise ValueError("fake evaluators require at least one configured response")
         self._responses = responses
         self._threshold_engine = threshold_engine or ThresholdEngine()
+        self._identity = identity or (responses[0].evaluator_type,)
         self._call_index = 0
         self._calls: list[EvaluatorCall] = []
+
+    @property
+    def evaluator_identity(self) -> tuple[str, ...]:
+        """Return the configured fake evaluator identity for cache compatibility."""
+        return self._identity
 
     @property
     def calls(self) -> tuple[EvaluatorCall, ...]:
@@ -36,7 +43,7 @@ class FakeEvaluator(QualityEvaluator):
         self,
         request: EvaluationRequest,
         quality_contract: QualityContract,
-    ) -> EvaluationResult:
+    ) -> EvaluationOutcome:
         """Return the next configured outcome using production threshold semantics."""
         evidence = self._responses[self._call_index % len(self._responses)]
         self._call_index += 1
@@ -52,4 +59,4 @@ class FakeEvaluator(QualityEvaluator):
                 result=result,
             )
         )
-        return result
+        return EvaluationOutcome(result=result)

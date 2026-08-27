@@ -1,6 +1,7 @@
 """Deterministic orchestration for composable Planner V1 policies."""
 
 from optima.domain.cache import CacheCandidate, CacheCandidateAssessment
+from optima.domain.evaluation import evaluator_identities_compatible
 from optima.domain.execution import (
     CachePolicy,
     ContextPolicy,
@@ -52,6 +53,10 @@ def select_plan(planner_input: PlannerInput) -> PlannerResult:
         if planner_input.cache_candidate is not None
         else None
     )
+    evaluator_compatible = cache_candidate is None or evaluator_identities_compatible(
+        planner_input.current_evaluator_identity,
+        cache_candidate.prior_evaluation,
+    )
     cache_decision = evaluate_cache_policy(
         enabled=planner_input.modules.semantic_cache_enabled,
         profile=profile,
@@ -59,9 +64,13 @@ def select_plan(planner_input: PlannerInput) -> PlannerResult:
         candidate=cache_candidate,
         contract=contract,
         thresholds=planner_input.thresholds,
+        evaluator_compatible=evaluator_compatible,
     )
     cache_assessment = (
-        CacheCandidateAssessment.from_candidate(cache_candidate)
+        CacheCandidateAssessment.from_candidate(
+            cache_candidate,
+            evaluator_compatible=evaluator_compatible,
+        )
         if cache_decision.candidate_assessed and cache_candidate is not None
         else None
     )

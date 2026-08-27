@@ -94,6 +94,7 @@ class PlannerInput(ImmutableModel):
     reducer_capability: ContextReducerCapability
     capabilities: PlannerCapabilities = Field(default_factory=PlannerCapabilities)
     cache_candidate: CacheCandidate | None = None
+    current_evaluator_identity: tuple[NonEmptyString, ...] | None = None
     historical_statistics: HistoricalPolicyStatistics | None = None
 
     @model_validator(mode="after")

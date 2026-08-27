@@ -7,6 +7,7 @@ from optima.domain.execution import (
     HistoricalEvidenceDisposition,
     ModelPolicy,
     PlannerReasonCode,
+    derive_cache_reuse_reason,
 )
 from optima.domain.quality_contract import (
     OptimizationMode,
@@ -64,6 +65,7 @@ def evaluate_cache_policy(
     candidate: CacheCandidate | None,
     contract: QualityContract,
     thresholds: PlannerThresholds,
+    evaluator_compatible: bool = True,
 ) -> CacheDecision:
     """Select safe cache reuse or the first controlling rejection reason."""
     if not enabled:
@@ -85,32 +87,27 @@ def evaluate_cache_policy(
             reason_code=PlannerReasonCode.CACHE_CANDIDATE_NOT_SUPPLIED,
         )
 
-    reason: PlannerReasonCode | None = None
-    if candidate.request_binding != request_binding:
-        reason = PlannerReasonCode.CACHE_REQUEST_BINDING_MISMATCH
-    elif candidate.similarity < thresholds.cache_similarity_threshold:
-        reason = PlannerReasonCode.CACHE_SIMILARITY_BELOW_THRESHOLD
-    elif not candidate.prior_evaluation.evaluator_valid:
-        reason = PlannerReasonCode.CACHE_PRIOR_EVALUATOR_INVALID
-    elif not candidate.prior_evaluation.passed:
-        reason = PlannerReasonCode.CACHE_PRIOR_EVALUATION_FAILED
-    elif candidate.prior_evaluation.score < contract.minimum_quality_score:
-        reason = PlannerReasonCode.CACHE_QUALITY_BELOW_CONTRACT_THRESHOLD
-    elif not candidate.contract_compatible:
-        reason = PlannerReasonCode.CACHE_CONTRACT_INCOMPATIBLE
-    elif not candidate.safe_to_reuse:
-        reason = PlannerReasonCode.CACHE_REUSE_UNSAFE
-
-    if reason is not None:
-        return CacheDecision(
-            policy=CachePolicy.SKIP,
-            candidate_assessed=True,
-            reason_code=reason,
-        )
+    reason = derive_cache_reuse_reason(
+        candidate_binding=candidate.request_binding,
+        request_binding=request_binding,
+        similarity=candidate.similarity,
+        similarity_threshold=thresholds.cache_similarity_threshold,
+        prior_evaluation=candidate.prior_evaluation,
+        minimum_quality_score=contract.minimum_quality_score,
+        grounding_required=contract.grounding_required,
+        evaluator_compatible=evaluator_compatible,
+        contract_compatible=candidate.contract_compatible,
+        safe_to_reuse=candidate.safe_to_reuse,
+    )
+    policy = (
+        CachePolicy.USE_CACHED_RESULT
+        if reason is PlannerReasonCode.CACHE_HIGH_CONFIDENCE_MATCH
+        else CachePolicy.SKIP
+    )
     return CacheDecision(
-        policy=CachePolicy.USE_CACHED_RESULT,
+        policy=policy,
         candidate_assessed=True,
-        reason_code=PlannerReasonCode.CACHE_HIGH_CONFIDENCE_MATCH,
+        reason_code=reason,
     )
 
 

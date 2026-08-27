@@ -68,7 +68,35 @@ def test_container_apps_map_production_runtime_environment_contract() -> None:
     assert "name: 'OPTIMA_PRODUCTION_EVALUATOR_MODE'" in module
     assert "name: 'OPTIMA_PRODUCTION_REQUIRE_REFERENCE_OUTPUT'" in module
     assert "name: 'OPTIMA_REQUIRE_REFERENCE_OUTPUT'" in module
+    assert "name: 'OPTIMA_JUDGE_DEPLOYMENT'" in module
+    assert "name: 'OPTIMA_JUDGE_MODEL'" in module
+    assert "name: 'OPTIMA_JUDGE_TIMEOUT_SECONDS'" in module
+    assert "validatedEvaluatorMode == 'EXACT_REFERENCE' ? 'true' : 'false'" in module
     assert "name: 'OPTIMA_FOUNDRY_MANAGED_IDENTITY_CLIENT_ID'" in module
     assert "name: 'OPTIMA_COSMOS_MANAGED_IDENTITY_CLIENT_ID'" in module
     assert "name: 'OPTIMA_REDIS_MANAGED_IDENTITY_CLIENT_ID'" in module
     assert "name: 'OPTIMA_API_BASE_URL'" in module
+
+
+def test_hackathon_parameters_select_reference_free_judge_without_deployment() -> None:
+    """Require explicit Slice 11C judge identities while keeping Azure mutation off."""
+    for relative_path in (
+        "infra/environments/hackathon.bicepparam",
+        "infra/environments/hackathon.runtime.bicepparam",
+    ):
+        content = read(relative_path)
+        assert "param productionEvaluatorMode = 'LLM_JUDGE'" in content
+        assert "param judgeDeployment = 'replace-judge-deployment'" in content
+        assert "param judgeModel = 'replace-judge-model'" in content
+        assert "param judgeTimeoutSeconds = 30" in content
+        assert "param deployContainerApps = false" in content
+
+
+def test_container_apps_reject_checked_in_judge_placeholders() -> None:
+    """Block LLM_JUDGE deployment until Slice 11C supplies real identities."""
+    module = read("infra/modules/container-apps.bicep")
+
+    assert "judgeConfigurationIsDeployable" in module
+    assert "judgeDeployment != 'replace-judge-deployment'" in module
+    assert "judgeModel != 'replace-judge-model'" in module
+    assert "requires deployable judge identities" in module

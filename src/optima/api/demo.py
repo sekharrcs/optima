@@ -117,7 +117,7 @@ def create_demo_app() -> FastAPI:
                         request_binding=DEMO_CACHE_REQUEST_BINDING,
                         similarity=1.0,
                         prior_evaluation=EvaluationResult(
-                            evaluator_type="local-demo-source-deterministic",
+                            evaluator_type="local-demo-deterministic",
                             evaluator_valid=True,
                             score=0.96,
                             threshold=0.80,

@@ -51,9 +51,11 @@ Context reduction and semantic cache must be independently bypassable through ty
 
 ### Evaluation
 - pluggable evaluator interface
-- deterministic evaluator examples
-- natural-language LLM-judge evaluator where deterministic evaluation is insufficient
+- `EXACT_REFERENCE` deterministic benchmark evaluator
+- `LLM_JUDGE` reference-free natural-language evaluator with strict versioned JSON evidence
+- explicit JUDGE model role, usage, pricing, and lifecycle ownership
 - explicit pass/fail threshold from the Quality Contract
+- optional Quality Contract grounding requirement against supplied context
 - mandatory evaluation for normal model-executed OPTIMA runs that claim contract compliance
 
 ### Experiment/dashboard

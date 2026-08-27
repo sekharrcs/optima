@@ -314,11 +314,60 @@ Slice 11C responsibilities.
 
 ### Provider abstraction
 Hides Microsoft Foundry/APIM request details from planner and execution-policy logic.
-Maps conceptual model roles such as `SMALL` and `STRONG` to configured deployments.
+Maps conceptual model roles such as `SMALL`, `STRONG`, and `JUDGE` to configured
+deployments. The JUDGE role has its own deployment, model identity, timeout, HTTP
+client, usage records, pricing entry, and application-lifetime close boundary. It
+is never inferred from the SMALL or STRONG deployment.
 
 ### Evaluator
-Produces a structured evaluation result against the Quality Contract.
-It measures quality; it does not independently choose the next model.
+
+Produces measured evidence against the Quality Contract. It does not choose the
+next model or declare the final contract result. The `ThresholdEngine` remains
+authoritative:
+
+```text
+Evaluator measurement
+        |
+EvaluationEvidence
+        |
+ThresholdEngine + QualityContract
+        |
+EvaluationResult
+```
+
+Production supports two explicit modes:
+
+* `EXACT_REFERENCE` performs deterministic benchmark measurement and requires
+  caller-supplied `reference_output`.
+* `LLM_JUDGE` performs reference-free natural-language measurement with a
+  separately configured JUDGE deployment. It never consumes `reference_output`.
+
+The LLM judge uses prompt `optima-llm-judge-prompt-v1`, request schema
+`optima-llm-judge-request-v1`, and response schema
+`optima-llm-judge-response-v1`. Trusted evaluation instructions are sent as the
+system message. Task text, candidate output, supplied context, and criteria are
+serialized as one JSON user-data object and treated as untrusted content. Caller
+metadata, reference output, and the Quality Contract threshold are not sent.
+
+The response is one strict JSON object with a bounded score, ordered criterion
+checks, applicable grounding evidence, a bounded reason code, and a short
+explanation. Unknown fields, malformed JSON, non-finite or out-of-range scores,
+criterion mismatch, contradictory reason evidence, and unsupported versions fail
+closed. The explanation is validated but is not copied into telemetry or result
+metadata. There is no evaluator-level retry, so one candidate evaluation causes
+at most one judge call and cannot multiply provider retry policy.
+
+`EvaluationOutcome` carries either an `EvaluationResult` or a score-free
+`EvaluationFailure`, plus actual JUDGE usage. The executor applies central pricing
+and includes judge tokens and cost in run totals. A possibly consumed provider
+failure is represented by an unpriced JUDGE usage with unknown token counts, which
+makes aggregate tokens and cost unavailable instead of falsely complete.
+
+When the Quality Contract requires grounding, usable context is mandatory before
+the judge call and grounding becomes a mandatory threshold check. With no context
+and no grounding requirement, the judge must report grounding as not applicable.
+The evaluator performs no external lookup and cannot verify facts beyond supplied
+evidence.
 
 ### Cost Calculator
 Calculates measured cost from actual model usage using centralized pricing configuration.
@@ -374,7 +423,7 @@ The `optima.run` span carries only bounded or validated trace attributes:
 - schema version, run ID, and correlation ID
 - plan family, Optimization Mode, Quality Profile, and task type
 - authoritative terminal status and contract result
-- escalation state and actual model-attempt count
+- escalation state, generation-attempt count, and JUDGE-attempt count
 - semantic-cache and context-reduction outcomes
 - availability flags for token, cost, and evaluation measurements
 - measured totals only when present
@@ -458,15 +507,17 @@ other owned resources, allowing cleanup failures to remain observable.
 `create_production_app()` validates complete Foundry, Cosmos, Redis, managed
 identity, and Application Insights settings before resource construction. It
 creates one app-local dependency graph with no fake fallback. The graph contains
-Foundry SMALL and STRONG providers, the Foundry embedding provider, semantic
-cache, Cosmos run history, deterministic context reduction, exact-reference
+Foundry SMALL and STRONG providers, an optional separately timed Foundry JUDGE
+provider, the Foundry embedding provider, semantic cache, Cosmos run history,
+deterministic context reduction, explicitly selected exact-reference or LLM-judge
 evaluation, centralized pricing, and observability.
 
-Construction order is telemetry, Foundry, embedding, Redis, Redis index
-bootstrap, and Cosmos. Shutdown closes Cosmos, Redis, embedding, Foundry, and
-telemetry. Partial startup uses the same reverse cleanup, suppresses cleanup
-errors after recording their type, and re-raises the original startup error.
-Uvicorn does not serve health or run routes until the lifespan yields.
+Construction order is telemetry, SMALL/STRONG Foundry, optional JUDGE, embedding,
+Redis, Redis index bootstrap, and Cosmos. Shutdown closes Cosmos, Redis,
+embedding, optional JUDGE, shared Foundry, and telemetry. Partial startup uses
+the same reverse cleanup, suppresses cleanup errors after recording their type,
+and re-raises the original startup error. Uvicorn does not serve health or run
+routes until the lifespan yields.
 
 ## Module configuration
 
