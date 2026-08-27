@@ -21,6 +21,11 @@ Slice 11C owns:
 * Azure preflight and Bicep execution
 * Runtime and external Foundry access application
 * First deployment and live smoke testing
+* Reviewed SMALL, STRONG, and embedding pricing inputs when monetary cost
+  measurement is required
+
+A user-facing reference-free natural-language evaluator remains outside both
+slices and is owned by a dedicated future evaluation slice.
 
 Neither slice may silently select another Azure region.
 
@@ -37,10 +42,27 @@ falls back to fake or demo dependencies. The lightweight
 `optima.api.app:app` and deterministic `optima.api.demo:app` remain explicit
 local entry points.
 
-Production selects the reviewed `EXACT_REFERENCE` evaluator and requires
-`reference_output`. The API rejects a missing reference with structured HTTP
-422 before cache lookup, model calls, or evaluator calls. Container Apps also
-sets `OPTIMA_REQUIRE_REFERENCE_OUTPUT=true` for the Streamlit form.
+Production selects the reviewed `EXACT_REFERENCE` evaluator. This is a
+deterministic **benchmark** evaluation mode: it can only verify a request whose
+caller already supplies the expected `reference_output`. The API rejects a
+missing reference with structured HTTP 422 before cache lookup, model calls, or
+evaluator calls. Container Apps also sets `OPTIMA_REQUIRE_REFERENCE_OUTPUT=true`
+for the Streamlit form.
+
+Normal user-facing requests, where the caller supplies a task but does not know
+the expected answer, are therefore **not yet servable** in production. Serving
+them requires a separately reviewed reference-free natural-language evaluator
+(the LLM-judge capability named in `docs/MVP_SCOPE`), which is a distinct future
+slice. Until it exists, the production runtime fails closed on reference-free
+requests rather than silently accepting unverifiable output.
+
+Readiness therefore separates into three explicit levels:
+
+* Container and runtime lifecycle readiness — delivered by Slice 11B.
+* Benchmark exact-reference evaluation readiness — delivered by Slice 11B.
+* User-facing reference-free evaluation capability — not delivered; a future
+  evaluation slice owns it. This slice must not be labelled ready for normal
+  production traffic while reference-free execution remains impossible.
 
 Construction proceeds in this order:
 
@@ -160,12 +182,52 @@ Redis in East US or another fallback region.
 
 ## Remaining product inputs
 
-The current production-safe evaluator is exact-reference. Reference-free
-requests are rejected before paid work. A separately reviewed natural-language
-evaluator is still required before the production contract can accept
-reference-free demo requests.
+The current production-safe evaluator is exact-reference and benchmark-only.
+Reference-free requests are rejected before paid work. A separately reviewed
+natural-language evaluator is still required before the production contract can
+accept reference-free user-facing requests.
 
-The runtime central cost calculator currently uses an empty versioned catalog.
-Token usage remains measured, but monetary costs are unavailable until reviewed
-SMALL, STRONG, and embedding rates for provider `microsoft-foundry-apim` are
-supplied through an approved pricing contract. OPTIMA does not fabricate rates.
+The runtime central cost calculator assembles its versioned catalog from
+configured rates. When no rates are configured, it uses an explicit unpriced
+catalog: token usage remains measured, but monetary cost stays unavailable
+rather than fabricated. OPTIMA never invents rates.
+
+Slice 11C must supply the following reviewed pricing inputs as deployment
+configuration, because the model deployments are not yet selected. All rates are
+per-million-token `Decimal` values in one shared currency, keyed inside the
+runtime to provider `microsoft-foundry-apim` and the exact SMALL, STRONG, and
+embedding deployment names already configured for the runtime:
+
+* `OPTIMA_PRICING_CATALOG_VERSION` — provenance/version identifier
+* `OPTIMA_PRICING_CURRENCY` — shared currency code, default `USD`
+* `OPTIMA_PRICING_SMALL_INPUT_RATE_PER_MILLION_TOKENS`
+* `OPTIMA_PRICING_SMALL_OUTPUT_RATE_PER_MILLION_TOKENS`
+* `OPTIMA_PRICING_SMALL_CACHED_INPUT_RATE_PER_MILLION_TOKENS` — optional
+* `OPTIMA_PRICING_STRONG_INPUT_RATE_PER_MILLION_TOKENS`
+* `OPTIMA_PRICING_STRONG_OUTPUT_RATE_PER_MILLION_TOKENS`
+* `OPTIMA_PRICING_STRONG_CACHED_INPUT_RATE_PER_MILLION_TOKENS` — optional
+* `OPTIMA_PRICING_EMBEDDING_INPUT_RATE_PER_MILLION_TOKENS`
+
+Partial pricing is rejected at settings construction so incomplete configuration
+cannot fabricate monetary evidence. When
+`OPTIMA_PRODUCTION_COST_MEASUREMENT_REQUIRED=true`, production startup fails
+clearly if the complete SMALL, STRONG, and embedding catalog is absent. When it
+is `false` and pricing is absent, monetary cost is reported as unavailable while
+token usage stays measured.
+
+## Slice 11C container validation gate
+
+Docker and Podman were unavailable during Slice 11B, so only static Dockerfile
+contracts were verified. Static Dockerfile tests are not sufficient for a first
+Azure deployment.
+
+Slice 11C must block application deployment until both the API and UI images
+have:
+
+1. built successfully as Linux `AMD64` images
+2. started successfully
+3. passed API and UI local or CI container smoke tests
+4. produced immutable ACR manifest digests
+
+Only after all four hold for both images may Slice 11C publish digests and enable
+Container Apps.

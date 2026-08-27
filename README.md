@@ -115,9 +115,18 @@ The production lifespan creates one dependency graph, validates or creates the
 Redis index before readiness, and closes Cosmos, Redis, embedding, Foundry, and
 telemetry resources in reverse ownership order.
 
-The current production evaluator mode is `EXACT_REFERENCE`. Production requires
+The current production evaluator mode is `EXACT_REFERENCE`, a benchmark
+evaluation mode. It verifies only requests that already supply
 `reference_output` and rejects a missing reference before any cache or model
-call. The Streamlit production form collects this value explicitly.
+call. Normal reference-free user-facing requests are not yet servable and await
+a separate reviewed natural-language evaluator. The Streamlit production form
+collects the reference value explicitly.
+
+Monetary cost measurement is optional. The runtime assembles its price catalog
+from configured SMALL, STRONG, and embedding rates; absent rates keep monetary
+cost unavailable while token usage stays measured, and partial rates are
+rejected. Enabling `OPTIMA_PRODUCTION_COST_MEASUREMENT_REQUIRED` makes startup
+fail closed unless a complete catalog is supplied.
 
 ## Container images
 

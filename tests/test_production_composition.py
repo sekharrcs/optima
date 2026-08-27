@@ -2,6 +2,7 @@
 
 import asyncio
 from dataclasses import dataclass, field
+from decimal import Decimal
 
 import pytest
 from fastapi import FastAPI
@@ -23,8 +24,16 @@ from optima.config import (
     RedisAuthMode,
 )
 from optima.domain.embedding import EmbeddingProfile
+from optima.domain.execution import ModelRole
+from optima.domain.run import ModelUsage
+from optima.evaluation import (
+    DeterministicEvaluator,
+    ExactReferenceMeasurement,
+    FakeEvaluator,
+)
 from optima.observability.noop import NO_OP_RUN, NoOpRunObservation
 from optima.providers import (
+    FOUNDRY_PROVIDER_NAME,
     FakeEmbeddingProvider,
     FakeModelProvider,
     FakeProviderResponse,
@@ -355,3 +364,105 @@ def test_shutdown_cleanup_error_does_not_skip_remaining_resources() -> None:
         "close:foundry",
         "close:telemetry",
     ]
+
+
+def test_production_runtime_uses_reviewed_deterministic_evaluator() -> None:
+    """Compose the reviewed exact-reference evaluator without any fake fallback."""
+    events: list[str] = []
+    runtime = asyncio.run(
+        build_production_runtime(
+            production_settings(),
+            observability=RecordingObservability(events),
+            builders=component_builders(events),
+        )
+    )
+    evaluator = runtime.dependencies.evaluator
+    asyncio.run(runtime.aclose())
+
+    assert not isinstance(evaluator, FakeEvaluator)
+    assert isinstance(evaluator, DeterministicEvaluator)
+    assert isinstance(evaluator._measurement, ExactReferenceMeasurement)
+
+
+def test_production_runtime_unpriced_catalog_keeps_cost_unavailable() -> None:
+    """Keep monetary cost unavailable when no reviewed rates are configured."""
+    events: list[str] = []
+    runtime = asyncio.run(
+        build_production_runtime(
+            production_settings(),
+            observability=RecordingObservability(events),
+            builders=component_builders(events),
+        )
+    )
+    calculated = runtime.dependencies.cost_calculator.calculate(
+        ModelUsage(
+            run_id="run-cost",
+            provider=FOUNDRY_PROVIDER_NAME,
+            deployment="small",
+            model_role=ModelRole.SMALL,
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+            latency_ms=5,
+        )
+    )
+    asyncio.run(runtime.aclose())
+
+    assert calculated is None
+
+
+def test_production_runtime_prices_usage_from_configured_catalog() -> None:
+    """Assemble a catalog keyed to the real provider and deployment identities."""
+    events: list[str] = []
+    settings = production_settings().model_copy(
+        update={
+            "pricing_catalog_version": "foundry-apim-2026-01-01",
+            "pricing_small_input_rate_per_million_tokens": Decimal("0.15"),
+            "pricing_small_output_rate_per_million_tokens": Decimal("0.60"),
+            "pricing_strong_input_rate_per_million_tokens": Decimal("2.50"),
+            "pricing_strong_output_rate_per_million_tokens": Decimal("10.00"),
+            "pricing_embedding_input_rate_per_million_tokens": Decimal("0.02"),
+        }
+    )
+    runtime = asyncio.run(
+        build_production_runtime(
+            settings,
+            observability=RecordingObservability(events),
+            builders=component_builders(events),
+        )
+    )
+    calculated = runtime.dependencies.cost_calculator.calculate(
+        ModelUsage(
+            run_id="run-cost",
+            provider=FOUNDRY_PROVIDER_NAME,
+            deployment="small",
+            model_role=ModelRole.SMALL,
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+            latency_ms=5,
+        )
+    )
+    asyncio.run(runtime.aclose())
+
+    assert calculated is not None
+    assert calculated.amount == Decimal("0.75")
+    assert calculated.provenance.catalog_version == "foundry-apim-2026-01-01"
+    assert calculated.provenance.currency == "USD"
+
+
+def test_production_runtime_requires_pricing_when_cost_measurement_required() -> None:
+    """Fail production startup before construction when required pricing is absent."""
+    events: list[str] = []
+    settings = production_settings().model_copy(
+        update={"production_cost_measurement_required": True}
+    )
+
+    with pytest.raises(ValueError, match="Production cost measurement requires"):
+        asyncio.run(
+            build_production_runtime(
+                settings,
+                observability=RecordingObservability(events),
+                builders=component_builders(events),
+            )
+        )
+
+    assert events == []

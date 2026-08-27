@@ -5,6 +5,7 @@ import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Protocol
 
 from fastapi import FastAPI
@@ -25,11 +26,11 @@ from optima.cache.redis import RedisSearchClient
 from optima.config import AppSettings, ProductionEvaluatorMode
 from optima.context import DeterministicExtractiveReducer, RegexTokenCounter
 from optima.context.safety import DeterministicExtractiveSafetyPolicy
-from optima.cost import CostCalculator, PriceCatalog
+from optima.cost import CostCalculator, PriceCatalog, PriceCatalogEntry
 from optima.evaluation import DeterministicEvaluator, ExactReferenceMeasurement
 from optima.observability import Observability
 from optima.observability.azure_monitor import build_observability
-from optima.providers import ModelProvider
+from optima.providers import FOUNDRY_PROVIDER_NAME, ModelProvider
 from optima.storage import (
     RunHistoryStore,
     build_cosmos_run_history_resources,
@@ -152,6 +153,69 @@ class _DependencyHolder:
         return self.dependencies
 
 
+def _build_price_catalog(settings: AppSettings) -> PriceCatalog:
+    """Assemble the reviewed production price catalog from configured rates.
+
+    Absent pricing yields an explicit unpriced catalog so monetary cost stays
+    unavailable rather than fabricated. Reviewed rates are keyed to the exact
+    Foundry provider and deployment identities the runtime actually reports, so
+    embedding output has no billable tokens and carries a zero output rate.
+    """
+    inputs = settings.production_pricing_inputs()
+    if inputs is None:
+        return PriceCatalog(
+            version="runtime-unpriced-v1",
+            currency=settings.pricing_currency,
+            entries=(),
+        )
+    foundry = settings.foundry_provider_configuration()
+    redis = settings.redis_semantic_cache_configuration()
+    if foundry is None or redis is None:
+        raise AssertionError(
+            "validated production settings require Foundry and Redis for pricing"
+        )
+    return PriceCatalog(
+        version=inputs.catalog_version,
+        currency=inputs.currency,
+        entries=(
+            PriceCatalogEntry(
+                provider=FOUNDRY_PROVIDER_NAME,
+                deployment=foundry.small_deployment,
+                input_rate_per_million_tokens=(
+                    inputs.small.input_rate_per_million_tokens
+                ),
+                output_rate_per_million_tokens=(
+                    inputs.small.output_rate_per_million_tokens
+                ),
+                cached_input_rate_per_million_tokens=(
+                    inputs.small.cached_input_rate_per_million_tokens
+                ),
+            ),
+            PriceCatalogEntry(
+                provider=FOUNDRY_PROVIDER_NAME,
+                deployment=foundry.strong_deployment,
+                input_rate_per_million_tokens=(
+                    inputs.strong.input_rate_per_million_tokens
+                ),
+                output_rate_per_million_tokens=(
+                    inputs.strong.output_rate_per_million_tokens
+                ),
+                cached_input_rate_per_million_tokens=(
+                    inputs.strong.cached_input_rate_per_million_tokens
+                ),
+            ),
+            PriceCatalogEntry(
+                provider=FOUNDRY_PROVIDER_NAME,
+                deployment=redis.embedding_deployment,
+                input_rate_per_million_tokens=(
+                    inputs.embedding_input_rate_per_million_tokens
+                ),
+                output_rate_per_million_tokens=Decimal("0"),
+            ),
+        ),
+    )
+
+
 async def build_production_runtime(
     settings: AppSettings,
     *,
@@ -192,13 +256,7 @@ async def build_production_runtime(
             evaluator=DeterministicEvaluator(
                 measurement=ExactReferenceMeasurement(),
             ),
-            cost_calculator=CostCalculator(
-                PriceCatalog(
-                    version="runtime-unpriced-v1",
-                    currency="USD",
-                    entries=(),
-                )
-            ),
+            cost_calculator=CostCalculator(_build_price_catalog(settings)),
             run_history_store=cosmos.store,
             semantic_cache=redis.cache,
             context_reducer=DeterministicExtractiveReducer(token_counter),

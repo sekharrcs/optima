@@ -1,5 +1,6 @@
 """Tests for typed application module settings."""
 
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,8 @@ from optima.config import (
     CosmosAuthMode,
     FoundryAuthMode,
     ProductionEvaluatorMode,
+    ProductionModelRoleRate,
+    ProductionPricingInputs,
     RedisAuthMode,
 )
 
@@ -25,6 +28,16 @@ def isolate_settings_sources(
         "OPTIMA_DEPLOYMENT_ENVIRONMENT",
         "OPTIMA_PRODUCTION_EVALUATOR_MODE",
         "OPTIMA_PRODUCTION_REQUIRE_REFERENCE_OUTPUT",
+        "OPTIMA_PRODUCTION_COST_MEASUREMENT_REQUIRED",
+        "OPTIMA_PRICING_CATALOG_VERSION",
+        "OPTIMA_PRICING_CURRENCY",
+        "OPTIMA_PRICING_SMALL_INPUT_RATE_PER_MILLION_TOKENS",
+        "OPTIMA_PRICING_SMALL_OUTPUT_RATE_PER_MILLION_TOKENS",
+        "OPTIMA_PRICING_SMALL_CACHED_INPUT_RATE_PER_MILLION_TOKENS",
+        "OPTIMA_PRICING_STRONG_INPUT_RATE_PER_MILLION_TOKENS",
+        "OPTIMA_PRICING_STRONG_OUTPUT_RATE_PER_MILLION_TOKENS",
+        "OPTIMA_PRICING_STRONG_CACHED_INPUT_RATE_PER_MILLION_TOKENS",
+        "OPTIMA_PRICING_EMBEDDING_INPUT_RATE_PER_MILLION_TOKENS",
         "OPTIMA_SEMANTIC_CACHE_ENABLED",
         "OPTIMA_CONTEXT_REDUCTION_ENABLED",
         "OPTIMA_HISTORICAL_POLICY_ENABLED",
@@ -143,6 +156,16 @@ def test_settings_accept_explicit_injection() -> None:
         "deployment_environment": "local",
         "production_evaluator_mode": None,
         "production_require_reference_output": False,
+        "production_cost_measurement_required": False,
+        "pricing_catalog_version": None,
+        "pricing_currency": "USD",
+        "pricing_small_input_rate_per_million_tokens": None,
+        "pricing_small_output_rate_per_million_tokens": None,
+        "pricing_small_cached_input_rate_per_million_tokens": None,
+        "pricing_strong_input_rate_per_million_tokens": None,
+        "pricing_strong_output_rate_per_million_tokens": None,
+        "pricing_strong_cached_input_rate_per_million_tokens": None,
+        "pricing_embedding_input_rate_per_million_tokens": None,
         "semantic_cache_enabled": False,
         "context_reduction_enabled": False,
         "historical_policy_enabled": False,
@@ -339,6 +362,70 @@ def test_production_runtime_requires_user_assigned_identity_client_ids(
         match=f"Production {service_name} Managed Identity requires a client ID",
     ):
         production_settings(**{field: None}).validate_production_runtime()
+
+
+def test_production_pricing_absent_keeps_cost_unavailable_not_fabricated() -> None:
+    """Keep pricing optional so monetary cost stays unavailable, not invented."""
+    assert production_settings().production_pricing_inputs() is None
+
+
+def test_production_pricing_rejects_partial_configuration() -> None:
+    """Reject partial pricing so incomplete rates cannot fabricate cost evidence."""
+    with pytest.raises(ValidationError, match="partial pricing cannot fabricate"):
+        production_settings(
+            pricing_catalog_version="foundry-apim-2026-01-01",
+            pricing_small_input_rate_per_million_tokens=Decimal("0.15"),
+        )
+
+
+def test_production_pricing_builds_complete_reviewed_inputs() -> None:
+    """Return every reviewed rate without altering decimal precision."""
+    settings = production_settings(
+        pricing_catalog_version="foundry-apim-2026-01-01",
+        pricing_currency="USD",
+        pricing_small_input_rate_per_million_tokens=Decimal("0.15"),
+        pricing_small_output_rate_per_million_tokens=Decimal("0.60"),
+        pricing_strong_input_rate_per_million_tokens=Decimal("2.50"),
+        pricing_strong_output_rate_per_million_tokens=Decimal("10.00"),
+        pricing_embedding_input_rate_per_million_tokens=Decimal("0.02"),
+    )
+
+    assert settings.production_pricing_inputs() == ProductionPricingInputs(
+        catalog_version="foundry-apim-2026-01-01",
+        currency="USD",
+        small=ProductionModelRoleRate(
+            input_rate_per_million_tokens=Decimal("0.15"),
+            output_rate_per_million_tokens=Decimal("0.60"),
+        ),
+        strong=ProductionModelRoleRate(
+            input_rate_per_million_tokens=Decimal("2.50"),
+            output_rate_per_million_tokens=Decimal("10.00"),
+        ),
+        embedding_input_rate_per_million_tokens=Decimal("0.02"),
+    )
+
+
+def test_production_runtime_requires_pricing_when_cost_measurement_required() -> None:
+    """Fail startup when cost measurement is required but pricing is absent."""
+    with pytest.raises(ValueError, match="Production cost measurement requires"):
+        production_settings(
+            production_cost_measurement_required=True,
+        ).validate_production_runtime()
+
+
+def test_production_runtime_accepts_required_cost_measurement_with_pricing() -> None:
+    """Accept required cost measurement once a complete catalog is configured."""
+    settings = production_settings(
+        production_cost_measurement_required=True,
+        pricing_catalog_version="foundry-apim-2026-01-01",
+        pricing_small_input_rate_per_million_tokens=Decimal("0.15"),
+        pricing_small_output_rate_per_million_tokens=Decimal("0.60"),
+        pricing_strong_input_rate_per_million_tokens=Decimal("2.50"),
+        pricing_strong_output_rate_per_million_tokens=Decimal("10.00"),
+        pricing_embedding_input_rate_per_million_tokens=Decimal("0.02"),
+    )
+
+    assert settings.validate_production_runtime() is settings
 
 
 def test_settings_read_prefixed_environment_variables(

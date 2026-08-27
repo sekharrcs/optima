@@ -1,5 +1,6 @@
 """Static regression contracts for Slice 11B Azure deployment readiness."""
 
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,8 +42,9 @@ def test_container_apps_require_separate_immutable_image_digests() -> None:
     assert "fail('Container Apps deployment requires" in main
     assert "apiImageDigest == toLower(apiImageDigest)" in main
     assert "uiImageDigest == toLower(uiImageDigest)" in main
+    compact_main = re.sub(r"\s+", "", main)
     for character in "0123456789abcdef":
-        assert f"'{character}', '')" in main
+        assert f"'{character}','')" in compact_main
     assert "placeholderImageDigest" in resources
     assert "fail('Container Apps deployment requires" in resources
     assert "apiImageDigest == toLower(apiImageDigest)" in resources
