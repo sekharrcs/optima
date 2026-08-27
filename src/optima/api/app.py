@@ -9,6 +9,11 @@ from fastapi import FastAPI
 from optima.api.dependencies import ExecutionDependencies
 from optima.api.routes.health import router as health_router
 from optima.api.routes.runs import ExecutionDependencyResolver, build_runs_router
+from optima.api.security import (
+    MAX_REQUEST_BODY_BYTES,
+    ExecutionConcurrencyLimiter,
+    RequestBodyLimitMiddleware,
+)
 from optima.observability.azure_monitor import build_observability
 from optima.observability.resilient import FailureIsolatedObservability
 
@@ -32,9 +37,19 @@ def create_app(
         resolved_dependencies = replace(
             resolved_dependencies,
             observability=observability,
+            execution_limiter=(
+                resolved_dependencies.execution_limiter
+                or ExecutionConcurrencyLimiter(
+                    resolved_dependencies.settings.execution_concurrency_limit
+                )
+            ),
         )
 
     application = FastAPI(title="OPTIMA API", lifespan=lifespan)
+    application.add_middleware(
+        RequestBodyLimitMiddleware,
+        maximum_body_bytes=MAX_REQUEST_BODY_BYTES,
+    )
     application.include_router(health_router, prefix="/api/v1")
     application.include_router(
         build_runs_router(execution_dependency_resolver or resolved_dependencies),

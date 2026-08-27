@@ -1,15 +1,17 @@
-FROM ghcr.io/astral-sh/uv:0.12.5 AS uv
+FROM ghcr.io/astral-sh/uv:0.12.5@sha256:e85be844203885286c60ffad8a858d48afb6c5a5c237ca0e67f12e74b8f174b1 AS uv
 
-FROM python:3.12.12-slim-bookworm AS builder
+FROM mcr.microsoft.com/azurelinux/base/python:3.12@sha256:0b729c82c0ddc0769248e287d7414f0cc4e42ae4aa5b786aa99883c247e42bdb AS builder
 COPY --from=uv /uv /usr/local/bin/uv
 ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy
 WORKDIR /app
 COPY pyproject.toml uv.lock ./
 COPY src ./src
-RUN uv sync --frozen --no-dev --no-editable --no-cache
+COPY scripts/generate_sbom.py ./scripts/generate_sbom.py
+RUN uv sync --frozen --no-dev --no-editable --no-cache \
+    && ./.venv/bin/python scripts/generate_sbom.py --component ui --output /app/sbom/ui.cdx.json
 
-FROM python:3.12.12-slim-bookworm AS runtime
+FROM mcr.microsoft.com/azurelinux/distroless/python:3.12-nonroot@sha256:d921452dba64944bf959f22450bb3740f5b2fff4a59faa64bd6b8eaf4c57b5b8 AS runtime
 ENV PATH=/app/.venv/bin:$PATH \
     PYTHONPATH=/app/src \
     PYTHONUNBUFFERED=1 \
@@ -18,11 +20,10 @@ ENV PATH=/app/.venv/bin:$PATH \
     STREAMLIT_SERVER_ADDRESS=0.0.0.0 \
     STREAMLIT_SERVER_HEADLESS=true \
     STREAMLIT_SERVER_PORT=8501
-RUN groupadd --gid 10001 optima \
-    && useradd --uid 10001 --gid 10001 --create-home --shell /usr/sbin/nologin optima
 WORKDIR /app
-COPY --from=builder --chown=10001:10001 /app/.venv ./.venv
-COPY --chown=10001:10001 src ./src
-USER 10001:10001
+COPY --from=builder /app/.venv ./.venv
+COPY --from=builder /app/sbom ./sbom
+COPY src ./src
+USER nonroot
 EXPOSE 8501
 CMD ["streamlit", "run", "src/ui/app.py"]

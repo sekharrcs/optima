@@ -25,6 +25,11 @@ BoundedHistoryLimit = Annotated[int, Field(gt=0, le=100)]
 BoundedRetryCount = Annotated[int, Field(gt=0, le=10)]
 BoundedEmbeddingDimension = Annotated[int, Field(gt=0, le=32_768)]
 BoundedRedisConnections = Annotated[int, Field(gt=0, le=100)]
+BoundedExecutionConcurrency = Annotated[int, Field(gt=0, le=32)]
+BoundedExecutionTimeoutSeconds = Annotated[
+    float,
+    Field(gt=0, le=300, allow_inf_nan=False),
+]
 BoundedTimeoutSeconds = Annotated[
     float,
     Field(gt=0, le=120, allow_inf_nan=False),
@@ -462,6 +467,8 @@ class AppSettings(BaseSettings):
     context_reduction_enabled: bool = True
     historical_policy_enabled: bool = True
     foundry_router_comparator_enabled: bool = False
+    execution_concurrency_limit: BoundedExecutionConcurrency = 4
+    execution_timeout_seconds: BoundedExecutionTimeoutSeconds = 300.0
     standard_quality_threshold: ConfiguredQualityScore = 0.80
     high_quality_threshold: ConfiguredQualityScore = 0.90
     critical_quality_threshold: ConfiguredQualityScore = 0.95

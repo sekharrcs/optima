@@ -18,6 +18,12 @@ param deployContainerApps bool = false
 @description('Create OPTIMA-owned runtime access assignments. Requires Azure RBAC administration on the registry.')
 param deployRuntimeAccess bool = false
 
+@description('Existing single-tenant Microsoft Entra application client ID for UI authentication.')
+param uiAuthClientId string
+
+@description('Microsoft Entra tenant ID that may authenticate to the public UI.')
+param uiAuthTenantId string
+
 @description('Immutable API image manifest digest produced by a later build slice.')
 @minLength(71)
 @maxLength(71)
@@ -220,6 +226,8 @@ module resources 'resource-group.bicep' = {
     redisEmbeddingDeployment: redisEmbeddingDeployment
     redisEmbeddingDimension: redisEmbeddingDimension
     redisEmbeddingModel: redisEmbeddingModel
+    uiAuthClientId: uiAuthClientId
+    uiAuthTenantId: uiAuthTenantId
     uiImageDigest: validatedUiImageDigest
   }
 }

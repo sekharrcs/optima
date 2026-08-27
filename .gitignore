@@ -11,5 +11,6 @@ htmlcov/
 .copilot-tracking/
 dist/
 build/
+security/reports/
 *.log
 .DS_Store

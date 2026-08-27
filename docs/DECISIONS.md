@@ -555,3 +555,27 @@ required context cross the configured judge-model data boundary, but raw judged
 content and responses are not logged. LLM-judge scores remain estimates subject
 to bias, self-preference, prompt sensitivity, stochastic and model-version effects,
 and generator-judge correlation.
+
+## ADR-036: Harden the public UI and production artifact boundary
+
+Status: Accepted
+
+The public Streamlit Container App uses Azure Container Apps built-in Microsoft
+Entra authentication with a pre-existing single-tenant app registration. It
+requires HTTPS and redirects anonymous requests to Entra before they reach the
+container. The API remains internal and unauthenticated at the application
+layer. The public UI retains history only in its current Streamlit session and
+does not browse shared Cosmos history.
+
+The production UI takes its API root only from process configuration, requires
+HTTPS in production mode, and refuses redirects. FastAPI bounds raw and parsed
+request sizes, metadata depth and size, maximum latency, active per-process
+executions, and the overall execution deadline. Caller-supplied Planner V1
+profile facts remain explicit demo assumptions and cannot bypass these limits.
+
+Production images use digest-pinned Azure Linux Python 3.12 builder and non-root
+distroless runtime bases plus a digest-pinned uv stage. Frozen no-development,
+non-editable installation is mandatory. Each image embeds a CycloneDX inventory
+of its exact installed Python environment. A final image build, smoke test,
+content inspection, and advisory/secret scan remain deployment gates whenever
+the current workstation cannot provide an OCI builder.

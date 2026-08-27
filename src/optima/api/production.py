@@ -17,6 +17,7 @@ from optima.api.dependencies import (
     build_foundry_judge_provider,
     build_foundry_provider_pair,
 )
+from optima.api.security import ExecutionConcurrencyLimiter
 from optima.cache import (
     SemanticCache,
     build_redis_semantic_cache_resources,
@@ -357,6 +358,9 @@ async def build_production_runtime(
             token_counter=token_counter,
             context_reducer_safety_policy=DeterministicExtractiveSafetyPolicy(),
             observability=observability,
+            execution_limiter=ExecutionConcurrencyLimiter(
+                settings.execution_concurrency_limit
+            ),
         )
         return ProductionRuntime(dependencies=dependencies, _closers=tuple(closers))
     except BaseException:

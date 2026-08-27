@@ -9,7 +9,9 @@ Slice 11B owns:
 
 * Production FastAPI dependency composition
 * FastAPI lifespan construction and cleanup
-* API and UI image definitions
+* API and UI image definitions and dependency SBOMs
+* Public UI Entra authentication configuration
+* Request-size, execution-time, and per-process concurrency limits
 * Redis index inspection, compatibility validation, and creation
 * East US 2 application parameters
 * Runtime environment-variable and immutable image contracts
@@ -117,10 +119,18 @@ custom ACL model. Slice 11B preserves this reviewed tradeoff.
 ## Container images
 
 `Dockerfile.api` exposes port `8000`. `Dockerfile.ui` exposes port `8501` and
-starts `streamlit run src/ui/app.py`. Both use Python 3.12.12 slim, install from
-`uv.lock` with `uv 0.12.5`, exclude development dependencies, and run as UID and
-GID `10001`. The Docker context is an allow list containing only
-`pyproject.toml`, `uv.lock`, and `src`.
+starts `streamlit run src/ui/app.py`. Both use digest-pinned Azure Linux 3.0
+Python 3.12 builder and non-root distroless runtime images. The pinned uv 0.12.5
+stage installs from `uv.lock` with `--frozen --no-dev --no-editable --no-cache`.
+The final image copies no package manager, compiler, shell setup, test tree, or
+source-control metadata and runs as the base image's declared `nonroot` user.
+The Docker context allow list contains only `pyproject.toml`, `uv.lock`, `src`,
+and the SBOM generator, while excluding bytecode and cache directories.
+
+Each builder generates a deterministic CycloneDX 1.6 inventory from its exact
+installed environment. The final API image contains `sbom/api.cdx.json`; the UI
+image contains `sbom/ui.cdx.json`. Repository copies under `security/sbom` are
+reproducible Linux x64 evidence from the same frozen production closure.
 
 Build and smoke test locally when Docker is available:
 
@@ -144,6 +154,22 @@ Container Apps owns `OPTIMA_DEPLOYMENT_ENVIRONMENT`, managed-identity IDs,
 Cosmos resource values, Redis endpoint values, Application Insights values, and
 the UI API URL. The AI/model owner supplies the Foundry endpoint and deployment
 identities.
+
+The deployed UI sets `OPTIMA_UI_PRODUCTION_MODE=true`. This requires an explicit
+HTTPS `OPTIMA_API_BASE_URL`; the Streamlit form exposes no destination override,
+and its HTTP client refuses redirects. `OPTIMA_API_TIMEOUT_SECONDS=315` exceeds
+the server's execution plus persistence budgets. Local development defaults to
+`http://127.0.0.1:8000` and may use an environment-only override while
+production mode is false.
+
+The API rejects request bodies above 4 MiB before JSON deserialization. Parsed
+requests limit input to 32,000 characters, context to 128,000, reference output
+to 32,000, criteria to 20 entries of 2,000 characters each, canonical metadata
+to 32 KiB and bounded nesting, and caller latency to 300,000 milliseconds.
+Production allows four active executions per process and at most three API
+replicas, applies a 300-second overall deadline, and aligns the Container Apps
+HTTP scale threshold to four concurrent requests. These controls bound one
+deployment but do not implement a distributed per-user quota.
 
 Evaluator configuration is explicit:
 
@@ -173,7 +199,15 @@ ID as its AUTH username. Redis uses fixed Azure Managed Redis TLS port `10000`.
 
 Application Insights must be enabled with its connection string, service name,
 deployment environment, and sampling ratio. Live Metrics, performance counters,
-and offline storage remain disabled.
+and offline storage remain disabled. IaC carries the connection string through
+secure module values and a Container Apps secret reference.
+
+The external UI uses Container Apps built-in Microsoft Entra authentication.
+Slice 11C must provide an existing single-tenant app registration and tenant ID,
+enable ID-token issuance, register the exact UI callback URI
+`https://<ui-fqdn>/.auth/login/aad/callback`, and restrict assignment to the
+intended hackathon users when tenant-wide access is too broad. The checked-in
+configuration stores no client secret and enables no token store.
 
 LLM-judge evaluation sends the original task, candidate output, explicit
 criteria, and required supplied context through the configured Foundry/APIM
@@ -191,6 +225,8 @@ Before Bicep execution, Slice 11C must validate as far as Azure APIs allow:
 4. Relevant subscription quota and limits
 5. Presence of immutable API and UI manifests in ACR
 6. Replacement of every Foundry, embedding, and digest placeholder
+7. Replacement of UI Entra client and tenant placeholders and verification of
+  the exact callback URI and user-assignment policy
 
 Valid SKU metadata and quota do not guarantee regional allocation capacity.
 Allocation failure must stop deployment with a clear error. It must not place
@@ -246,6 +282,8 @@ Slice 11C must also supply and verify:
   currency when cost measurement is required
 7. Immutable API and UI image digests and all existing Redis, Cosmos,
   Application Insights, and Foundry inputs
+8. Existing single-tenant UI Entra app client ID, tenant ID, ID-token issuance,
+   callback URI, and intended-user assignment
 
 Actual model names, deployment names, and rates remain deployment inputs. This
 repository does not fabricate them.
@@ -253,8 +291,9 @@ repository does not fabricate them.
 ## Slice 11C container validation gate
 
 Docker and Podman were unavailable during Slice 11B, so only static Dockerfile
-contracts were verified. Static Dockerfile tests are not sufficient for a first
-Azure deployment.
+contracts, frozen Linux dependency artifacts, and each pinned base image were
+verified. Static contracts and base scans are not sufficient for a first Azure
+deployment.
 
 Slice 11C must block application deployment until both the API and UI images
 have:
@@ -263,6 +302,10 @@ have:
 2. started successfully
 3. passed API and UI local or CI container smoke tests
 4. produced immutable ACR manifest digests
+5. been scanned as final images for OS and Python advisories, secrets, and
+  unexpected executable content
+6. been checked for non-root execution, embedded SBOMs, no development packages,
+  no `.git` or `.env` content, and no package-manager caches
 
-Only after all four hold for both images may Slice 11C publish digests and enable
+Only after all six hold for both images may Slice 11C publish digests and enable
 Container Apps.

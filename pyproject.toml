@@ -12,7 +12,7 @@ dependencies = [
     "pydantic>=2.13.4",
     "pydantic-settings>=2.15.0",
     "redis==8.1.0",
-    "streamlit>=1.50,<1.51",
+    "streamlit>=1.54,<1.55",
     "uvicorn>=0.52.1",
 ]
 
@@ -23,6 +23,9 @@ build-backend = "uv_build"
 [[tool.uv.index]]
 url = "https://packagefeedproxy.microsoft.io/pypi/simple"
 default = true
+
+[tool.uv]
+constraint-dependencies = ["pillow>=12.3,<13"]
 
 [dependency-groups]
 dev = [

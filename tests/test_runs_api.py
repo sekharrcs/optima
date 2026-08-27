@@ -1,5 +1,7 @@
 """API integration tests for the Slice 5 small-first vertical path."""
 
+import asyncio
+import json
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -11,7 +13,21 @@ from pydantic import ValidationError
 
 from optima.api.app import create_app
 from optima.api.dependencies import ExecutionDependencies
-from optima.api.models import RunRequest
+from optima.api.models import (
+    MAX_CONTEXT_CHARACTERS,
+    MAX_CRITERIA_ENTRIES,
+    MAX_CRITERION_CHARACTERS,
+    MAX_INPUT_TEXT_CHARACTERS,
+    MAX_LATENCY_MILLISECONDS,
+    MAX_METADATA_BYTES,
+    MAX_METADATA_DEPTH,
+    MAX_REFERENCE_OUTPUT_CHARACTERS,
+    RunRequest,
+)
+from optima.api.security import (
+    MAX_REQUEST_BODY_BYTES,
+    ExecutionConcurrencyLimiter,
+)
 from optima.cache import (
     FakeSemanticCache,
     SemanticCache,
@@ -98,6 +114,25 @@ class RaisingSmallProvider:
         request: ModelProviderRequest,
     ) -> ModelProviderResult:
         raise RuntimeError("provider unavailable")
+
+
+class BlockingSmallProvider:
+    """Small-role provider that remains active until the server deadline cancels it."""
+
+    provider_name = "blocking-provider"
+    deployment_name = "small"
+    model_role = ModelRole.SMALL
+
+    def __init__(self) -> None:
+        self.call_count = 0
+
+    async def generate(
+        self,
+        request: ModelProviderRequest,
+    ) -> ModelProviderResult:
+        self.call_count += 1
+        await asyncio.Event().wait()
+        raise AssertionError("blocking provider must be cancelled")
 
 
 def request_payload(**updates: object) -> dict[str, object]:
@@ -832,6 +867,165 @@ def test_run_endpoint_strictly_rejects_unknown_and_coerced_inputs() -> None:
     assert len(small.calls) == 0
     assert len(strong.calls) == 0
     assert len(evaluator.calls) == 0
+
+
+def _metadata_with_serialized_size(size: int) -> dict[str, str]:
+    """Build one ASCII metadata object with an exact compact JSON byte size."""
+    overhead = len(json.dumps({"value": ""}, separators=(",", ":")).encode())
+    return {"value": "x" * (size - overhead)}
+
+
+def _nested_metadata(container_levels: int) -> dict[str, object]:
+    """Build one object with a deterministic number of nested containers."""
+    value: object = "leaf"
+    for _ in range(container_levels):
+        value = {"child": value}
+    if not isinstance(value, dict):
+        raise AssertionError("positive container levels must produce an object")
+    return value
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"input_text": "x" * MAX_INPUT_TEXT_CHARACTERS},
+        {"context": "x" * MAX_CONTEXT_CHARACTERS},
+        {"reference_output": "x" * MAX_REFERENCE_OUTPUT_CHARACTERS},
+        {"criteria": ["x" * MAX_CRITERION_CHARACTERS]},
+        {"criteria": ["x"] * MAX_CRITERIA_ENTRIES},
+        {"metadata": _metadata_with_serialized_size(MAX_METADATA_BYTES)},
+        {"metadata": _nested_metadata(MAX_METADATA_DEPTH + 1)},
+        {"max_latency_ms": MAX_LATENCY_MILLISECONDS},
+    ],
+)
+def test_run_endpoint_accepts_security_boundary_values(
+    updates: dict[str, object],
+) -> None:
+    """Accept each request field at its documented inclusive security limit."""
+    configured, small, strong, evaluator = dependencies(0.93)
+
+    response = TestClient(create_app(execution_dependencies=configured)).post(
+        "/api/v1/runs",
+        json=request_payload(**updates),
+    )
+
+    assert response.status_code == 200
+    assert len(small.calls) == 1
+    assert strong.calls == ()
+    assert len(evaluator.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"input_text": "x" * (MAX_INPUT_TEXT_CHARACTERS + 1)},
+        {"context": "x" * (MAX_CONTEXT_CHARACTERS + 1)},
+        {"reference_output": "x" * (MAX_REFERENCE_OUTPUT_CHARACTERS + 1)},
+        {"criteria": ["x" * (MAX_CRITERION_CHARACTERS + 1)]},
+        {"criteria": ["x"] * (MAX_CRITERIA_ENTRIES + 1)},
+        {"metadata": _metadata_with_serialized_size(MAX_METADATA_BYTES + 1)},
+        {"metadata": _nested_metadata(MAX_METADATA_DEPTH + 2)},
+        {"max_latency_ms": MAX_LATENCY_MILLISECONDS + 1},
+    ],
+)
+def test_run_endpoint_rejects_security_limit_excess_before_provider_calls(
+    updates: dict[str, object],
+) -> None:
+    """Reject each over-limit input before cache, model, or evaluator execution."""
+    configured, small, strong, evaluator = dependencies(0.93)
+
+    response = TestClient(create_app(execution_dependencies=configured)).post(
+        "/api/v1/runs",
+        json=request_payload(**updates),
+    )
+
+    assert response.status_code == 422
+    assert small.calls == ()
+    assert strong.calls == ()
+    assert evaluator.calls == ()
+
+
+def test_request_body_limit_accepts_exact_limit_and_rejects_limit_plus_one() -> None:
+    """Apply the raw body ceiling before JSON parsing or dependency execution."""
+    configured, small, strong, evaluator = dependencies(0.93)
+    client = TestClient(create_app(execution_dependencies=configured))
+
+    exact = client.post(
+        "/api/v1/runs",
+        content=b" " * MAX_REQUEST_BODY_BYTES,
+        headers={"content-type": "application/json"},
+    )
+    excessive = client.post(
+        "/api/v1/runs",
+        content=b" " * (MAX_REQUEST_BODY_BYTES + 1),
+        headers={"content-type": "application/json"},
+    )
+
+    assert exact.status_code == 422
+    assert excessive.status_code == 413
+    assert excessive.json()["detail"]["code"] == "REQUEST_BODY_TOO_LARGE"
+    assert small.calls == ()
+    assert strong.calls == ()
+    assert evaluator.calls == ()
+
+
+def test_execution_capacity_rejects_without_queueing_or_provider_calls() -> None:
+    """Reject excess process-local work before allocating run or provider capacity."""
+    configured, small, strong, evaluator = dependencies(0.93)
+    limiter = ExecutionConcurrencyLimiter(1)
+    application = create_app(
+        execution_dependencies=replace(configured, execution_limiter=limiter)
+    )
+
+    with limiter.acquire():
+        response = TestClient(application).post(
+            "/api/v1/runs",
+            json=request_payload(),
+        )
+
+    assert response.status_code == 429
+    assert response.json()["detail"] == {
+        "code": "EXECUTION_CAPACITY_EXCEEDED",
+        "message": "This OPTIMA instance is at its execution concurrency limit",
+        "facts": {"maximum_concurrency": 1},
+    }
+    assert limiter.active == 0
+    assert small.calls == ()
+    assert strong.calls == ()
+    assert evaluator.calls == ()
+
+
+def test_server_execution_timeout_cancels_provider_and_releases_capacity() -> None:
+    """Enforce one overall deadline and release the process-local execution slot."""
+    configured, _, strong, evaluator = dependencies(0.93)
+    blocking = BlockingSmallProvider()
+    limiter = ExecutionConcurrencyLimiter(1)
+    application = create_app(
+        execution_dependencies=replace(
+            configured,
+            settings=configured.settings.model_copy(
+                update={"execution_timeout_seconds": 0.01}
+            ),
+            small_provider=blocking,
+            execution_limiter=limiter,
+        )
+    )
+
+    response = TestClient(application).post(
+        "/api/v1/runs",
+        json=request_payload(max_latency_ms=MAX_LATENCY_MILLISECONDS),
+    )
+
+    assert response.status_code == 504
+    assert response.json()["detail"] == {
+        "code": "EXECUTION_TIMEOUT",
+        "message": "OPTIMA execution exceeded its server-side deadline",
+        "facts": {"timeout_ms": 10},
+    }
+    assert blocking.call_count == 1
+    assert limiter.active == 0
+    assert strong.calls == ()
+    assert evaluator.calls == ()
 
 
 def test_default_app_returns_structured_unconfigured_error() -> None:

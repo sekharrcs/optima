@@ -3,3 +3,11 @@
 !uv.lock
 !src/
 !src/**
+!scripts/
+!scripts/generate_sbom.py
+**/__pycache__/
+**/*.py[cod]
+**/.env
+**/.env.*
+**/.git
+**/.git/**

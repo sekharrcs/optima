@@ -17,7 +17,9 @@ This is not a chatbot-first UI. The answer matters, but the product being demons
 
 Use Streamlit for the hackathon UI.
 
-Do not add authentication, user administration, tenant settings, or a general-purpose configuration console to the MVP.
+Do not add home-grown authentication, user administration, tenant settings, or
+a general-purpose configuration console to the MVP. An externally deployed UI
+must remain behind Azure Container Apps built-in Microsoft Entra authentication.
 
 ## Navigation
 

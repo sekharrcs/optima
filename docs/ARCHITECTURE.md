@@ -93,7 +93,7 @@ Subscription-scope Bicep
                 +--> Azure Container Registry Basic
                 +--> Azure Container Apps Consumption
                 |     |- internal OPTIMA FastAPI API
-                |     |- public OPTIMA Streamlit UI
+                |     |- Entra-protected public OPTIMA Streamlit UI
                 +--> Azure Cosmos DB for NoSQL serverless
                 +--> Azure Managed Redis Balanced B0
                 +--> Log Analytics + Application Insights
@@ -105,7 +105,8 @@ OPTIMA API --> Foundry or APIM Azure OpenAI v1 endpoint
 
 Slices 11A and 11B omit Key Vault because runtime service authentication uses managed
 identity. The generated Application Insights connection string identifies the
-telemetry destination and is not a security token. APIM and Foundry resources
+telemetry destination and is carried through secure Bicep output/input and a
+Container Apps secret reference. APIM and Foundry resources
 remain external reviewed inputs because the current provider supports either
 direct Foundry or an APIM gateway and no gateway is required by application
 behavior.
@@ -113,7 +114,9 @@ behavior.
 Public Azure service endpoints are an intentional hackathon tradeoff. Cosmos
 local auth, Redis access keys, and ACR admin credentials are disabled. The API
 is internal to the Container Apps environment because it has no caller
-authentication; only the UI has public ingress.
+authentication. Only the UI has public ingress, and Container Apps built-in
+authentication requires a tenant-restricted Microsoft Entra session before a
+request reaches Streamlit.
 
 See `docs/AZURE_INFRASTRUCTURE.md` for resource configuration, configuration
 mapping, identity scopes, provider registrations, cost controls, and deployment
