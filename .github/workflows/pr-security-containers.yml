@@ -1,0 +1,789 @@
+name: PR security and final containers
+
+on:
+  pull_request:
+    branches:
+      - main
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-security-containers-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  EXPECTED_HEAD_SHA: "${{ github.event.pull_request.head.sha }}"
+  BASE_SHA: "${{ github.event.pull_request.base.sha }}"
+  UV_CACHE_DIR: "${{ runner.temp }}/uv-cache"
+  UV_NO_CACHE: "1"
+  SYFT_VERSION: "1.51.1"
+  SYFT_ARCHIVE: syft_1.51.1_linux_amd64.tar.gz
+  SYFT_SHA256: 8fcb33017a0dc1058298c923c436d19dfa68ae93968e0b423248542e3afb9fc3
+  SYFT_URL: https://github.com/anchore/syft/releases/download/v1.51.1/syft_1.51.1_linux_amd64.tar.gz
+  TRIVY_VERSION: "0.74.0"
+  TRIVY_ARCHIVE: trivy_0.74.0_Linux-64bit.tar.gz
+  TRIVY_SHA256: 2ae6fe3ee734b7fdf11335663e18c75ea12dccc76062f09f164a3b0f8be4371a
+  TRIVY_URL: https://github.com/aquasecurity/trivy/releases/download/v0.74.0/trivy_0.74.0_Linux-64bit.tar.gz
+
+jobs:
+  application-validation:
+    name: Validate exact-head application
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    outputs:
+      validation-evidence: "${{ steps.bundle-validation-evidence.outputs.archive }}"
+    steps:
+      # actions/checkout v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: "${{ github.event.pull_request.head.sha }}"
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify runner and exact source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "x86_64"
+          actual_head="$(git rev-parse HEAD)"
+          test "$actual_head" = "$EXPECTED_HEAD_SHA"
+          if git config --local --get-regexp '^http\..*\.extraheader$'; then
+            echo "Checkout credentials remain configured" >&2
+            exit 1
+          fi
+          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          git cat-file -e "$BASE_SHA^{commit}"
+          cat /etc/os-release
+          uname -m
+          printf 'Validated commit: %s\n' "$actual_head"
+          runner_os="$(grep '^PRETTY_NAME=' /etc/os-release | cut -d= -f2- | tr -d '"')"
+          {
+            printf '## Application validation source\n\n'
+            printf -- '- Runner: `%s` (`%s`, `%s`)\n' "$RUNNER_NAME" "$runner_os" "$(uname -m)"
+            printf -- '- Exact PR head: `%s`\n' "$actual_head"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # astral-sh/setup-uv v10.0.1
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
+        with:
+          version: "0.12.5"
+          enable-cache: false
+          python-version: "3.12"
+
+      - name: Prepare application evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          uv_version="$(uv --version)"
+          test "$uv_version" = "uv 0.12.5"
+          python_version="$(uv run --no-project --python 3.12 python -c 'import platform; print(platform.python_version())')"
+          case "$python_version" in
+            3.12.*) ;;
+            *) echo "Expected Python 3.12, got $python_version" >&2; exit 1 ;;
+          esac
+          printf 'uv=%s\npython=%s\n' "$uv_version" "$python_version" \
+            > "$RUNNER_TEMP/evidence/application-tools.txt"
+
+      - name: Check lock and synchronize all groups
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv lock --check
+          uv sync --frozen --all-groups
+
+      - name: Check Ruff formatting
+        shell: bash
+        run: uv run ruff format --check .
+
+      - name: Run Ruff lint
+        shell: bash
+        run: uv run ruff check .
+
+      - name: Run strict mypy
+        shell: bash
+        run: uv run mypy src tests
+
+      - name: Run full pytest suite and derive counts
+        shell: bash
+        run: |
+          set -uo pipefail
+          evidence="$RUNNER_TEMP/evidence"
+          uv run pytest --junitxml="$evidence/pytest.xml"
+          pytest_status=$?
+          set -e
+          if test -f "$evidence/pytest.xml"; then
+            uv run --no-sync python - "$evidence/pytest.xml" "$evidence/pytest-counts.json" <<'PY'
+          import json
+          import sys
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          if sys.flags.optimize != 0:
+              raise SystemExit("optimized Python is forbidden for policy validation")
+          report_path = Path(sys.argv[1])
+          output_path = Path(sys.argv[2])
+          root = ET.parse(report_path).getroot()
+          suites = [root] if root.tag.endswith("testsuite") else list(root)
+          totals = {
+              key: sum(int(suite.attrib.get(key, "0")) for suite in suites)
+              for key in ("tests", "failures", "errors", "skipped")
+          }
+          totals["passed"] = (
+              totals["tests"]
+              - totals["failures"]
+              - totals["errors"]
+              - totals["skipped"]
+          )
+          if totals["tests"] <= 0 or totals["passed"] < 0:
+              raise SystemExit("JUnit totals are invalid")
+          output_path.write_text(
+              json.dumps(totals, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          summary_path = Path(__import__("os").environ["GITHUB_STEP_SUMMARY"])
+          with summary_path.open("a", encoding="utf-8") as summary:
+              summary.write("\n## Pytest evidence\n\n")
+              summary.write(f"- Total: `{totals['tests']}`\n")
+              summary.write(f"- Passed: `{totals['passed']}`\n")
+              summary.write(f"- Failed: `{totals['failures']}`\n")
+              summary.write(f"- Errors: `{totals['errors']}`\n")
+              summary.write(f"- Skipped: `{totals['skipped']}`\n")
+          PY
+          fi
+          exit "$pytest_status"
+
+      - name: Check base-to-head diff
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check "$BASE_SHA" HEAD
+
+      - name: Bundle validation evidence for container job
+        id: bundle-validation-evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/evidence"
+          test -s "$evidence/pytest.xml"
+          test -s "$evidence/pytest-counts.json"
+          archive="$(tar -C "$evidence" -czf - pytest.xml pytest-counts.json application-tools.txt | base64 --wrap=0)"
+          printf 'archive=%s\n' "$archive" >> "$GITHUB_OUTPUT"
+
+      # actions/upload-artifact v7.0.1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: failure()
+        with:
+          name: pr-security-application-failure
+          path: ${{ runner.temp }}/evidence
+          if-no-files-found: warn
+          retention-days: 3
+
+  final-container-verification:
+    name: Verify exact final containers
+    needs: application-validation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      # actions/checkout v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: "${{ github.event.pull_request.head.sha }}"
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify runner and exact source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "x86_64"
+          actual_head="$(git rev-parse HEAD)"
+          test "$actual_head" = "$EXPECTED_HEAD_SHA"
+          if git config --local --get-regexp '^http\..*\.extraheader$'; then
+            echo "Checkout credentials remain configured" >&2
+            exit 1
+          fi
+          cat /etc/os-release
+          uname -m
+          printf 'Validated commit: %s\n' "$actual_head"
+          runner_os="$(grep '^PRETTY_NAME=' /etc/os-release | cut -d= -f2- | tr -d '"')"
+          {
+            printf '## Final-container verification source\n\n'
+            printf -- '- Runner: `%s` (`%s`, `%s`)\n' "$RUNNER_NAME" "$runner_os" "$(uname -m)"
+            printf -- '- Exact PR head: `%s`\n' "$actual_head"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # astral-sh/setup-uv v10.0.1
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
+        with:
+          version: "0.12.5"
+          enable-cache: false
+          python-version: "3.12"
+
+      - name: Restore application evidence
+        shell: bash
+        env:
+          VALIDATION_EVIDENCE_BUNDLE: "${{ needs.application-validation.outputs.validation-evidence }}"
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/evidence"
+          mkdir -p "$evidence"
+          test -n "$VALIDATION_EVIDENCE_BUNDLE"
+          printf '%s' "$VALIDATION_EVIDENCE_BUNDLE" | base64 --decode | tar -xz -C "$evidence"
+          test -s "$evidence/pytest.xml"
+          test -s "$evidence/pytest-counts.json"
+
+      - name: Download and verify official security tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          downloads="$RUNNER_TEMP/security-downloads"
+          tools="$RUNNER_TEMP/security-tools"
+          scanner_workspace="$RUNNER_TEMP/scanner-workspace"
+          scanner_home="$RUNNER_TEMP/scanner-home"
+          scanner_policy="$RUNNER_TEMP/scanner-policy"
+          mkdir -p "$downloads" "$tools" "$scanner_workspace" "$scanner_home" "$scanner_policy"
+          printf '{}\n' > "$scanner_policy/syft.yaml"
+          cat > "$scanner_policy/trivy.yaml" <<'YAML'
+          vulnerability:
+            vex: []
+            ignore-status: []
+          scan:
+            skip-dirs: []
+            skip-files: []
+          YAML
+          : > "$scanner_policy/.trivyignore"
+          printf '{}\n' > "$scanner_policy/trivy-secret.yaml"
+          curl --fail --location --proto '=https' --tlsv1.2 --retry 3 --retry-all-errors \
+            --output "$downloads/$SYFT_ARCHIVE" "$SYFT_URL"
+          curl --fail --location --proto '=https' --tlsv1.2 --retry 3 --retry-all-errors \
+            --output "$downloads/$TRIVY_ARCHIVE" "$TRIVY_URL"
+          cd "$downloads"
+          printf '%s  %s\n' "$SYFT_SHA256" "$SYFT_ARCHIVE" | sha256sum --check --strict
+          printf '%s  %s\n' "$TRIVY_SHA256" "$TRIVY_ARCHIVE" | sha256sum --check --strict
+          tar -xzf "$SYFT_ARCHIVE" -C "$tools" syft
+          tar -xzf "$TRIVY_ARCHIVE" -C "$tools" trivy
+          test -x "$tools/syft"
+          test -x "$tools/trivy"
+          cd "$scanner_workspace"
+          env -i HOME="$scanner_home" PATH="/usr/bin:/bin" \
+            "$tools/syft" --config "$scanner_policy/syft.yaml" version \
+            | tee "$RUNNER_TEMP/evidence/syft-version.txt"
+          env -i HOME="$scanner_home" PATH="/usr/bin:/bin" \
+            "$tools/trivy" --config "$scanner_policy/trivy.yaml" --version \
+            | tee "$RUNNER_TEMP/evidence/trivy-version.txt"
+          grep -F "$SYFT_VERSION" "$RUNNER_TEMP/evidence/syft-version.txt"
+          grep -F "$TRIVY_VERSION" "$RUNNER_TEMP/evidence/trivy-version.txt"
+          printf '%s\n' "$tools" >> "$GITHUB_PATH"
+
+      - name: Build exact final images
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker version
+          docker build --pull --no-cache --platform linux/amd64 --file Dockerfile.api --tag optima-api:pr .
+          docker build --pull --no-cache --platform linux/amd64 --file Dockerfile.ui --tag optima-ui:pr .
+          docker image inspect optima-api:pr > "$RUNNER_TEMP/evidence/api-image-inspect.json"
+          docker image inspect optima-ui:pr > "$RUNNER_TEMP/evidence/ui-image-inspect.json"
+
+      - name: Validate final image configuration and identifiers
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run --no-project --python 3.12 python - "$RUNNER_TEMP/evidence" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          if sys.flags.optimize != 0:
+              raise SystemExit("optimized Python is forbidden for policy validation")
+          evidence = Path(sys.argv[1])
+          expected = {
+              "api": {
+                  "command": [
+                      "uvicorn",
+                      "optima.api.production:create_production_app",
+                      "--factory",
+                      "--host",
+                      "0.0.0.0",
+                      "--port",
+                      "8000",
+                  ],
+                  "port": "8000/tcp",
+              },
+              "ui": {
+                  "command": ["streamlit", "run", "src/ui/app.py"],
+                  "port": "8501/tcp",
+              },
+          }
+          summary = {}
+          for component, contract in expected.items():
+              document = json.loads(
+                  (evidence / f"{component}-image-inspect.json").read_text(
+                      encoding="utf-8"
+                  )
+              )
+              if not isinstance(document, list) or len(document) != 1:
+                  raise SystemExit(f"{component} image inspect shape is invalid")
+              image = document[0]
+              config = image["Config"]
+              checks = (
+                  (image["Os"] == "linux", "operating system"),
+                  (image["Architecture"] == "amd64", "architecture"),
+                  (image["Id"].startswith("sha256:"), "image ID"),
+                  (config["User"] == "nonroot", "runtime user"),
+                  (config["WorkingDir"] == "/app", "working directory"),
+                  (config.get("Entrypoint") in (None, []), "entrypoint"),
+                  (config["Cmd"] == contract["command"], "command"),
+                  (contract["port"] in config["ExposedPorts"], "exposed port"),
+              )
+              for passed, label in checks:
+                  if not passed:
+                      raise SystemExit(f"{component} image {label} is invalid")
+              image_id = image["Id"]
+              (evidence / f"{component}-image-id.txt").write_text(
+                  image_id + "\n", encoding="utf-8"
+              )
+              summary[component] = {
+                  "architecture": image["Architecture"],
+                  "command": config["Cmd"],
+                  "environment": sorted(config.get("Env") or []),
+                  "exposed_ports": sorted(config["ExposedPorts"]),
+                  "image_id": image_id,
+                  "operating_system": image["Os"],
+                  "repo_digests": sorted(image.get("RepoDigests") or []),
+                  "user": config["User"],
+                  "working_directory": config["WorkingDir"],
+              }
+          (evidence / "image-metadata-summary.json").write_text(
+              json.dumps(summary, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Probe actual API runtime and production imports
+        shell: bash
+        run: |
+          set -euo pipefail
+          runtime_probe="$(cat <<'PY'
+          import json
+          import os
+          import ssl
+          import sys
+
+          import azure.cosmos
+          import azure.identity
+          import azure.monitor.opentelemetry.exporter
+          import cryptography.hazmat.bindings._rust
+          import PIL._imaging
+          import pyarrow.lib
+          import redis
+          import uvicorn
+          from optima.api.production import create_production_app
+
+          if sys.flags.optimize != 0:
+              raise SystemExit("optimized Python is forbidden for policy validation")
+          context = ssl.create_default_context()
+          evidence = {
+              "ca_certificates": len(context.get_ca_certs()),
+              "factory_importable": callable(create_production_app),
+              "gid": os.getegid(),
+              "uid": os.geteuid(),
+          }
+          if evidence["uid"] <= 0:
+              raise SystemExit("API runtime UID must be non-root")
+          if evidence["gid"] <= 0:
+              raise SystemExit("API runtime GID must be non-root")
+          if evidence["ca_certificates"] <= 0:
+              raise SystemExit("API runtime CA certificates are missing")
+          if not evidence["factory_importable"]:
+              raise SystemExit("API production factory is not importable")
+          print(json.dumps(evidence, sort_keys=True))
+          PY
+          )"
+          docker run --rm --entrypoint python optima-api:pr -c "$runtime_probe" \
+            > "$RUNNER_TEMP/evidence/api-runtime-probe.json"
+
+      - name: Probe actual UI runtime and writable paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          runtime_probe="$(cat <<'PY'
+          import json
+          import os
+          import ssl
+          import sys
+          import tempfile
+          from pathlib import Path
+
+          import numpy._core._multiarray_umath
+          import pandas._libs.interval
+          import PIL._imaging
+          import pyarrow.lib
+          import streamlit
+
+          if sys.flags.optimize != 0:
+              raise SystemExit("optimized Python is forbidden for policy validation")
+          with tempfile.NamedTemporaryFile() as temporary_file:
+              temporary_file.write(b"optima")
+              temporary_file.flush()
+              temporary_path = temporary_file.name
+          home = Path.home()
+          home_probe = home / ".optima-write-probe"
+          home_probe.write_text("optima", encoding="utf-8")
+          home_probe.unlink()
+          context = ssl.create_default_context()
+          evidence = {
+              "ca_certificates": len(context.get_ca_certs()),
+              "gid": os.getegid(),
+              "home": str(home),
+              "home_writable": True,
+              "temporary_path": temporary_path,
+              "uid": os.geteuid(),
+          }
+          if evidence["uid"] <= 0:
+              raise SystemExit("UI runtime UID must be non-root")
+          if evidence["gid"] <= 0:
+              raise SystemExit("UI runtime GID must be non-root")
+          if evidence["ca_certificates"] <= 0:
+              raise SystemExit("UI runtime CA certificates are missing")
+          print(json.dumps(evidence, sort_keys=True))
+          PY
+          )"
+          docker run --rm --entrypoint python optima-ui:pr -c "$runtime_probe" \
+            > "$RUNNER_TEMP/evidence/ui-runtime-probe.json"
+
+      - name: Reject development packages in both final images
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_probe="$(cat <<'PY'
+          import json
+          import re
+          import sys
+          from importlib.metadata import distributions
+
+          if sys.flags.optimize != 0:
+              raise SystemExit("optimized Python is forbidden for policy validation")
+          blocked = {
+              "ast-serialize",
+              "iniconfig",
+              "librt",
+              "mypy",
+              "mypy-extensions",
+              "pathspec",
+              "pluggy",
+              "pygments",
+              "pytest",
+              "ruff",
+          }
+          normalize = lambda value: re.sub(r"[-_.]+", "-", value).lower()
+          installed = {
+              normalize(distribution.metadata["Name"])
+              for distribution in distributions()
+              if distribution.metadata["Name"]
+          }
+          present = sorted(blocked & installed)
+          if present:
+              raise SystemExit(f"development packages installed: {present}")
+          print(json.dumps({"blocked_present": present, "installed_count": len(installed)}))
+          PY
+          )"
+          docker run --rm --entrypoint python optima-api:pr -c "$package_probe" \
+            > "$RUNNER_TEMP/evidence/api-package-probe.json"
+          docker run --rm --entrypoint python optima-ui:pr -c "$package_probe" \
+            > "$RUNNER_TEMP/evidence/ui-package-probe.json"
+
+      - name: Smoke test credential-free API health
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --detach --name optima-api-smoke \
+            --publish 127.0.0.1::8000 \
+            --entrypoint uvicorn \
+            optima-api:pr \
+            optima.api.app:app --host 0.0.0.0 --port 8000
+          api_port="$(docker port optima-api-smoke 8000/tcp | tail -n1 | awk -F: '{print $NF}')"
+          test -n "$api_port"
+          ready=false
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent --show-error --max-time 2 \
+              "http://127.0.0.1:$api_port/api/v1/health" \
+              --output "$RUNNER_TEMP/evidence/api-health.json"; then
+              ready=true
+              break
+            fi
+            sleep 2
+          done
+          test "$ready" = "true"
+          uv run --no-project --python 3.12 python - "$RUNNER_TEMP/evidence/api-health.json" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          if sys.flags.optimize != 0:
+              raise SystemExit("optimized Python is forbidden for policy validation")
+          response = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if response != {"status": "ok"}:
+              raise SystemExit("API health response is invalid")
+          PY
+
+      - name: Capture API logs and remove container
+        if: always()
+        shell: bash
+        run: |
+          docker logs optima-api-smoke > "$RUNNER_TEMP/evidence/api-smoke.log" 2>&1 || true
+          docker rm --force optima-api-smoke >/dev/null 2>&1 || true
+
+      - name: Smoke test default Streamlit command
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --detach --name optima-ui-smoke \
+            --publish 127.0.0.1::8501 \
+            --env OPTIMA_API_BASE_URL=http://127.0.0.1:8000 \
+            --env OPTIMA_UI_PRODUCTION_MODE=false \
+            optima-ui:pr
+          ui_port="$(docker port optima-ui-smoke 8501/tcp | tail -n1 | awk -F: '{print $NF}')"
+          test -n "$ui_port"
+          ready=false
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent --show-error --max-time 2 \
+              "http://127.0.0.1:$ui_port/" \
+              --output "$RUNNER_TEMP/evidence/ui-root.html"; then
+              ready=true
+              break
+            fi
+            sleep 2
+          done
+          test "$ready" = "true"
+          test -s "$RUNNER_TEMP/evidence/ui-root.html"
+
+      - name: Capture UI logs and remove container
+        if: always()
+        shell: bash
+        run: |
+          docker logs optima-ui-smoke > "$RUNNER_TEMP/evidence/ui-smoke.log" 2>&1 || true
+          docker rm --force optima-ui-smoke >/dev/null 2>&1 || true
+
+      - name: Export and verify final filesystems without an image shell
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/evidence"
+          api_archive="$RUNNER_TEMP/api-rootfs.tar"
+          ui_archive="$RUNNER_TEMP/ui-rootfs.tar"
+          cleanup() {
+            docker rm --force optima-api-rootfs optima-ui-rootfs >/dev/null 2>&1 || true
+            rm -f "$api_archive" "$ui_archive"
+          }
+          trap cleanup EXIT
+          docker create --name optima-api-rootfs optima-api:pr >/dev/null
+          docker export --output "$api_archive" optima-api-rootfs
+          docker rm optima-api-rootfs >/dev/null
+          uv run --no-project --python 3.12 python scripts/verify_container_artifacts.py rootfs \
+            --component api \
+            --archive "$api_archive" \
+            --output "$evidence/api-rootfs-summary.json"
+          rm -f "$api_archive"
+          docker create --name optima-ui-rootfs optima-ui:pr >/dev/null
+          docker export --output "$ui_archive" optima-ui-rootfs
+          docker rm optima-ui-rootfs >/dev/null
+          uv run --no-project --python 3.12 python scripts/verify_container_artifacts.py rootfs \
+            --component ui \
+            --archive "$ui_archive" \
+            --output "$evidence/ui-rootfs-summary.json"
+
+      - name: Generate and validate final-image CycloneDX SBOMs
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/evidence"
+          scanner_workspace="$RUNNER_TEMP/scanner-workspace"
+          scanner_home="$RUNNER_TEMP/scanner-home"
+          scanner_policy="$RUNNER_TEMP/scanner-policy"
+          tools="$RUNNER_TEMP/security-tools"
+          cd "$scanner_workspace"
+          env -i HOME="$scanner_home" PATH="/usr/bin:/bin" \
+            "$tools/syft" --config "$scanner_policy/syft.yaml" docker:optima-api:pr \
+            --output "cyclonedx-json=$evidence/final-api-image.cdx.json"
+          env -i HOME="$scanner_home" PATH="/usr/bin:/bin" \
+            "$tools/syft" --config "$scanner_policy/syft.yaml" docker:optima-ui:pr \
+            --output "cyclonedx-json=$evidence/final-ui-image.cdx.json"
+          uv run --no-project --python 3.12 python - "$evidence" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          if sys.flags.optimize != 0:
+              raise SystemExit("optimized Python is forbidden for policy validation")
+          evidence = Path(sys.argv[1])
+          summary = {}
+          for component in ("api", "ui"):
+              path = evidence / f"final-{component}-image.cdx.json"
+              if not path.is_file() or path.stat().st_size == 0:
+                  raise SystemExit(f"{component} final-image SBOM is empty")
+              document = json.loads(path.read_text(encoding="utf-8"))
+              if document.get("bomFormat") != "CycloneDX":
+                  raise SystemExit(f"{component} final-image SBOM format is invalid")
+              components = document.get("components")
+              if not isinstance(components, list) or not components:
+                  raise SystemExit(f"{component} final-image SBOM has no components")
+              purls = [item.get("purl", "") for item in components if isinstance(item, dict)]
+              python_packages = sum(value.startswith("pkg:pypi/") for value in purls)
+              os_packages = sum(value.startswith("pkg:rpm/") for value in purls)
+              if python_packages <= 0:
+                  raise SystemExit(f"{component} final-image SBOM has no Python packages")
+              if os_packages <= 0:
+                  raise SystemExit(f"{component} final-image SBOM has no OS packages")
+              summary[component] = {
+                  "component_count": len(components),
+                  "os_package_count": os_packages,
+                  "python_package_count": python_packages,
+                  "sbom": path.name,
+                  "spec_version": document.get("specVersion"),
+              }
+          (evidence / "final-image-sbom-summary.json").write_text(
+              json.dumps(summary, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Scan both final images with Trivy
+        shell: bash
+        run: |
+          set +e
+          evidence="$RUNNER_TEMP/evidence"
+          scanner_workspace="$RUNNER_TEMP/scanner-workspace"
+          scanner_home="$RUNNER_TEMP/scanner-home"
+          scanner_policy="$RUNNER_TEMP/scanner-policy"
+          tools="$RUNNER_TEMP/security-tools"
+          cd "$scanner_workspace"
+          env -i HOME="$scanner_home" PATH="/usr/bin:/bin" \
+            "$tools/trivy" --config "$scanner_policy/trivy.yaml" image \
+            --cache-dir "$RUNNER_TEMP/trivy-cache" \
+            --ignorefile "$scanner_policy/.trivyignore" \
+            --secret-config "$scanner_policy/trivy-secret.yaml" \
+            --scanners vuln,secret --list-all-pkgs --format json \
+            --output "$evidence/api-trivy.json" optima-api:pr
+          api_status=$?
+          env -i HOME="$scanner_home" PATH="/usr/bin:/bin" \
+            "$tools/trivy" --config "$scanner_policy/trivy.yaml" image \
+            --cache-dir "$RUNNER_TEMP/trivy-cache" \
+            --ignorefile "$scanner_policy/.trivyignore" \
+            --secret-config "$scanner_policy/trivy-secret.yaml" \
+            --scanners vuln,secret --list-all-pkgs --format json \
+            --output "$evidence/ui-trivy.json" optima-ui:pr
+          ui_status=$?
+          set -e
+          if test "$api_status" -ne 0 || test "$ui_status" -ne 0; then
+            echo "Trivy failed: api=$api_status ui=$ui_status" >&2
+            exit 1
+          fi
+
+      - name: Evaluate aggregate Trivy policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/evidence"
+          uv run --no-project --python 3.12 python scripts/verify_container_artifacts.py trivy \
+            --report "api=$evidence/api-trivy.json" \
+            --report "ui=$evidence/ui-trivy.json" \
+            --expected-artifact "api=optima-api:pr" \
+            --expected-artifact "ui=optima-ui:pr" \
+            --expected-image-id "api=$(tr -d '\r\n' < "$evidence/api-image-id.txt")" \
+            --expected-image-id "ui=$(tr -d '\r\n' < "$evidence/ui-image-id.txt")" \
+            --output "$evidence/trivy-summary.json"
+
+      - name: Publish exact verification summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run --no-project --python 3.12 python - "$RUNNER_TEMP/evidence" <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          if sys.flags.optimize != 0:
+              raise SystemExit("optimized Python is forbidden for policy validation")
+          evidence = Path(sys.argv[1])
+          summary_path = Path(os.environ["GITHUB_STEP_SUMMARY"])
+
+          def load(name):
+              path = evidence / name
+              if not path.is_file():
+                  return None
+              return json.loads(path.read_text(encoding="utf-8"))
+
+          pytest = load("pytest-counts.json")
+          images = load("image-metadata-summary.json")
+          api_runtime = load("api-runtime-probe.json")
+          ui_runtime = load("ui-runtime-probe.json")
+          sboms = load("final-image-sbom-summary.json")
+          scans = load("trivy-summary.json")
+          api_rootfs = load("api-rootfs-summary.json")
+          ui_rootfs = load("ui-rootfs-summary.json")
+
+          with summary_path.open("a", encoding="utf-8") as summary:
+              summary.write("\n## Final-container evidence\n\n")
+              if pytest:
+                  summary.write(
+                      f"- Pytest: {pytest['passed']} passed, {pytest['failures']} failed, "
+                      f"{pytest['errors']} errors, {pytest['skipped']} skipped, "
+                      f"{pytest['tests']} total\n"
+                  )
+              if images:
+                  for component in ("api", "ui"):
+                      image = images[component]
+                      summary.write(
+                          f"- {component.upper()} image ID: `{image['image_id']}`; "
+                          f"configured user: `{image['user']}`; local RepoDigests: "
+                          f"`{len(image['repo_digests'])}`\n"
+                      )
+              if api_runtime:
+                  summary.write(
+                      f"- API runtime user: UID `{api_runtime['uid']}`, "
+                      f"GID `{api_runtime['gid']}`; health: "
+                      f"`{'pass' if (evidence / 'api-health.json').is_file() else 'unavailable'}`\n"
+                  )
+              if ui_runtime:
+                  summary.write(
+                      f"- UI runtime user: UID `{ui_runtime['uid']}`, "
+                      f"GID `{ui_runtime['gid']}`; Streamlit HTTP: "
+                      f"`{'pass' if (evidence / 'ui-root.html').is_file() else 'unavailable'}`\n"
+                  )
+              if api_rootfs and ui_rootfs:
+                  summary.write(
+                      f"- Rootfs policy: API `{api_rootfs['status']}`, "
+                      f"UI `{ui_rootfs['status']}`\n"
+                  )
+              if sboms:
+                  summary.write(
+                      f"- Final-image SBOMs: `{sboms['api']['sbom']}`, "
+                      f"`{sboms['ui']['sbom']}`\n"
+                  )
+              if scans:
+                  counts = scans["severity_counts"]
+                  count_text = ", ".join(
+                      f"{severity}={count}" for severity, count in sorted(counts.items())
+                  ) or "none"
+                  summary.write(
+                      f"- Trivy aggregate: `{scans['status']}`; vulnerabilities: "
+                      f"{count_text}; secrets={scans['secret_findings']}\n"
+                  )
+              else:
+                  summary.write("- Trivy aggregate: unavailable because no policy summary was produced\n")
+          PY
+
+      # actions/upload-artifact v7.0.1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: pr-security-final-containers
+          path: ${{ runner.temp }}/evidence
+          if-no-files-found: error
+          retention-days: 3

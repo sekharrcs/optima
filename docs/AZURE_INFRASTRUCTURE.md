@@ -11,7 +11,8 @@ description: Slice 11A and 11B Azure topology, runtime composition, deployment c
 > Slices 11A and 11B define infrastructure and deployment readiness only. They do not
 > deploy, update, or delete Azure resources. It defines optional runtime access
 > assignments, but it does not create federated credentials, GitHub
-> environments, or GitHub secrets.
+> environments, or GitHub secrets. Slice 11B-S adds credential-free, read-only
+> pull-request verification; it has no Azure identity or deployment capability.
 
 The reviewed target metadata is:
 
@@ -55,7 +56,7 @@ images and completes live access and regional preflight.
 ## Azure topology
 
 ```text
-GitHub Actions (later slice)
+GitHub Actions deployment (Slice 11C)
         |
         | OIDC federation
         v
@@ -410,23 +411,40 @@ Resource deletion must be a separate reviewed action.
 Container Apps deployment is gated by `deployContainerApps=false`. Before
 setting it to `true`, all of these conditions must hold:
 
-1. API and UI Linux AMD64 images exist at the configured immutable manifest digests.
-2. The API image exposes a production entry point that composes all required
+1. The exact commit passed the Slice 11B-S read-only Linux AMD64 workflow,
+  including API and UI runtime smoke tests, non-root and native checks, rootfs
+  inspection, separate final-image SBOM generation, vulnerability policy, and
+  secret scanning.
+2. Slice 11C published the API and UI images to ACR, and both exist at the
+  configured immutable registry manifest digests. Local Docker image IDs are not
+  registry manifest digests.
+3. The API image exposes a production entry point that composes all required
    providers, evaluator, cost catalog, store, cache, and lifecycle owners.
-3. The API lifespan flushes and closes observability, Foundry transports,
+4. The API lifespan flushes and closes observability, Foundry transports,
    Cosmos resources, Redis renewal/client resources, and embedding resources.
-4. OPTIMA runtime access was bootstrapped with `deployRuntimeAccess=true`, then
+5. OPTIMA runtime access was bootstrapped with `deployRuntimeAccess=true`, then
   returned to `false`; external Foundry access was applied and verified.
-5. Redis bootstrap can inspect or create `optima-cache-v1` with the reviewed profile.
-6. Placeholder Foundry and embedding parameters have been replaced.
-7. The API health endpoint and UI startup have passed container smoke tests.
-8. Placeholder UI Entra client and tenant IDs have been replaced, a client secret
+6. Redis bootstrap can inspect or create `optima-cache-v1` with the reviewed profile.
+7. Placeholder Foundry and embedding parameters have been replaced.
+8. The production API health endpoint and UI startup pass with live configuration.
+9. Placeholder UI Entra client and tenant IDs have been replaced, a client secret
   is supplied through the secure `uiAuthClientSecret` parameter, and the exact
   `/.auth/login/aad/callback` URI is registered.
-9. Both final images have zero unresolved applicable high or critical scanner
-  findings and contain their generated CycloneDX SBOMs.
+10. Live Entra checks confirm authorized and unauthorized behavior, Streamlit
+   access, API internality, acceptable session and logout behavior, secret
+   non-disclosure, and explicit user restriction or application assignment.
+
+Exact-head workflow evidence is valid only for the commit recorded by that run.
+No hosted result, ACR publication, Azure deployment, production authentication,
+or live authorization result is claimed here.
 
 ## Future deployment flow
+
+The Slice 11B-S workflow is a separate pre-merge path. It runs untrusted
+pull-request code with `contents: read`, no persisted checkout credential, no
+secret or Azure identity, and no deployment command. Its Docker socket reaches
+only the ephemeral hosted runner. Slice 11C will add the distinct trusted OIDC
+deployment path shown below.
 
 ```text
 GitHub Actions
@@ -450,7 +468,8 @@ Build and push immutable API/UI images
 Enable Container Apps after access and runtime gates pass
 ```
 
-No workflow is implemented in Slice 11A or Slice 11B.
+A successful Slice 11B-S run may make PR #20 merge-ready for its exact head. It
+does not authorize merge and cannot declare Slice 11C deployed or successful.
 
 ## Risks and deployment blockers
 
@@ -471,6 +490,7 @@ No workflow is implemented in Slice 11A or Slice 11B.
   prerequisites. Placeholder IDs block Container Apps deployment.
 * The shared backend history endpoints remain internal and have no per-user
   ownership model. The public UI exposes only session-local history.
-* Final API and UI image builds and scans remain mandatory before deployment.
+* A successful hosted exact-head Slice 11B-S final-image build and scan remains
+  mandatory before deployment; no hosted result is recorded yet.
 * Scale-to-zero introduces API/UI cold starts and may affect demo latency.
 * The Log Analytics cap is an emergency brake, not a precise billing limit.

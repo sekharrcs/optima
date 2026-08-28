@@ -15,9 +15,12 @@ malicious execution or exfiltration indicator and no secret in the 56-commit Git
 history. This is evidence from named tools at reviewed versions, not a guarantee
 that the software or every dependency is malware-free.
 
-The deployment recommendation remains **NO-GO** until both final images are
-built, started, inspected, and scanned. Docker, Podman, WSL, BuildKit, containerd,
-and equivalent local builders were unavailable on the review workstation.
+The deployment recommendation remains **NO-GO**. Slice 11B-S defines an
+exact-head pull-request workflow that can build, start, inspect, inventory, and
+scan both final images on an ephemeral Linux x86_64 runner, but no hosted run has
+yet established those results. Any future green evidence applies only to the
+commit recorded by that run. It does not prove ACR publication, Azure deployment,
+production startup, managed-identity access, or live Entra behavior.
 
 ## Threat model
 
@@ -32,6 +35,41 @@ embedding, evaluation, cache, and persistence work. Relevant threats include:
 * Credential, prompt, context, or exception leakage through source or telemetry
 * Malicious source, dependency, install hook, base image, or copied build content
 * Vulnerable native libraries in the deployable artifact
+
+## Pull-request workflow trust boundary
+
+`.github/workflows/pr-security-containers.yml` runs on `pull_request`, never
+`pull_request_target`, and grants only `contents: read`. Each job checks out
+`${{ github.event.pull_request.head.sha }}` explicitly, disables persisted
+checkout credentials, and verifies that the checked-out commit equals the event
+head SHA. A green result is evidence only for that recorded commit; a later commit
+requires its own successful exact-head run.
+
+The workflow receives no repository secret, production secret, Azure identity,
+OIDC token, write-capable repository token, or Azure deployment capability. It
+does not log in to Azure, publish an image, or create, update, or delete a cloud
+resource. The runner still has outbound network access for package resolution,
+tool and vulnerability-database downloads, base-image pulls, and the GitHub
+Actions service. GitHub also supplies short-lived, read-only checkout and artifact
+service tokens required by those operations. The workflow therefore provides no
+network isolation; its boundary is the absence of a credentialed or authenticated
+Azure deployment and control-plane path.
+
+Third-party actions are pinned to immutable full commit SHAs. Syft and Trivy are
+downloaded at fixed versions from their official projects and used only after
+their hard-coded SHA-256 checksums pass. Both scanners run from an empty directory
+outside the pull-request checkout with explicit trusted configuration and empty
+ignore files stored under the runner temporary directory. Pull-request-controlled
+Syft, Trivy, ignore, VEX, skipped-path, ignored-status, and custom secret settings
+cannot alter these invocations.
+
+Pull-request code can control processes inside its ephemeral hosted runner,
+including builds that use the runner's Docker socket. That socket reaches only
+the ephemeral runner Docker daemon. Because the job has no durable credential,
+write-capable repository token, Azure identity, or authenticated Azure control-plane
+authority, control of the runner does not create a credentialed deployment path to
+Azure or production resources. Outbound access and short-lived GitHub service tokens
+remain part of the runner threat model.
 
 ## Authentication boundary
 
@@ -206,17 +244,27 @@ image's declared `nonroot` user, and receive only the virtual environment, sourc
 and SBOM. The allow-listed build context excludes `.git`, tests, `.env` files,
 documentation, infrastructure, caches, and Python bytecode.
 
-`security/sbom/api.cdx.json` and `security/sbom/ui.cdx.json` are deterministic
-CycloneDX 1.6 artifacts for the frozen Linux x64 production closure. Each names
-its runtime image component and records 70 third-party Python libraries. The
-Docker build regenerates the matching SBOM inside each exact builder environment.
+`security/sbom/api.cdx.json` and `security/sbom/ui.cdx.json` are committed,
+deterministic CycloneDX 1.6 Python dependency SBOMs for the frozen Linux x64
+production closure. Each names its runtime image component and records 70
+third-party Python libraries. The Docker build regenerates the matching SBOM
+inside each exact builder environment.
 
-These are Python dependency SBOMs generated from the frozen environment, not final
-container image SBOMs. They inventory Python distributions only. They do not
-include the base image operating-system packages or the native shared libraries
-present in the built image. A final-container SBOM must be generated and verified
-against each built image, including applicable operating-system and native
-components, during the blocking artifact gate below.
+The committed SBOMs inventory Python distributions only. They do not inventory
+the base operating-system packages or native shared libraries in a built final
+image. Slice 11B-S therefore generates separate Syft CycloneDX SBOMs from the
+exact locally built API and UI final images. Those final-image SBOMs, image
+inspection evidence, local image IDs, rootfs summaries, smoke logs, and Trivy
+reports are short-retention GitHub Actions artifacts. They are not committed and
+must not be relabeled as the embedded Python dependency SBOMs.
+
+No hosted Slice 11B-S result has yet been recorded. Scanner or vulnerability
+database unavailability fails the workflow and is not a clean scan result. The
+workflow also fails for any secret finding or unresolved applicable HIGH or
+CRITICAL vulnerability. Each Trivy report must match the expected component image
+reference and locally captured image ID, and must contain nonempty operating-system
+and Python package inventories. Empty, mismatched, or incomplete reports fail
+closed.
 
 ## Security scan results
 
@@ -259,24 +307,36 @@ gitleaks git --redact=100 .
 trivy filesystem --scanners vuln,secret,misconfig .
 ```
 
-After an OCI builder is available, complete the blocking artifact gate:
+## Exact-head merge gate
 
-```powershell
-docker build --file Dockerfile.api --tag optima-api:security .
-docker build --file Dockerfile.ui --tag optima-ui:security .
-trivy image --scanners vuln,secret optima-api:security
-trivy image --scanners vuln,secret optima-ui:security
-```
+PR #20 may be recommended **GO** for merge only when its exact ending commit has
+a successful `PR security and final containers` workflow and all of this evidence
+is present:
 
-Inspect both final images for their declared non-root user, entrypoint, embedded
-SBOM, package list, executable files, `.git`, tests, `.env` files, credentials,
-SSH material, package-manager caches, and build tools before publishing.
+* Full Linux suite passed
+* Both exact final images built
+* API health and UI response passed
+* Both actual runtimes were non-root
+* Final rootfs/native inspections passed
+* Two final-image SBOMs were generated
+* Both vulnerability reports had no unresolved applicable HIGH/CRITICAL finding
+* Both secret scans had no finding
+* No unexplained malicious content was identified
+* Existing security tests passed
+* Workflow privilege and supply-chain review passed
+
+A GO recommendation does not change the pull request's draft state and does not
+authorize merge. Exact-head green evidence is necessary pre-merge evidence only.
+It does not declare Slice 11C deployed or successful. Slice 11C retains ACR
+publication, OIDC and deployment, production runtime startup, managed-identity
+access, regional checks, and live Entra acceptance.
 
 ## Unresolved security backlog
 
 The following items remain explicit:
 
-* Build, start, inspect, and scan both final production images
+* Obtain and review a successful hosted exact-head Slice 11B-S run for both final
+  production images
 * Create, supply, and rotate the UI Entra client secret at preflight, then validate
   the Entra callback, tenant restriction, and intended-user assignment in a
   non-production preflight before public exposure
