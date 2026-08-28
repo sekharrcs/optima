@@ -346,6 +346,16 @@ def test_pr_security_workflow_scopes_concurrency_to_numeric_pr_number() -> None:
     assert "github.event.pull_request.number" not in _run_scripts(content)
 
 
+def test_pr_security_workflow_top_level_env_uses_available_contexts() -> None:
+    """Reject job-only contexts before GitHub can create a workflow run."""
+    environment = "\n".join(_top_level_block(_pr_security_workflow(), "env"))
+
+    assert "${{ runner." not in environment
+    assert "${{ job." not in environment
+    assert "${{ steps." not in environment
+    assert "${{ needs." not in environment
+
+
 def test_pr_security_workflow_compiles_every_dedented_python_heredoc() -> None:
     """Compile every embedded program exactly as YAML passes it to Bash."""
     programs = _python_heredocs(_pr_security_workflow())

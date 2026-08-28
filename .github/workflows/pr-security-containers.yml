@@ -16,7 +16,6 @@ concurrency:
 env:
   EXPECTED_HEAD_SHA: "${{ github.event.pull_request.head.sha }}"
   BASE_SHA: "${{ github.event.pull_request.base.sha }}"
-  UV_CACHE_DIR: "${{ runner.temp }}/uv-cache"
   UV_NO_CACHE: "1"
   SYFT_VERSION: "1.51.1"
   SYFT_ARCHIVE: syft_1.51.1_linux_amd64.tar.gz
