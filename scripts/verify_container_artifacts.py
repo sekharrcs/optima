@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import io
 import json
+import re
 import sys
 import tarfile
 from collections import Counter
+from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
 from typing import IO, Any, Literal
 
@@ -18,6 +22,11 @@ TRIVY_SCHEMA_VERSION = 2
 MAX_FINDINGS = 64
 MAX_TEXT_LENGTH = 240
 PRIVATE_KEY_SCAN_CHUNK_BYTES = 64 * 1024
+MAX_PEM_LINE_BYTES = 4096
+MIN_PRIVATE_KEY_ENCODED_BYTES = 16
+MAX_DISTRIBUTION_METADATA_BYTES = 64 * 1024
+MAX_DISTRIBUTION_RECORD_BYTES = 16 * 1024 * 1024
+MAX_RUNTIME_SBOM_BYTES = 16 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 250_000
 
 Component = Literal["api", "ui"]
@@ -39,6 +48,13 @@ PRIVATE_KEY_HEADERS = (
     b"-----BEGIN DSA PRIVATE KEY-----",
     b"-----BEGIN EC PRIVATE KEY-----",
     b"-----BEGIN OPENSSH PRIVATE KEY-----",
+)
+PRIVATE_KEY_BOUNDARIES = {
+    header: header.replace(b"BEGIN", b"END", 1) for header in PRIVATE_KEY_HEADERS
+}
+PRIVATE_KEY_END_MARKERS = frozenset(PRIVATE_KEY_BOUNDARIES.values())
+BASE64_ALPHABET = frozenset(
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 )
 PACKAGE_MANAGERS = {
     "apk",
@@ -147,16 +163,205 @@ def _executable_parent(path: str) -> str:
     return str(PurePosixPath(path).parent)
 
 
+def _site_packages_root(path: str) -> str | None:
+    """Return the supported virtual-environment site-packages root for a path."""
+    parts = PurePosixPath(path).parts
+    if (
+        len(parts) >= 5
+        and parts[0] == "app"
+        and parts[1] == ".venv"
+        and parts[2] in {"lib", "lib64"}
+        and parts[3].startswith("python")
+        and parts[4] == "site-packages"
+    ):
+        return "/".join(parts[:5])
+    return None
+
+
+def _canonical_distribution_name(value: str) -> str:
+    """Return the normalized Python distribution name used for comparisons."""
+    return re.sub(r"[-_.]+", "-", value).casefold()
+
+
+def _distribution_directory_name(info_directory: str) -> str | None:
+    """Return the distribution portion of a valid wheel metadata directory."""
+    if not info_directory.endswith(".dist-info"):
+        return None
+    stem = info_directory[: -len(".dist-info")]
+    distribution, separator, version = stem.rpartition("-")
+    if not separator or not distribution or not version:
+        return None
+    return distribution
+
+
+def _metadata_distribution_identity(extracted: IO[bytes]) -> tuple[str, str] | None:
+    """Read bounded core-metadata Name and Version fields."""
+    content = extracted.read(MAX_DISTRIBUTION_METADATA_BYTES + 1)
+    if len(content) > MAX_DISTRIBUTION_METADATA_BYTES:
+        return None
+    fields: dict[str, str] = {}
+    for line in content.splitlines():
+        name, separator, value = line.partition(b":")
+        field = name.lower()
+        if separator and field in {b"name", b"version"}:
+            try:
+                decoded = value.strip().decode("utf-8")
+            except UnicodeDecodeError:
+                return None
+            if not decoded or field.decode() in fields:
+                return None
+            fields[field.decode()] = decoded
+        if not line:
+            break
+    if fields.keys() != {"name", "version"}:
+        return None
+    return fields["name"], fields["version"]
+
+
+def _runtime_sbom_distributions(extracted: IO[bytes]) -> set[tuple[str, str]]:
+    """Return bounded non-OPTIMA Python distribution identities from an SBOM."""
+    content = extracted.read(MAX_RUNTIME_SBOM_BYTES + 1)
+    if len(content) > MAX_RUNTIME_SBOM_BYTES:
+        return set()
+    try:
+        document = json.loads(content)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return set()
+    if not isinstance(document, dict) or document.get("bomFormat") != "CycloneDX":
+        return set()
+    components = document.get("components")
+    if not isinstance(components, list):
+        return set()
+    distributions: set[tuple[str, str]] = set()
+    for component in components:
+        if not isinstance(component, dict) or component.get("type") != "library":
+            continue
+        name = component.get("name")
+        version = component.get("version")
+        purl = component.get("purl")
+        if (
+            isinstance(name, str)
+            and isinstance(version, str)
+            and isinstance(purl, str)
+            and purl.startswith("pkg:pypi/")
+            and _canonical_distribution_name(name) != "optima"
+        ):
+            distributions.add((_canonical_distribution_name(name), version))
+    return distributions
+
+
+def _distribution_record_paths(
+    extracted: IO[bytes],
+    *,
+    site_packages_root: str,
+) -> set[str] | None:
+    """Read bounded wheel RECORD paths that remain inside site-packages."""
+    content = extracted.read(MAX_DISTRIBUTION_RECORD_BYTES + 1)
+    if len(content) > MAX_DISTRIBUTION_RECORD_BYTES:
+        return None
+    try:
+        rows = csv.reader(io.StringIO(content.decode("utf-8")), strict=True)
+        paths: set[str] = set()
+        for row in rows:
+            if not row:
+                continue
+            relative, error = _normalize_archive_path(row[0])
+            if (
+                error is not None
+                or relative in {None, "."}
+                or PurePosixPath(row[0]).is_absolute()
+            ):
+                continue
+            paths.add(f"{site_packages_root}/{relative}")
+    except (csv.Error, UnicodeDecodeError):
+        return None
+    return paths
+
+
+def _validated_third_party_distribution_paths(
+    archive: tarfile.TarFile,
+    component: Component,
+) -> set[str]:
+    """Return files and directories proven to belong to non-OPTIMA wheels."""
+    regular_members: dict[str, tarfile.TarInfo] = {}
+    record_candidates: list[tuple[str, str, tarfile.TarInfo]] = []
+    for index, member in enumerate(archive):
+        if index >= MAX_ARCHIVE_ENTRIES:
+            return set()
+        normalized, error = _normalize_archive_path(member.name)
+        if error is not None or normalized is None or not member.isreg():
+            continue
+        regular_members[normalized] = member
+        root = _site_packages_root(normalized)
+        if root is None:
+            continue
+        relative_parts = PurePosixPath(normalized).parts[5:]
+        if len(relative_parts) == 2 and relative_parts[1] == "RECORD":
+            record_candidates.append((root, relative_parts[0], member))
+
+    owned_paths: set[str] = set()
+    sbom_member = regular_members.get(f"app/sbom/{component}.cdx.json")
+    if sbom_member is None:
+        return owned_paths
+    sbom = archive.extractfile(sbom_member)
+    if sbom is None:
+        return owned_paths
+    runtime_distributions = _runtime_sbom_distributions(sbom)
+    for root, info_directory, record_member in record_candidates:
+        directory_distribution = _distribution_directory_name(info_directory)
+        if directory_distribution is None:
+            continue
+        metadata_path = f"{root}/{info_directory}/METADATA"
+        wheel_path = f"{root}/{info_directory}/WHEEL"
+        record_path = f"{root}/{info_directory}/RECORD"
+        metadata_member = regular_members.get(metadata_path)
+        if metadata_member is None or wheel_path not in regular_members:
+            continue
+        metadata = archive.extractfile(metadata_member)
+        record = archive.extractfile(record_member)
+        if metadata is None or record is None:
+            continue
+        metadata_identity = _metadata_distribution_identity(metadata)
+        if metadata_identity is None:
+            continue
+        metadata_name, metadata_version = metadata_identity
+        canonical_name = _canonical_distribution_name(metadata_name)
+        if (
+            canonical_name == "optima"
+            or canonical_name != _canonical_distribution_name(directory_distribution)
+            or (canonical_name, metadata_version) not in runtime_distributions
+        ):
+            continue
+        record_paths = _distribution_record_paths(
+            record,
+            site_packages_root=root,
+        )
+        required_metadata = {metadata_path, wheel_path, record_path}
+        if record_paths is None or not required_metadata <= record_paths:
+            continue
+        distribution_files = record_paths & regular_members.keys()
+        owned_paths.update(distribution_files)
+        for distribution_file in distribution_files:
+            parent = PurePosixPath(distribution_file).parent
+            while str(parent) != root and _starts_with(str(parent), root):
+                owned_paths.add(str(parent))
+                parent = parent.parent
+    return owned_paths
+
+
 def _path_policy_finding(
     path: str,
     *,
     executable: bool,
+    third_party_distribution_paths: set[str],
+    link: bool,
 ) -> dict[str, str] | None:
     """Return the first applicable final-image path policy violation."""
     pure_path = PurePosixPath(path)
     parts = tuple(part.casefold() for part in pure_path.parts)
     filename = pure_path.name.casefold()
     parent = _executable_parent(path).casefold()
+    third_party_site_package = not link and path in third_party_distribution_paths
 
     if ".git" in parts:
         return _finding("git_metadata", "unexpected .git metadata", path=path)
@@ -164,19 +369,27 @@ def _path_policy_finding(
         return _finding(
             "credential_env", f"unexpected {filename} credential file", path=path
         )
-    if _starts_with(path.casefold(), "app/tests") or (
-        _starts_with(path.casefold(), "app")
-        and filename.startswith("test_")
-        and filename.endswith(".py")
+    if not third_party_site_package and (
+        _starts_with(path.casefold(), "app/tests")
+        or (_starts_with(path.casefold(), "app") and "tests" in parts)
+        or (
+            _starts_with(path.casefold(), "app")
+            and filename.startswith("test_")
+            and filename.endswith(".py")
+        )
     ):
         return _finding("repository_tests", "unexpected repository tests", path=path)
-    if _starts_with(path.casefold(), "app") and "fixtures" in parts:
+    if (
+        not third_party_site_package
+        and _starts_with(path.casefold(), "app")
+        and "fixtures" in parts
+    ):
         return _finding(
             "repository_fixtures", "unexpected repository fixtures", path=path
         )
     if _starts_with(path.casefold(), "app/scripts"):
         return _finding("build_scripts", "unexpected application scripts", path=path)
-    if (
+    if not third_party_site_package and (
         filename in {"pyproject.toml", "uv.lock"}
         or filename == "dockerfile"
         or filename.startswith("dockerfile.")
@@ -226,25 +439,100 @@ def _path_policy_finding(
             return _finding("compiler", "unexpected compiler or build tool", path=path)
         if filename in SHELLS:
             return _finding("shell", "unexpected shell binary", path=path)
-    if "include" in parts and pure_path.suffix.casefold() in {
-        ".h",
-        ".hh",
-        ".hpp",
-        ".hxx",
-    }:
+    if (
+        not third_party_site_package
+        and ("include" in parts or _starts_with(path.casefold(), "app"))
+        and pure_path.suffix.casefold()
+        in {
+            ".h",
+            ".hh",
+            ".hpp",
+            ".hxx",
+        }
+    ):
         return _finding("build_header", "unexpected build header", path=path)
     return None
 
 
-def _contains_private_key_header(extracted: IO[bytes]) -> bool:
-    """Stream one regular file and detect private-key headers with bounded memory."""
-    overlap_size = max(len(header) for header in PRIVATE_KEY_HEADERS) - 1
-    overlap = b""
+def _bounded_binary_lines(extracted: IO[bytes]) -> Iterator[tuple[bytes, bool]]:
+    """Read bounded binary lines from one file chunk without retaining file contents."""
+    line = bytearray()
+    overflow = False
     while chunk := extracted.read(PRIVATE_KEY_SCAN_CHUNK_BYTES):
-        candidate = overlap + chunk
-        if any(header in candidate for header in PRIVATE_KEY_HEADERS):
-            return True
-        overlap = candidate[-overlap_size:]
+        for value in chunk:
+            if value == 0x0A:
+                yield bytes(line), overflow
+                line.clear()
+                overflow = False
+            elif len(line) < MAX_PEM_LINE_BYTES:
+                line.append(value)
+            else:
+                overflow = True
+    if line or overflow:
+        yield bytes(line), overflow
+
+
+def _contains_structured_private_key(extracted: IO[bytes]) -> bool:
+    """Stream one file and detect complete, plausibly encoded private-key PEMs."""
+    expected_end: bytes | None = None
+    encoded_length = 0
+    encoded_data_length = 0
+    padding_length = 0
+    encoded_data_started = False
+
+    for raw_line, overflow in _bounded_binary_lines(extracted):
+        line = raw_line.strip(b" \t\r")
+        if overflow:
+            expected_end = None
+            continue
+
+        replacement_end = PRIVATE_KEY_BOUNDARIES.get(line)
+        if replacement_end is not None:
+            expected_end = replacement_end
+            encoded_length = 0
+            encoded_data_length = 0
+            padding_length = 0
+            encoded_data_started = False
+            continue
+        if expected_end is None:
+            continue
+        if line == expected_end:
+            if (
+                encoded_data_length >= MIN_PRIVATE_KEY_ENCODED_BYTES
+                and encoded_length % 4 == 0
+                and padding_length <= 2
+            ):
+                return True
+            expected_end = None
+            continue
+        if line in PRIVATE_KEY_END_MARKERS:
+            expected_end = None
+            continue
+        if not line:
+            continue
+        if not encoded_data_started and b":" in line:
+            header_name, separator, header_value = line.partition(b":")
+            if (
+                separator
+                and header_name
+                and header_value.strip()
+                and all(0x20 <= value <= 0x7E for value in line)
+            ):
+                continue
+            expected_end = None
+            continue
+
+        for value in line:
+            if value in BASE64_ALPHABET and padding_length == 0:
+                encoded_data_started = True
+                encoded_data_length += 1
+                encoded_length += 1
+            elif value == ord("=") and encoded_data_length > 0:
+                padding_length += 1
+                encoded_length += 1
+            else:
+                expected_end = None
+                break
     return False
 
 
@@ -325,6 +613,11 @@ def inspect_rootfs(component: Component, archive_path: Path) -> dict[str, object
     seen_paths: dict[str, tuple[bytes, int, str]] = {}
 
     try:
+        with tarfile.open(archive_path, mode="r:*") as archive:
+            third_party_distribution_paths = _validated_third_party_distribution_paths(
+                archive,
+                component,
+            )
         with tarfile.open(archive_path, mode="r:*") as archive:
             for index, member in enumerate(archive):
                 if index >= MAX_ARCHIVE_ENTRIES:
@@ -418,6 +711,8 @@ def inspect_rootfs(component: Component, archive_path: Path) -> dict[str, object
                     normalized,
                     executable=(member.issym() or member.islnk())
                     or ((member.mode & 0o111) != 0 and member.isreg()),
+                    third_party_distribution_paths=third_party_distribution_paths,
+                    link=member.issym() or member.islnk(),
                 )
                 if path_finding is not None:
                     _append_finding(findings, path_finding, finding_total)
@@ -435,7 +730,7 @@ def inspect_rootfs(component: Component, archive_path: Path) -> dict[str, object
                             finding_total,
                         )
                         continue
-                    if _contains_private_key_header(extracted):
+                    if _contains_structured_private_key(extracted):
                         _append_finding(
                             findings,
                             _finding(

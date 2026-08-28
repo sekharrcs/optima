@@ -25,8 +25,58 @@ def _rootfs_files(component: str) -> dict[str, bytes]:
         **{source: b"# application source\n" for source in sources},
         "app/.venv/bin/python": b"synthetic python runtime\n",
         "app/.venv/lib/python3.12/site-packages/optima.pth": b"/app/src\n",
-        f"app/sbom/{component}.cdx.json": b'{"bomFormat":"CycloneDX"}\n',
+        f"app/sbom/{component}.cdx.json": (
+            b'{"bomFormat":"CycloneDX","components":[]}\n'
+        ),
     }
+
+
+def _private_key_pem(key_type: str = "PRIVATE KEY") -> bytes:
+    encoded_body = b"QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo="
+    return (
+        f"-----BEGIN {key_type}-----\n".encode()
+        + encoded_body
+        + b"\n"
+        + f"-----END {key_type}-----\n".encode()
+    )
+
+
+def _distribution_files(
+    distribution: str,
+    *owned_paths: str,
+) -> dict[str, bytes]:
+    site_packages = "app/.venv/lib/python3.12/site-packages"
+    info_directory = f"{distribution.replace('-', '_')}-1.0.0.dist-info"
+    metadata_paths = (
+        f"{info_directory}/METADATA",
+        f"{info_directory}/WHEEL",
+        f"{info_directory}/RECORD",
+    )
+    record = "".join(f"{path},,\n" for path in (*owned_paths, *metadata_paths))
+    return {
+        f"{site_packages}/{info_directory}/METADATA": (
+            f"Metadata-Version: 2.4\nName: {distribution}\nVersion: 1.0.0\n"
+        ).encode(),
+        f"{site_packages}/{info_directory}/WHEEL": b"Wheel-Version: 1.0\n",
+        f"{site_packages}/{info_directory}/RECORD": record.encode(),
+        **{
+            f"{site_packages}/{owned_path}": b"synthetic dependency content\n"
+            for owned_path in owned_paths
+        },
+    }
+
+
+def _runtime_sbom(*distributions: tuple[str, str]) -> bytes:
+    components = [
+        {
+            "type": "library",
+            "name": name,
+            "version": version,
+            "purl": f"pkg:pypi/{name}@{version}",
+        }
+        for name, version in distributions
+    ]
+    return json.dumps({"bomFormat": "CycloneDX", "components": components}).encode()
 
 
 def _write_rootfs(
@@ -332,11 +382,22 @@ def test_final_image_rootfs_requires_runtime_inventory(
         ("app/.env.production", b"SETTING=synthetic", ".env.production"),
         (
             "app/src/optima/private.pem",
-            b"-----BEGIN PRIVATE KEY-----\nTOP-SECRET-MATERIAL\n",
+            _private_key_pem(),
             "private key",
         ),
         ("app/tests/test_example.py", b"assert True", "tests"),
+        ("app/src/test_example.py", b"assert True", "tests"),
+        ("app/src/optima/tests/helper.py", b"helper = True", "tests"),
+        ("app/src/optima/fixtures/example.json", b"{}", "fixtures"),
         ("app/scripts/build.py", b"print('build')", "scripts"),
+        ("app/pyproject.toml", b"[build-system]", "build-only source"),
+        ("app/uv.lock", b"version = 1", "build-only source"),
+        ("app/Dockerfile", b"FROM scratch", "build-only source"),
+        ("app/docs/design.md", b"design", "repository source"),
+        ("app/infra/main.bicep", b"targetScope = 'subscription'", "repository source"),
+        ("app/.copilot-tracking/plan.md", b"plan", "repository source"),
+        ("app/src/optima/include/private.h", b"build header", "build header"),
+        ("app/src/optima/native.hpp", b"build header", "build header"),
         ("root/.cache/uv/archive-v0/item", b"cache", "uv cache"),
         ("root/.cache/pip/http-v2/item", b"cache", "pip cache"),
         ("var/cache/dnf/item", b"cache", "package-manager cache"),
@@ -373,6 +434,342 @@ def test_final_image_rootfs_rejects_build_and_sensitive_artifacts(
     assert reason in output.casefold()
     assert len(output) <= 4096
     assert "TOP-SECRET-MATERIAL" not in output
+
+
+@pytest.mark.parametrize(
+    ("distribution", "owned_path"),
+    [
+        ("numpy", "numpy/_core/include/numpy/arrayobject.h"),
+        ("cryptography", "cryptography/tests/test_fernet.py"),
+        ("msal", "msal/test_authority.py"),
+        ("package", "package/fixtures/certificate.pem"),
+        ("package", "package/pyproject.toml"),
+    ],
+)
+def test_final_image_rootfs_allows_dependency_owned_package_contents(
+    tmp_path: Path,
+    distribution: str,
+    owned_path: str,
+) -> None:
+    """Do not classify installed wheel contents as copied repository material."""
+    archive = tmp_path / "api-rootfs.tar"
+    _write_rootfs(
+        archive,
+        "api",
+        extra_files={
+            **_distribution_files(distribution, owned_path),
+            "app/sbom/api.cdx.json": _runtime_sbom((distribution, "1.0.0")),
+        },
+    )
+
+    result = _run_verifier(
+        "rootfs",
+        "--component",
+        "api",
+        "--archive",
+        str(archive),
+        "--output",
+        str(tmp_path / "rootfs-evidence.json"),
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    ("owned_path", "content", "reason"),
+    [
+        (
+            "package/.git/config",
+            b"synthetic git metadata",
+            ".git",
+        ),
+        (
+            "package/.env",
+            b"SETTING=synthetic",
+            ".env",
+        ),
+        (
+            "package/private.pem",
+            _private_key_pem(),
+            "private key",
+        ),
+    ],
+)
+def test_dependency_path_exemption_does_not_bypass_global_artifact_rules(
+    tmp_path: Path,
+    owned_path: str,
+    content: bytes,
+    reason: str,
+) -> None:
+    """Keep global metadata, credential, and key rules active in dependencies."""
+    archive = tmp_path / "api-rootfs.tar"
+    files = _distribution_files("package", owned_path)
+    files["app/sbom/api.cdx.json"] = _runtime_sbom(("package", "1.0.0"))
+    files[f"app/.venv/lib/python3.12/site-packages/{owned_path}"] = content
+    _write_rootfs(archive, "api", extra_files=files)
+
+    result = _run_verifier(
+        "rootfs",
+        "--component",
+        "api",
+        "--archive",
+        str(archive),
+        "--output",
+        str(tmp_path / "rootfs-evidence.json"),
+    )
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert reason in (result.stdout + result.stderr).casefold()
+
+
+@pytest.mark.parametrize(
+    "owned_path",
+    [
+        "optima/tests/test_policy.py",
+        "optima/fixtures/policy.json",
+        "optima/include/policy.h",
+        "optima/pyproject.toml",
+    ],
+)
+def test_optima_distribution_cannot_inherit_third_party_exemption(
+    tmp_path: Path,
+    owned_path: str,
+) -> None:
+    """Keep app-owned material forbidden even with internally consistent metadata."""
+    archive = tmp_path / "api-rootfs.tar"
+    _write_rootfs(
+        archive,
+        "api",
+        extra_files=_distribution_files("optima", owned_path),
+    )
+
+    result = _run_verifier(
+        "rootfs",
+        "--component",
+        "api",
+        "--archive",
+        str(archive),
+        "--output",
+        str(tmp_path / "rootfs-evidence.json"),
+    )
+
+    assert result.returncode == 1, result.stdout + result.stderr
+
+
+def test_unowned_site_package_path_cannot_inherit_third_party_exemption(
+    tmp_path: Path,
+) -> None:
+    """Require wheel metadata to prove ownership of dependency test material."""
+    archive = tmp_path / "api-rootfs.tar"
+    _write_rootfs(
+        archive,
+        "api",
+        extra_files={
+            "app/.venv/lib/python3.12/site-packages/package/tests/test_policy.py": (
+                b"assert True\n"
+            )
+        },
+    )
+
+    result = _run_verifier(
+        "rootfs",
+        "--component",
+        "api",
+        "--archive",
+        str(archive),
+        "--output",
+        str(tmp_path / "rootfs-evidence.json"),
+    )
+
+    assert result.returncode == 1, result.stdout + result.stderr
+
+
+def test_distribution_missing_from_runtime_sbom_cannot_inherit_exemption(
+    tmp_path: Path,
+) -> None:
+    """Require the generated runtime inventory to corroborate wheel ownership."""
+    archive = tmp_path / "api-rootfs.tar"
+    owned_path = "package/tests/test_policy.py"
+    _write_rootfs(
+        archive,
+        "api",
+        extra_files=_distribution_files("package", owned_path),
+    )
+
+    result = _run_verifier(
+        "rootfs",
+        "--component",
+        "api",
+        "--archive",
+        str(archive),
+        "--output",
+        str(tmp_path / "rootfs-evidence.json"),
+    )
+
+    assert result.returncode == 1, result.stdout + result.stderr
+
+
+def test_distribution_record_cannot_exempt_a_symlink(tmp_path: Path) -> None:
+    """Do not allow a dependency-owned link to evade path classification."""
+    archive = tmp_path / "api-rootfs.tar"
+    owned_path = "package/tests/test_policy.py"
+    files = _distribution_files("package", owned_path)
+    files.pop(f"app/.venv/lib/python3.12/site-packages/{owned_path}")
+    _write_rootfs(archive, "api", extra_files=files)
+    with tarfile.open(archive, "a") as rootfs:
+        test_link = tarfile.TarInfo(
+            f"app/.venv/lib/python3.12/site-packages/{owned_path}"
+        )
+        test_link.type = tarfile.SYMTYPE
+        test_link.linkname = "/app/src/optima/api/app.py"
+        rootfs.addfile(test_link)
+
+    result = _run_verifier(
+        "rootfs",
+        "--component",
+        "api",
+        "--archive",
+        str(archive),
+        "--output",
+        str(tmp_path / "rootfs-evidence.json"),
+    )
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "tests" in (result.stdout + result.stderr).casefold()
+
+
+def test_distribution_record_does_not_exempt_parent_traversal(tmp_path: Path) -> None:
+    """Ignore installed console-script paths without exempting their targets."""
+    archive = tmp_path / "api-rootfs.tar"
+    owned_path = "package/tests/test_policy.py"
+    files = _distribution_files("package", owned_path)
+    record_path = (
+        "app/.venv/lib/python3.12/site-packages/package-1.0.0.dist-info/RECORD"
+    )
+    files[record_path] += b"../../../bin/package-cli,,\n"
+    files["app/src/test_escape.py"] = b"assert True\n"
+    files["app/sbom/api.cdx.json"] = _runtime_sbom(("package", "1.0.0"))
+    _write_rootfs(archive, "api", extra_files=files)
+
+    result = _run_verifier(
+        "rootfs",
+        "--component",
+        "api",
+        "--archive",
+        str(archive),
+        "--output",
+        str(tmp_path / "rootfs-evidence.json"),
+    )
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "app/src/test_escape.py" in (result.stdout + result.stderr)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        b'PRIVATE_KEY_TYPES = (b"-----BEGIN PRIVATE KEY-----", '
+        b'b"-----END PRIVATE KEY-----")\n',
+        b'PEM_BEGIN = "-----BEGIN RSA PRIVATE KEY-----"\n'
+        b'PEM_END = "-----END RSA PRIVATE KEY-----"\n',
+        b"-----BEGIN PRIVATE KEY-----\n-----END PRIVATE KEY-----\n",
+        b"-----BEGIN PRIVATE KEY-----\nnot-base64!\n-----END PRIVATE KEY-----\n",
+        b"-----BEGIN PRIVATE KEY-----\nQUJDREVGR0hJSktM\n"
+        b"-----END RSA PRIVATE KEY-----\n",
+    ],
+)
+def test_final_image_rootfs_allows_private_key_marker_literals(
+    tmp_path: Path,
+    content: bytes,
+) -> None:
+    """Allow marker names and malformed fragments that are not structured keys."""
+    archive = tmp_path / "api-rootfs.tar"
+    _write_rootfs(
+        archive,
+        "api",
+        extra_files={"app/src/optima/marker_literal.py": content},
+    )
+
+    result = _run_verifier(
+        "rootfs",
+        "--component",
+        "api",
+        "--archive",
+        str(archive),
+        "--output",
+        str(tmp_path / "rootfs-evidence.json"),
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    "key_type",
+    [
+        "PRIVATE KEY",
+        "ENCRYPTED PRIVATE KEY",
+        "RSA PRIVATE KEY",
+        "DSA PRIVATE KEY",
+        "EC PRIVATE KEY",
+        "OPENSSH PRIVATE KEY",
+    ],
+)
+def test_final_image_rootfs_rejects_every_structured_private_key_type(
+    tmp_path: Path,
+    key_type: str,
+) -> None:
+    """Reject each supported complete private-key PEM boundary pair."""
+    archive = tmp_path / "api-rootfs.tar"
+    _write_rootfs(
+        archive,
+        "api",
+        extra_files={"app/src/optima/private.pem": _private_key_pem(key_type)},
+    )
+
+    result = _run_verifier(
+        "rootfs",
+        "--component",
+        "api",
+        "--archive",
+        str(archive),
+        "--output",
+        str(tmp_path / "rootfs-evidence.json"),
+    )
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "private key" in (result.stdout + result.stderr).casefold()
+
+
+def test_final_image_rootfs_rejects_legacy_encrypted_private_key(
+    tmp_path: Path,
+) -> None:
+    """Recognize OpenSSL PEM encryption headers before encoded key data."""
+    archive = tmp_path / "api-rootfs.tar"
+    encrypted_key = (
+        b"-----BEGIN RSA PRIVATE KEY-----\r\n"
+        b"Proc-Type: 4,ENCRYPTED\r\n"
+        b"DEK-Info: AES-256-CBC,0123456789ABCDEF\r\n\r\n"
+        b"QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo=\r\n"
+        b"-----END RSA PRIVATE KEY-----"
+    )
+    _write_rootfs(
+        archive,
+        "api",
+        extra_files={"app/src/optima/private.pem": encrypted_key},
+    )
+
+    result = _run_verifier(
+        "rootfs",
+        "--component",
+        "api",
+        "--archive",
+        str(archive),
+        "--output",
+        str(tmp_path / "rootfs-evidence.json"),
+    )
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "private key" in (result.stdout + result.stderr).casefold()
 
 
 def test_final_image_rootfs_rejects_forbidden_executable_in_nonstandard_path(
@@ -433,9 +830,8 @@ def test_final_image_rootfs_scans_private_key_material_past_first_chunk(
 ) -> None:
     """Scan an entire regular file for private-key headers with bounded memory."""
     archive = tmp_path / "api-rootfs.tar"
-    padded_key = (
-        b"x" * (96 * 1024) + b"-----BEGIN PRIVATE KEY-----\n" + b"TOP-SECRET-MATERIAL\n"
-    )
+    padding = b"x" * ((64 * 1024) - 12) + b"\n"
+    padded_key = padding + _private_key_pem()
     _write_rootfs(
         archive,
         "api",
@@ -466,7 +862,7 @@ def test_final_image_rootfs_policy_cannot_be_bypassed_with_pythonoptimize(
     _write_rootfs(
         archive,
         "api",
-        extra_files={"app/src/optima/private.pem": b"-----BEGIN PRIVATE KEY-----\n"},
+        extra_files={"app/src/optima/private.pem": _private_key_pem("RSA PRIVATE KEY")},
     )
 
     result = _run_verifier(

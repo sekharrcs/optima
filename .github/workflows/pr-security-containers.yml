@@ -572,7 +572,7 @@ jobs:
       - name: Export and verify final filesystems without an image shell
         shell: bash
         run: |
-          set -euo pipefail
+          set -uo pipefail
           evidence="$RUNNER_TEMP/evidence"
           api_archive="$RUNNER_TEMP/api-rootfs.tar"
           ui_archive="$RUNNER_TEMP/ui-rootfs.tar"
@@ -582,25 +582,38 @@ jobs:
           }
           trap cleanup EXIT
           docker create --name optima-api-rootfs optima-api:pr >/dev/null
+          api_create_status=$?
           docker export --output "$api_archive" optima-api-rootfs
+          api_export_status=$?
           docker rm optima-api-rootfs >/dev/null
+          api_remove_status=$?
           uv run --no-project --python 3.12 python scripts/verify_container_artifacts.py rootfs \
             --component api \
             --archive "$api_archive" \
             --output "$evidence/api-rootfs-summary.json"
+          api_rootfs_status=$?
           rm -f "$api_archive"
           docker create --name optima-ui-rootfs optima-ui:pr >/dev/null
+          ui_create_status=$?
           docker export --output "$ui_archive" optima-ui-rootfs
+          ui_export_status=$?
           docker rm optima-ui-rootfs >/dev/null
+          ui_remove_status=$?
           uv run --no-project --python 3.12 python scripts/verify_container_artifacts.py rootfs \
             --component ui \
             --archive "$ui_archive" \
             --output "$evidence/ui-rootfs-summary.json"
+          ui_rootfs_status=$?
+          printf '%s %s %s %s %s %s %s %s\n' \
+            "$api_create_status" "$api_export_status" "$api_remove_status" \
+            "$api_rootfs_status" "$ui_create_status" "$ui_export_status" \
+            "$ui_remove_status" "$ui_rootfs_status" \
+            > "$evidence/rootfs-command-statuses.txt"
 
       - name: Generate and validate final-image CycloneDX SBOMs
         shell: bash
         run: |
-          set -euo pipefail
+          set -uo pipefail
           evidence="$RUNNER_TEMP/evidence"
           scanner_workspace="$RUNNER_TEMP/scanner-workspace"
           scanner_home="$RUNNER_TEMP/scanner-home"
@@ -610,9 +623,11 @@ jobs:
           env -i HOME="$scanner_home" PATH="/usr/bin:/bin" \
             "$tools/syft" --config "$scanner_policy/syft.yaml" docker:optima-api:pr \
             --output "cyclonedx-json=$evidence/final-api-image.cdx.json"
+          api_syft_status=$?
           env -i HOME="$scanner_home" PATH="/usr/bin:/bin" \
             "$tools/syft" --config "$scanner_policy/syft.yaml" docker:optima-ui:pr \
             --output "cyclonedx-json=$evidence/final-ui-image.cdx.json"
+          ui_syft_status=$?
           uv run --no-project --python 3.12 python - "$evidence" <<'PY'
           import json
           import sys
@@ -624,33 +639,60 @@ jobs:
           summary = {}
           for component in ("api", "ui"):
               path = evidence / f"final-{component}-image.cdx.json"
-              if not path.is_file() or path.stat().st_size == 0:
-                  raise SystemExit(f"{component} final-image SBOM is empty")
-              document = json.loads(path.read_text(encoding="utf-8"))
-              if document.get("bomFormat") != "CycloneDX":
-                  raise SystemExit(f"{component} final-image SBOM format is invalid")
-              components = document.get("components")
-              if not isinstance(components, list) or not components:
-                  raise SystemExit(f"{component} final-image SBOM has no components")
-              purls = [item.get("purl", "") for item in components if isinstance(item, dict)]
-              python_packages = sum(value.startswith("pkg:pypi/") for value in purls)
-              os_packages = sum(value.startswith("pkg:rpm/") for value in purls)
-              if python_packages <= 0:
-                  raise SystemExit(f"{component} final-image SBOM has no Python packages")
-              if os_packages <= 0:
-                  raise SystemExit(f"{component} final-image SBOM has no OS packages")
-              summary[component] = {
+              result = {
+                "component_count": 0,
+                "findings": [],
+                "os_package_count": 0,
+                "python_package_count": 0,
+                "sbom": path.name,
+                "spec_version": None,
+                "status": "fail",
+              }
+              try:
+                if not path.is_file() or path.stat().st_size == 0:
+                  raise ValueError("final-image SBOM is empty")
+                document = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(document, dict):
+                  raise ValueError("final-image SBOM root is invalid")
+                if document.get("bomFormat") != "CycloneDX":
+                  raise ValueError("final-image SBOM format is invalid")
+                components = document.get("components")
+                if not isinstance(components, list) or not components:
+                  raise ValueError("final-image SBOM has no components")
+                purls = [
+                  item.get("purl", "")
+                  for item in components
+                  if isinstance(item, dict)
+                ]
+                python_packages = sum(
+                  value.startswith("pkg:pypi/") for value in purls
+                )
+                os_packages = sum(value.startswith("pkg:rpm/") for value in purls)
+                if python_packages <= 0:
+                  raise ValueError("final-image SBOM has no Python packages")
+                if os_packages <= 0:
+                  raise ValueError("final-image SBOM has no OS packages")
+                result.update({
                   "component_count": len(components),
                   "os_package_count": os_packages,
                   "python_package_count": python_packages,
-                  "sbom": path.name,
                   "spec_version": document.get("specVersion"),
-              }
+                  "status": "pass",
+                })
+              except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+                result["findings"] = [type(error).__name__]
+              summary[component] = result
           (evidence / "final-image-sbom-summary.json").write_text(
               json.dumps(summary, indent=2, sort_keys=True) + "\n",
               encoding="utf-8",
           )
+          if any(result["status"] != "pass" for result in summary.values()):
+              raise SystemExit(1)
           PY
+          sbom_validation_status=$?
+          printf '%s %s %s\n' \
+            "$api_syft_status" "$ui_syft_status" "$sbom_validation_status" \
+            > "$evidence/sbom-command-statuses.txt"
 
       - name: Scan both final images with Trivy
         shell: bash
@@ -669,7 +711,7 @@ jobs:
             --secret-config "$scanner_policy/trivy-secret.yaml" \
             --scanners vuln,secret --list-all-pkgs --format json \
             --output "$evidence/api-trivy.json" optima-api:pr
-          api_status=$?
+          api_trivy_status=$?
           env -i HOME="$scanner_home" PATH="/usr/bin:/bin" \
             "$tools/trivy" --config "$scanner_policy/trivy.yaml" image \
             --cache-dir "$RUNNER_TEMP/trivy-cache" \
@@ -677,17 +719,15 @@ jobs:
             --secret-config "$scanner_policy/trivy-secret.yaml" \
             --scanners vuln,secret --list-all-pkgs --format json \
             --output "$evidence/ui-trivy.json" optima-ui:pr
-          ui_status=$?
+          ui_trivy_status=$?
           set -e
-          if test "$api_status" -ne 0 || test "$ui_status" -ne 0; then
-            echo "Trivy failed: api=$api_status ui=$ui_status" >&2
-            exit 1
-          fi
+          printf '%s %s\n' "$api_trivy_status" "$ui_trivy_status" \
+            > "$evidence/trivy-command-statuses.txt"
 
       - name: Evaluate aggregate Trivy policy
         shell: bash
         run: |
-          set -euo pipefail
+          set -uo pipefail
           evidence="$RUNNER_TEMP/evidence"
           uv run --no-project --python 3.12 python scripts/verify_container_artifacts.py trivy \
             --report "api=$evidence/api-trivy.json" \
@@ -697,6 +737,105 @@ jobs:
             --expected-image-id "api=$(tr -d '\r\n' < "$evidence/api-image-id.txt")" \
             --expected-image-id "ui=$(tr -d '\r\n' < "$evidence/ui-image-id.txt")" \
             --output "$evidence/trivy-summary.json"
+          trivy_policy_status=$?
+          printf '%s\n' "$trivy_policy_status" \
+            > "$evidence/trivy-policy-status.txt"
+
+      - name: Apply aggregate final-image security gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/evidence"
+          uv run --no-project --python 3.12 python - "$evidence" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          if sys.flags.optimize != 0:
+              raise SystemExit("optimized Python is forbidden for policy validation")
+          evidence = Path(sys.argv[1])
+          findings = []
+          command_statuses = {}
+          status_contracts = {
+              "rootfs-command-statuses.txt": (
+                  "api_create",
+                  "api_export",
+                  "api_remove",
+                  "api_rootfs",
+                  "ui_create",
+                  "ui_export",
+                  "ui_remove",
+                  "ui_rootfs",
+              ),
+              "sbom-command-statuses.txt": (
+                  "api_syft",
+                  "ui_syft",
+                  "sbom_validation",
+              ),
+              "trivy-command-statuses.txt": ("api_trivy", "ui_trivy"),
+              "trivy-policy-status.txt": ("trivy_policy",),
+          }
+          for filename, names in status_contracts.items():
+              path = evidence / filename
+              try:
+                  values = [
+                      int(value)
+                      for value in path.read_text(encoding="utf-8").split()
+                  ]
+              except (OSError, UnicodeError, ValueError):
+                  findings.append(f"{filename}: missing or malformed command statuses")
+                  continue
+              if len(values) != len(names):
+                  findings.append(f"{filename}: unexpected command status count")
+                  continue
+              for name, status in zip(names, values, strict=True):
+                  command_statuses[name] = status
+                  if status != 0:
+                      findings.append(f"{name}: command failed with status {status}")
+
+          def load_summary(filename):
+              try:
+                  document = json.loads(
+                      (evidence / filename).read_text(encoding="utf-8")
+                  )
+              except (OSError, UnicodeError, json.JSONDecodeError):
+                  findings.append(f"{filename}: missing or malformed summary")
+                  return None
+              if not isinstance(document, dict):
+                  findings.append(f"{filename}: summary root is malformed")
+                  return None
+              return document
+
+          for component in ("api", "ui"):
+              rootfs = load_summary(f"{component}-rootfs-summary.json")
+              if rootfs is not None and rootfs.get("status") != "pass":
+                  findings.append(f"{component}: rootfs policy failed")
+
+          sboms = load_summary("final-image-sbom-summary.json")
+          if sboms is not None:
+              for component in ("api", "ui"):
+                  result = sboms.get(component)
+                  if not isinstance(result, dict) or result.get("status") != "pass":
+                      findings.append(f"{component}: SBOM validation failed")
+
+          scan_summary = load_summary("trivy-summary.json")
+          if scan_summary is not None and scan_summary.get("status") != "pass":
+              findings.append("aggregate Trivy policy failed")
+
+          gate = {
+              "command_statuses": command_statuses,
+              "findings": findings,
+              "status": "fail" if findings else "pass",
+          }
+          (evidence / "security-gate-summary.json").write_text(
+              json.dumps(gate, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          if findings:
+              for finding in findings:
+                  print(finding, file=sys.stderr)
+              raise SystemExit(1)
+          PY
 
       - name: Publish exact verification summary
         if: always()

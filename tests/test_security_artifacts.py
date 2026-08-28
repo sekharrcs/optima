@@ -2,6 +2,9 @@
 
 import json
 import re
+import shutil
+import subprocess
+import sys
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -388,9 +391,30 @@ def test_pr_security_workflow_compiles_every_dedented_python_heredoc() -> None:
     """Compile every embedded program exactly as YAML passes it to Bash."""
     programs = _python_heredocs(_pr_security_workflow())
 
-    assert len(programs) == 8
+    assert len(programs) == 9
     for index, program in enumerate(programs):
         compile(program, f"pr-security-containers.yml:heredoc-{index}", "exec")
+
+
+def test_pr_security_workflow_all_shell_blocks_pass_bash_syntax() -> None:
+    """Validate every literal workflow command after YAML indentation removal."""
+    bash = shutil.which("bash")
+    if bash is None and sys.platform == "win32":
+        git_bash = Path("C:/Program Files/Git/bin/bash.exe")
+        bash = str(git_bash) if git_bash.is_file() else None
+    assert bash is not None, "bash is required to validate workflow shell syntax"
+
+    blocks = _literal_run_blocks(_pr_security_workflow())
+    assert len(blocks) == 24
+    for index, block in enumerate(blocks):
+        result = subprocess.run(
+            [bash, "-n"],
+            input=block,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, f"shell block {index}: {result.stderr}"
 
 
 def test_pr_security_workflow_isolates_scanners_from_checkout_configuration() -> None:
@@ -460,3 +484,87 @@ def test_pr_security_workflow_uploads_untracked_final_image_evidence() -> None:
     assert re.search(r"(?m)^\s*path:\s*\S+", content)
     assert "security/sbom/" not in content
     assert "security/reports/" not in content
+
+
+def test_pr_security_workflow_defers_all_security_failures_to_one_gate() -> None:
+    """Collect both images' evidence before applying one fail-closed policy gate."""
+    content = _pr_security_workflow()
+    scripts = "\n".join(_literal_run_blocks(content))
+
+    assert "continue-on-error" not in content
+    assert scripts.count("api_rootfs_status=$?") == 1
+    assert scripts.count("ui_rootfs_status=$?") == 1
+    assert scripts.count("api_syft_status=$?") == 1
+    assert scripts.count("ui_syft_status=$?") == 1
+    assert scripts.count("api_trivy_status=$?") == 1
+    assert scripts.count("ui_trivy_status=$?") == 1
+    assert scripts.count("sbom_validation_status=$?") == 1
+    assert scripts.count("trivy_policy_status=$?") == 1
+    assert content.count("name: Apply aggregate final-image security gate") == 1
+
+    rootfs_api = scripts.index("--component api")
+    rootfs_ui = scripts.index("--component ui")
+    syft_api = scripts.index("docker:optima-api:pr")
+    syft_ui = scripts.index("docker:optima-ui:pr")
+    trivy_api = scripts.index("optima-api:pr", syft_ui + 1)
+    trivy_ui = scripts.index("optima-ui:pr", trivy_api + 1)
+    final_gate = scripts.index("security-gate-summary.json")
+    assert (
+        rootfs_api < rootfs_ui < syft_api < syft_ui < trivy_api < trivy_ui < final_gate
+    )
+    assert "api-rootfs-summary.json" in scripts
+    assert "ui-rootfs-summary.json" in scripts
+    assert "final-image-sbom-summary.json" in scripts
+    assert "trivy-summary.json" in scripts
+
+
+def test_pr_security_aggregate_gate_cannot_hide_scanner_failure(
+    tmp_path: Path,
+) -> None:
+    """Fail on a captured scanner error even when every policy summary passes."""
+    status_files = {
+        "rootfs-command-statuses.txt": "0 0 0 0 0 0 0 0\n",
+        "sbom-command-statuses.txt": "0 0 0\n",
+        "trivy-command-statuses.txt": "0 9\n",
+        "trivy-policy-status.txt": "0\n",
+    }
+    for name, content in status_files.items():
+        (tmp_path / name).write_text(content, encoding="utf-8")
+    for component in ("api", "ui"):
+        (tmp_path / f"{component}-rootfs-summary.json").write_text(
+            json.dumps({"status": "pass"}),
+            encoding="utf-8",
+        )
+    (tmp_path / "final-image-sbom-summary.json").write_text(
+        json.dumps(
+            {
+                "api": {"status": "pass"},
+                "ui": {"status": "pass"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "trivy-summary.json").write_text(
+        json.dumps({"status": "pass"}),
+        encoding="utf-8",
+    )
+    gate_program = next(
+        program
+        for program in _python_heredocs(_pr_security_workflow())
+        if "security-gate-summary.json" in program
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", gate_program, str(tmp_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    gate = json.loads(
+        (tmp_path / "security-gate-summary.json").read_text(encoding="utf-8")
+    )
+
+    assert result.returncode == 1
+    assert gate["status"] == "fail"
+    assert gate["command_statuses"]["ui_trivy"] == 9
+    assert any("ui_trivy" in finding for finding in gate["findings"])
