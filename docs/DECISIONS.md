@@ -563,9 +563,14 @@ Status: Accepted
 The public Streamlit Container App uses Azure Container Apps built-in Microsoft
 Entra authentication with a pre-existing single-tenant app registration. It
 requires HTTPS and redirects anonymous requests to Entra before they reach the
-container. The API remains internal and unauthenticated at the application
-layer. The public UI retains history only in its current Streamlit session and
-does not browse shared Cosmos history.
+container. The registration uses the confidential-client authorization-code
+(hybrid) flow: a client secret is referenced as the `ui-auth-client-secret`
+Container Apps secret through `clientSecretSettingName` and supplied only at
+preflight through the secure `uiAuthClientSecret` parameter, because Container Apps
+otherwise falls back to the weaker implicit flow. The token store stays disabled
+because OPTIMA only authenticates the user. The API remains internal and
+unauthenticated at the application layer. The public UI retains history only in its
+current Streamlit session and does not browse shared Cosmos history.
 
 The production UI takes its API root only from process configuration, requires
 HTTPS in production mode, and refuses redirects. FastAPI bounds raw and parsed

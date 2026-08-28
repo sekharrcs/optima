@@ -420,8 +420,9 @@ setting it to `true`, all of these conditions must hold:
 5. Redis bootstrap can inspect or create `optima-cache-v1` with the reviewed profile.
 6. Placeholder Foundry and embedding parameters have been replaced.
 7. The API health endpoint and UI startup have passed container smoke tests.
-8. Placeholder UI Entra client and tenant IDs have been replaced, ID-token
-  issuance is enabled, and the exact `/.auth/login/aad/callback` URI is registered.
+8. Placeholder UI Entra client and tenant IDs have been replaced, a client secret
+  is supplied through the secure `uiAuthClientSecret` parameter, and the exact
+  `/.auth/login/aad/callback` URI is registered.
 9. Both final images have zero unresolved applicable high or critical scanner
   findings and contain their generated CycloneDX SBOMs.
 

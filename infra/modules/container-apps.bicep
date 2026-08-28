@@ -40,6 +40,10 @@ param uiAuthClientId string
 @description('Microsoft Entra tenant ID that may authenticate to the public UI.')
 param uiAuthTenantId string
 
+@secure()
+@description('Confidential-client secret of the existing UI Entra app registration. Enables the authorization-code (hybrid) flow instead of the implicit flow. Supplied at preflight; never committed.')
+param uiAuthClientSecret string
+
 @description('Cosmos DB HTTPS account endpoint.')
 param cosmosEndpoint string
 
@@ -393,6 +397,12 @@ resource ui 'Microsoft.App/containerApps@2025-07-01' = {
         transport: 'auto'
       }
       maxInactiveRevisions: 2
+      secrets: [
+        {
+          name: 'ui-auth-client-secret'
+          value: uiAuthClientSecret
+        }
+      ]
       registries: [
         {
           identity: uiIdentityResourceId
@@ -495,6 +505,7 @@ resource uiAuthentication 'Microsoft.App/containerApps/authConfigs@2025-07-01' =
         enabled: true
         registration: {
           clientId: uiAuthClientId
+          clientSecretSettingName: 'ui-auth-client-secret'
           openIdIssuer: '${environment().authentication.loginEndpoint}${uiAuthTenantId}/v2.0'
         }
         validation: {
@@ -510,6 +521,8 @@ resource uiAuthentication 'Microsoft.App/containerApps/authConfigs@2025-07-01' =
         nonceExpirationInterval: '00:05:00'
         validateNonce: true
       }
+      // OPTIMA only authenticates the user; it never calls downstream APIs with a
+      // delegated user token, so no access/refresh token is persisted.
       tokenStore: {
         enabled: false
       }

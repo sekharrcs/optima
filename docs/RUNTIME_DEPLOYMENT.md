@@ -202,12 +202,18 @@ deployment environment, and sampling ratio. Live Metrics, performance counters,
 and offline storage remain disabled. IaC carries the connection string through
 secure module values and a Container Apps secret reference.
 
-The external UI uses Container Apps built-in Microsoft Entra authentication.
-Slice 11C must provide an existing single-tenant app registration and tenant ID,
-enable ID-token issuance, register the exact UI callback URI
+The external UI uses Container Apps built-in Microsoft Entra authentication with
+the confidential-client authorization-code (hybrid) flow. Slice 11C must provide an
+existing single-tenant app registration and tenant ID, create a client secret and
+pass it only through the secure `uiAuthClientSecret` deployment parameter at
+preflight, register the exact UI callback URI
 `https://<ui-fqdn>/.auth/login/aad/callback`, and restrict assignment to the
-intended hackathon users when tenant-wide access is too broad. The checked-in
-configuration stores no client secret and enables no token store.
+intended hackathon users when tenant-wide access is too broad. The secret is
+referenced through `clientSecretSettingName` as the `ui-auth-client-secret`
+Container Apps secret; without a credential the platform falls back to the weaker
+implicit flow. Parameter files carry no secret, and the token store stays disabled
+because OPTIMA only authenticates the user. A successful Bicep build does not prove
+interactive sign-in; authentication is verified only at the live preflight.
 
 LLM-judge evaluation sends the original task, candidate output, explicit
 criteria, and required supplied context through the configured Foundry/APIM
@@ -225,8 +231,9 @@ Before Bicep execution, Slice 11C must validate as far as Azure APIs allow:
 4. Relevant subscription quota and limits
 5. Presence of immutable API and UI manifests in ACR
 6. Replacement of every Foundry, embedding, and digest placeholder
-7. Replacement of UI Entra client and tenant placeholders and verification of
-  the exact callback URI and user-assignment policy
+7. Replacement of UI Entra client and tenant placeholders, provision of the client
+  secret as the secure `uiAuthClientSecret` parameter, and verification of the
+  exact callback URI and user-assignment policy
 
 Valid SKU metadata and quota do not guarantee regional allocation capacity.
 Allocation failure must stop deployment with a clear error. It must not place
@@ -282,8 +289,9 @@ Slice 11C must also supply and verify:
   currency when cost measurement is required
 7. Immutable API and UI image digests and all existing Redis, Cosmos,
   Application Insights, and Foundry inputs
-8. Existing single-tenant UI Entra app client ID, tenant ID, ID-token issuance,
-   callback URI, and intended-user assignment
+8. Existing single-tenant UI Entra app client ID, tenant ID, confidential-client
+   secret supplied as the secure `uiAuthClientSecret` parameter, callback URI, and
+   intended-user assignment
 
 Actual model names, deployment names, and rates remain deployment inputs. This
 repository does not fabricate them.

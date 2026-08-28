@@ -24,6 +24,10 @@ param uiAuthClientId string
 @description('Microsoft Entra tenant ID that may authenticate to the public UI.')
 param uiAuthTenantId string
 
+@secure()
+@description('Confidential-client secret of the existing UI Entra app registration. Supplied at preflight; never committed to source or parameter files.')
+param uiAuthClientSecret string = ''
+
 @description('Immutable API image manifest digest produced by a later build slice.')
 @minLength(71)
 @maxLength(71)
@@ -227,6 +231,7 @@ module resources 'resource-group.bicep' = {
     redisEmbeddingDimension: redisEmbeddingDimension
     redisEmbeddingModel: redisEmbeddingModel
     uiAuthClientId: uiAuthClientId
+    uiAuthClientSecret: uiAuthClientSecret
     uiAuthTenantId: uiAuthTenantId
     uiImageDigest: validatedUiImageDigest
   }

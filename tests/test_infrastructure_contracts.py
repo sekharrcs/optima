@@ -121,18 +121,61 @@ def test_public_ui_requires_tenant_restricted_entra_authentication() -> None:
     assert "requireHttps: true" in module
     assert "allowInsecure: false\n        external: true" in module
     assert "allowInsecure: false\n        external: false" in module
-    assert "clientSecretSettingName" not in module
+    # A confidential-client secret is required: without it Container Apps falls back
+    # to the weaker implicit flow, so the secret reference is a security control.
+    assert "clientSecretSettingName: 'ui-auth-client-secret'" in module
     assert "tokenStore: {\n        enabled: false" in module
 
 
+def test_public_ui_entra_uses_secret_referenced_confidential_client() -> None:
+    """Require a secret-referenced confidential client, never a plain env value."""
+    module = read("infra/modules/container-apps.bicep")
+    resources = read("infra/resource-group.bicep")
+    main = read("infra/main.bicep")
+
+    # The UI Entra registration references a Container Apps secret by name.
+    assert "clientSecretSettingName: 'ui-auth-client-secret'" in module
+    assert "name: 'ui-auth-client-secret'" in module
+    assert "value: uiAuthClientSecret" in module
+
+    # The credential is a secure parameter used only as the secret value, never as a
+    # plain container environment value.
+    assert "@secure()" in module
+    assert "param uiAuthClientSecret string" in module
+    assert module.count("uiAuthClientSecret") == 2
+
+    # Both entry points thread the secure parameter with an empty default so committed
+    # parameter files never carry the credential.
+    for entry in (resources, main):
+        assert "param uiAuthClientSecret string = ''" in entry
+        assert "uiAuthClientSecret: uiAuthClientSecret" in entry
+        output_lines = [
+            line for line in entry.splitlines() if line.startswith("output ")
+        ]
+        assert all("uiAuthClientSecret" not in line for line in output_lines)
+
+
+def test_ui_auth_client_secret_absent_from_committed_parameter_files() -> None:
+    """Keep the confidential-client secret out of committed parameter files."""
+    for relative_path in (
+        "infra/environments/hackathon.bicepparam",
+        "infra/environments/hackathon.runtime.bicepparam",
+    ):
+        assert "uiAuthClientSecret" not in read(relative_path)
+
+
 def test_container_app_deployment_rejects_placeholder_entra_identity() -> None:
-    """Prevent deployment from silently enabling auth with placeholder IDs."""
+    """Reject deployment with placeholder identities or a missing client secret."""
     resources = read("infra/resource-group.bicep")
 
     assert "uiAuthClientId != placeholderIdentity" in resources
     assert "uiAuthTenantId != placeholderIdentity" in resources
+    assert "!empty(uiAuthClientSecret)" in resources
     assert "!deployContainerApps || uiAuthConfigurationIsDeployable" in resources
-    assert "requires a non-placeholder UI Entra client and tenant ID" in resources
+    assert (
+        "requires a non-placeholder UI Entra client ID, tenant ID, and "
+        "confidential-client secret" in resources
+    )
 
 
 def test_application_insights_connection_uses_container_app_secret_reference() -> None:

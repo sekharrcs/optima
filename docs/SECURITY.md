@@ -41,16 +41,51 @@ Entra session before Streamlit receives a request. Anonymous browser requests ar
 redirected to the configured Entra provider. The API remains internal because it
 has no application-layer caller authentication.
 
-Slice 11C must provide an existing single-tenant Entra app registration and:
+The UI Entra registration uses the confidential-client authorization-code (hybrid)
+flow. Container Apps built-in authentication needs a client credential to complete
+the server-side authorization-code exchange. When no credential is configured, it
+silently falls back to the OpenID Connect implicit flow and receives only an ID
+token, a flow Microsoft recommends avoiding. The `Microsoft.App/containerApps`
+`authConfigs` schema exposes only a client secret (`clientSecretSettingName`) or a
+signing certificate for the Entra registration; it has no federated or
+managed-identity credentialless option. OPTIMA therefore references a client secret
+through `clientSecretSettingName`.
+
+The secret is handled Azure-natively and never committed:
+
+* A `@secure()` `uiAuthClientSecret` parameter carries it into the deployment and
+  compiles to an ARM `securestring`.
+* It is stored as the `ui-auth-client-secret` Container Apps secret and referenced
+  only by the auth registration, never as a plain container environment value.
+* It has an empty default, so parameter files carry no credential, and it is never
+  a Bicep output.
+* Deployment fails when Container Apps are enabled without a non-placeholder client
+  ID, tenant ID, and a non-empty client secret. There is no permissive fallback.
+
+The token store stays disabled: OPTIMA only authenticates the user and never calls
+downstream APIs with a delegated user token, so no access or refresh token needs
+persisting. OPTIMA does not trust or consume caller-supplied identity headers.
+
+A certificate credential (`clientSecretCertificateThumbprint` with its issuer or
+subject-alternative-name variants) is the documented alternative. It was not
+selected. For a short-lived hackathon environment it adds certificate issuance,
+upload, and rotation lifecycle without a practical security gain over a
+secret-referenced confidential client, because both are confidential-client
+credentials held server-side by the platform. It remains a future hardening option.
+
+Slice 11C must, before public exposure, use an existing single-tenant Entra app
+registration and:
 
 * Replace the checked-in client and tenant ID placeholders
-* Enable ID-token issuance for the browser sign-in flow
+* Create a client secret on the registration and pass it only as the secure
+  `uiAuthClientSecret` deployment parameter at preflight
 * Register `https://<ui-fqdn>/.auth/login/aad/callback` as a Web redirect URI
 * Restrict app assignment to intended hackathon users when tenant-wide access is
   broader than required
 
-The Bicep auth configuration stores no client secret and disables the token
-store. OPTIMA does not trust or consume caller-supplied identity headers.
+This flow is configured in infrastructure but not yet verified against a live
+tenant. A successful Bicep build is not proof that interactive sign-in works.
+Authentication is confirmed only after the live preflight in the security backlog.
 
 ## API and UI trust boundary
 
@@ -119,6 +154,11 @@ connection string is a destination identifier, but IaC still carries it through
 a secure module output, a secure module input, and a Container Apps secret
 reference. It is not returned by the root template.
 
+The UI Entra confidential-client secret is handled the same way. A secure parameter
+with an empty default becomes the `ui-auth-client-secret` Container Apps secret,
+referenced only by the auth registration. It is never committed, defaulted to a real
+value, emitted as an output, or exposed as a container environment value.
+
 Production logs emit fixed messages or bounded exception type names. Telemetry
 does not export request or response bodies, raw paths, query strings, headers,
 cookies, authorization values, API keys, prompts, context, reference output,
@@ -170,6 +210,13 @@ documentation, infrastructure, caches, and Python bytecode.
 CycloneDX 1.6 artifacts for the frozen Linux x64 production closure. Each names
 its runtime image component and records 70 third-party Python libraries. The
 Docker build regenerates the matching SBOM inside each exact builder environment.
+
+These are Python dependency SBOMs generated from the frozen environment, not final
+container image SBOMs. They inventory Python distributions only. They do not
+include the base image operating-system packages or the native shared libraries
+present in the built image. A final-container SBOM must be generated and verified
+against each built image, including applicable operating-system and native
+components, during the blocking artifact gate below.
 
 ## Security scan results
 
@@ -230,8 +277,9 @@ SSH material, package-manager caches, and build tools before publishing.
 The following items remain explicit:
 
 * Build, start, inspect, and scan both final production images
-* Validate the Entra callback, tenant restriction, and intended-user assignment
-  in a non-production preflight before public exposure
+* Create, supply, and rotate the UI Entra client secret at preflight, then validate
+  the Entra callback, tenant restriction, and intended-user assignment in a
+  non-production preflight before public exposure
 * Add identity-aware durable history ownership before exposing backend history
   through a public multi-user experience
 * Add distributed identity-aware quotas before sustained or broad usage
