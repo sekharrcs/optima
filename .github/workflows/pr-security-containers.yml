@@ -77,7 +77,9 @@ jobs:
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/evidence"
           uv_version="$(uv --version)"
-          test "$uv_version" = "uv 0.12.5"
+          uv_semver="${uv_version#uv }"
+          uv_semver="${uv_semver%% *}"
+          test "$uv_semver" = "0.12.5"
           python_version="$(uv run --no-project --python 3.12 python -c 'import platform; print(platform.python_version())')"
           case "$python_version" in
             3.12.*) ;;

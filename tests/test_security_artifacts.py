@@ -356,6 +356,24 @@ def test_pr_security_workflow_top_level_env_uses_available_contexts() -> None:
     assert "${{ needs." not in environment
 
 
+def test_pr_security_workflow_requires_exact_uv_semantic_version() -> None:
+    """Allow official metadata without accepting another uv semantic version."""
+    scripts = "\n".join(_literal_run_blocks(_pr_security_workflow()))
+    validation = '''uv_version="$(uv --version)"
+uv_semver="${uv_version#uv }"
+uv_semver="${uv_semver%% *}"
+test "$uv_semver" = "0.12.5"'''
+
+    assert validation in scripts
+
+    def extract_semantic_version(output: str) -> str:
+        without_prefix = output.removeprefix("uv ")
+        return without_prefix.split(" ", maxsplit=1)[0]
+
+    assert extract_semantic_version("uv 0.12.5 (1fd1c40d8 2026-08-26)") == "0.12.5"
+    assert extract_semantic_version("uv 0.12.4 (official build metadata)") != "0.12.5"
+
+
 def test_pr_security_workflow_compiles_every_dedented_python_heredoc() -> None:
     """Compile every embedded program exactly as YAML passes it to Bash."""
     programs = _python_heredocs(_pr_security_workflow())
