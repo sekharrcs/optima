@@ -572,6 +572,7 @@ jobs:
       - name: Export and verify final filesystems without an image shell
         shell: bash
         run: |
+          set +e
           set -uo pipefail
           evidence="$RUNNER_TEMP/evidence"
           api_archive="$RUNNER_TEMP/api-rootfs.tar"
@@ -613,6 +614,7 @@ jobs:
       - name: Generate and validate final-image CycloneDX SBOMs
         shell: bash
         run: |
+          set +e
           set -uo pipefail
           evidence="$RUNNER_TEMP/evidence"
           scanner_workspace="$RUNNER_TEMP/scanner-workspace"
@@ -698,6 +700,7 @@ jobs:
         shell: bash
         run: |
           set +e
+          set -uo pipefail
           evidence="$RUNNER_TEMP/evidence"
           scanner_workspace="$RUNNER_TEMP/scanner-workspace"
           scanner_home="$RUNNER_TEMP/scanner-home"
@@ -727,6 +730,7 @@ jobs:
       - name: Evaluate aggregate Trivy policy
         shell: bash
         run: |
+          set +e
           set -uo pipefail
           evidence="$RUNNER_TEMP/evidence"
           uv run --no-project --python 3.12 python scripts/verify_container_artifacts.py trivy \

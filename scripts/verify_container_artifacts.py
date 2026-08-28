@@ -278,18 +278,35 @@ def _distribution_record_paths(
     return paths
 
 
+def _pep3147_bytecode_path(source_path: str, site_packages_root: str) -> str | None:
+    """Derive the active CPython cache path for one wheel-owned Python source."""
+    python_directory = PurePosixPath(site_packages_root).parts[3]
+    version_match = re.fullmatch(r"python(\d+)\.(\d+)", python_directory)
+    source = PurePosixPath(source_path)
+    if version_match is None or source.suffix != ".py":
+        return None
+    cache_tag = f"cpython-{version_match.group(1)}{version_match.group(2)}"
+    return str(source.parent / "__pycache__" / f"{source.stem}.{cache_tag}.pyc")
+
+
 def _validated_third_party_distribution_paths(
     archive: tarfile.TarFile,
     component: Component,
 ) -> set[str]:
     """Return files and directories proven to belong to non-OPTIMA wheels."""
     regular_members: dict[str, tarfile.TarInfo] = {}
+    directory_paths: set[str] = set()
     record_candidates: list[tuple[str, str, tarfile.TarInfo]] = []
     for index, member in enumerate(archive):
         if index >= MAX_ARCHIVE_ENTRIES:
             return set()
         normalized, error = _normalize_archive_path(member.name)
-        if error is not None or normalized is None or not member.isreg():
+        if error is not None or normalized is None:
+            continue
+        if member.isdir():
+            directory_paths.add(normalized)
+            continue
+        if not member.isreg():
             continue
         regular_members[normalized] = member
         root = _site_packages_root(normalized)
@@ -341,6 +358,14 @@ def _validated_third_party_distribution_paths(
             continue
         distribution_files = record_paths & regular_members.keys()
         owned_paths.update(distribution_files)
+        for distribution_file in distribution_files:
+            bytecode_path = _pep3147_bytecode_path(distribution_file, root)
+            if bytecode_path is None or bytecode_path not in regular_members:
+                continue
+            owned_paths.add(bytecode_path)
+            cache_directory = str(PurePosixPath(bytecode_path).parent)
+            if cache_directory in directory_paths:
+                owned_paths.add(cache_directory)
         for distribution_file in distribution_files:
             parent = PurePosixPath(distribution_file).parent
             while str(parent) != root and _starts_with(str(parent), root):

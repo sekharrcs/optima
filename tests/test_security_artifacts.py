@@ -1,6 +1,7 @@
 """Tests for reproducible pre-deployment security evidence."""
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -9,6 +10,8 @@ import tomllib
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+
+import pytest
 
 from scripts.generate_sbom import generate_sbom
 
@@ -115,6 +118,30 @@ def _python_heredocs(content: str) -> list[str]:
                 ) from error
             programs.append("\n".join(lines[index + 1 : end]) + "\n")
     return programs
+
+
+def _named_run_block(content: str, step_name: str) -> str:
+    """Return the literal run block belonging to one named workflow step."""
+    lines = content.splitlines()
+    name_index = lines.index(f"      - name: {step_name}")
+    run_index = next(
+        index
+        for index in range(name_index + 1, len(lines))
+        if re.match(r"^\s+run:\s*\|-?\s*$", lines[index]) is not None
+    )
+    parent_indentation = len(lines[run_index]) - len(lines[run_index].lstrip())
+    raw_block: list[str] = []
+    for line in lines[run_index + 1 :]:
+        indentation = len(line) - len(line.lstrip())
+        if line.strip() and indentation <= parent_indentation:
+            break
+        raw_block.append(line)
+    content_indentation = min(
+        len(line) - len(line.lstrip()) for line in raw_block if line.strip()
+    )
+    return "\n".join(
+        line[content_indentation:] if line.strip() else "" for line in raw_block
+    )
 
 
 def _locked_packages() -> dict[str, dict[str, Any]]:
@@ -518,18 +545,124 @@ def test_pr_security_workflow_defers_all_security_failures_to_one_gate() -> None
     assert "trivy-summary.json" in scripts
 
 
-def test_pr_security_aggregate_gate_cannot_hide_scanner_failure(
+def test_pr_security_collectors_explicitly_disable_inherited_errexit() -> None:
+    """Prevent GitHub's Bash -e default from truncating collected evidence."""
+    content = _pr_security_workflow()
+    collectors = (
+        "Export and verify final filesystems without an image shell",
+        "Generate and validate final-image CycloneDX SBOMs",
+        "Scan both final images with Trivy",
+        "Evaluate aggregate Trivy policy",
+    )
+
+    for step_name in collectors:
+        block = _named_run_block(content, step_name)
+        commands = [line.strip() for line in block.splitlines() if line.strip()]
+        assert commands[0] == "set +e", step_name
+        assert "set -uo pipefail" in commands[:2], step_name
+
+    gate = _named_run_block(content, "Apply aggregate final-image security gate")
+    assert gate.splitlines()[0] == "set -euo pipefail"
+
+
+def test_rootfs_collector_continues_after_first_failure_under_bash_errexit(
     tmp_path: Path,
 ) -> None:
-    """Fail on a captured scanner error even when every policy summary passes."""
-    status_files = {
-        "rootfs-command-statuses.txt": "0 0 0 0 0 0 0 0\n",
-        "sbom-command-statuses.txt": "0 0 0\n",
-        "trivy-command-statuses.txt": "0 9\n",
-        "trivy-policy-status.txt": "0\n",
+    """Run the extracted collector with Bash -e and prove both images are recorded."""
+    bash = shutil.which("bash")
+    if bash is None and sys.platform == "win32":
+        git_bash = Path("C:/Program Files/Git/bin/bash.exe")
+        bash = str(git_bash) if git_bash.is_file() else None
+    assert bash is not None, "bash is required to execute the workflow collector"
+    block = _named_run_block(
+        _pr_security_workflow(),
+        "Export and verify final filesystems without an image shell",
+    )
+    stubs = r"""
+docker() {
+    if test "$1" = "create" && test "$4" = "optima-api:pr"; then
+        return 7
+    fi
+    if test "$1" = "export"; then
+        : > "$3"
+    fi
+    return 0
+}
+uv() {
+    local component=""
+    local output=""
+    while test "$#" -gt 0; do
+        case "$1" in
+            --component) component="$2"; shift 2 ;;
+            --output) output="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    printf '{"component":"%s","status":"pass"}\n' "$component" > "$output"
+    return 0
+}
+"""
+    (tmp_path / "evidence").mkdir()
+    environment = os.environ.copy()
+    environment["RUNNER_TEMP"] = tmp_path.as_posix()
+    result = subprocess.run(
+        [bash, "-e", "-o", "pipefail", "-c", stubs + block],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=environment,
+    )
+
+    statuses = (tmp_path / "evidence" / "rootfs-command-statuses.txt").read_text(
+        encoding="utf-8"
+    )
+    ui_summary = json.loads(
+        (tmp_path / "evidence" / "ui-rootfs-summary.json").read_text(encoding="utf-8")
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert statuses.split() == ["7", "0", "0", "0", "0", "0", "0", "0"]
+    assert ui_summary == {"component": "ui", "status": "pass"}
+
+
+@pytest.mark.parametrize(
+    ("status_file", "status_index", "status_name"),
+    [
+        ("rootfs-command-statuses.txt", 0, "api_create"),
+        ("rootfs-command-statuses.txt", 1, "api_export"),
+        ("rootfs-command-statuses.txt", 2, "api_remove"),
+        ("rootfs-command-statuses.txt", 3, "api_rootfs"),
+        ("rootfs-command-statuses.txt", 4, "ui_create"),
+        ("rootfs-command-statuses.txt", 5, "ui_export"),
+        ("rootfs-command-statuses.txt", 6, "ui_remove"),
+        ("rootfs-command-statuses.txt", 7, "ui_rootfs"),
+        ("sbom-command-statuses.txt", 0, "api_syft"),
+        ("sbom-command-statuses.txt", 1, "ui_syft"),
+        ("sbom-command-statuses.txt", 2, "sbom_validation"),
+        ("trivy-command-statuses.txt", 0, "api_trivy"),
+        ("trivy-command-statuses.txt", 1, "ui_trivy"),
+        ("trivy-policy-status.txt", 0, "trivy_policy"),
+    ],
+)
+def test_pr_security_aggregate_gate_enforces_every_collector_status(
+    tmp_path: Path,
+    status_file: str,
+    status_index: int,
+    status_name: str,
+) -> None:
+    """Fail on every captured command error even when policy summaries pass."""
+    status_values = {
+        "rootfs-command-statuses.txt": [0] * 8,
+        "sbom-command-statuses.txt": [0] * 3,
+        "trivy-command-statuses.txt": [0] * 2,
+        "trivy-policy-status.txt": [0],
     }
-    for name, content in status_files.items():
-        (tmp_path / name).write_text(content, encoding="utf-8")
+    status_values[status_file][status_index] = 9
+    for name, values in status_values.items():
+        (tmp_path / name).write_text(
+            " ".join(str(value) for value in values) + "\n",
+            encoding="utf-8",
+        )
     for component in ("api", "ui"):
         (tmp_path / f"{component}-rootfs-summary.json").write_text(
             json.dumps({"status": "pass"}),
@@ -566,5 +699,5 @@ def test_pr_security_aggregate_gate_cannot_hide_scanner_failure(
 
     assert result.returncode == 1
     assert gate["status"] == "fail"
-    assert gate["command_statuses"]["ui_trivy"] == 9
-    assert any("ui_trivy" in finding for finding in gate["findings"])
+    assert gate["command_statuses"][status_name] == 9
+    assert any(status_name in finding for finding in gate["findings"])

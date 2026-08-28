@@ -6,7 +6,7 @@ import subprocess
 import sys
 import tarfile
 from io import BytesIO
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import pytest
@@ -84,6 +84,7 @@ def _write_rootfs(
     component: str,
     *,
     extra_files: dict[str, bytes] | None = None,
+    extra_directories: set[str] | None = None,
     omitted_files: set[str] | None = None,
 ) -> None:
     files = _rootfs_files(component)
@@ -91,6 +92,11 @@ def _write_rootfs(
     for omitted in omitted_files or set():
         files.pop(omitted)
     with tarfile.open(path, "w") as archive:
+        for name in sorted(extra_directories or set()):
+            member = tarfile.TarInfo(name)
+            member.type = tarfile.DIRTYPE
+            member.mode = 0o755
+            archive.addfile(member)
         for name, data in files.items():
             member = tarfile.TarInfo(name)
             member.size = len(data)
@@ -473,6 +479,139 @@ def test_final_image_rootfs_allows_dependency_owned_package_contents(
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    ("distribution", "source_path"),
+    [
+        ("certifi", "certifi/tests/test_core.py"),
+        ("numpy", "numpy/_core/tests/test_numeric.py"),
+    ],
+)
+def test_final_image_rootfs_allows_record_derived_pep3147_bytecode(
+    tmp_path: Path,
+    distribution: str,
+    source_path: str,
+) -> None:
+    """Accept UV bytecode derived from a validated wheel-owned Python source."""
+    archive = tmp_path / "api-rootfs.tar"
+    source = PurePosixPath(source_path)
+    cache_directory = source.parent / "__pycache__"
+    bytecode_path = cache_directory / f"{source.stem}.cpython-312.pyc"
+    _write_rootfs(
+        archive,
+        "api",
+        extra_directories={f"app/.venv/lib/python3.12/site-packages/{cache_directory}"},
+        extra_files={
+            **_distribution_files(distribution, source_path),
+            (
+                f"app/.venv/lib/python3.12/site-packages/{bytecode_path}"
+            ): b"synthetic UV bytecode\n",
+            "app/sbom/api.cdx.json": _runtime_sbom((distribution, "1.0.0")),
+        },
+    )
+
+    result = _run_verifier(
+        "rootfs",
+        "--component",
+        "api",
+        "--archive",
+        str(archive),
+        "--output",
+        str(tmp_path / "rootfs-evidence.json"),
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    ("distribution", "source_path", "bytecode_path"),
+    [
+        (
+            "package",
+            "package/runtime.py",
+            "package/tests/__pycache__/test_orphan.cpython-312.pyc",
+        ),
+        (
+            "package",
+            "package/tests/test_policy.py",
+            "package/tests/__pycache__/test_policy.cpython-311.pyc",
+        ),
+        (
+            "package",
+            "package/tests/test_policy.py",
+            "package/tests/__pycache__/forged.cpython-312.pyc",
+        ),
+        (
+            "optima",
+            "optima/tests/test_policy.py",
+            "optima/tests/__pycache__/test_policy.cpython-312.pyc",
+        ),
+    ],
+)
+def test_final_image_rootfs_rejects_unowned_or_forged_bytecode(
+    tmp_path: Path,
+    distribution: str,
+    source_path: str,
+    bytecode_path: str,
+) -> None:
+    """Reject orphan, wrong-tag, forged-name, and OPTIMA-owned bytecode."""
+    archive = tmp_path / "api-rootfs.tar"
+    site_packages = "app/.venv/lib/python3.12/site-packages"
+    _write_rootfs(
+        archive,
+        "api",
+        extra_directories={f"{site_packages}/{PurePosixPath(bytecode_path).parent}"},
+        extra_files={
+            **_distribution_files(distribution, source_path),
+            f"{site_packages}/{bytecode_path}": b"synthetic untrusted bytecode\n",
+            "app/sbom/api.cdx.json": _runtime_sbom((distribution, "1.0.0")),
+        },
+    )
+
+    result = _run_verifier(
+        "rootfs",
+        "--component",
+        "api",
+        "--archive",
+        str(archive),
+        "--output",
+        str(tmp_path / "rootfs-evidence.json"),
+    )
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "tests" in (result.stdout + result.stderr).casefold()
+
+
+def test_final_image_rootfs_rejects_app_owned_pep3147_bytecode(
+    tmp_path: Path,
+) -> None:
+    """Keep application source bytecode outside third-party wheel ownership."""
+    archive = tmp_path / "api-rootfs.tar"
+    _write_rootfs(
+        archive,
+        "api",
+        extra_directories={"app/src/optima/tests/__pycache__"},
+        extra_files={
+            "app/src/optima/tests/test_policy.py": b"assert True\n",
+            "app/src/optima/tests/__pycache__/test_policy.cpython-312.pyc": (
+                b"synthetic application bytecode\n"
+            ),
+        },
+    )
+
+    result = _run_verifier(
+        "rootfs",
+        "--component",
+        "api",
+        "--archive",
+        str(archive),
+        "--output",
+        str(tmp_path / "rootfs-evidence.json"),
+    )
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "tests" in (result.stdout + result.stderr).casefold()
 
 
 @pytest.mark.parametrize(
