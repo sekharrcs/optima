@@ -112,7 +112,7 @@ jobs:
         run: |
           set -uo pipefail
           evidence="$RUNNER_TEMP/evidence"
-          uv run pytest --junitxml="$evidence/pytest.xml"
+          uv run --no-sync python -m pytest --junitxml="$evidence/pytest.xml"
           pytest_status=$?
           set -e
           if test -f "$evidence/pytest.xml"; then

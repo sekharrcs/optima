@@ -374,6 +374,16 @@ test "$uv_semver" = "0.12.5"'''
     assert extract_semantic_version("uv 0.12.4 (official build metadata)") != "0.12.5"
 
 
+def test_pr_security_workflow_runs_full_suite_from_repository_root() -> None:
+    """Invoke pytest as a module so checkout-local scripts remain importable."""
+    scripts = "\n".join(_literal_run_blocks(_pr_security_workflow()))
+
+    assert (
+        'uv run --no-sync python -m pytest --junitxml="$evidence/pytest.xml"' in scripts
+    )
+    assert re.search(r"(?m)^\s*uv run(?: --no-sync)? pytest(?:\s|$)", scripts) is None
+
+
 def test_pr_security_workflow_compiles_every_dedented_python_heredoc() -> None:
     """Compile every embedded program exactly as YAML passes it to Bash."""
     programs = _python_heredocs(_pr_security_workflow())
