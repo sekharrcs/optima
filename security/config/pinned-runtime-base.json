@@ -1,0 +1,120 @@
+{
+  "components": {
+    "api": {
+      "dockerfile": "Dockerfile.api",
+      "image_tag": "optima-api:pr"
+    },
+    "ui": {
+      "dockerfile": "Dockerfile.ui",
+      "image_tag": "optima-ui:pr"
+    }
+  },
+  "exact_subtrees": [
+    {
+      "entries": [
+        "var/cache",
+        "var/cache/ldconfig",
+        "var/cache/ldconfig/aux-cache"
+      ],
+      "path": "var/cache"
+    }
+  ],
+  "image": {
+    "config_digest": "sha256:18da20740c8286c11f78700fe506957a8009f2cc3291c8cc8288454b2cae7511",
+    "index_digest": "sha256:d921452dba64944bf959f22450bb3740f5b2fff4a59faa64bd6b8eaf4c57b5b8",
+    "manifest_digest": "sha256:62e947ec7edfe308b97cebfab4e89e413c66a63ffcb3c021cb25ff3b70332639",
+    "platform": {
+      "architecture": "amd64",
+      "os": "linux"
+    },
+    "reference": "mcr.microsoft.com/azurelinux/distroless/python:3.12-nonroot@sha256:d921452dba64944bf959f22450bb3740f5b2fff4a59faa64bd6b8eaf4c57b5b8",
+    "rootfs_diff_ids": [
+      "sha256:e7cf7da29bd85aa6f70e9b80640e82141e6e20112096c8adbb3ebd8174aa3965",
+      "sha256:81d1727fb374caf1bbd1183d3fd22d4bc8d87a48a25f51a4b07bac7ebb200b79"
+    ]
+  },
+  "packages": [
+    {
+      "name": "SymCrypt",
+      "purl": "pkg:rpm/azurelinux/SymCrypt@103.8.0-1.azl3?arch=x86_64&distro=azurelinux-3.0",
+      "version": "103.8.0-1.azl3.x86_64"
+    },
+    {
+      "name": "SymCrypt-OpenSSL",
+      "purl": "pkg:rpm/azurelinux/SymCrypt-OpenSSL@1.10.0-1.azl3?arch=x86_64&distro=azurelinux-3.0",
+      "version": "1.10.0-1.azl3.x86_64"
+    }
+  ],
+  "policy": "optima-pinned-runtime-base-v1",
+  "reviewed_entries": [
+    {
+      "gid": 0,
+      "mode": "0755",
+      "path": "usr/include/e_scossl.h",
+      "sha256": "d9bcb4c543480bcc624c7258e07c53fd8be004b4a05b5e85709f7e7d3820c9ad",
+      "size": 339,
+      "type": "file",
+      "uid": 0
+    },
+    {
+      "gid": 0,
+      "mode": "0755",
+      "path": "usr/include/symcrypt.h",
+      "sha256": "54fdf60238a02328cb7457420c8bdcb6478a3b54152135ecc5221084e80ce33b",
+      "size": 453529,
+      "type": "file",
+      "uid": 0
+    },
+    {
+      "gid": 0,
+      "mode": "0755",
+      "path": "usr/include/symcrypt_internal.h",
+      "sha256": "1aff0521fddc3bb40ae9ba7ef1a88285f85d21c24a4876ca7961899493233b44",
+      "size": 174122,
+      "type": "file",
+      "uid": 0
+    },
+    {
+      "gid": 0,
+      "mode": "0755",
+      "path": "usr/include/symcrypt_low_level.h",
+      "sha256": "1b7099c7815a111d8f9b396e938e168a7aaa8b17153c43e98d9d115170696371",
+      "size": 135062,
+      "type": "file",
+      "uid": 0
+    },
+    {
+      "gid": 0,
+      "mode": "0755",
+      "path": "usr/include/symcrypt_no_sal.h",
+      "sha256": "12588ccebc480440555242b10f6078692a9d38d4435a865de243d48e185f4aca",
+      "size": 1268,
+      "type": "file",
+      "uid": 0
+    },
+    {
+      "gid": 0,
+      "mode": "0755",
+      "path": "var/cache",
+      "type": "directory",
+      "uid": 0
+    },
+    {
+      "gid": 0,
+      "mode": "0700",
+      "path": "var/cache/ldconfig",
+      "type": "directory",
+      "uid": 0
+    },
+    {
+      "gid": 0,
+      "mode": "0600",
+      "path": "var/cache/ldconfig/aux-cache",
+      "sha256": "4730ffbcc3c3ab820172649e4422c98dbcbf4f1fa5692913341537e3be894584",
+      "size": 3567,
+      "type": "file",
+      "uid": 0
+    }
+  ],
+  "schema_version": 1
+}

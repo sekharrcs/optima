@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import io
 import json
 import re
@@ -29,8 +30,50 @@ MAX_DISTRIBUTION_METADATA_BYTES = 1024 * 1024
 MAX_DISTRIBUTION_RECORD_BYTES = 16 * 1024 * 1024
 MAX_RUNTIME_SBOM_BYTES = 16 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 250_000
+MAX_ATTESTATION_JSON_BYTES = 1024 * 1024
+MAX_IMAGE_SAVE_ARCHIVE_BYTES = 8 * 1024 * 1024 * 1024
+MAX_ROOTFS_ARCHIVE_BYTES = 8 * 1024 * 1024 * 1024
+MAX_SAVED_LAYER_BYTES = 4 * 1024 * 1024 * 1024
+SHA256_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
 
 Component = Literal["api", "ui"]
+
+PINNED_BASE_IDENTITIES = {
+    (
+        "sha256:d921452dba64944bf959f22450bb3740f5b2fff4a59faa64bd6b8eaf4c57b5b8",
+        "linux",
+        "amd64",
+    ): {
+        "config_digest": (
+            "sha256:18da20740c8286c11f78700fe506957a8009f2cc3291c8cc8288454b2cae7511"
+        ),
+        "manifest_digest": (
+            "sha256:62e947ec7edfe308b97cebfab4e89e413c66a63ffcb3c021cb25ff3b70332639"
+        ),
+    }
+}
+
+REVIEWED_BASE_PATHS = frozenset(
+    {
+        "usr/include/e_scossl.h",
+        "usr/include/symcrypt.h",
+        "usr/include/symcrypt_internal.h",
+        "usr/include/symcrypt_low_level.h",
+        "usr/include/symcrypt_no_sal.h",
+        "var/cache",
+        "var/cache/ldconfig",
+        "var/cache/ldconfig/aux-cache",
+    }
+)
+EXACT_BASE_SUBTREES = {
+    "var/cache": frozenset(
+        {
+            "var/cache",
+            "var/cache/ldconfig",
+            "var/cache/ldconfig/aux-cache",
+        }
+    )
+}
 
 REQUIRED_ANCHORS: dict[Component, tuple[str, ...]] = {
     "api": (
@@ -130,6 +173,877 @@ def _normalize_archive_path(name: str) -> tuple[str | None, str | None]:
     if not parts:
         return ".", None
     return "/".join(parts), None
+
+
+class AttestationError(ValueError):
+    """Represent one fail-closed pinned-base attestation finding."""
+
+    def __init__(self, code: str, message: str, *, path: str | None = None) -> None:
+        super().__init__(message)
+        self.finding = _finding(code, message, path=path)
+
+
+def _sha256_stream(stream: IO[bytes]) -> str:
+    """Return a streaming SHA-256 digest with the standard prefix."""
+    digest = hashlib.sha256()
+    while chunk := stream.read(PRIVATE_KEY_SCAN_CHUNK_BYTES):
+        digest.update(chunk)
+    return f"sha256:{digest.hexdigest()}"
+
+
+def _sha256_path(path: Path) -> str:
+    """Return a streaming SHA-256 digest for one file."""
+    with path.open("rb") as stream:
+        return _sha256_stream(stream)
+
+
+def _require_bounded_archive(path: Path, *, label: str, maximum_bytes: int) -> None:
+    """Require one nonempty regular archive within its byte-size safety limit."""
+    if path.is_symlink() or not path.is_file():
+        raise AttestationError(
+            "unsafe_archive_file",
+            f"{label} must be a regular non-symlink file",
+            path=path.name,
+        )
+    size = path.stat().st_size
+    if size <= 0 or size > maximum_bytes:
+        raise AttestationError(
+            "archive_size_limit",
+            f"{label} is empty or exceeds the byte-size safety limit",
+            path=path.name,
+        )
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Build a JSON object while rejecting ambiguous duplicate keys."""
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON object key")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> None:
+    """Reject non-standard JSON constants such as NaN and Infinity."""
+    raise ValueError(f"non-standard JSON constant: {value}")
+
+
+def _strict_json_loads(content: bytes) -> object:
+    """Parse strict JSON bytes without duplicate keys or non-standard constants."""
+    return json.loads(
+        content,
+        object_pairs_hook=_reject_duplicate_json_keys,
+        parse_constant=_reject_json_constant,
+    )
+
+
+def _bounded_json_document(path: Path) -> dict[str, Any]:
+    """Read one bounded JSON object or raise an attestation error."""
+    try:
+        with path.open("rb") as stream:
+            content = stream.read(MAX_ATTESTATION_JSON_BYTES + 1)
+    except FileNotFoundError as error:
+        raise AttestationError(
+            "missing_trusted_manifest",
+            "trusted manifest is missing",
+            path=path.name,
+        ) from error
+    if len(content) > MAX_ATTESTATION_JSON_BYTES:
+        raise AttestationError(
+            "malformed_trusted_manifest",
+            "trusted manifest exceeds the size limit",
+            path=path.name,
+        )
+    try:
+        document = _strict_json_loads(content)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise AttestationError(
+            "malformed_trusted_manifest",
+            "trusted manifest is not valid JSON",
+            path=path.name,
+        ) from error
+    if not isinstance(document, dict):
+        raise AttestationError(
+            "malformed_trusted_manifest",
+            "trusted manifest root must be an object",
+            path=path.name,
+        )
+    return document
+
+
+def _require_object(value: object, label: str) -> dict[str, Any]:
+    """Return a JSON object or reject the malformed trusted field."""
+    if not isinstance(value, dict):
+        raise AttestationError(
+            "malformed_trusted_manifest",
+            f"trusted manifest {label} must be an object",
+        )
+    return value
+
+
+def _require_string(value: object, label: str) -> str:
+    """Return a nonempty bounded JSON string or reject it."""
+    if not isinstance(value, str) or not value or len(value) > MAX_TEXT_LENGTH:
+        raise AttestationError(
+            "malformed_trusted_manifest",
+            f"trusted manifest {label} must be a bounded string",
+        )
+    return value
+
+
+def _require_digest(value: object, label: str) -> str:
+    """Return a canonical SHA-256 digest or reject it."""
+    digest = _require_string(value, label)
+    if SHA256_PATTERN.fullmatch(digest) is None:
+        raise AttestationError(
+            "malformed_trusted_manifest",
+            f"trusted manifest {label} is not a canonical SHA-256 digest",
+        )
+    return digest
+
+
+def _trusted_attestation_contract(
+    component: Component,
+    manifest_path: Path,
+) -> dict[str, Any]:
+    """Validate and return the narrowly bounded trusted-base contract."""
+    document = _bounded_json_document(manifest_path)
+    if document.get("schema_version") != 1:
+        raise AttestationError(
+            "unsupported_trusted_manifest",
+            "trusted manifest schema version is unsupported",
+        )
+    if document.get("policy") != "optima-pinned-runtime-base-v1":
+        raise AttestationError(
+            "unsupported_trusted_manifest",
+            "trusted manifest policy is unsupported",
+        )
+
+    components = _require_object(document.get("components"), "components")
+    component_contract = _require_object(components.get(component), component)
+    expected_dockerfile = _require_string(
+        component_contract.get("dockerfile"),
+        f"{component} dockerfile",
+    )
+    expected_tag = _require_string(
+        component_contract.get("image_tag"),
+        f"{component} image tag",
+    )
+    if expected_tag != f"optima-{component}:pr":
+        raise AttestationError(
+            "component_mismatch",
+            f"trusted manifest {component} image tag is invalid",
+        )
+
+    image = _require_object(document.get("image"), "image")
+    index_digest = _require_digest(image.get("index_digest"), "index digest")
+    manifest_digest = _require_digest(
+        image.get("manifest_digest"),
+        "child manifest digest",
+    )
+    config_digest = _require_digest(image.get("config_digest"), "base config digest")
+    reference = _require_string(image.get("reference"), "image reference")
+    if reference.rpartition("@")[2] != index_digest:
+        raise AttestationError(
+            "index_digest_mismatch",
+            "trusted image reference does not match the index digest",
+        )
+    platform = _require_object(image.get("platform"), "image platform")
+    expected_os = _require_string(platform.get("os"), "platform OS")
+    expected_architecture = _require_string(
+        platform.get("architecture"),
+        "platform architecture",
+    )
+    if expected_os != "linux" or expected_architecture != "amd64":
+        raise AttestationError(
+            "platform_mismatch",
+            "trusted platform must be linux/amd64",
+        )
+    compiled_identity = PINNED_BASE_IDENTITIES.get(
+        (index_digest, expected_os, expected_architecture)
+    )
+    if compiled_identity is None:
+        raise AttestationError(
+            "unapproved_base_identity",
+            "trusted index and platform are not an approved compiled base identity",
+        )
+    if manifest_digest != compiled_identity["manifest_digest"]:
+        raise AttestationError(
+            "manifest_digest_mismatch",
+            "reviewed child manifest digest does not match the compiled base identity",
+        )
+    if config_digest != compiled_identity["config_digest"]:
+        raise AttestationError(
+            "base_config_digest_mismatch",
+            "reviewed base config digest does not match the compiled base identity",
+        )
+    raw_prefix = image.get("rootfs_diff_ids")
+    if not isinstance(raw_prefix, list) or len(raw_prefix) != 2:
+        raise AttestationError(
+            "malformed_trusted_manifest",
+            "trusted rootfs DiffID prefix must contain exactly two entries",
+        )
+    diff_id_prefix = [
+        _require_digest(value, f"rootfs DiffID {index}")
+        for index, value in enumerate(raw_prefix)
+    ]
+    if len(set(diff_id_prefix)) != len(diff_id_prefix):
+        raise AttestationError(
+            "malformed_trusted_manifest",
+            "trusted rootfs DiffID prefix contains duplicates",
+        )
+
+    raw_entries = document.get("reviewed_entries")
+    if not isinstance(raw_entries, list):
+        raise AttestationError(
+            "malformed_trusted_manifest",
+            "trusted reviewed entries must be an array",
+        )
+    reviewed_entries: dict[str, dict[str, Any]] = {}
+    for index, raw_entry in enumerate(raw_entries):
+        entry = _require_object(raw_entry, f"reviewed entry {index}")
+        path = _require_string(entry.get("path"), f"reviewed entry {index} path")
+        normalized, path_error = _normalize_archive_path(path)
+        if (
+            path_error is not None
+            or normalized != path
+            or path not in REVIEWED_BASE_PATHS
+        ):
+            raise AttestationError(
+                "unapproved_reviewed_path",
+                "trusted manifest contains an unapproved reviewed path",
+                path=path,
+            )
+        if path in reviewed_entries:
+            raise AttestationError(
+                "duplicate_reviewed_path",
+                "trusted manifest contains a duplicate reviewed path",
+                path=path,
+            )
+        entry_type = _require_string(entry.get("type"), f"{path} type")
+        expected_type = (
+            "directory"
+            if path
+            in EXACT_BASE_SUBTREES["var/cache"] - {"var/cache/ldconfig/aux-cache"}
+            else "file"
+        )
+        if entry_type != expected_type:
+            raise AttestationError(
+                "reviewed_type_mismatch",
+                "trusted reviewed path has the wrong type",
+                path=path,
+            )
+        for identity_field in ("uid", "gid"):
+            identity = entry.get(identity_field)
+            if type(identity) is not int or identity < 0:
+                raise AttestationError(
+                    "malformed_trusted_manifest",
+                    f"trusted {path} {identity_field} is invalid",
+                    path=path,
+                )
+        mode = _require_string(entry.get("mode"), f"{path} mode")
+        if re.fullmatch(r"0[0-7]{3}", mode) is None:
+            raise AttestationError(
+                "malformed_trusted_manifest",
+                "trusted reviewed mode is invalid",
+                path=path,
+            )
+        if entry_type == "file":
+            size = entry.get("size")
+            if type(size) is not int or size < 0:
+                raise AttestationError(
+                    "malformed_trusted_manifest",
+                    "trusted reviewed file size is invalid",
+                    path=path,
+                )
+            digest = entry.get("sha256")
+            if (
+                not isinstance(digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            ):
+                raise AttestationError(
+                    "malformed_trusted_manifest",
+                    "trusted reviewed file hash is invalid",
+                    path=path,
+                )
+        reviewed_entries[path] = entry
+    if reviewed_entries.keys() != REVIEWED_BASE_PATHS:
+        raise AttestationError(
+            "reviewed_inventory_mismatch",
+            "trusted manifest must contain exactly the eight reviewed paths",
+        )
+
+    subtrees = document.get("exact_subtrees")
+    if subtrees != [
+        {"entries": sorted(EXACT_BASE_SUBTREES["var/cache"]), "path": "var/cache"}
+    ]:
+        raise AttestationError(
+            "exact_subtree_mismatch",
+            "trusted manifest var/cache subtree contract is invalid",
+        )
+    packages = document.get("packages")
+    if not isinstance(packages, list) or not packages:
+        raise AttestationError(
+            "malformed_trusted_manifest",
+            "trusted manifest package provenance is missing",
+        )
+    for index, raw_package in enumerate(packages):
+        package = _require_object(raw_package, f"package {index}")
+        _require_string(package.get("name"), f"package {index} name")
+        _require_string(package.get("version"), f"package {index} version")
+        purl = _require_string(package.get("purl"), f"package {index} purl")
+        if not purl.startswith("pkg:rpm/"):
+            raise AttestationError(
+                "malformed_trusted_manifest",
+                "trusted package purl is not an RPM purl",
+            )
+    return {
+        "base_config_digest": config_digest,
+        "component_dockerfile": expected_dockerfile,
+        "diff_id_prefix": diff_id_prefix,
+        "expected_architecture": expected_architecture,
+        "expected_os": expected_os,
+        "expected_tag": expected_tag,
+        "index_digest": index_digest,
+        "manifest_digest": manifest_digest,
+        "reference": reference,
+        "reviewed_entries": reviewed_entries,
+    }
+
+
+def _archive_members(
+    archive: tarfile.TarFile, *, label: str
+) -> dict[str, tarfile.TarInfo]:
+    """Index one tar archive while rejecting unsafe and duplicate entries."""
+    members: dict[str, tarfile.TarInfo] = {}
+    for index, member in enumerate(archive):
+        if index >= MAX_ARCHIVE_ENTRIES:
+            raise AttestationError(
+                "archive_entry_limit",
+                f"{label} exceeds the entry safety limit",
+            )
+        normalized, path_error = _normalize_archive_path(member.name)
+        if path_error is not None or normalized is None:
+            raise AttestationError(
+                "unsafe_archive_path",
+                f"{label} contains {path_error or 'an unsafe archive path'}",
+            )
+        if normalized in members:
+            raise AttestationError(
+                "duplicate_archive_entry",
+                f"{label} contains a duplicate archive path",
+                path=normalized,
+            )
+        members[normalized] = member
+    return members
+
+
+def _json_archive_member(
+    archive: tarfile.TarFile,
+    member: tarfile.TarInfo,
+    *,
+    label: str,
+) -> object:
+    """Read one bounded regular JSON member from an archive."""
+    if not member.isreg() or member.size > MAX_ATTESTATION_JSON_BYTES:
+        raise AttestationError(
+            "malformed_image_archive",
+            f"{label} is not a bounded regular file",
+            path=member.name,
+        )
+    extracted = archive.extractfile(member)
+    if extracted is None:
+        raise AttestationError(
+            "malformed_image_archive",
+            f"{label} cannot be read",
+            path=member.name,
+        )
+    try:
+        return _strict_json_loads(extracted.read())
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise AttestationError(
+            "malformed_image_archive",
+            f"{label} is not valid JSON",
+            path=member.name,
+        ) from error
+
+
+def _protected_ancestors(paths: set[str]) -> set[str]:
+    """Return every strict ancestor of the protected reviewed paths."""
+    ancestors = {"."}
+    for path in paths:
+        parent = PurePosixPath(path).parent
+        while str(parent) != ".":
+            ancestors.add(str(parent))
+            parent = parent.parent
+    return ancestors
+
+
+def _whiteout_target(path: str) -> tuple[str | None, bool]:
+    """Return a Docker whiteout target and whether it is opaque."""
+    pure_path = PurePosixPath(path)
+    if pure_path.name == ".wh..wh..opq":
+        return str(pure_path.parent), True
+    if pure_path.name.startswith(".wh."):
+        target_name = pure_path.name.removeprefix(".wh.")
+        if target_name:
+            return str(pure_path.parent / target_name), False
+    return None, False
+
+
+def _inspect_later_layer(
+    stream: IO[bytes],
+    *,
+    label: str,
+    reviewed_paths: set[str],
+) -> None:
+    """Reject later-layer operations that can modify reviewed base paths."""
+    ancestors = _protected_ancestors(reviewed_paths)
+    seen: set[str] = set()
+    try:
+        with tarfile.open(fileobj=stream, mode="r|") as layer:
+            for index, member in enumerate(layer):
+                if index >= MAX_ARCHIVE_ENTRIES:
+                    raise AttestationError(
+                        "archive_entry_limit",
+                        f"{label} exceeds the entry safety limit",
+                    )
+                normalized, path_error = _normalize_archive_path(member.name)
+                if path_error is not None or normalized is None:
+                    raise AttestationError(
+                        "unsafe_archive_path",
+                        f"{label} contains {path_error or 'an unsafe path'}",
+                    )
+                if normalized in seen:
+                    raise AttestationError(
+                        "duplicate_archive_entry",
+                        f"{label} contains a duplicate path",
+                        path=normalized,
+                    )
+                seen.add(normalized)
+                whiteout_target, opaque = _whiteout_target(normalized)
+                if whiteout_target is not None and (
+                    whiteout_target == "."
+                    or any(
+                        _starts_with(path, whiteout_target) for path in reviewed_paths
+                    )
+                ):
+                    code = "opaque_reviewed_ancestor" if opaque else "reviewed_whiteout"
+                    raise AttestationError(
+                        code,
+                        "later layer masks a reviewed path or ancestor",
+                        path=normalized,
+                    )
+                if normalized in reviewed_paths:
+                    raise AttestationError(
+                        "later_layer_reviewed_override",
+                        "later layer adds or replaces a reviewed path",
+                        path=normalized,
+                    )
+                if any(
+                    _starts_with(normalized, subtree) for subtree in EXACT_BASE_SUBTREES
+                ):
+                    raise AttestationError(
+                        "later_layer_reviewed_subtree_change",
+                        "later layer changes an exact reviewed subtree",
+                        path=normalized,
+                    )
+                if normalized in ancestors:
+                    raise AttestationError(
+                        "later_layer_ancestor_replacement",
+                        "later layer restates an ancestor of a reviewed path",
+                        path=normalized,
+                    )
+    except tarfile.TarError as error:
+        raise AttestationError(
+            "malformed_layer",
+            f"{label} is malformed",
+        ) from error
+
+
+def _inspect_saved_image(
+    image_archive: Path,
+    contract: dict[str, Any],
+) -> dict[str, Any]:
+    """Verify Docker-save structure, layer bytes, platform, and base ancestry."""
+    try:
+        _require_bounded_archive(
+            image_archive,
+            label="image-save archive",
+            maximum_bytes=MAX_IMAGE_SAVE_ARCHIVE_BYTES,
+        )
+        with tarfile.open(image_archive, mode="r:") as archive:
+            members = _archive_members(archive, label="image-save archive")
+            manifest_member = members.get("manifest.json")
+            if manifest_member is None:
+                raise AttestationError(
+                    "missing_image_manifest",
+                    "image-save archive has no manifest.json",
+                )
+            raw_manifest = _json_archive_member(
+                archive,
+                manifest_member,
+                label="image-save manifest",
+            )
+            if not isinstance(raw_manifest, list) or len(raw_manifest) != 1:
+                raise AttestationError(
+                    "image_count_mismatch",
+                    "image-save archive must contain exactly one image",
+                )
+            image_record = _require_object(raw_manifest[0], "image-save record")
+            repo_tags = image_record.get("RepoTags")
+            if repo_tags != [contract["expected_tag"]]:
+                raise AttestationError(
+                    "image_tag_mismatch",
+                    "image-save archive does not contain the expected image tag",
+                )
+            config_name = _require_string(
+                image_record.get("Config"),
+                "image-save config path",
+            )
+            normalized_config, config_error = _normalize_archive_path(config_name)
+            if config_error is not None or normalized_config != config_name:
+                raise AttestationError(
+                    "unsafe_archive_path",
+                    "image-save config path is unsafe",
+                )
+            config_member = members.get(config_name)
+            if config_member is None:
+                raise AttestationError(
+                    "missing_image_config",
+                    "image-save config file is missing",
+                    path=config_name,
+                )
+            raw_config = _json_archive_member(
+                archive,
+                config_member,
+                label="image config",
+            )
+            if not isinstance(raw_config, dict):
+                raise AttestationError(
+                    "malformed_image_config",
+                    "image config root must be an object",
+                )
+            config_stream = archive.extractfile(config_member)
+            if config_stream is None:
+                raise AttestationError(
+                    "malformed_image_config",
+                    "image config cannot be read",
+                )
+            final_config_digest = _sha256_stream(config_stream)
+            if config_name != f"{final_config_digest.removeprefix('sha256:')}.json":
+                raise AttestationError(
+                    "config_digest_mismatch",
+                    "image config filename does not match its content digest",
+                    path=config_name,
+                )
+            if raw_config.get("os") != contract["expected_os"]:
+                raise AttestationError(
+                    "os_mismatch",
+                    "image config OS does not match trusted platform",
+                )
+            if raw_config.get("architecture") != contract["expected_architecture"]:
+                raise AttestationError(
+                    "architecture_mismatch",
+                    "image config architecture does not match trusted platform",
+                )
+            rootfs = _require_object(raw_config.get("rootfs"), "image rootfs")
+            if rootfs.get("type") != "layers":
+                raise AttestationError(
+                    "malformed_image_config",
+                    "image rootfs type must be layers",
+                )
+            raw_diff_ids = rootfs.get("diff_ids")
+            raw_layers = image_record.get("Layers")
+            if not isinstance(raw_diff_ids, list) or not isinstance(raw_layers, list):
+                raise AttestationError(
+                    "malformed_image_config",
+                    "image layers and DiffIDs must be arrays",
+                )
+            if len(raw_diff_ids) != len(raw_layers) or not raw_layers:
+                raise AttestationError(
+                    "layer_count_mismatch",
+                    "image layer and DiffID counts do not match",
+                )
+            diff_ids = [
+                _require_digest(value, f"image DiffID {index}")
+                for index, value in enumerate(raw_diff_ids)
+            ]
+            layer_names: list[str] = []
+            layer_digests: list[str] = []
+            for index, value in enumerate(raw_layers):
+                layer_name = _require_string(value, f"image layer {index}")
+                normalized_layer, layer_error = _normalize_archive_path(layer_name)
+                if layer_error is not None or normalized_layer != layer_name:
+                    raise AttestationError(
+                        "unsafe_archive_path",
+                        "image-save layer path is unsafe",
+                    )
+                if layer_name in layer_names:
+                    raise AttestationError(
+                        "duplicate_image_layer",
+                        "image-save record contains a duplicate layer",
+                        path=layer_name,
+                    )
+                layer_member = members.get(layer_name)
+                if layer_member is None or not layer_member.isreg():
+                    raise AttestationError(
+                        "missing_image_layer",
+                        "image-save layer is missing or not regular",
+                        path=layer_name,
+                    )
+                if layer_member.size <= 0 or layer_member.size > MAX_SAVED_LAYER_BYTES:
+                    raise AttestationError(
+                        "archive_size_limit",
+                        "saved image layer exceeds the byte-size safety limit",
+                        path=layer_name,
+                    )
+                layer_stream = archive.extractfile(layer_member)
+                if layer_stream is None:
+                    raise AttestationError(
+                        "malformed_image_layer",
+                        "image-save layer cannot be read",
+                        path=layer_name,
+                    )
+                layer_names.append(layer_name)
+                layer_digests.append(_sha256_stream(layer_stream))
+            if layer_digests != diff_ids:
+                raise AttestationError(
+                    "layer_diff_id_mismatch",
+                    "saved layer content does not match ordered image DiffIDs",
+                )
+            prefix = contract["diff_id_prefix"]
+            if diff_ids[: len(prefix)] != prefix:
+                raise AttestationError(
+                    "base_diff_id_mismatch",
+                    "ordered image RootFS DiffIDs do not begin with the trusted "
+                    "base prefix",
+                )
+            reviewed_paths = set(contract["reviewed_entries"])
+            for layer_index, layer_name in enumerate(
+                layer_names[len(prefix) :], len(prefix)
+            ):
+                layer_member = members[layer_name]
+                layer_stream = archive.extractfile(layer_member)
+                if layer_stream is None:
+                    raise AttestationError(
+                        "malformed_image_layer",
+                        "later image layer cannot be read",
+                        path=layer_name,
+                    )
+                _inspect_later_layer(
+                    layer_stream,
+                    label=f"image layer {layer_index}",
+                    reviewed_paths=reviewed_paths,
+                )
+            return {
+                "final_config_digest": final_config_digest,
+                "final_image_platform": {
+                    "architecture": raw_config["architecture"],
+                    "os": raw_config["os"],
+                },
+                "later_layer_protected_paths_absent": True,
+                "layer_count": len(layer_names),
+                "rootfs_diff_ids": diff_ids,
+                "verified_base_rootfs_diff_id_prefix": diff_ids[: len(prefix)],
+            }
+    except FileNotFoundError as error:
+        raise AttestationError(
+            "missing_image_archive",
+            "image-save archive is missing",
+            path=image_archive.name,
+        ) from error
+    except (OSError, tarfile.TarError) as error:
+        raise AttestationError(
+            "malformed_image_archive",
+            f"image-save archive is malformed: {type(error).__name__}",
+        ) from error
+
+
+def _verify_reviewed_rootfs(
+    rootfs_archive: Path,
+    reviewed_entries: dict[str, dict[str, Any]],
+) -> list[dict[str, object]]:
+    """Verify and return exact reviewed rootfs metadata, sizes, and hashes."""
+    try:
+        _require_bounded_archive(
+            rootfs_archive,
+            label="exported rootfs",
+            maximum_bytes=MAX_ROOTFS_ARCHIVE_BYTES,
+        )
+        with tarfile.open(rootfs_archive, mode="r:") as archive:
+            members = _archive_members(archive, label="exported rootfs")
+            verified_entries: list[dict[str, object]] = []
+            for path, expected in reviewed_entries.items():
+                member = members.get(path)
+                if member is None:
+                    raise AttestationError(
+                        "missing_reviewed_path",
+                        "exported rootfs is missing a reviewed path",
+                        path=path,
+                    )
+                expected_type = expected["type"]
+                if (expected_type == "file" and not member.isreg()) or (
+                    expected_type == "directory" and not member.isdir()
+                ):
+                    raise AttestationError(
+                        "reviewed_type_mismatch",
+                        "exported rootfs reviewed path has the wrong type",
+                        path=path,
+                    )
+                if member.uid != expected["uid"]:
+                    raise AttestationError(
+                        "reviewed_uid_mismatch",
+                        "exported rootfs reviewed path has the wrong uid",
+                        path=path,
+                    )
+                if member.gid != expected["gid"]:
+                    raise AttestationError(
+                        "reviewed_gid_mismatch",
+                        "exported rootfs reviewed path has the wrong gid",
+                        path=path,
+                    )
+                if member.mode & 0o7777 != int(expected["mode"], 8):
+                    raise AttestationError(
+                        "reviewed_mode_mismatch",
+                        "exported rootfs reviewed path has the wrong mode",
+                        path=path,
+                    )
+                verified_entry: dict[str, object] = {
+                    "gid": member.gid,
+                    "mode": f"0{member.mode & 0o7777:03o}",
+                    "path": path,
+                    "type": expected_type,
+                    "uid": member.uid,
+                }
+                if expected_type == "file":
+                    if member.size != expected["size"]:
+                        raise AttestationError(
+                            "reviewed_size_mismatch",
+                            "exported rootfs reviewed file has the wrong size",
+                            path=path,
+                        )
+                    extracted = archive.extractfile(member)
+                    if extracted is None:
+                        raise AttestationError(
+                            "reviewed_read_error",
+                            "exported rootfs reviewed file cannot be read",
+                            path=path,
+                        )
+                    actual_hash = _sha256_stream(extracted).removeprefix("sha256:")
+                    if actual_hash != expected["sha256"]:
+                        raise AttestationError(
+                            "reviewed_hash_mismatch",
+                            "exported rootfs reviewed file has the wrong content hash",
+                            path=path,
+                        )
+                    verified_entry.update({"sha256": actual_hash, "size": member.size})
+                verified_entries.append(verified_entry)
+            for subtree, expected_paths in EXACT_BASE_SUBTREES.items():
+                actual_paths = {path for path in members if _starts_with(path, subtree)}
+                if actual_paths != expected_paths:
+                    raise AttestationError(
+                        "reviewed_subtree_mismatch",
+                        "exported rootfs reviewed subtree contains unexpected entries",
+                        path=subtree,
+                    )
+            return verified_entries
+    except FileNotFoundError as error:
+        raise AttestationError(
+            "missing_rootfs_archive",
+            "exported rootfs archive is missing",
+            path=rootfs_archive.name,
+        ) from error
+    except (OSError, tarfile.TarError) as error:
+        raise AttestationError(
+            "malformed_rootfs_archive",
+            f"exported rootfs archive is malformed: {type(error).__name__}",
+        ) from error
+
+
+def inspect_base_attestation(
+    component: Component,
+    image_archive: Path,
+    rootfs_archive: Path,
+    trusted_manifest: Path,
+    dockerfile: Path,
+) -> dict[str, object]:
+    """Attest one final image to the exact trusted base and reviewed rootfs paths."""
+    findings: list[dict[str, str]] = []
+    image_evidence: dict[str, Any] = {}
+    contract: dict[str, Any] = {}
+    try:
+        contract = _trusted_attestation_contract(component, trusted_manifest)
+        if dockerfile.name != contract["component_dockerfile"]:
+            raise AttestationError(
+                "dockerfile_component_mismatch",
+                "Dockerfile path does not match the trusted component",
+                path=dockerfile.name,
+            )
+        try:
+            dockerfile_text = dockerfile.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            raise AttestationError(
+                "dockerfile_read_error",
+                "Dockerfile cannot be read as UTF-8",
+                path=dockerfile.name,
+            ) from error
+        runtime_from = f"FROM {contract['reference']} AS runtime"
+        if dockerfile_text.splitlines().count(runtime_from) != 1:
+            raise AttestationError(
+                "dockerfile_digest_mismatch",
+                "Dockerfile does not contain exactly one trusted runtime FROM",
+                path=dockerfile.name,
+            )
+        image_evidence = _inspect_saved_image(image_archive, contract)
+        image_evidence["verified_reviewed_entries"] = _verify_reviewed_rootfs(
+            rootfs_archive,
+            contract["reviewed_entries"],
+        )
+    except AttestationError as error:
+        findings.append(error.finding)
+
+    manifest_digest = None
+    rootfs_digest = None
+    try:
+        manifest_digest = _sha256_path(trusted_manifest)
+    except OSError:
+        pass
+    try:
+        _require_bounded_archive(
+            rootfs_archive,
+            label="exported rootfs",
+            maximum_bytes=MAX_ROOTFS_ARCHIVE_BYTES,
+        )
+        rootfs_digest = _sha256_path(rootfs_archive)
+    except (AttestationError, OSError):
+        pass
+    evidence: dict[str, object] = {
+        "schema_version": EVIDENCE_SCHEMA_VERSION,
+        "policy": "optima-pinned-runtime-base-attestation-v1",
+        "component": component,
+        "status": "fail" if findings else "pass",
+        "trusted_manifest": trusted_manifest.name,
+        "trusted_manifest_sha256": manifest_digest,
+        "rootfs_archive": rootfs_archive.name,
+        "rootfs_archive_sha256": rootfs_digest,
+        "image_archive": image_archive.name,
+        "reviewed_path_count": len(REVIEWED_BASE_PATHS),
+        "attested_paths": sorted(REVIEWED_BASE_PATHS),
+        "findings": findings,
+    }
+    if contract:
+        evidence.update(
+            {
+                "base_index_digest": contract["index_digest"],
+                "base_reference": contract["reference"],
+                "reviewed_base_config_digest": contract["base_config_digest"],
+                "reviewed_base_manifest_digest": contract["manifest_digest"],
+            }
+        )
+    evidence.update(image_evidence)
+    return evidence
 
 
 def _link_target_is_safe(path: str, linkname: str, *, symbolic: bool) -> bool:
@@ -648,10 +1562,170 @@ def _required_inventory_findings(
     return findings
 
 
-def inspect_rootfs(component: Component, archive_path: Path) -> dict[str, object]:
+def _attested_rootfs_paths(
+    component: Component,
+    archive_path: Path,
+    attestation_path: Path,
+) -> tuple[set[str], dict[str, object]]:
+    """Validate an attestation summary against this exact rootfs archive."""
+    try:
+        with attestation_path.open("rb") as stream:
+            content = stream.read(MAX_ATTESTATION_JSON_BYTES + 1)
+    except FileNotFoundError as error:
+        raise AttestationError(
+            "missing_base_attestation",
+            "base attestation summary is missing",
+            path=attestation_path.name,
+        ) from error
+    if len(content) > MAX_ATTESTATION_JSON_BYTES:
+        raise AttestationError(
+            "malformed_base_attestation",
+            "base attestation summary exceeds the size limit",
+        )
+    try:
+        evidence = _strict_json_loads(content)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise AttestationError(
+            "malformed_base_attestation",
+            "base attestation summary is not valid JSON",
+        ) from error
+    if not isinstance(evidence, dict):
+        raise AttestationError(
+            "malformed_base_attestation",
+            "base attestation summary root must be an object",
+        )
+    if (
+        evidence.get("schema_version") != EVIDENCE_SCHEMA_VERSION
+        or evidence.get("policy") != "optima-pinned-runtime-base-attestation-v1"
+        or evidence.get("status") != "pass"
+        or evidence.get("component") != component
+    ):
+        raise AttestationError(
+            "base_attestation_mismatch",
+            "base attestation summary is not a passing component match",
+        )
+    if evidence.get("rootfs_archive_sha256") != _sha256_path(archive_path):
+        raise AttestationError(
+            "base_attestation_rootfs_mismatch",
+            "base attestation does not bind this exported rootfs",
+        )
+    expected_paths = sorted(REVIEWED_BASE_PATHS)
+    verified_entries = evidence.get("verified_reviewed_entries")
+    verified_paths = (
+        [entry.get("path") for entry in verified_entries]
+        if isinstance(verified_entries, list)
+        and all(isinstance(entry, dict) for entry in verified_entries)
+        else None
+    )
+    if (
+        evidence.get("attested_paths") != expected_paths
+        or evidence.get("reviewed_path_count") != len(expected_paths)
+        or evidence.get("findings") != []
+        or verified_paths != expected_paths
+    ):
+        raise AttestationError(
+            "base_attestation_inventory_mismatch",
+            "base attestation does not contain exactly the reviewed path inventory",
+        )
+    final_config_digest = evidence.get("final_config_digest")
+    final_platform = evidence.get("final_image_platform")
+    rootfs_diff_ids = evidence.get("rootfs_diff_ids")
+    verified_prefix = evidence.get("verified_base_rootfs_diff_id_prefix")
+    complete_derived_facts = (
+        isinstance(final_config_digest, str)
+        and SHA256_PATTERN.fullmatch(final_config_digest) is not None
+        and final_platform == {"architecture": "amd64", "os": "linux"}
+        and isinstance(rootfs_diff_ids, list)
+        and isinstance(verified_prefix, list)
+        and len(verified_prefix) == 2
+        and rootfs_diff_ids[:2] == verified_prefix
+        and all(
+            isinstance(value, str) and SHA256_PATTERN.fullmatch(value) is not None
+            for value in rootfs_diff_ids
+        )
+        and evidence.get("later_layer_protected_paths_absent") is True
+    )
+    if not complete_derived_facts:
+        raise AttestationError(
+            "base_attestation_derived_facts_mismatch",
+            "base attestation is missing complete archive-derived facts",
+        )
+    assert isinstance(verified_entries, list)
+    for entry in verified_entries:
+        assert isinstance(entry, dict)
+        required = {"gid", "mode", "path", "type", "uid"}
+        if (
+            not required <= entry.keys()
+            or type(entry["uid"]) is not int
+            or entry["uid"] < 0
+            or type(entry["gid"]) is not int
+            or entry["gid"] < 0
+            or not isinstance(entry["mode"], str)
+            or re.fullmatch(r"0[0-7]{3}", entry["mode"]) is None
+            or entry["type"] not in {"directory", "file"}
+        ):
+            raise AttestationError(
+                "base_attestation_derived_facts_mismatch",
+                "base attestation reviewed metadata is incomplete",
+            )
+        if entry["type"] == "file" and (
+            type(entry.get("size")) is not int
+            or entry["size"] < 0
+            or not isinstance(entry.get("sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", entry["sha256"]) is None
+        ):
+            raise AttestationError(
+                "base_attestation_derived_facts_mismatch",
+                "base attestation reviewed file facts are incomplete",
+            )
+    identity = {
+        key: evidence.get(key)
+        for key in (
+            "base_index_digest",
+            "reviewed_base_config_digest",
+            "reviewed_base_manifest_digest",
+            "trusted_manifest_sha256",
+        )
+    }
+    if any(
+        not isinstance(value, str) or SHA256_PATTERN.fullmatch(value) is None
+        for value in identity.values()
+    ):
+        raise AttestationError(
+            "base_attestation_identity_mismatch",
+            "base attestation is missing a canonical trusted identity",
+        )
+    return set(expected_paths), identity
+
+
+def inspect_rootfs(
+    component: Component,
+    archive_path: Path,
+    *,
+    attestation_path: Path | None = None,
+) -> dict[str, object]:
     """Inspect one exported rootfs tar without extracting archive members."""
     findings: list[dict[str, str]] = []
     finding_total = [0]
+    attested_paths: set[str] = set()
+    attestation_identity: dict[str, object] | None = None
+    if attestation_path is not None:
+        try:
+            attested_paths, attestation_identity = _attested_rootfs_paths(
+                component,
+                archive_path,
+                attestation_path,
+            )
+        except (AttestationError, OSError) as error:
+            finding = (
+                error.finding
+                if isinstance(error, AttestationError)
+                else _finding(
+                    "base_attestation_read_error",
+                    f"base attestation binding failed: {type(error).__name__}",
+                )
+            )
+            _append_finding(findings, finding, finding_total)
     paths: set[str] = set()
     file_entries: set[str] = set()
     regular_files: set[str] = set()
@@ -662,12 +1736,17 @@ def inspect_rootfs(component: Component, archive_path: Path) -> dict[str, object
     build_manifests: set[str] = set()
 
     try:
-        with tarfile.open(archive_path, mode="r:*") as archive:
+        _require_bounded_archive(
+            archive_path,
+            label="exported rootfs",
+            maximum_bytes=MAX_ROOTFS_ARCHIVE_BYTES,
+        )
+        with tarfile.open(archive_path, mode="r:") as archive:
             third_party_distribution_paths = _validated_third_party_distribution_paths(
                 archive,
                 component,
             )
-        with tarfile.open(archive_path, mode="r:*") as archive:
+        with tarfile.open(archive_path, mode="r:") as archive:
             for index, member in enumerate(archive):
                 if index >= MAX_ARCHIVE_ENTRIES:
                     _append_finding(
@@ -782,7 +1861,13 @@ def inspect_rootfs(component: Component, archive_path: Path) -> dict[str, object
                     third_party_distribution_paths=third_party_distribution_paths,
                     link=member.issym() or member.islnk(),
                 )
-                if path_finding is not None:
+                attested_base_finding = (
+                    normalized in attested_paths
+                    and path_finding is not None
+                    and path_finding["code"]
+                    in {"build_header", "package_manager_cache"}
+                )
+                if path_finding is not None and not attested_base_finding:
                     _append_finding(findings, path_finding, finding_total)
 
                 if member.isreg():
@@ -808,6 +1893,8 @@ def inspect_rootfs(component: Component, archive_path: Path) -> dict[str, object
                             ),
                             finding_total,
                         )
+    except AttestationError as error:
+        _append_finding(findings, error.finding, finding_total)
     except FileNotFoundError:
         _append_finding(
             findings,
@@ -837,7 +1924,7 @@ def inspect_rootfs(component: Component, archive_path: Path) -> dict[str, object
     findings.sort(
         key=lambda item: (item["code"], item.get("path", ""), item["message"])
     )
-    return {
+    evidence: dict[str, object] = {
         "schema_version": EVIDENCE_SCHEMA_VERSION,
         "policy": "optima-final-rootfs-v1",
         "component": component,
@@ -857,6 +1944,9 @@ def inspect_rootfs(component: Component, archive_path: Path) -> dict[str, object
         },
         "findings": findings,
     }
+    if attestation_identity is not None:
+        evidence["base_attestation"] = attestation_identity
+    return evidence
 
 
 def _optional_finding_array(
@@ -1351,6 +2441,22 @@ def _rootfs_console_summary(evidence: dict[str, object]) -> str:
     return _bounded_text(f"rootfs {component}: {status}{suffix}")
 
 
+def _attestation_console_summary(evidence: dict[str, object]) -> str:
+    """Return a bounded pinned-base attestation summary for console logs."""
+    component = evidence["component"]
+    status = str(evidence["status"]).upper()
+    findings = evidence["findings"]
+    messages: list[str] = []
+    if isinstance(findings, list):
+        for finding in findings[:8]:
+            if isinstance(finding, dict):
+                message = finding.get("message", "attestation finding")
+                path = finding.get("path")
+                messages.append(f"{message}{f' ({path})' if path else ''}")
+    suffix = f": {'; '.join(messages)}" if messages else ""
+    return _bounded_text(f"base attestation {component}: {status}{suffix}")
+
+
 def _trivy_console_summary(evidence: dict[str, object]) -> str:
     """Return a bounded aggregate Trivy summary for console logs."""
     segments = [f"trivy aggregate: {str(evidence['status']).upper()}"]
@@ -1402,7 +2508,23 @@ def create_parser() -> argparse.ArgumentParser:
     )
     rootfs_parser.add_argument("--component", choices=("api", "ui"), required=True)
     rootfs_parser.add_argument("--archive", type=Path, required=True)
+    rootfs_parser.add_argument("--attestation", type=Path)
     rootfs_parser.add_argument("--output", type=Path, required=True)
+
+    attestation_parser = subparsers.add_parser(
+        "attest-base",
+        help="attest one saved image and exported rootfs to the pinned runtime base",
+    )
+    attestation_parser.add_argument(
+        "--component",
+        choices=("api", "ui"),
+        required=True,
+    )
+    attestation_parser.add_argument("--image-archive", type=Path, required=True)
+    attestation_parser.add_argument("--rootfs-archive", type=Path, required=True)
+    attestation_parser.add_argument("--trusted-manifest", type=Path, required=True)
+    attestation_parser.add_argument("--dockerfile", type=Path, required=True)
+    attestation_parser.add_argument("--output", type=Path, required=True)
 
     trivy_parser = subparsers.add_parser(
         "trivy",
@@ -1419,10 +2541,27 @@ def run(arguments: argparse.Namespace) -> int:
     """Run the selected verifier and return its policy exit code."""
     if arguments.command == "rootfs":
         component: Component = arguments.component
-        evidence = inspect_rootfs(component, arguments.archive)
+        evidence = inspect_rootfs(
+            component,
+            arguments.archive,
+            attestation_path=arguments.attestation,
+        )
         _write_evidence(arguments.output, evidence)
         print(_rootfs_console_summary(evidence))
         return EXIT_SUCCESS if evidence["status"] == "pass" else EXIT_FAILURE
+
+    if arguments.command == "attest-base":
+        attestation_component: Component = arguments.component
+        attestation = inspect_base_attestation(
+            attestation_component,
+            arguments.image_archive,
+            arguments.rootfs_archive,
+            arguments.trusted_manifest,
+            arguments.dockerfile,
+        )
+        _write_evidence(arguments.output, attestation)
+        print(_attestation_console_summary(attestation))
+        return EXIT_SUCCESS if attestation["status"] == "pass" else EXIT_FAILURE
 
     report_values: list[str] = arguments.report
     expected_artifact_values: list[str] = arguments.expected_artifact

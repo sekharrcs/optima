@@ -1376,12 +1376,37 @@ def test_pr_security_workflow_uploads_untracked_final_image_evidence() -> None:
     assert "security/reports/" not in content
 
 
+def test_pr_security_workflow_attests_both_saved_images_and_rootfs_archives() -> None:
+    """Require OCI ancestry and reviewed base paths before rootfs exceptions apply."""
+    scripts = "\n".join(_literal_run_blocks(_pr_security_workflow()))
+
+    assert scripts.count("docker image save --output") == 2
+    assert scripts.count("verify_container_artifacts.py attest-base") == 2
+    assert scripts.count("--image-archive") == 2
+    assert scripts.count("--rootfs-archive") == 2
+    assert scripts.count("--trusted-manifest") == 2
+    assert scripts.count("--dockerfile") == 2
+    assert scripts.count("--attestation") == 2
+    assert "security/config/pinned-runtime-base.json" in scripts
+    assert "api-base-attestation-summary.json" in scripts
+    assert "ui-base-attestation-summary.json" in scripts
+    assert "pinned-runtime-base.json" in scripts
+    assert '"reviewed_base_config_digest"' in scripts
+    assert '"reviewed_base_manifest_digest"' in scripts
+    assert '"base_config_digest"' not in scripts
+    assert '"base_manifest_digest"' not in scripts
+
+
 def test_pr_security_workflow_defers_all_security_failures_to_one_gate() -> None:
     """Collect both images' evidence before applying one fail-closed policy gate."""
     content = _pr_security_workflow()
     scripts = "\n".join(_literal_run_blocks(content))
 
     assert "continue-on-error" not in content
+    assert scripts.count("api_image_save_status=$?") == 1
+    assert scripts.count("ui_image_save_status=$?") == 1
+    assert scripts.count("api_attestation_status=$?") == 1
+    assert scripts.count("ui_attestation_status=$?") == 1
     assert scripts.count("api_rootfs_status=$?") == 1
     assert scripts.count("ui_rootfs_status=$?") == 1
     assert scripts.count("api_syft_status=$?") == 1
@@ -1404,6 +1429,8 @@ def test_pr_security_workflow_defers_all_security_failures_to_one_gate() -> None
     )
     assert "api-rootfs-summary.json" in scripts
     assert "ui-rootfs-summary.json" in scripts
+    assert "api-base-attestation-summary.json" in scripts
+    assert "ui-base-attestation-summary.json" in scripts
     assert "final-image-sbom-summary.json" in scripts
     assert "trivy-summary.json" in scripts
 
@@ -1484,21 +1511,38 @@ uv() {
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert statuses.split() == ["7", "0", "0", "0", "0", "0", "0", "0"]
+    assert statuses.split() == [
+        "0",
+        "7",
+        "0",
+        "0",
+        "0",
+        "0",
+        "0",
+        "0",
+        "0",
+        "0",
+        "0",
+        "0",
+    ]
     assert ui_summary == {"component": "ui", "status": "pass"}
 
 
 @pytest.mark.parametrize(
     ("status_file", "status_index", "status_name"),
     [
-        ("rootfs-command-statuses.txt", 0, "api_create"),
-        ("rootfs-command-statuses.txt", 1, "api_export"),
-        ("rootfs-command-statuses.txt", 2, "api_remove"),
-        ("rootfs-command-statuses.txt", 3, "api_rootfs"),
-        ("rootfs-command-statuses.txt", 4, "ui_create"),
-        ("rootfs-command-statuses.txt", 5, "ui_export"),
-        ("rootfs-command-statuses.txt", 6, "ui_remove"),
-        ("rootfs-command-statuses.txt", 7, "ui_rootfs"),
+        ("rootfs-command-statuses.txt", 0, "api_image_save"),
+        ("rootfs-command-statuses.txt", 1, "api_create"),
+        ("rootfs-command-statuses.txt", 2, "api_export"),
+        ("rootfs-command-statuses.txt", 3, "api_remove"),
+        ("rootfs-command-statuses.txt", 4, "api_attestation"),
+        ("rootfs-command-statuses.txt", 5, "api_rootfs"),
+        ("rootfs-command-statuses.txt", 6, "ui_image_save"),
+        ("rootfs-command-statuses.txt", 7, "ui_create"),
+        ("rootfs-command-statuses.txt", 8, "ui_export"),
+        ("rootfs-command-statuses.txt", 9, "ui_remove"),
+        ("rootfs-command-statuses.txt", 10, "ui_attestation"),
+        ("rootfs-command-statuses.txt", 11, "ui_rootfs"),
         ("sbom-command-statuses.txt", 0, "api_syft"),
         ("sbom-command-statuses.txt", 1, "ui_syft"),
         ("sbom-command-statuses.txt", 2, "sbom_validation"),
@@ -1515,7 +1559,7 @@ def test_pr_security_aggregate_gate_enforces_every_collector_status(
 ) -> None:
     """Fail on every captured command error even when policy summaries pass."""
     status_values = {
-        "rootfs-command-statuses.txt": [0] * 8,
+        "rootfs-command-statuses.txt": [0] * 12,
         "sbom-command-statuses.txt": [0] * 3,
         "trivy-command-statuses.txt": [0] * 2,
         "trivy-policy-status.txt": [0],
@@ -1527,6 +1571,10 @@ def test_pr_security_aggregate_gate_enforces_every_collector_status(
             encoding="utf-8",
         )
     for component in ("api", "ui"):
+        (tmp_path / f"{component}-base-attestation-summary.json").write_text(
+            json.dumps({"component": component, "status": "pass"}),
+            encoding="utf-8",
+        )
         (tmp_path / f"{component}-rootfs-summary.json").write_text(
             json.dumps({"status": "pass"}),
             encoding="utf-8",

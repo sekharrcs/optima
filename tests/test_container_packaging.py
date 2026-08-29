@@ -1,5 +1,8 @@
 """Static contracts for the API and UI production container definitions."""
 
+import copy
+import gzip
+import hashlib
 import json
 import os
 import subprocess
@@ -11,8 +14,24 @@ from typing import Any
 
 import pytest
 
+from scripts import verify_container_artifacts as artifact_verifier
+
 ROOT = Path(__file__).resolve().parents[1]
 VERIFY_SCRIPT = ROOT / "scripts" / "verify_container_artifacts.py"
+TRUSTED_BASE_MANIFEST = ROOT / "security" / "config" / "pinned-runtime-base.json"
+RUNTIME_BASE_INDEX = (
+    "sha256:d921452dba64944bf959f22450bb3740f5b2fff4a59faa64bd6b8eaf4c57b5b8"
+)
+RUNTIME_BASE_MANIFEST = (
+    "sha256:62e947ec7edfe308b97cebfab4e89e413c66a63ffcb3c021cb25ff3b70332639"
+)
+RUNTIME_BASE_CONFIG = (
+    "sha256:18da20740c8286c11f78700fe506957a8009f2cc3291c8cc8288454b2cae7511"
+)
+RUNTIME_BASE_DIFF_IDS = [
+    "sha256:e7cf7da29bd85aa6f70e9b80640e82141e6e20112096c8adbb3ebd8174aa3965",
+    "sha256:81d1727fb374caf1bbd1183d3fd22d4bc8d87a48a25f51a4b07bac7ebb200b79",
+]
 
 
 def _rootfs_files(component: str) -> dict[str, bytes]:
@@ -104,6 +123,310 @@ def _write_rootfs(
             member.size = len(data)
             member.mode = 0o755 if name.endswith("/python") else 0o644
             archive.addfile(member, BytesIO(data))
+
+
+def _tar_bytes(
+    entries: list[tarfile.TarInfo | tuple[tarfile.TarInfo, bytes]],
+    *,
+    archive_format: int | None = None,
+) -> bytes:
+    stream = BytesIO()
+    with tarfile.open(
+        fileobj=stream,
+        mode="w",
+        format=archive_format or tarfile.DEFAULT_FORMAT,
+    ) as archive:
+        for entry in entries:
+            member, data = entry if isinstance(entry, tuple) else (entry, None)
+            archive.addfile(member, BytesIO(data) if data is not None else None)
+    return stream.getvalue()
+
+
+def _regular_member(
+    name: str,
+    data: bytes,
+    *,
+    mode: int = 0o644,
+    uid: int = 0,
+    gid: int = 0,
+) -> tuple[tarfile.TarInfo, bytes]:
+    member = tarfile.TarInfo(name)
+    member.size = len(data)
+    member.mode = mode
+    member.uid = uid
+    member.gid = gid
+    return member, data
+
+
+def _directory_member(
+    name: str,
+    *,
+    mode: int = 0o755,
+    uid: int = 0,
+    gid: int = 0,
+) -> tarfile.TarInfo:
+    member = tarfile.TarInfo(name)
+    member.type = tarfile.DIRTYPE
+    member.mode = mode
+    member.uid = uid
+    member.gid = gid
+    return member
+
+
+def _synthetic_attestation_inputs(
+    tmp_path: Path,
+    component: str = "api",
+    *,
+    compress_later_layer: bool = False,
+    image_architecture: str = "amd64",
+    later_layer_entries: list[tarfile.TarInfo | tuple[tarfile.TarInfo, bytes]]
+    | None = None,
+    later_layer_format: int | None = None,
+) -> tuple[Path, Path, Path, Path]:
+    reviewed_files = {
+        "usr/include/e_scossl.h": b"synthetic openssl header\n",
+        "usr/include/symcrypt.h": b"synthetic symcrypt header\n",
+        "usr/include/symcrypt_internal.h": b"synthetic internal header\n",
+        "usr/include/symcrypt_low_level.h": b"synthetic low-level header\n",
+        "usr/include/symcrypt_no_sal.h": b"synthetic no-sal header\n",
+        "var/cache/ldconfig/aux-cache": b"synthetic linker cache\n",
+    }
+    reviewed_entries = [
+        {
+            "gid": 0,
+            "mode": "0755",
+            "path": path,
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "size": len(data),
+            "type": "file",
+            "uid": 0,
+        }
+        for path, data in reviewed_files.items()
+        if path.startswith("usr/include/")
+    ]
+    reviewed_entries.extend(
+        [
+            {
+                "gid": 0,
+                "mode": "0755",
+                "path": "var/cache",
+                "type": "directory",
+                "uid": 0,
+            },
+            {
+                "gid": 0,
+                "mode": "0700",
+                "path": "var/cache/ldconfig",
+                "type": "directory",
+                "uid": 0,
+            },
+            {
+                "gid": 0,
+                "mode": "0600",
+                "path": "var/cache/ldconfig/aux-cache",
+                "sha256": hashlib.sha256(
+                    reviewed_files["var/cache/ldconfig/aux-cache"]
+                ).hexdigest(),
+                "size": len(reviewed_files["var/cache/ldconfig/aux-cache"]),
+                "type": "file",
+                "uid": 0,
+            },
+        ]
+    )
+    base_layers = [
+        _tar_bytes([_regular_member("base/one", b"base layer one\n")]),
+        _tar_bytes([_regular_member("base/two", b"base layer two\n")]),
+    ]
+    application_layer = _tar_bytes(
+        later_layer_entries
+        if later_layer_entries is not None
+        else [_regular_member("app/src/application.py", b"application\n")],
+        archive_format=later_layer_format,
+    )
+    if compress_later_layer:
+        application_layer = gzip.compress(application_layer, mtime=0)
+    layers = [*base_layers, application_layer]
+    diff_ids = [f"sha256:{hashlib.sha256(layer).hexdigest()}" for layer in layers]
+    index_digest = RUNTIME_BASE_INDEX
+    child_digest = RUNTIME_BASE_MANIFEST
+    base_config_digest = RUNTIME_BASE_CONFIG
+    reference = f"example.invalid/runtime@{index_digest}"
+    trusted = {
+        "components": {
+            component: {
+                "dockerfile": f"Dockerfile.{component}",
+                "image_tag": f"optima-{component}:pr",
+            }
+        },
+        "exact_subtrees": [
+            {
+                "entries": [
+                    "var/cache",
+                    "var/cache/ldconfig",
+                    "var/cache/ldconfig/aux-cache",
+                ],
+                "path": "var/cache",
+            }
+        ],
+        "image": {
+            "config_digest": base_config_digest,
+            "index_digest": index_digest,
+            "manifest_digest": child_digest,
+            "platform": {"architecture": "amd64", "os": "linux"},
+            "reference": reference,
+            "rootfs_diff_ids": diff_ids[:2],
+        },
+        "packages": [
+            {
+                "name": "Synthetic",
+                "purl": "pkg:rpm/example/Synthetic@1.0?arch=x86_64",
+                "version": "1.0.x86_64",
+            }
+        ],
+        "policy": "optima-pinned-runtime-base-v1",
+        "reviewed_entries": reviewed_entries,
+        "schema_version": 1,
+    }
+    trusted_path = tmp_path / "trusted.json"
+    trusted_path.write_text(json.dumps(trusted), encoding="utf-8")
+    dockerfile_path = tmp_path / f"Dockerfile.{component}"
+    dockerfile_path.write_text(f"FROM {reference} AS runtime\n", encoding="utf-8")
+
+    config = {
+        "architecture": image_architecture,
+        "os": "linux",
+        "rootfs": {"diff_ids": diff_ids, "type": "layers"},
+    }
+    config_bytes = json.dumps(config, separators=(",", ":")).encode()
+    config_name = f"{hashlib.sha256(config_bytes).hexdigest()}.json"
+    layer_names = [f"layer-{index}/layer.tar" for index in range(len(layers))]
+    save_manifest = [
+        {
+            "Config": config_name,
+            "Layers": layer_names,
+            "RepoTags": [f"optima-{component}:pr"],
+        }
+    ]
+    image_archive = tmp_path / f"{component}-image.tar"
+    with tarfile.open(image_archive, "w") as archive:
+        manifest_bytes = json.dumps(save_manifest).encode()
+        archive.addfile(
+            _regular_member("manifest.json", manifest_bytes)[0],
+            BytesIO(manifest_bytes),
+        )
+        archive.addfile(
+            _regular_member(config_name, config_bytes)[0],
+            BytesIO(config_bytes),
+        )
+        for name, layer in zip(layer_names, layers, strict=True):
+            archive.addfile(_regular_member(name, layer)[0], BytesIO(layer))
+
+    rootfs_path = tmp_path / f"{component}-rootfs.tar"
+    _write_rootfs(rootfs_path, component)
+    with tarfile.open(rootfs_path, "a") as archive:
+        archive.addfile(_directory_member("var/cache", mode=0o755))
+        archive.addfile(_directory_member("var/cache/ldconfig", mode=0o700))
+        for path, data in reviewed_files.items():
+            mode = 0o600 if path.endswith("aux-cache") else 0o755
+            archive.addfile(_regular_member(path, data, mode=mode)[0], BytesIO(data))
+    return image_archive, rootfs_path, trusted_path, dockerfile_path
+
+
+def _run_base_attestation(
+    tmp_path: Path,
+    image: Path,
+    rootfs: Path,
+    trusted: Path,
+    dockerfile_path: Path,
+    *,
+    component: str = "api",
+) -> subprocess.CompletedProcess[str]:
+    return _run_verifier(
+        "attest-base",
+        "--component",
+        component,
+        "--image-archive",
+        str(image),
+        "--rootfs-archive",
+        str(rootfs),
+        "--trusted-manifest",
+        str(trusted),
+        "--dockerfile",
+        str(dockerfile_path),
+        "--output",
+        str(tmp_path / "attestation.json"),
+    )
+
+
+def _rewrite_rootfs_entry(
+    archive_path: Path,
+    target: str,
+    mutation: str,
+) -> None:
+    entries: list[tarfile.TarInfo | tuple[tarfile.TarInfo, bytes]] = []
+    with tarfile.open(archive_path, "r") as archive:
+        for member in archive:
+            rewritten = copy.copy(member)
+            extracted = archive.extractfile(member) if member.isreg() else None
+            data = extracted.read() if extracted is not None else None
+            if member.name == target:
+                if mutation == "bytes":
+                    assert data is not None
+                    data = b"X" + data[1:]
+                elif mutation == "size":
+                    assert data is not None
+                    data += b"larger"
+                    rewritten.size = len(data)
+                elif mutation == "mode":
+                    rewritten.mode ^= 0o100
+                elif mutation == "uid":
+                    rewritten.uid += 1
+                elif mutation == "gid":
+                    rewritten.gid += 1
+                elif mutation == "type":
+                    rewritten.type = tarfile.SYMTYPE
+                    rewritten.linkname = "elsewhere"
+                    rewritten.size = 0
+                    data = None
+                else:
+                    raise AssertionError(f"unsupported mutation {mutation}")
+            entries.append((rewritten, data) if data is not None else rewritten)
+    archive_path.write_bytes(_tar_bytes(entries))
+
+
+def _append_tar_entries(
+    archive_path: Path,
+    entries: list[tarfile.TarInfo | tuple[tarfile.TarInfo, bytes]],
+) -> None:
+    with tarfile.open(archive_path, "a") as archive:
+        for entry in entries:
+            member, data = entry if isinstance(entry, tuple) else (entry, None)
+            archive.addfile(member, BytesIO(data) if data is not None else None)
+
+
+def _corrupt_saved_config_filename(image_archive: Path) -> None:
+    entries: list[tuple[str, bytes]] = []
+    with tarfile.open(image_archive, "r") as archive:
+        for member in archive:
+            if not member.isreg():
+                continue
+            extracted = archive.extractfile(member)
+            assert extracted is not None
+            entries.append((member.name, extracted.read()))
+    manifest = json.loads(
+        next(data for name, data in entries if name == "manifest.json")
+    )
+    old_config = manifest[0]["Config"]
+    new_config = f"{'f' * 64}.json"
+    manifest[0]["Config"] = new_config
+    rewritten: list[tarfile.TarInfo | tuple[tarfile.TarInfo, bytes]] = []
+    for name, data in entries:
+        if name == "manifest.json":
+            data = json.dumps(manifest).encode()
+        elif name == old_config:
+            name = new_config
+        rewritten.append(_regular_member(name, data))
+    image_archive.write_bytes(_tar_bytes(rewritten))
 
 
 def _run_verifier(
@@ -311,6 +634,758 @@ def test_container_base_images_pin_reviewed_manifest_digests() -> None:
         assert content.count(expected_builder) == 1
         assert content.count(expected_runtime) == 1
         assert content.count(expected_uv) == 1
+
+
+def test_trusted_runtime_base_manifest_pins_reviewed_provenance() -> None:
+    """Pin reviewed OCI and RPM provenance independently from the trust manifest."""
+    manifest = json.loads(TRUSTED_BASE_MANIFEST.read_text(encoding="utf-8"))
+
+    assert set(manifest) == {
+        "components",
+        "exact_subtrees",
+        "image",
+        "packages",
+        "policy",
+        "reviewed_entries",
+        "schema_version",
+    }
+    assert manifest["schema_version"] == 1
+    assert manifest["policy"] == "optima-pinned-runtime-base-v1"
+    assert manifest["components"] == {
+        "api": {
+            "dockerfile": "Dockerfile.api",
+            "image_tag": "optima-api:pr",
+        },
+        "ui": {
+            "dockerfile": "Dockerfile.ui",
+            "image_tag": "optima-ui:pr",
+        },
+    }
+    assert manifest["exact_subtrees"] == [
+        {
+            "entries": [
+                "var/cache",
+                "var/cache/ldconfig",
+                "var/cache/ldconfig/aux-cache",
+            ],
+            "path": "var/cache",
+        }
+    ]
+    assert manifest["image"] == {
+        "config_digest": RUNTIME_BASE_CONFIG,
+        "index_digest": RUNTIME_BASE_INDEX,
+        "manifest_digest": RUNTIME_BASE_MANIFEST,
+        "platform": {"architecture": "amd64", "os": "linux"},
+        "reference": (
+            "mcr.microsoft.com/azurelinux/distroless/python:3.12-nonroot@"
+            f"{RUNTIME_BASE_INDEX}"
+        ),
+        "rootfs_diff_ids": RUNTIME_BASE_DIFF_IDS,
+    }
+    assert manifest["packages"] == [
+        {
+            "name": "SymCrypt",
+            "purl": (
+                "pkg:rpm/azurelinux/SymCrypt@103.8.0-1.azl3?"
+                "arch=x86_64&distro=azurelinux-3.0"
+            ),
+            "version": "103.8.0-1.azl3.x86_64",
+        },
+        {
+            "name": "SymCrypt-OpenSSL",
+            "purl": (
+                "pkg:rpm/azurelinux/SymCrypt-OpenSSL@1.10.0-1.azl3?"
+                "arch=x86_64&distro=azurelinux-3.0"
+            ),
+            "version": "1.10.0-1.azl3.x86_64",
+        },
+    ]
+    assert {entry["path"]: entry for entry in manifest["reviewed_entries"]} == {
+        "usr/include/e_scossl.h": {
+            "gid": 0,
+            "mode": "0755",
+            "path": "usr/include/e_scossl.h",
+            "sha256": (
+                "d9bcb4c543480bcc624c7258e07c53fd8be004b4a05b5e85709f7e7d3820c9ad"
+            ),
+            "size": 339,
+            "type": "file",
+            "uid": 0,
+        },
+        "usr/include/symcrypt.h": {
+            "gid": 0,
+            "mode": "0755",
+            "path": "usr/include/symcrypt.h",
+            "sha256": (
+                "54fdf60238a02328cb7457420c8bdcb6478a3b54152135ecc5221084e80ce33b"
+            ),
+            "size": 453529,
+            "type": "file",
+            "uid": 0,
+        },
+        "usr/include/symcrypt_internal.h": {
+            "gid": 0,
+            "mode": "0755",
+            "path": "usr/include/symcrypt_internal.h",
+            "sha256": (
+                "1aff0521fddc3bb40ae9ba7ef1a88285f85d21c24a4876ca7961899493233b44"
+            ),
+            "size": 174122,
+            "type": "file",
+            "uid": 0,
+        },
+        "usr/include/symcrypt_low_level.h": {
+            "gid": 0,
+            "mode": "0755",
+            "path": "usr/include/symcrypt_low_level.h",
+            "sha256": (
+                "1b7099c7815a111d8f9b396e938e168a7aaa8b17153c43e98d9d115170696371"
+            ),
+            "size": 135062,
+            "type": "file",
+            "uid": 0,
+        },
+        "usr/include/symcrypt_no_sal.h": {
+            "gid": 0,
+            "mode": "0755",
+            "path": "usr/include/symcrypt_no_sal.h",
+            "sha256": (
+                "12588ccebc480440555242b10f6078692a9d38d4435a865de243d48e185f4aca"
+            ),
+            "size": 1268,
+            "type": "file",
+            "uid": 0,
+        },
+        "var/cache": {
+            "gid": 0,
+            "mode": "0755",
+            "path": "var/cache",
+            "type": "directory",
+            "uid": 0,
+        },
+        "var/cache/ldconfig": {
+            "gid": 0,
+            "mode": "0700",
+            "path": "var/cache/ldconfig",
+            "type": "directory",
+            "uid": 0,
+        },
+        "var/cache/ldconfig/aux-cache": {
+            "gid": 0,
+            "mode": "0600",
+            "path": "var/cache/ldconfig/aux-cache",
+            "sha256": (
+                "4730ffbcc3c3ab820172649e4422c98dbcbf4f1fa5692913341537e3be894584"
+            ),
+            "size": 3567,
+            "type": "file",
+            "uid": 0,
+        },
+    }
+    runtime_from = (
+        "FROM mcr.microsoft.com/azurelinux/distroless/python:3.12-nonroot@"
+        f"{RUNTIME_BASE_INDEX} AS runtime"
+    )
+    assert all(
+        runtime_from in dockerfile(name) for name in ("Dockerfile.api", "Dockerfile.ui")
+    )
+
+
+def test_verifier_compiles_exact_production_base_identity() -> None:
+    """Keep reviewed remote declarations independent from editable evidence JSON."""
+    assert artifact_verifier.PINNED_BASE_IDENTITIES == {
+        (RUNTIME_BASE_INDEX, "linux", "amd64"): {
+            "config_digest": RUNTIME_BASE_CONFIG,
+            "manifest_digest": RUNTIME_BASE_MANIFEST,
+        }
+    }
+
+
+@pytest.mark.parametrize("component", ["api", "ui"])
+def test_pinned_base_attestation_accepts_valid_synthetic_archives(
+    tmp_path: Path,
+    component: str,
+) -> None:
+    """Accept exact base ancestry, untouched reviewed paths, and matching rootfs."""
+    image, rootfs, trusted, dockerfile_path = _synthetic_attestation_inputs(
+        tmp_path,
+        component,
+    )
+    output = tmp_path / "attestation.json"
+
+    result = _run_base_attestation(
+        tmp_path,
+        image,
+        rootfs,
+        trusted,
+        dockerfile_path,
+        component=component,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    evidence = json.loads(output.read_text(encoding="utf-8"))
+    assert evidence["status"] == "pass"
+    assert evidence["component"] == component
+    assert evidence["reviewed_path_count"] == 8
+    assert evidence["reviewed_base_config_digest"] == RUNTIME_BASE_CONFIG
+    assert evidence["reviewed_base_manifest_digest"] == RUNTIME_BASE_MANIFEST
+    assert "base_config_digest" not in evidence
+    assert "base_manifest_digest" not in evidence
+    assert evidence["final_image_platform"] == {
+        "architecture": "amd64",
+        "os": "linux",
+    }
+    trusted_document = json.loads(trusted.read_text(encoding="utf-8"))
+    assert (
+        evidence["verified_base_rootfs_diff_id_prefix"]
+        == trusted_document["image"]["rootfs_diff_ids"]
+    )
+    assert evidence["later_layer_protected_paths_absent"] is True
+    verified_entries = evidence["verified_reviewed_entries"]
+    assert {
+        entry["path"] for entry in verified_entries
+    } == artifact_verifier.REVIEWED_BASE_PATHS
+    assert all(
+        {"gid", "mode", "path", "type", "uid"} <= entry.keys()
+        for entry in verified_entries
+    )
+    assert all(
+        {"sha256", "size"} <= entry.keys()
+        for entry in verified_entries
+        if entry["type"] == "file"
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    [
+        ("index_digest", "index"),
+        ("manifest_digest", "manifest"),
+        ("config_digest", "config"),
+        ("architecture", "platform"),
+        ("diff_id", "diff"),
+        ("diff_order", "diff"),
+        ("dockerfile", "dockerfile"),
+    ],
+)
+def test_pinned_base_attestation_rejects_identity_mismatch(
+    tmp_path: Path,
+    mutation: str,
+    reason: str,
+) -> None:
+    """Reject every OCI, platform, and Dockerfile identity mismatch."""
+    image, rootfs, trusted_path, dockerfile_path = _synthetic_attestation_inputs(
+        tmp_path
+    )
+    trusted = json.loads(trusted_path.read_text(encoding="utf-8"))
+    if mutation == "architecture":
+        trusted["image"]["platform"]["architecture"] = "arm64"
+    elif mutation == "diff_id":
+        trusted["image"]["rootfs_diff_ids"][0] = f"sha256:{'f' * 64}"
+    elif mutation == "diff_order":
+        trusted["image"]["rootfs_diff_ids"].reverse()
+    elif mutation == "dockerfile":
+        dockerfile_path.write_text("FROM scratch AS runtime\n", encoding="utf-8")
+    else:
+        trusted["image"][mutation] = f"sha256:{'f' * 64}"
+    trusted_path.write_text(json.dumps(trusted), encoding="utf-8")
+
+    result = _run_base_attestation(
+        tmp_path,
+        image,
+        rootfs,
+        trusted_path,
+        dockerfile_path,
+    )
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert reason in (result.stdout + result.stderr).casefold()
+
+
+def test_attested_rootfs_suppresses_only_exact_reviewed_base_findings(
+    tmp_path: Path,
+) -> None:
+    """Allow only the eight attested base paths while keeping global checks active."""
+    image, rootfs, trusted, dockerfile_path = _synthetic_attestation_inputs(tmp_path)
+    attestation = _run_base_attestation(
+        tmp_path, image, rootfs, trusted, dockerfile_path
+    )
+    assert attestation.returncode == 0, attestation.stdout + attestation.stderr
+
+    result = _run_verifier(
+        "rootfs",
+        "--component",
+        "api",
+        "--archive",
+        str(rootfs),
+        "--attestation",
+        str(tmp_path / "attestation.json"),
+        "--output",
+        str(tmp_path / "rootfs-summary.json"),
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    ("target", "mutation", "reason"),
+    [
+        ("usr/include/e_scossl.h", "bytes", "hash"),
+        ("usr/include/e_scossl.h", "size", "size"),
+        ("usr/include/e_scossl.h", "mode", "mode"),
+        ("usr/include/e_scossl.h", "uid", "uid"),
+        ("usr/include/e_scossl.h", "gid", "gid"),
+        ("usr/include/e_scossl.h", "type", "type"),
+        ("var/cache", "mode", "mode"),
+        ("var/cache/ldconfig", "type", "type"),
+    ],
+)
+def test_pinned_base_attestation_rejects_changed_rootfs_metadata_or_bytes(
+    tmp_path: Path,
+    target: str,
+    mutation: str,
+    reason: str,
+) -> None:
+    """Reject changed bytes, size, mode, ownership, or type for reviewed entries."""
+    image, rootfs, trusted, dockerfile_path = _synthetic_attestation_inputs(tmp_path)
+    _rewrite_rootfs_entry(rootfs, target, mutation)
+
+    result = _run_base_attestation(tmp_path, image, rootfs, trusted, dockerfile_path)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert reason in (result.stdout + result.stderr).casefold()
+
+
+def test_pinned_base_attestation_requires_exact_cache_subtree(tmp_path: Path) -> None:
+    """Reject every additional descendant under the reviewed var/cache subtree."""
+    image, rootfs, trusted, dockerfile_path = _synthetic_attestation_inputs(tmp_path)
+    _append_tar_entries(rootfs, [_regular_member("var/cache/unlisted", b"cache\n")])
+
+    result = _run_base_attestation(tmp_path, image, rootfs, trusted, dockerfile_path)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "subtree" in (result.stdout + result.stderr).casefold()
+
+
+@pytest.mark.parametrize(
+    ("entry", "reason"),
+    [
+        (_regular_member("usr/include/e_scossl.h", b"override\n"), "replaces"),
+        (_regular_member("var/cache/unlisted", b"addition\n"), "reviewed"),
+        (_regular_member("usr/include/.wh.e_scossl.h", b""), "masks"),
+        (_regular_member("usr/.wh.include", b""), "masks"),
+        (_regular_member("usr/include/.wh..wh..opq", b""), "masks"),
+        (_regular_member(".wh..wh..opq", b""), "masks"),
+    ],
+)
+def test_pinned_base_attestation_rejects_later_layer_changes_and_whiteouts(
+    tmp_path: Path,
+    entry: tarfile.TarInfo | tuple[tarfile.TarInfo, bytes],
+    reason: str,
+) -> None:
+    """Reject direct, ancestor, and opaque later-layer changes to reviewed paths."""
+    image, rootfs, trusted, dockerfile_path = _synthetic_attestation_inputs(
+        tmp_path,
+        later_layer_entries=[entry],
+    )
+
+    result = _run_base_attestation(tmp_path, image, rootfs, trusted, dockerfile_path)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert reason in (result.stdout + result.stderr).casefold()
+
+
+@pytest.mark.parametrize(
+    "entry_type", [tarfile.SYMTYPE, tarfile.LNKTYPE, tarfile.CHRTYPE]
+)
+def test_pinned_base_attestation_rejects_later_layer_links_and_devices(
+    tmp_path: Path,
+    entry_type: bytes,
+) -> None:
+    """Reject later-layer symlinks, hardlinks, and devices at protected ancestors."""
+    member = tarfile.TarInfo("usr/include")
+    member.type = entry_type
+    member.linkname = "elsewhere"
+    image, rootfs, trusted, dockerfile_path = _synthetic_attestation_inputs(
+        tmp_path,
+        later_layer_entries=[member],
+    )
+
+    result = _run_base_attestation(tmp_path, image, rootfs, trusted, dockerfile_path)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "ancestor" in (result.stdout + result.stderr).casefold()
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        _directory_member(".", mode=0o700),
+        _directory_member("usr", uid=1),
+        _directory_member("usr/include", gid=1),
+        _directory_member("var", mode=0o700),
+        _directory_member("./usr/include", mode=0o700),
+        _directory_member("usr//include", mode=0o700),
+    ],
+)
+def test_pinned_base_attestation_rejects_later_layer_ancestor_directories(
+    tmp_path: Path,
+    entry: tarfile.TarInfo,
+) -> None:
+    """Reject every root or strict-ancestor restatement regardless of metadata."""
+    image, rootfs, trusted, dockerfile_path = _synthetic_attestation_inputs(
+        tmp_path,
+        later_layer_entries=[entry],
+    )
+
+    result = _run_base_attestation(tmp_path, image, rootfs, trusted, dockerfile_path)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "ancestor" in (result.stdout + result.stderr).casefold()
+
+
+@pytest.mark.parametrize("archive_format", [tarfile.PAX_FORMAT, tarfile.GNU_FORMAT])
+def test_pinned_base_attestation_rejects_tar_path_overrides(
+    tmp_path: Path,
+    archive_format: int,
+) -> None:
+    """Apply PAX and GNU path overrides before protected-path decisions."""
+    if archive_format == tarfile.PAX_FORMAT:
+        member = _directory_member("ignored")
+        member.pax_headers = {"path": "./usr/include"}
+    else:
+        member = _directory_member("./" * 60 + "usr/include")
+    image, rootfs, trusted, dockerfile_path = _synthetic_attestation_inputs(
+        tmp_path,
+        later_layer_entries=[member],
+        later_layer_format=archive_format,
+    )
+
+    result = _run_base_attestation(tmp_path, image, rootfs, trusted, dockerfile_path)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "ancestor" in (result.stdout + result.stderr).casefold()
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        [_regular_member("../usr/include/e_scossl.h", b"escape\n")],
+        [
+            _regular_member("app/duplicate", b"one\n"),
+            _regular_member("app/duplicate", b"two\n"),
+        ],
+        [
+            _regular_member("app/normalized", b"one\n"),
+            _regular_member("./app//normalized", b"two\n"),
+        ],
+    ],
+)
+def test_pinned_base_attestation_rejects_unsafe_or_duplicate_layer_paths(
+    tmp_path: Path,
+    entries: list[tarfile.TarInfo | tuple[tarfile.TarInfo, bytes]],
+) -> None:
+    """Reject traversal and duplicate paths even outside the reviewed inventory."""
+    image, rootfs, trusted, dockerfile_path = _synthetic_attestation_inputs(
+        tmp_path,
+        later_layer_entries=entries,
+    )
+
+    result = _run_base_attestation(tmp_path, image, rootfs, trusted, dockerfile_path)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+
+
+def test_pinned_base_attestation_rejects_wrong_image_architecture(
+    tmp_path: Path,
+) -> None:
+    """Bind the saved final image config to linux/amd64."""
+    image, rootfs, trusted, dockerfile_path = _synthetic_attestation_inputs(
+        tmp_path,
+        image_architecture="arm64",
+    )
+
+    result = _run_base_attestation(tmp_path, image, rootfs, trusted, dockerfile_path)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "architecture" in (result.stdout + result.stderr).casefold()
+
+
+def test_pinned_base_attestation_rejects_config_filename_digest_mismatch(
+    tmp_path: Path,
+) -> None:
+    """Require Docker-save config filenames to equal their content digest."""
+    image, rootfs, trusted, dockerfile_path = _synthetic_attestation_inputs(tmp_path)
+    _corrupt_saved_config_filename(image)
+
+    result = _run_base_attestation(tmp_path, image, rootfs, trusted, dockerfile_path)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "config filename" in (result.stdout + result.stderr).casefold()
+
+
+def test_pinned_base_attestation_rejects_compressed_saved_layer(tmp_path: Path) -> None:
+    """Do not compare a compressed blob digest with an uncompressed RootFS DiffID."""
+    image, rootfs, trusted, dockerfile_path = _synthetic_attestation_inputs(
+        tmp_path,
+        compress_later_layer=True,
+    )
+
+    result = _run_base_attestation(tmp_path, image, rootfs, trusted, dockerfile_path)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "layer" in (result.stdout + result.stderr).casefold()
+
+
+def test_pinned_base_attestation_rejects_duplicate_trusted_json_keys(
+    tmp_path: Path,
+) -> None:
+    """Reject ambiguous trusted JSON instead of silently accepting the last key."""
+    image, rootfs, trusted, dockerfile_path = _synthetic_attestation_inputs(tmp_path)
+    content = trusted.read_text(encoding="utf-8")
+    trusted.write_text(
+        content.replace(
+            '"schema_version": 1',
+            '"schema_version": 1, "schema_version": 1',
+        ),
+        encoding="utf-8",
+    )
+
+    result = _run_base_attestation(tmp_path, image, rootfs, trusted, dockerfile_path)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "json" in (result.stdout + result.stderr).casefold()
+
+
+@pytest.mark.parametrize(
+    ("limit_name", "reason"),
+    [
+        ("MAX_IMAGE_SAVE_ARCHIVE_BYTES", "image-save archive"),
+        ("MAX_ROOTFS_ARCHIVE_BYTES", "exported rootfs"),
+    ],
+)
+def test_pinned_base_attestation_enforces_archive_byte_limits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    limit_name: str,
+    reason: str,
+) -> None:
+    """Bound archive bytes before parsing attacker-controlled tar structures."""
+    image, rootfs, trusted, dockerfile_path = _synthetic_attestation_inputs(tmp_path)
+    monkeypatch.setattr(artifact_verifier, limit_name, 1)
+
+    evidence = artifact_verifier.inspect_base_attestation(
+        "api",
+        image,
+        rootfs,
+        trusted,
+        dockerfile_path,
+    )
+
+    assert evidence["status"] == "fail"
+    findings = evidence["findings"]
+    assert isinstance(findings, list)
+    finding = findings[0]
+    assert isinstance(finding, dict)
+    assert finding["code"] == "archive_size_limit"
+    assert reason in finding["message"]
+
+
+@pytest.mark.parametrize("archive_kind", ["image", "rootfs"])
+def test_pinned_base_attestation_rejects_compressed_outer_archives(
+    tmp_path: Path,
+    archive_kind: str,
+) -> None:
+    """Require the uncompressed tar formats emitted by Docker save and export."""
+    image, rootfs, trusted, dockerfile_path = _synthetic_attestation_inputs(tmp_path)
+    archive = image if archive_kind == "image" else rootfs
+    archive.write_bytes(gzip.compress(archive.read_bytes(), mtime=0))
+
+    result = _run_base_attestation(tmp_path, image, rootfs, trusted, dockerfile_path)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "archive" in (result.stdout + result.stderr).casefold()
+
+
+def test_attested_rootfs_rejects_unlisted_header(tmp_path: Path) -> None:
+    """Keep the global build-header policy active outside the eight exact paths."""
+    image, rootfs, trusted, dockerfile_path = _synthetic_attestation_inputs(tmp_path)
+    _append_tar_entries(
+        rootfs, [_regular_member("usr/include/unlisted.h", b"header\n")]
+    )
+    attestation = _run_base_attestation(
+        tmp_path, image, rootfs, trusted, dockerfile_path
+    )
+    assert attestation.returncode == 0, attestation.stdout + attestation.stderr
+
+    result = _run_verifier(
+        "rootfs",
+        "--component",
+        "api",
+        "--archive",
+        str(rootfs),
+        "--attestation",
+        str(tmp_path / "attestation.json"),
+        "--output",
+        str(tmp_path / "rootfs-summary.json"),
+    )
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "build header" in (result.stdout + result.stderr).casefold()
+
+
+def test_rootfs_rejects_tampered_attestation_summary(tmp_path: Path) -> None:
+    """Reject a passing summary whose exact attested inventory was broadened."""
+    image, rootfs, trusted, dockerfile_path = _synthetic_attestation_inputs(tmp_path)
+    attestation = _run_base_attestation(
+        tmp_path, image, rootfs, trusted, dockerfile_path
+    )
+    assert attestation.returncode == 0, attestation.stdout + attestation.stderr
+    summary_path = tmp_path / "attestation.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["attested_paths"].append("usr/include/unlisted.h")
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+
+    result = _run_verifier(
+        "rootfs",
+        "--component",
+        "api",
+        "--archive",
+        str(rootfs),
+        "--attestation",
+        str(summary_path),
+        "--output",
+        str(tmp_path / "rootfs-summary.json"),
+    )
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "inventory" in (result.stdout + result.stderr).casefold()
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "later_layer_protected_paths_absent",
+        "verified_base_rootfs_diff_id_prefix",
+        "verified_reviewed_entries",
+    ],
+)
+def test_rootfs_requires_complete_artifact_derived_attestation(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    """Do not activate exact-path suppression from an incomplete attestation."""
+    image, rootfs, trusted, dockerfile_path = _synthetic_attestation_inputs(tmp_path)
+    attestation = _run_base_attestation(
+        tmp_path, image, rootfs, trusted, dockerfile_path
+    )
+    assert attestation.returncode == 0, attestation.stdout + attestation.stderr
+    summary_path = tmp_path / "attestation.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary.pop(field)
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+
+    result = _run_verifier(
+        "rootfs",
+        "--component",
+        "api",
+        "--archive",
+        str(rootfs),
+        "--attestation",
+        str(summary_path),
+        "--output",
+        str(tmp_path / "rootfs-summary.json"),
+    )
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    evidence = json.loads(
+        (tmp_path / "rootfs-summary.json").read_text(encoding="utf-8")
+    )
+    assert "base_attestation" not in evidence
+
+
+@pytest.mark.parametrize("malformation", ["duplicate", "nonfinite"])
+def test_rootfs_rejects_ambiguous_attestation_summary_json(
+    tmp_path: Path,
+    malformation: str,
+) -> None:
+    """Reject duplicate keys and non-standard numeric constants in summaries."""
+    image, rootfs, trusted, dockerfile_path = _synthetic_attestation_inputs(tmp_path)
+    attestation = _run_base_attestation(
+        tmp_path, image, rootfs, trusted, dockerfile_path
+    )
+    assert attestation.returncode == 0, attestation.stdout + attestation.stderr
+    summary_path = tmp_path / "attestation.json"
+    content = summary_path.read_text(encoding="utf-8")
+    if malformation == "duplicate":
+        content = content.replace(
+            '"status": "pass"',
+            '"status": "pass", "status": "pass"',
+        )
+    else:
+        content = content.replace("{", '{"nonfinite": NaN,', 1)
+    summary_path.write_text(content, encoding="utf-8")
+
+    result = _run_verifier(
+        "rootfs",
+        "--component",
+        "api",
+        "--archive",
+        str(rootfs),
+        "--attestation",
+        str(summary_path),
+        "--output",
+        str(tmp_path / "rootfs-summary.json"),
+    )
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    evidence = json.loads(
+        (tmp_path / "rootfs-summary.json").read_text(encoding="utf-8")
+    )
+    assert any(
+        finding["code"] == "malformed_base_attestation"
+        for finding in evidence["findings"]
+    )
+
+
+@pytest.mark.parametrize("unsafe_kind", ["duplicate", "traversal", "malformed"])
+def test_pinned_base_attestation_rejects_unsafe_rootfs_archives(
+    tmp_path: Path,
+    unsafe_kind: str,
+) -> None:
+    """Reject duplicate, parent-traversal, and malformed exported rootfs archives."""
+    image, rootfs, trusted, dockerfile_path = _synthetic_attestation_inputs(tmp_path)
+    if unsafe_kind == "duplicate":
+        _append_tar_entries(
+            rootfs, [_regular_member("app/src/optima/api/app.py", b"x")]
+        )
+    elif unsafe_kind == "traversal":
+        _append_tar_entries(rootfs, [_regular_member("../escape", b"x")])
+    else:
+        rootfs.write_bytes(b"not a tar archive")
+
+    result = _run_base_attestation(tmp_path, image, rootfs, trusted, dockerfile_path)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+
+
+def test_pinned_base_attestation_rejects_trusted_manifest_path_broadening(
+    tmp_path: Path,
+) -> None:
+    """Prevent manifest edits from broadening the fixed reviewed path inventory."""
+    image, rootfs, trusted_path, dockerfile_path = _synthetic_attestation_inputs(
+        tmp_path
+    )
+    trusted = json.loads(trusted_path.read_text(encoding="utf-8"))
+    trusted["reviewed_entries"][0]["path"] = "usr/include/unlisted.h"
+    trusted_path.write_text(json.dumps(trusted), encoding="utf-8")
+
+    result = _run_base_attestation(
+        tmp_path, image, rootfs, trusted_path, dockerfile_path
+    )
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "unapproved" in (result.stdout + result.stderr).casefold()
 
 
 @pytest.mark.parametrize("component", ["api", "ui"])

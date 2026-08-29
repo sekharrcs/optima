@@ -575,40 +575,67 @@ jobs:
           set +e
           set -uo pipefail
           evidence="$RUNNER_TEMP/evidence"
+          trusted_manifest="security/config/pinned-runtime-base.json"
+          api_image_archive="$RUNNER_TEMP/api-image.tar"
           api_archive="$RUNNER_TEMP/api-rootfs.tar"
+          ui_image_archive="$RUNNER_TEMP/ui-image.tar"
           ui_archive="$RUNNER_TEMP/ui-rootfs.tar"
           cleanup() {
             docker rm --force optima-api-rootfs optima-ui-rootfs >/dev/null 2>&1 || true
-            rm -f "$api_archive" "$ui_archive"
+            rm -f "$api_image_archive" "$api_archive" \
+              "$ui_image_archive" "$ui_archive"
           }
           trap cleanup EXIT
+          docker image save --output "$api_image_archive" optima-api:pr
+          api_image_save_status=$?
           docker create --name optima-api-rootfs optima-api:pr >/dev/null
           api_create_status=$?
           docker export --output "$api_archive" optima-api-rootfs
           api_export_status=$?
           docker rm optima-api-rootfs >/dev/null
           api_remove_status=$?
+          uv run --no-project --python 3.12 python scripts/verify_container_artifacts.py attest-base \
+            --component api \
+            --image-archive "$api_image_archive" \
+            --rootfs-archive "$api_archive" \
+            --trusted-manifest "$trusted_manifest" \
+            --dockerfile Dockerfile.api \
+            --output "$evidence/api-base-attestation-summary.json"
+          api_attestation_status=$?
           uv run --no-project --python 3.12 python scripts/verify_container_artifacts.py rootfs \
             --component api \
             --archive "$api_archive" \
+            --attestation "$evidence/api-base-attestation-summary.json" \
             --output "$evidence/api-rootfs-summary.json"
           api_rootfs_status=$?
-          rm -f "$api_archive"
+          rm -f "$api_image_archive" "$api_archive"
+          docker image save --output "$ui_image_archive" optima-ui:pr
+          ui_image_save_status=$?
           docker create --name optima-ui-rootfs optima-ui:pr >/dev/null
           ui_create_status=$?
           docker export --output "$ui_archive" optima-ui-rootfs
           ui_export_status=$?
           docker rm optima-ui-rootfs >/dev/null
           ui_remove_status=$?
+          uv run --no-project --python 3.12 python scripts/verify_container_artifacts.py attest-base \
+            --component ui \
+            --image-archive "$ui_image_archive" \
+            --rootfs-archive "$ui_archive" \
+            --trusted-manifest "$trusted_manifest" \
+            --dockerfile Dockerfile.ui \
+            --output "$evidence/ui-base-attestation-summary.json"
+          ui_attestation_status=$?
           uv run --no-project --python 3.12 python scripts/verify_container_artifacts.py rootfs \
             --component ui \
             --archive "$ui_archive" \
+            --attestation "$evidence/ui-base-attestation-summary.json" \
             --output "$evidence/ui-rootfs-summary.json"
           ui_rootfs_status=$?
-          printf '%s %s %s %s %s %s %s %s\n' \
-            "$api_create_status" "$api_export_status" "$api_remove_status" \
-            "$api_rootfs_status" "$ui_create_status" "$ui_export_status" \
-            "$ui_remove_status" "$ui_rootfs_status" \
+          printf '%s %s %s %s %s %s %s %s %s %s %s %s\n' \
+            "$api_image_save_status" "$api_create_status" "$api_export_status" \
+            "$api_remove_status" "$api_attestation_status" "$api_rootfs_status" \
+            "$ui_image_save_status" "$ui_create_status" "$ui_export_status" \
+            "$ui_remove_status" "$ui_attestation_status" "$ui_rootfs_status" \
             > "$evidence/rootfs-command-statuses.txt"
 
       - name: Generate and validate final-image CycloneDX SBOMs
@@ -762,13 +789,17 @@ jobs:
           command_statuses = {}
           status_contracts = {
               "rootfs-command-statuses.txt": (
+                  "api_image_save",
                   "api_create",
                   "api_export",
                   "api_remove",
+                  "api_attestation",
                   "api_rootfs",
+                  "ui_image_save",
                   "ui_create",
                   "ui_export",
                   "ui_remove",
+                  "ui_attestation",
                   "ui_rootfs",
               ),
               "sbom-command-statuses.txt": (
@@ -810,10 +841,49 @@ jobs:
                   return None
               return document
 
+          attestation_identities = []
+          identity_keys = (
+              "base_index_digest",
+              "reviewed_base_config_digest",
+              "reviewed_base_manifest_digest",
+              "trusted_manifest_sha256",
+          )
           for component in ("api", "ui"):
+              attestation = load_summary(
+                  f"{component}-base-attestation-summary.json"
+              )
+              identity = None
+              if attestation is not None:
+                  if (
+                      attestation.get("status") != "pass"
+                      or attestation.get("component") != component
+                  ):
+                      findings.append(f"{component}: base attestation failed")
+                  identity = {
+                      key: attestation.get(key) for key in identity_keys
+                  }
+                  if not all(
+                      isinstance(value, str) and value.startswith("sha256:")
+                      for value in identity.values()
+                  ):
+                      findings.append(
+                          f"{component}: base attestation identity is incomplete"
+                      )
+                  else:
+                      attestation_identities.append(identity)
               rootfs = load_summary(f"{component}-rootfs-summary.json")
-              if rootfs is not None and rootfs.get("status") != "pass":
-                  findings.append(f"{component}: rootfs policy failed")
+              if rootfs is not None:
+                  if rootfs.get("status") != "pass":
+                      findings.append(f"{component}: rootfs policy failed")
+                  if identity is not None and rootfs.get("base_attestation") != identity:
+                      findings.append(
+                          f"{component}: rootfs and base attestation identities differ"
+                      )
+          if (
+              len(attestation_identities) == 2
+              and attestation_identities[0] != attestation_identities[1]
+          ):
+              findings.append("API and UI base attestation identities differ")
 
           sboms = load_summary("final-image-sbom-summary.json")
           if sboms is not None:
@@ -871,6 +941,8 @@ jobs:
           scans = load("trivy-summary.json")
           api_rootfs = load("api-rootfs-summary.json")
           ui_rootfs = load("ui-rootfs-summary.json")
+          api_attestation = load("api-base-attestation-summary.json")
+          ui_attestation = load("ui-base-attestation-summary.json")
 
           with summary_path.open("a", encoding="utf-8") as summary:
               summary.write("\n## Final-container evidence\n\n")
@@ -904,6 +976,18 @@ jobs:
                   summary.write(
                       f"- Rootfs policy: API `{api_rootfs['status']}`, "
                       f"UI `{ui_rootfs['status']}`\n"
+                  )
+              if api_attestation and ui_attestation:
+                  summary.write(
+                      f"- Pinned-base attestation: API `{api_attestation['status']}`, "
+                    f"UI `{ui_attestation['status']}`; reviewed index "
+                      f"`{api_attestation.get('base_index_digest', 'unavailable')}`; "
+                    f"reviewed amd64 child manifest "
+                    f"`{api_attestation.get('reviewed_base_manifest_digest', 'unavailable')}`; "
+                    f"reviewed base config "
+                    f"`{api_attestation.get('reviewed_base_config_digest', 'unavailable')}`; "
+                      f"trusted manifest "
+                      f"`{api_attestation.get('trusted_manifest_sha256', 'unavailable')}`\n"
                   )
               if sboms:
                   summary.write(
