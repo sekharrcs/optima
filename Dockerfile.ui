@@ -8,7 +8,10 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 COPY src ./src
 COPY scripts/generate_sbom.py ./scripts/generate_sbom.py
+COPY scripts/prune_runtime_artifacts.py ./scripts/prune_runtime_artifacts.py
 RUN uv sync --frozen --no-dev --no-editable --no-cache \
+    && ./.venv/bin/python scripts/prune_runtime_artifacts.py --environment-root /app/.venv --disposable-build-environment \
+    && ./.venv/bin/python scripts/prune_runtime_artifacts.py --environment-root /app/.venv --verify-only \
     && ./.venv/bin/python scripts/generate_sbom.py --component ui --output /app/sbom/ui.cdx.json
 
 FROM mcr.microsoft.com/azurelinux/distroless/python:3.12-nonroot@sha256:d921452dba64944bf959f22450bb3740f5b2fff4a59faa64bd6b8eaf4c57b5b8 AS runtime

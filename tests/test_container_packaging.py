@@ -44,6 +44,7 @@ def _private_key_pem(key_type: str = "PRIVATE KEY") -> bytes:
 def _distribution_files(
     distribution: str,
     *owned_paths: str,
+    metadata_suffix: bytes = b"",
 ) -> dict[str, bytes]:
     site_packages = "app/.venv/lib/python3.12/site-packages"
     info_directory = f"{distribution.replace('-', '_')}-1.0.0.dist-info"
@@ -56,7 +57,8 @@ def _distribution_files(
     return {
         f"{site_packages}/{info_directory}/METADATA": (
             f"Metadata-Version: 2.4\nName: {distribution}\nVersion: 1.0.0\n"
-        ).encode(),
+        ).encode()
+        + metadata_suffix,
         f"{site_packages}/{info_directory}/WHEEL": b"Wheel-Version: 1.0\n",
         f"{site_packages}/{info_directory}/RECORD": record.encode(),
         **{
@@ -212,6 +214,8 @@ def test_api_image_uses_locked_non_root_production_entrypoint() -> None:
     )
     assert "ghcr.io/astral-sh/uv:0.12.5@sha256:" in content
     assert "uv sync --frozen --no-dev --no-editable --no-cache" in content
+    assert "scripts/prune_runtime_artifacts.py --environment-root /app/.venv" in content
+    assert "--environment-root /app/.venv --verify-only" in content
     assert "--component api --output /app/sbom/api.cdx.json" in content
     assert "/app/sbom ./sbom" in content
     assert "USER nonroot" in content
@@ -234,6 +238,8 @@ def test_ui_image_uses_locked_non_root_streamlit_entrypoint() -> None:
     )
     assert "ghcr.io/astral-sh/uv:0.12.5@sha256:" in content
     assert "uv sync --frozen --no-dev --no-editable --no-cache" in content
+    assert "scripts/prune_runtime_artifacts.py --environment-root /app/.venv" in content
+    assert "--environment-root /app/.venv --verify-only" in content
     assert "--component ui --output /app/sbom/ui.cdx.json" in content
     assert "/app/sbom ./sbom" in content
     assert "STREAMLIT_SERVER_ADDRESS=0.0.0.0" in content
@@ -256,6 +262,7 @@ def test_docker_context_is_an_explicit_source_allow_list() -> None:
         "!src/**",
         "!scripts/",
         "!scripts/generate_sbom.py",
+        "!scripts/prune_runtime_artifacts.py",
         "**/__pycache__/",
         "**/*.py[cod]",
         "**/.env",
@@ -263,6 +270,25 @@ def test_docker_context_is_an_explicit_source_allow_list() -> None:
         "**/.git",
         "**/.git/**",
     ]
+
+
+def test_container_build_prunes_and_verifies_before_generating_sbom() -> None:
+    """Run builder-only pruning after sync and before runtime inventory generation."""
+    for name in ("Dockerfile.api", "Dockerfile.ui"):
+        content = dockerfile(name)
+        runtime = content.split(" AS runtime", maxsplit=1)[1]
+
+        assert content.count("COPY scripts/prune_runtime_artifacts.py") == 1
+        assert content.count("--disposable-build-environment") == 1
+        assert content.index("uv sync --frozen") < content.index(
+            "scripts/prune_runtime_artifacts.py --environment-root /app/.venv"
+        )
+        assert content.index(
+            "--environment-root /app/.venv --verify-only"
+        ) < content.index("scripts/generate_sbom.py --component")
+        assert "prune_runtime_artifacts.py" not in runtime
+        assert runtime.count("COPY --from=builder") == 2
+        assert "COPY src ./src" in runtime
 
 
 def test_container_base_images_pin_reviewed_manifest_digests() -> None:
@@ -307,6 +333,12 @@ def test_final_image_rootfs_accepts_minimal_runtime_inventory(
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
+    evidence = json.loads(
+        (tmp_path / "rootfs-evidence.json").read_text(encoding="utf-8")
+    )
+    assert evidence["counts"]["test_roots"] == 0
+    assert evidence["counts"]["conftest_files"] == 0
+    assert evidence["counts"]["build_manifests"] == 0
 
 
 @pytest.mark.parametrize("component", ["api", "ui"])
@@ -446,10 +478,10 @@ def test_final_image_rootfs_rejects_build_and_sensitive_artifacts(
     ("distribution", "owned_path"),
     [
         ("numpy", "numpy/_core/include/numpy/arrayobject.h"),
-        ("cryptography", "cryptography/tests/test_fernet.py"),
         ("msal", "msal/test_authority.py"),
         ("package", "package/fixtures/certificate.pem"),
-        ("package", "package/pyproject.toml"),
+        ("package", "package/data/schema.json"),
+        ("package", "package/LICENSE"),
     ],
 )
 def test_final_image_rootfs_allows_dependency_owned_package_contents(
@@ -484,8 +516,8 @@ def test_final_image_rootfs_allows_dependency_owned_package_contents(
 @pytest.mark.parametrize(
     ("distribution", "source_path"),
     [
-        ("certifi", "certifi/tests/test_core.py"),
-        ("numpy", "numpy/_core/tests/test_numeric.py"),
+        ("certifi", "certifi/core.py"),
+        ("numpy", "numpy/_core/numeric.py"),
     ],
 )
 def test_final_image_rootfs_allows_record_derived_pep3147_bytecode(
@@ -522,6 +554,78 @@ def test_final_image_rootfs_allows_record_derived_pep3147_bytecode(
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_final_image_rootfs_accepts_pandas_sized_metadata(tmp_path: Path) -> None:
+    """Recognize valid wheel identity when METADATA is larger than 64 KiB."""
+    archive = tmp_path / "api-rootfs.tar"
+    owned_path = "pandas/include/public.h"
+    _write_rootfs(
+        archive,
+        "api",
+        extra_files={
+            **_distribution_files(
+                "pandas",
+                owned_path,
+                metadata_suffix=b"Description: " + (b"x" * 90_000) + b"\n",
+            ),
+            "app/sbom/api.cdx.json": _runtime_sbom(("pandas", "1.0.0")),
+        },
+    )
+
+    result = _run_verifier(
+        "rootfs",
+        "--component",
+        "api",
+        "--archive",
+        str(archive),
+        "--output",
+        str(tmp_path / "rootfs-evidence.json"),
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    ("distribution", "owned_path"),
+    [
+        ("cryptography", "cryptography/tests/test_fernet.py"),
+        ("package", "package/test/test_policy.py"),
+        ("package", "package/conftest.py"),
+        ("pandas", "pandas/pyproject.toml"),
+    ],
+)
+def test_final_image_rootfs_rejects_wheel_owned_prunable_artifacts(
+    tmp_path: Path,
+    distribution: str,
+    owned_path: str,
+) -> None:
+    """Never use wheel ownership to exempt tests, conftest, or build manifests."""
+    archive = tmp_path / "api-rootfs.tar"
+    _write_rootfs(
+        archive,
+        "api",
+        extra_files={
+            **_distribution_files(distribution, owned_path),
+            "app/sbom/api.cdx.json": _runtime_sbom((distribution, "1.0.0")),
+        },
+    )
+
+    result = _run_verifier(
+        "rootfs",
+        "--component",
+        "api",
+        "--archive",
+        str(archive),
+        "--output",
+        str(tmp_path / "rootfs-evidence.json"),
+    )
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    evidence = json.loads(
+        (tmp_path / "rootfs-evidence.json").read_text(encoding="utf-8")
+    )
+    assert evidence["counts"]["findings"] >= 1
 
 
 @pytest.mark.parametrize(
@@ -746,6 +850,48 @@ def test_distribution_missing_from_runtime_sbom_cannot_inherit_exemption(
     )
 
     assert result.returncode == 1, result.stdout + result.stderr
+
+
+def test_forged_runtime_sbom_purl_identity_cannot_inherit_exemption(
+    tmp_path: Path,
+) -> None:
+    """Require SBOM name/version fields to agree with the package purl identity."""
+    archive = tmp_path / "api-rootfs.tar"
+    owned_path = "package/include/public.h"
+    forged_sbom = json.dumps(
+        {
+            "bomFormat": "CycloneDX",
+            "components": [
+                {
+                    "type": "library",
+                    "name": "package",
+                    "version": "1.0.0",
+                    "purl": "pkg:pypi/different-package@1.0.0",
+                }
+            ],
+        }
+    ).encode()
+    _write_rootfs(
+        archive,
+        "api",
+        extra_files={
+            **_distribution_files("package", owned_path),
+            "app/sbom/api.cdx.json": forged_sbom,
+        },
+    )
+
+    result = _run_verifier(
+        "rootfs",
+        "--component",
+        "api",
+        "--archive",
+        str(archive),
+        "--output",
+        str(tmp_path / "rootfs-evidence.json"),
+    )
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "build header" in (result.stdout + result.stderr).casefold()
 
 
 def test_distribution_record_cannot_exempt_a_symlink(tmp_path: Path) -> None:

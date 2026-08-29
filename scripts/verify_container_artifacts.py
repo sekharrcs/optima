@@ -13,6 +13,7 @@ from collections import Counter
 from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
 from typing import IO, Any, Literal
+from urllib.parse import unquote
 
 EXIT_SUCCESS = 0
 EXIT_FAILURE = 1
@@ -24,7 +25,7 @@ MAX_TEXT_LENGTH = 240
 PRIVATE_KEY_SCAN_CHUNK_BYTES = 64 * 1024
 MAX_PEM_LINE_BYTES = 4096
 MIN_PRIVATE_KEY_ENCODED_BYTES = 16
-MAX_DISTRIBUTION_METADATA_BYTES = 64 * 1024
+MAX_DISTRIBUTION_METADATA_BYTES = 1024 * 1024
 MAX_DISTRIBUTION_RECORD_BYTES = 16 * 1024 * 1024
 MAX_RUNTIME_SBOM_BYTES = 16 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 250_000
@@ -239,11 +240,22 @@ def _runtime_sbom_distributions(extracted: IO[bytes]) -> set[tuple[str, str]]:
         name = component.get("name")
         version = component.get("version")
         purl = component.get("purl")
+        purl_name = ""
+        purl_version = ""
+        if isinstance(purl, str) and purl.startswith("pkg:pypi/"):
+            purl_identity = purl.removeprefix("pkg:pypi/").split("?", maxsplit=1)[0]
+            purl_identity = purl_identity.split("#", maxsplit=1)[0]
+            encoded_name, separator, encoded_version = purl_identity.rpartition("@")
+            if separator:
+                purl_name = unquote(encoded_name)
+                purl_version = unquote(encoded_version)
         if (
             isinstance(name, str)
             and isinstance(version, str)
             and isinstance(purl, str)
-            and purl.startswith("pkg:pypi/")
+            and _canonical_distribution_name(purl_name)
+            == _canonical_distribution_name(name)
+            and purl_version == version
             and _canonical_distribution_name(name) != "optima"
         ):
             distributions.add((_canonical_distribution_name(name), version))
@@ -394,13 +406,22 @@ def _path_policy_finding(
         return _finding(
             "credential_env", f"unexpected {filename} credential file", path=path
         )
-    if not third_party_site_package and (
-        _starts_with(path.casefold(), "app/tests")
-        or (_starts_with(path.casefold(), "app") and "tests" in parts)
-        or (
-            _starts_with(path.casefold(), "app")
-            and filename.startswith("test_")
-            and filename.endswith(".py")
+    if (
+        _starts_with(path.casefold(), "app")
+        and (
+            any(part in {"test", "tests"} for part in parts)
+            or filename == "conftest.py"
+        )
+    ) or (
+        not third_party_site_package
+        and (
+            _starts_with(path.casefold(), "app/tests")
+            or (_starts_with(path.casefold(), "app") and "tests" in parts)
+            or (
+                _starts_with(path.casefold(), "app")
+                and filename.startswith("test_")
+                and filename.endswith(".py")
+            )
         )
     ):
         return _finding("repository_tests", "unexpected repository tests", path=path)
@@ -414,7 +435,7 @@ def _path_policy_finding(
         )
     if _starts_with(path.casefold(), "app/scripts"):
         return _finding("build_scripts", "unexpected application scripts", path=path)
-    if not third_party_site_package and (
+    if (
         filename in {"pyproject.toml", "uv.lock"}
         or filename == "dockerfile"
         or filename.startswith("dockerfile.")
@@ -636,6 +657,9 @@ def inspect_rootfs(component: Component, archive_path: Path) -> dict[str, object
     regular_files: set[str] = set()
     entry_counts: Counter[str] = Counter()
     seen_paths: dict[str, tuple[bytes, int, str]] = {}
+    test_roots: set[str] = set()
+    conftest_files: set[str] = set()
+    build_manifests: set[str] = set()
 
     try:
         with tarfile.open(archive_path, mode="r:*") as archive:
@@ -693,6 +717,25 @@ def inspect_rootfs(component: Component, archive_path: Path) -> dict[str, object
                     continue
                 seen_paths[normalized] = signature
                 paths.add(normalized)
+                normalized_path = PurePosixPath(normalized)
+                normalized_parts = tuple(
+                    part.casefold() for part in normalized_path.parts
+                )
+                for part_index, part in enumerate(normalized_parts):
+                    if part in {"test", "tests"} and normalized_parts[0] == "app":
+                        test_roots.add(
+                            "/".join(normalized_path.parts[: part_index + 1])
+                        )
+                if normalized_parts and normalized_parts[0] == "app":
+                    filename = normalized_path.name.casefold()
+                    if filename == "conftest.py":
+                        conftest_files.add(normalized)
+                    if filename in {
+                        "pyproject.toml",
+                        "uv.lock",
+                        "dockerfile",
+                    } or filename.startswith("dockerfile."):
+                        build_manifests.add(normalized)
 
                 if member.isreg():
                     entry_counts["regular_files"] += 1
@@ -804,9 +847,12 @@ def inspect_rootfs(component: Component, archive_path: Path) -> dict[str, object
             "directories": entry_counts["directories"],
             "entries": entry_counts["entries"],
             "findings": finding_total[0],
+            "build_manifests": len(build_manifests),
+            "conftest_files": len(conftest_files),
             "links": entry_counts["links"],
             "regular_files": entry_counts["regular_files"],
             "retained_findings": len(findings),
+            "test_roots": len(test_roots),
             "unsafe_entry_types": entry_counts["unsafe_entry_types"],
         },
         "findings": findings,
