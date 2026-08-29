@@ -19,6 +19,7 @@ from urllib.parse import urlparse
 import pytest
 
 from scripts.generate_sbom import generate_sbom
+from scripts.prune_runtime_artifacts import PruneError, prune_environment
 
 ROOT = Path(__file__).resolve().parents[1]
 PR_SECURITY_WORKFLOW = ROOT / ".github" / "workflows" / "pr-security-containers.yml"
@@ -260,6 +261,114 @@ def test_runtime_pruner_removes_owned_tests_and_derived_bytecode(
     assert not (site_packages / "numpy" / "conftest.py").exists()
     assert (site_packages / "numpy" / "runtime.py").is_file()
     assert (site_packages / "numpy" / "test_attributes.py").is_file()
+
+
+def test_runtime_pruner_removes_exact_certifi_executable_test_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Remove the exact executable test shipped by the certifi 2026.7.22 wheel."""
+    environment_root = tmp_path / ".venv"
+    site_packages = _write_distribution(
+        environment_root,
+        "certifi",
+        {
+            "certifi/__init__.py": b"from .core import where\n",
+            "certifi/cacert.pem": b"runtime trust bundle\n",
+            "certifi/core.py": b"def where(): return 'cacert.pem'\n",
+            "certifi/tests/__init__.py": b"",
+            "certifi/tests/test_certify.py": b"def test_bundle(): assert True\n",
+        },
+        package_version="2026.7.22",
+    )
+    test_source = site_packages / "certifi" / "tests" / "test_certify.py"
+    record_path = site_packages / "certifi-2026.7.22.dist-info" / "RECORD"
+    with record_path.open(encoding="utf-8", newline="") as stream:
+        test_rows = {
+            row[0]: row[1:]
+            for row in csv.reader(stream)
+            if row[0].startswith("certifi/tests/")
+        }
+    assert set(test_rows) == {
+        "certifi/tests/__init__.py",
+        "certifi/tests/test_certify.py",
+    }
+    assert all(
+        hash_field.startswith("sha256=") and size_field.isdecimal()
+        for hash_field, size_field in test_rows.values()
+    )
+    original_stat = Path.stat
+
+    def wheel_stat(
+        path: Path,
+        *,
+        follow_symlinks: bool = True,
+    ) -> os.stat_result:
+        result = original_stat(path, follow_symlinks=follow_symlinks)
+        if path != test_source:
+            return result
+        values = list(result)
+        values[stat.ST_MODE] = int(values[stat.ST_MODE]) | (
+            stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+        )
+        return os.stat_result(values)
+
+    monkeypatch.setattr(Path, "stat", wheel_stat)
+
+    result = prune_environment(environment_root)
+
+    assert result["files_removed"] == 2
+    assert not (site_packages / "certifi" / "tests").exists()
+    assert (site_packages / "certifi" / "core.py").is_file()
+    assert (site_packages / "certifi" / "cacert.pem").is_file()
+    record = record_path.read_text(encoding="utf-8")
+    assert "certifi/tests/" not in record
+    assert "certifi/core.py,sha256=" in record
+    assert "certifi/cacert.pem,sha256=" in record
+
+
+@pytest.mark.parametrize(
+    ("package_version", "relative_path"),
+    [
+        ("2026.7.23", "certifi/tests/test_certify.py"),
+        ("2026.7.22", "certifi/tests/test_other.py"),
+    ],
+)
+def test_runtime_pruner_rejects_other_executable_certifi_test_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    package_version: str,
+    relative_path: str,
+) -> None:
+    """Keep the certifi executable exception pinned to one version and path."""
+    environment_root = tmp_path / ".venv"
+    site_packages = _write_distribution(
+        environment_root,
+        "certifi",
+        {relative_path: b"def test_bundle(): assert True\n"},
+        package_version=package_version,
+    )
+    test_source = site_packages / relative_path
+    original_stat = Path.stat
+
+    def wheel_stat(
+        path: Path,
+        *,
+        follow_symlinks: bool = True,
+    ) -> os.stat_result:
+        result = original_stat(path, follow_symlinks=follow_symlinks)
+        if path != test_source:
+            return result
+        values = list(result)
+        values[stat.ST_MODE] = int(values[stat.ST_MODE]) | stat.S_IXUSR
+        return os.stat_result(values)
+
+    monkeypatch.setattr(Path, "stat", wheel_stat)
+
+    with pytest.raises(PruneError, match="unsafe file class"):
+        prune_environment(environment_root)
+
+    assert test_source.is_file()
 
 
 @pytest.mark.parametrize(

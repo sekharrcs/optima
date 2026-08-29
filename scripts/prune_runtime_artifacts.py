@@ -31,6 +31,9 @@ REVIEWED_CONFTESTS = frozenset(
         ("pyarrow", "pyarrow/conftest.py"),
     }
 )
+REVIEWED_EXECUTABLE_TEST_FILES = frozenset(
+    {("certifi", "2026.7.22", "certifi/tests/test_certify.py")}
+)
 REVIEWED_TEST_ROOTS: dict[str, dict[str, frozenset[str]]] = {
     "certifi": {"certifi/tests": frozenset({".py"})},
     "gitdb": {"gitdb/test": frozenset({".py"})},
@@ -506,7 +509,15 @@ def _validate_reviewed_target(
                 entry.path, distribution.site_packages, test_root
             )
             or _test_file_class(entry.path) not in allowed_extensions
-            or entry.path.stat().st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+            or (
+                entry.path.stat().st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+                and (
+                    distribution.canonical_name,
+                    distribution.version,
+                    relative,
+                )
+                not in REVIEWED_EXECUTABLE_TEST_FILES
+            )
         ):
             raise PruneError(
                 f"unsafe file class in reviewed test root: {entry.raw_path}"
