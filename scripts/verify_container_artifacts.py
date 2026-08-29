@@ -539,13 +539,27 @@ def _archive_members(
     return members
 
 
-def _json_archive_member(
+def _parse_image_config_path(path: str) -> str:
+    """Return the digest from one canonical Docker-save config path."""
+    legacy_match = re.fullmatch(r"([0-9a-f]{64})\.json", path)
+    oci_match = re.fullmatch(r"blobs/sha256/([0-9a-f]{64})", path)
+    match = legacy_match or oci_match
+    if match is None:
+        raise AttestationError(
+            "malformed_image_config_path",
+            "image-save config path is not a canonical SHA-256 config path",
+            path=path,
+        )
+    return f"sha256:{match.group(1)}"
+
+
+def _bounded_archive_member_bytes(
     archive: tarfile.TarFile,
     member: tarfile.TarInfo,
     *,
     label: str,
-) -> object:
-    """Read one bounded regular JSON member from an archive."""
+) -> bytes:
+    """Read one bounded regular archive member."""
     if not member.isreg() or member.size > MAX_ATTESTATION_JSON_BYTES:
         raise AttestationError(
             "malformed_image_archive",
@@ -559,8 +573,19 @@ def _json_archive_member(
             f"{label} cannot be read",
             path=member.name,
         )
+    return extracted.read()
+
+
+def _json_archive_member(
+    archive: tarfile.TarFile,
+    member: tarfile.TarInfo,
+    *,
+    label: str,
+) -> object:
+    """Read one bounded regular JSON member from an archive."""
+    content = _bounded_archive_member_bytes(archive, member, label=label)
     try:
-        return _strict_json_loads(extracted.read())
+        return _strict_json_loads(content)
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
         raise AttestationError(
             "malformed_image_archive",
@@ -708,6 +733,7 @@ def _inspect_saved_image(
                     "unsafe_archive_path",
                     "image-save config path is unsafe",
                 )
+            expected_config_digest = _parse_image_config_path(config_name)
             config_member = members.get(config_name)
             if config_member is None:
                 raise AttestationError(
@@ -715,28 +741,30 @@ def _inspect_saved_image(
                     "image-save config file is missing",
                     path=config_name,
                 )
-            raw_config = _json_archive_member(
+            config_content = _bounded_archive_member_bytes(
                 archive,
                 config_member,
                 label="image config",
             )
+            final_config_digest = f"sha256:{hashlib.sha256(config_content).hexdigest()}"
+            if final_config_digest != expected_config_digest:
+                raise AttestationError(
+                    "config_digest_mismatch",
+                    "image config path digest does not match its content digest",
+                    path=config_name,
+                )
+            try:
+                raw_config = _strict_json_loads(config_content)
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+                raise AttestationError(
+                    "malformed_image_archive",
+                    "image config is not valid JSON",
+                    path=config_name,
+                ) from error
             if not isinstance(raw_config, dict):
                 raise AttestationError(
                     "malformed_image_config",
                     "image config root must be an object",
-                )
-            config_stream = archive.extractfile(config_member)
-            if config_stream is None:
-                raise AttestationError(
-                    "malformed_image_config",
-                    "image config cannot be read",
-                )
-            final_config_digest = _sha256_stream(config_stream)
-            if config_name != f"{final_config_digest.removeprefix('sha256:')}.json":
-                raise AttestationError(
-                    "config_digest_mismatch",
-                    "image config filename does not match its content digest",
-                    path=config_name,
                 )
             if raw_config.get("os") != contract["expected_os"]:
                 raise AttestationError(

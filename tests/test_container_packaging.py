@@ -178,6 +178,7 @@ def _synthetic_attestation_inputs(
     component: str = "api",
     *,
     compress_later_layer: bool = False,
+    config_path_style: str = "legacy",
     image_architecture: str = "amd64",
     later_layer_entries: list[tarfile.TarInfo | tuple[tarfile.TarInfo, bytes]]
     | None = None,
@@ -298,7 +299,13 @@ def _synthetic_attestation_inputs(
         "rootfs": {"diff_ids": diff_ids, "type": "layers"},
     }
     config_bytes = json.dumps(config, separators=(",", ":")).encode()
-    config_name = f"{hashlib.sha256(config_bytes).hexdigest()}.json"
+    config_digest = hashlib.sha256(config_bytes).hexdigest()
+    if config_path_style == "legacy":
+        config_name = f"{config_digest}.json"
+    elif config_path_style == "oci":
+        config_name = f"blobs/sha256/{config_digest}"
+    else:
+        raise AssertionError(f"unsupported config path style: {config_path_style}")
     layer_names = [f"layer-{index}/layer.tar" for index in range(len(layers))]
     save_manifest = [
         {
@@ -404,7 +411,13 @@ def _append_tar_entries(
             archive.addfile(member, BytesIO(data) if data is not None else None)
 
 
-def _corrupt_saved_config_filename(image_archive: Path) -> None:
+def _rewrite_saved_config(
+    image_archive: Path,
+    *,
+    replacement_name: str | None = None,
+    replacement_bytes: bytes | None = None,
+    duplicate_name: str | None = None,
+) -> None:
     entries: list[tuple[str, bytes]] = []
     with tarfile.open(image_archive, "r") as archive:
         for member in archive:
@@ -417,15 +430,22 @@ def _corrupt_saved_config_filename(image_archive: Path) -> None:
         next(data for name, data in entries if name == "manifest.json")
     )
     old_config = manifest[0]["Config"]
-    new_config = f"{'f' * 64}.json"
+    new_config = replacement_name or old_config
     manifest[0]["Config"] = new_config
     rewritten: list[tarfile.TarInfo | tuple[tarfile.TarInfo, bytes]] = []
+    rewritten_config_bytes: bytes | None = None
     for name, data in entries:
         if name == "manifest.json":
             data = json.dumps(manifest).encode()
         elif name == old_config:
             name = new_config
+            if replacement_bytes is not None:
+                data = replacement_bytes
+            rewritten_config_bytes = data
         rewritten.append(_regular_member(name, data))
+    if duplicate_name is not None:
+        assert rewritten_config_bytes is not None
+        rewritten.append(_regular_member(duplicate_name, rewritten_config_bytes))
     image_archive.write_bytes(_tar_bytes(rewritten))
 
 
@@ -802,14 +822,17 @@ def test_verifier_compiles_exact_production_base_identity() -> None:
 
 
 @pytest.mark.parametrize("component", ["api", "ui"])
+@pytest.mark.parametrize("config_path_style", ["legacy", "oci"])
 def test_pinned_base_attestation_accepts_valid_synthetic_archives(
     tmp_path: Path,
     component: str,
+    config_path_style: str,
 ) -> None:
     """Accept exact base ancestry, untouched reviewed paths, and matching rootfs."""
     image, rootfs, trusted, dockerfile_path = _synthetic_attestation_inputs(
         tmp_path,
         component,
+        config_path_style=config_path_style,
     )
     output = tmp_path / "attestation.json"
 
@@ -1111,17 +1134,73 @@ def test_pinned_base_attestation_rejects_wrong_image_architecture(
     assert "architecture" in (result.stdout + result.stderr).casefold()
 
 
-def test_pinned_base_attestation_rejects_config_filename_digest_mismatch(
+@pytest.mark.parametrize("config_path_style", ["legacy", "oci"])
+@pytest.mark.parametrize("mismatch", ["bytes", "digest"])
+def test_pinned_base_attestation_rejects_config_digest_mismatch(
     tmp_path: Path,
+    config_path_style: str,
+    mismatch: str,
 ) -> None:
-    """Require Docker-save config filenames to equal their content digest."""
-    image, rootfs, trusted, dockerfile_path = _synthetic_attestation_inputs(tmp_path)
-    _corrupt_saved_config_filename(image)
+    """Bind either canonical saved-config path to its exact content bytes."""
+    image, rootfs, trusted, dockerfile_path = _synthetic_attestation_inputs(
+        tmp_path,
+        config_path_style=config_path_style,
+    )
+    if mismatch == "bytes":
+        _rewrite_saved_config(image, replacement_bytes=b"not matching JSON")
+    else:
+        wrong_digest = "f" * 64
+        replacement_name = (
+            f"{wrong_digest}.json"
+            if config_path_style == "legacy"
+            else f"blobs/sha256/{wrong_digest}"
+        )
+        _rewrite_saved_config(image, replacement_name=replacement_name)
 
     result = _run_base_attestation(tmp_path, image, rootfs, trusted, dockerfile_path)
 
     assert result.returncode == 1, result.stdout + result.stderr
-    assert "config filename" in (result.stdout + result.stderr).casefold()
+    assert "config" in (result.stdout + result.stderr).casefold()
+    assert "digest" in (result.stdout + result.stderr).casefold()
+
+
+@pytest.mark.parametrize(
+    "config_path",
+    [
+        f"{'A' * 64}.json",
+        f"blobs/sha256/{'A' * 64}",
+        f"blobs/sha256/extra/{'a' * 64}",
+        f"blobs/sha256/../{'a' * 64}",
+        f"blobs/sha512/{'a' * 64}",
+        f"blobs/sha256/{'a' * 64}.json",
+        "blobs/sha256/not-a-digest",
+    ],
+)
+def test_saved_config_parser_rejects_noncanonical_paths(config_path: str) -> None:
+    """Reject every saved-config path outside the two canonical forms."""
+    with pytest.raises(artifact_verifier.AttestationError):
+        artifact_verifier._parse_image_config_path(config_path)
+
+
+def test_pinned_base_attestation_rejects_normalized_duplicate_config_member(
+    tmp_path: Path,
+) -> None:
+    """Reject duplicate OCI config members even when only normalization reveals it."""
+    image, rootfs, trusted, dockerfile_path = _synthetic_attestation_inputs(
+        tmp_path,
+        config_path_style="oci",
+    )
+    with tarfile.open(image, "r") as archive:
+        manifest_member = archive.getmember("manifest.json")
+        manifest_stream = archive.extractfile(manifest_member)
+        assert manifest_stream is not None
+        config_name = json.loads(manifest_stream.read())[0]["Config"]
+    _rewrite_saved_config(image, duplicate_name=f"./{config_name}")
+
+    result = _run_base_attestation(tmp_path, image, rootfs, trusted, dockerfile_path)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "duplicate archive path" in (result.stdout + result.stderr).casefold()
 
 
 def test_pinned_base_attestation_rejects_compressed_saved_layer(tmp_path: Path) -> None:
