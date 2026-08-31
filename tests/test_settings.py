@@ -179,6 +179,8 @@ def test_settings_accept_explicit_injection() -> None:
         "context_reduction_enabled": False,
         "historical_policy_enabled": False,
         "foundry_router_comparator_enabled": True,
+        "execution_concurrency_limit": 4,
+        "execution_timeout_seconds": 300.0,
         "standard_quality_threshold": 0.80,
         "high_quality_threshold": 0.90,
         "critical_quality_threshold": 0.95,

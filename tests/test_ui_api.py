@@ -315,3 +315,110 @@ def test_api_client_rejects_non_json_success_response() -> None:
         OptimaApiClient(transport=transport).execute(execute_inputs().to_run_request())
 
     assert captured.value.code == "INVALID_API_RESPONSE"
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://api.internal",
+        "https://user:password@api.internal",
+        "https://api.internal/path",
+        "https://api.internal?target=other",
+        "https://api.internal#fragment",
+    ],
+)
+def test_production_api_client_rejects_insecure_or_ambiguous_roots(
+    monkeypatch: pytest.MonkeyPatch,
+    base_url: str,
+) -> None:
+    """Fail closed on non-HTTPS or non-root production destinations."""
+    monkeypatch.setenv("OPTIMA_UI_PRODUCTION_MODE", "true")
+    monkeypatch.setenv("OPTIMA_API_BASE_URL", base_url)
+
+    with pytest.raises(ValueError, match="absolute HTTPS root URL"):
+        OptimaApiClient.from_environment()
+
+
+def test_production_api_client_requires_explicit_destination(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Prevent production mode from silently falling back to localhost."""
+    monkeypatch.setenv("OPTIMA_UI_PRODUCTION_MODE", "true")
+    monkeypatch.delenv("OPTIMA_API_BASE_URL", raising=False)
+
+    with pytest.raises(ValueError, match="OPTIMA_API_BASE_URL is required"):
+        OptimaApiClient.from_environment()
+
+
+def test_local_api_client_preserves_trusted_environment_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep an explicit environment-only local development workflow."""
+    requested_urls: list[httpx.URL] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requested_urls.append(request.url)
+        return httpx.Response(503, json={})
+
+    monkeypatch.setenv("OPTIMA_UI_PRODUCTION_MODE", "false")
+    monkeypatch.setenv("OPTIMA_API_BASE_URL", "http://localhost:8765")
+    client = OptimaApiClient.from_environment(transport=httpx.MockTransport(respond))
+
+    with pytest.raises(ApiClientError):
+        client.execute(execute_inputs().to_run_request())
+
+    assert requested_urls == [httpx.URL("http://localhost:8765/api/v1/runs")]
+
+
+@pytest.mark.parametrize("timeout", ["0", "361", "nan", "not-a-number"])
+def test_environment_api_client_rejects_invalid_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    timeout: str,
+) -> None:
+    """Reject non-finite, non-positive, and unreasonably large UI deadlines."""
+    monkeypatch.setenv("OPTIMA_API_TIMEOUT_SECONDS", timeout)
+
+    with pytest.raises(ValueError, match="OPTIMA_API_TIMEOUT_SECONDS"):
+        OptimaApiClient.from_environment()
+
+
+def test_environment_api_client_applies_configured_transport_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Use the trusted production timeout budget for each HTTP client."""
+    observed_timeout: list[float] = []
+
+    def timeout_response(request: httpx.Request) -> httpx.Response:
+        observed_timeout.append(float(request.extensions["timeout"]["read"]))
+        return httpx.Response(503, json={})
+
+    monkeypatch.setenv("OPTIMA_UI_PRODUCTION_MODE", "true")
+    monkeypatch.setenv("OPTIMA_API_BASE_URL", "https://api.internal")
+    monkeypatch.setenv("OPTIMA_API_TIMEOUT_SECONDS", "315")
+
+    with pytest.raises(ApiClientError):
+        OptimaApiClient.from_environment(
+            transport=httpx.MockTransport(timeout_response)
+        ).execute(execute_inputs().to_run_request())
+
+    assert observed_timeout == [315.0]
+
+
+def test_api_client_rejects_redirect_without_contacting_target() -> None:
+    """Do not follow a configured API redirect into another trust domain."""
+    requested_urls: list[httpx.URL] = []
+
+    def redirect(request: httpx.Request) -> httpx.Response:
+        requested_urls.append(request.url)
+        return httpx.Response(
+            307,
+            headers={"location": "https://untrusted.example/api/v1/runs"},
+        )
+
+    with pytest.raises(ApiClientError) as captured:
+        OptimaApiClient(transport=httpx.MockTransport(redirect)).execute(
+            execute_inputs().to_run_request()
+        )
+
+    assert captured.value.code == "API_REDIRECT_REJECTED"
+    assert requested_urls == [httpx.URL("http://127.0.0.1:8000/api/v1/runs")]

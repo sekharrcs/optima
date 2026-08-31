@@ -6,6 +6,8 @@ param deployContainerApps = false
 param deployRuntimeAccess = false
 
 // Slice 11C must replace these non-deployable digests and model placeholders.
+param uiAuthClientId = '00000000-0000-0000-0000-000000000000'
+param uiAuthTenantId = '00000000-0000-0000-0000-000000000000'
 param apiImageDigest = 'sha256:0000000000000000000000000000000000000000000000000000000000000000'
 param uiImageDigest = 'sha256:0000000000000000000000000000000000000000000000000000000000000000'
 param foundryBaseUrl = 'https://replace-before-deployment.openai.azure.com/openai/v1'

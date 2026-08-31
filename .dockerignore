@@ -3,3 +3,12 @@
 !uv.lock
 !src/
 !src/**
+!scripts/
+!scripts/generate_sbom.py
+!scripts/prune_runtime_artifacts.py
+**/__pycache__/
+**/*.py[cod]
+**/.env
+**/.env.*
+**/.git
+**/.git/**

@@ -9,14 +9,24 @@ Slice 11B owns:
 
 * Production FastAPI dependency composition
 * FastAPI lifespan construction and cleanup
-* API and UI image definitions
+* API and UI image definitions and dependency SBOMs
+* Public UI Entra authentication configuration
+* Request-size, execution-time, and per-process concurrency limits
 * Redis index inspection, compatibility validation, and creation
 * East US 2 application parameters
 * Runtime environment-variable and immutable image contracts
 
+Slice 11B-S owns:
+
+* Credential-free, read-only validation of the exact pull-request head
+* Full Linux application checks and local Linux AMD64 API and UI image builds
+* Local runtime, smoke, rootfs, native-library, package, SBOM, vulnerability, and
+  secret verification for both final images
+* Short-retention GitHub Actions evidence for the exact commit under review
+
 Slice 11C owns:
 
-* GitHub Actions and OIDC login usage
+* OIDC-authenticated deployment workflow and Azure login usage
 * API and UI image publication to ACR
 * Azure preflight and Bicep execution
 * Runtime and external Foundry access application
@@ -80,6 +90,15 @@ The API health endpoint is `/api/v1/health`. Uvicorn does not accept traffic
 until FastAPI lifespan yields, so an index or configuration failure prevents a
 false ready response.
 
+The credential-free Slice 11B-S workflow starts the exact API image with a command
+override to `uvicorn optima.api.app:app --host 0.0.0.0 --port 8000` and checks
+`/api/v1/health` on a random loopback host port. It separately verifies that the
+production factory imports and remains the image's configured default command.
+This proves local image execution, imports, non-root operation, TLS CA loading,
+and the lightweight health route. It does not execute the production lifespan or
+validate Foundry, Redis, Cosmos, telemetry, pricing, managed identity, or Azure
+configuration. Those checks require Slice 11C.
+
 ## Redis index bootstrap
 
 Startup inspects `FT._LIST`. If `optima-cache-v1` is absent and no stale contract
@@ -117,10 +136,23 @@ custom ACL model. Slice 11B preserves this reviewed tradeoff.
 ## Container images
 
 `Dockerfile.api` exposes port `8000`. `Dockerfile.ui` exposes port `8501` and
-starts `streamlit run src/ui/app.py`. Both use Python 3.12.12 slim, install from
-`uv.lock` with `uv 0.12.5`, exclude development dependencies, and run as UID and
-GID `10001`. The Docker context is an allow list containing only
-`pyproject.toml`, `uv.lock`, and `src`.
+starts `streamlit run src/ui/app.py`. Both use digest-pinned Azure Linux 3.0
+Python 3.12 builder and non-root distroless runtime images. The pinned uv 0.12.5
+stage installs from `uv.lock` with `--frozen --no-dev --no-editable --no-cache`.
+The final image copies no package manager, compiler, shell setup, test tree, or
+source-control metadata and runs as the base image's declared `nonroot` user.
+The Docker context allow list contains only `pyproject.toml`, `uv.lock`, `src`,
+and the SBOM generator, while excluding bytecode and cache directories.
+
+Each builder generates a deterministic CycloneDX 1.6 inventory from its exact
+installed environment. The final API image contains `sbom/api.cdx.json`; the UI
+image contains `sbom/ui.cdx.json`. Repository copies under `security/sbom` are
+reproducible Linux x64 evidence from the same frozen production closure.
+
+Slice 11B-S also generates separate Syft CycloneDX SBOMs from the locally built
+final images. These short-retention workflow artifacts include operating-system
+and language package evidence and do not replace the embedded or committed
+Python dependency SBOMs.
 
 Build and smoke test locally when Docker is available:
 
@@ -131,12 +163,15 @@ docker run --rm --env-file .env -p 8000:8000 optima-api:local
 docker run --rm -e OPTIMA_API_BASE_URL=http://host.docker.internal:8000 -p 8501:8501 optima-ui:local
 ```
 
-Slice 11C publishes each image and supplies its manifest digest as
-`apiImageDigest` or `uiImageDigest`. The all-zero parameter values are
-non-deployable placeholders. `deployContainerApps` remains `false` by default.
-Enabling it with an all-zero value or anything other than lowercase `sha256:`
-plus 64 hexadecimal characters triggers a Bicep `fail()` guard before Container
-Apps composition. Slice 11C still verifies exact manifest existence in ACR.
+The Slice 11B-S pre-push build records each local Docker content-addressed image
+ID. A local image ID identifies that local build and is not an ACR registry
+manifest digest. Slice 11C publishes each image and supplies its immutable ACR
+manifest digest as `apiImageDigest` or `uiImageDigest`. The all-zero parameter
+values are non-deployable placeholders. `deployContainerApps` remains `false` by
+default. Enabling it with an all-zero value or anything other than lowercase
+`sha256:` plus 64 hexadecimal characters triggers a Bicep `fail()` guard before
+Container Apps composition. Slice 11C still verifies exact manifest existence in
+ACR.
 
 ## Runtime configuration
 
@@ -144,6 +179,22 @@ Container Apps owns `OPTIMA_DEPLOYMENT_ENVIRONMENT`, managed-identity IDs,
 Cosmos resource values, Redis endpoint values, Application Insights values, and
 the UI API URL. The AI/model owner supplies the Foundry endpoint and deployment
 identities.
+
+The deployed UI sets `OPTIMA_UI_PRODUCTION_MODE=true`. This requires an explicit
+HTTPS `OPTIMA_API_BASE_URL`; the Streamlit form exposes no destination override,
+and its HTTP client refuses redirects. `OPTIMA_API_TIMEOUT_SECONDS=315` exceeds
+the server's execution plus persistence budgets. Local development defaults to
+`http://127.0.0.1:8000` and may use an environment-only override while
+production mode is false.
+
+The API rejects request bodies above 4 MiB before JSON deserialization. Parsed
+requests limit input to 32,000 characters, context to 128,000, reference output
+to 32,000, criteria to 20 entries of 2,000 characters each, canonical metadata
+to 32 KiB and bounded nesting, and caller latency to 300,000 milliseconds.
+Production allows four active executions per process and at most three API
+replicas, applies a 300-second overall deadline, and aligns the Container Apps
+HTTP scale threshold to four concurrent requests. These controls bound one
+deployment but do not implement a distributed per-user quota.
 
 Evaluator configuration is explicit:
 
@@ -173,7 +224,21 @@ ID as its AUTH username. Redis uses fixed Azure Managed Redis TLS port `10000`.
 
 Application Insights must be enabled with its connection string, service name,
 deployment environment, and sampling ratio. Live Metrics, performance counters,
-and offline storage remain disabled.
+and offline storage remain disabled. IaC carries the connection string through
+secure module values and a Container Apps secret reference.
+
+The external UI uses Container Apps built-in Microsoft Entra authentication with
+the confidential-client authorization-code (hybrid) flow. Slice 11C must provide an
+existing single-tenant app registration and tenant ID, create a client secret and
+pass it only through the secure `uiAuthClientSecret` deployment parameter at
+preflight, register the exact UI callback URI
+`https://<ui-fqdn>/.auth/login/aad/callback`, and restrict assignment to the
+intended hackathon users when tenant-wide access is too broad. The secret is
+referenced through `clientSecretSettingName` as the `ui-auth-client-secret`
+Container Apps secret; without a credential the platform falls back to the weaker
+implicit flow. Parameter files carry no secret, and the token store stays disabled
+because OPTIMA only authenticates the user. A successful Bicep build does not prove
+interactive sign-in; authentication is verified only at the live preflight.
 
 LLM-judge evaluation sends the original task, candidate output, explicit
 criteria, and required supplied context through the configured Foundry/APIM
@@ -191,10 +256,33 @@ Before Bicep execution, Slice 11C must validate as far as Azure APIs allow:
 4. Relevant subscription quota and limits
 5. Presence of immutable API and UI manifests in ACR
 6. Replacement of every Foundry, embedding, and digest placeholder
+7. Replacement of UI Entra client and tenant placeholders, provision of the client
+  secret as the secure `uiAuthClientSecret` parameter, and verification of the
+  exact callback URI and user-assignment policy
 
 Valid SKU metadata and quota do not guarantee regional allocation capacity.
 Allocation failure must stop deployment with a clear error. It must not place
 Redis in East US or another fallback region.
+
+## Slice 11C live Entra acceptance gate
+
+Before public exposure, Slice 11C must complete all twelve checks against the
+deployed UI and its exact configuration:
+
+1. Confirm the app registration is single-tenant.
+2. Create the confidential-client secret securely.
+3. Supply the secret only as a secure deployment input.
+4. Register the exact `https://<UI-FQDN>/.auth/login/aad/callback` Web redirect URI.
+5. Confirm an anonymous request redirects to Microsoft login.
+6. Confirm an explicitly authorized hackathon user signs in.
+7. Confirm an unauthorized user is denied.
+8. Confirm an authenticated request reaches Streamlit.
+9. Confirm the API remains internal and non-public.
+10. Confirm logout and session behavior is acceptable.
+11. Confirm the client secret is absent from normal environment variables,
+  outputs, logs, and source.
+12. Confirm user restriction or application assignment prevents unintended
+  tenant-wide paid use.
 
 ## Remaining Slice 11C inputs
 
@@ -246,23 +334,35 @@ Slice 11C must also supply and verify:
   currency when cost measurement is required
 7. Immutable API and UI image digests and all existing Redis, Cosmos,
   Application Insights, and Foundry inputs
+8. Existing single-tenant UI Entra app client ID, tenant ID, confidential-client
+   secret supplied as the secure `uiAuthClientSecret` parameter, callback URI, and
+   intended-user assignment
 
 Actual model names, deployment names, and rates remain deployment inputs. This
 repository does not fabricate them.
 
 ## Slice 11C container validation gate
 
-Docker and Podman were unavailable during Slice 11B, so only static Dockerfile
-contracts were verified. Static Dockerfile tests are not sufficient for a first
-Azure deployment.
+Slice 11B-S defines credential-free exact-head final-image verification on an
+ephemeral Linux x86_64 runner. No hosted result has yet been recorded. A future
+green workflow applies only to its recorded commit and does not prove ACR
+publication, production lifespan startup, live managed-identity access, or live
+Entra behavior.
 
-Slice 11C must block application deployment until both the API and UI images
+Slice 11C must keep `deployContainerApps=false` until both the API and UI images
 have:
 
-1. built successfully as Linux `AMD64` images
-2. started successfully
-3. passed API and UI local or CI container smoke tests
-4. produced immutable ACR manifest digests
+1. Passed the exact-head Slice 11B-S Linux `AMD64` build and runtime checks.
+2. Passed API health and normal-command UI smoke tests.
+3. Passed final-image scans for OS and Python advisories, secrets, and unexpected
+   executable content.
+4. Passed non-root, native-library, embedded-SBOM, development-package, rootfs,
+   `.git`, `.env`, and package-manager-cache checks.
+5. Been published by Slice 11C and resolved to immutable ACR manifest digests.
+6. Passed production lifespan startup with live configuration and required Azure
+   access.
 
-Only after all four hold for both images may Slice 11C publish digests and enable
-Container Apps.
+Only after all six hold for both images, and all deployment and live Entra gates
+pass, may Slice 11C enable Container Apps. A green Slice 11B-S workflow may make
+PR #20 merge-ready for its exact head, but it cannot declare Slice 11C deployed
+or successful.

@@ -9,6 +9,7 @@ import httpx
 from azure.core.credentials import TokenCredential
 from azure.identity import AzureCliCredential, ManagedIdentityCredential
 
+from optima.api.security import ExecutionConcurrencyLimiter
 from optima.cache import SemanticCache
 from optima.config import AppSettings, FoundryAuthMode, FoundryProviderConfiguration
 from optima.context import ContextReducer, TokenCounter
@@ -59,6 +60,7 @@ class ExecutionDependencies:
     run_id_factory: Callable[[], str] = new_run_id
     correlation_id_factory: Callable[[], str] = new_correlation_id
     observability: Observability | None = None
+    execution_limiter: ExecutionConcurrencyLimiter | None = None
 
 
 @dataclass(frozen=True)

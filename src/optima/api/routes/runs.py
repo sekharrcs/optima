@@ -1,5 +1,6 @@
 """Versioned API routes for OPTIMA execution and run history."""
 
+import asyncio
 from collections.abc import Callable
 from typing import Annotated, Never
 
@@ -7,6 +8,7 @@ from fastapi import APIRouter, HTTPException, Query, Response, status
 
 from optima.api.dependencies import ExecutionDependencies
 from optima.api.models import ApiError, RunRequest
+from optima.api.security import ExecutionCapacityExceededError
 from optima.cache import SemanticCacheLookupRequest
 from optima.config import ProductionEvaluatorMode
 from optima.context.safety import ContextReducerSafetyRequest
@@ -137,33 +139,74 @@ def build_runs_router(
                 code="GROUNDING_NOT_SUPPORTED",
                 message="EXACT_REFERENCE cannot establish grounding",
             )
-        run_id = resolved.run_id_factory()
-        correlation_id = resolved.correlation_id_factory()
-        clock = resolved.monotonic_clock or SystemMonotonicClock()
-        request_started_at = clock.now()
-        observability = resolved.observability
-        if observability is None:
-            raise AssertionError("application composition must resolve observability")
-        with observability.start_run(
-            run_id=run_id,
-            correlation_id=correlation_id,
-        ) as run_observation:
-            try:
-                return await _execute_observed_run(
-                    run_request=run_request,
-                    response=response,
-                    dependencies=resolved,
+        limiter = resolved.execution_limiter
+        if limiter is None:
+            raise AssertionError("application composition must resolve execution limit")
+        try:
+            with limiter.acquire():
+                run_id = resolved.run_id_factory()
+                correlation_id = resolved.correlation_id_factory()
+                clock = resolved.monotonic_clock or SystemMonotonicClock()
+                request_started_at = clock.now()
+                observability = resolved.observability
+                if observability is None:
+                    raise AssertionError(
+                        "application composition must resolve observability"
+                    )
+                with observability.start_run(
                     run_id=run_id,
                     correlation_id=correlation_id,
-                    clock=clock,
-                    request_started_at=request_started_at,
-                    observation=run_observation,
-                )
-            except Exception as error:
-                run_observation.record_pre_result_failure(
-                    _pre_result_failure_category(error)
-                )
-                raise
+                ) as run_observation:
+                    timeout_ms = min(
+                        int(resolved.settings.execution_timeout_seconds * 1000),
+                        run_request.max_latency_ms
+                        or int(resolved.settings.execution_timeout_seconds * 1000),
+                    )
+                    try:
+                        async with asyncio.timeout(timeout_ms / 1000):
+                            result = await _execute_observed_run(
+                                run_request=run_request,
+                                response=response,
+                                dependencies=resolved,
+                                run_id=run_id,
+                                correlation_id=correlation_id,
+                                clock=clock,
+                                request_started_at=request_started_at,
+                                observation=run_observation,
+                            )
+                    except TimeoutError:
+                        run_observation.record_pre_result_failure(
+                            FailureCategory.TIMEOUT
+                        )
+                        _raise_api_error(
+                            status.HTTP_504_GATEWAY_TIMEOUT,
+                            code="EXECUTION_TIMEOUT",
+                            message=(
+                                "OPTIMA execution exceeded its server-side deadline"
+                            ),
+                            facts={"timeout_ms": timeout_ms},
+                        )
+                    except Exception as error:
+                        run_observation.record_pre_result_failure(
+                            _pre_result_failure_category(error)
+                        )
+                        raise
+                    await _record_run_history_persistence(
+                        response,
+                        resolved.run_history_store,
+                        result,
+                        run_observation,
+                        save_timeout_seconds=resolved.settings.cosmos_timeout_seconds,
+                    )
+                    run_observation.project_result(result)
+                    return result
+        except ExecutionCapacityExceededError:
+            _raise_api_error(
+                status.HTTP_429_TOO_MANY_REQUESTS,
+                code="EXECUTION_CAPACITY_EXCEEDED",
+                message="This OPTIMA instance is at its execution concurrency limit",
+                facts={"maximum_concurrency": limiter.maximum_concurrency},
+            )
 
     @router.get("/runs/{run_id}", response_model=RunResult)
     async def get_run(run_id: str) -> RunResult:
@@ -490,13 +533,6 @@ async def _execute_observed_run(
             facts={"context_policy": execution_plan.context_policy.value},
         )
 
-    await _record_run_history_persistence(
-        response,
-        dependencies.run_history_store,
-        result,
-        observation,
-    )
-    observation.project_result(result)
     return result
 
 
@@ -543,6 +579,8 @@ async def _record_run_history_persistence(
     store: RunHistoryStore | None,
     result: RunResult,
     observation: RunObservation,
+    *,
+    save_timeout_seconds: float,
 ) -> None:
     """Report best-effort persistence via headers without altering the result."""
     if store is None:
@@ -551,7 +589,10 @@ async def _record_run_history_persistence(
     with observation.start_stage(ObservationStage.RUN_HISTORY_SAVE) as observed:
         error_code: RunHistoryErrorCode | None = None
         try:
-            await store.save(result)
+            async with asyncio.timeout(save_timeout_seconds):
+                await store.save(result)
+        except TimeoutError:
+            error_code = RunHistoryErrorCode.TIMED_OUT
         except RunHistoryError as error:
             error_code = error.code
         except Exception:

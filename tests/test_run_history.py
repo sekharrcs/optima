@@ -150,6 +150,23 @@ class SaveErrorRunHistoryStore:
         return ()
 
 
+class BlockingRunHistoryStore:
+    """Block persistence until its independent timeout cancels the attempt."""
+
+    def __init__(self) -> None:
+        self.save_calls = 0
+
+    async def save(self, result: RunResult) -> None:
+        self.save_calls += 1
+        await asyncio.Event().wait()
+
+    async def get(self, run_id: str) -> RunResult:
+        raise RunHistoryNotFoundError
+
+    async def list_recent(self, limit: int) -> tuple[RunResult, ...]:
+        return ()
+
+
 class TimeoutSmallProvider:
     """Produce a truthful terminal timed-out RunResult through the executor."""
 
@@ -927,6 +944,33 @@ def test_api_returns_completed_result_when_persistence_unavailable() -> None:
     assert store.save_calls == 1
     assert len(small.calls) == 1
     assert len(strong.calls) == 0
+    assert len(evaluator.calls) == 1
+
+
+def test_api_returns_completed_result_when_persistence_exceeds_its_timeout() -> None:
+    """Never convert completed paid work into a retryable execution timeout."""
+    configured, small, strong, evaluator = dependencies(0.93)
+    store = BlockingRunHistoryStore()
+    configured = replace(
+        configured,
+        settings=configured.settings.model_copy(
+            update={"cosmos_timeout_seconds": 0.01}
+        ),
+        run_history_store=store,
+    )
+
+    response = TestClient(create_app(execution_dependencies=configured)).post(
+        "/api/v1/runs",
+        json=request_payload(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "COMPLETED"
+    assert response.headers["X-OPTIMA-Run-History"] == "FAILED"
+    assert response.headers["X-OPTIMA-Run-History-Error"] == "RUN_HISTORY_TIMED_OUT"
+    assert store.save_calls == 1
+    assert len(small.calls) == 1
+    assert strong.calls == ()
     assert len(evaluator.calls) == 1
 
 

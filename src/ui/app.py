@@ -7,13 +7,14 @@ from enum import StrEnum
 from typing import cast
 
 import streamlit as st
+from pydantic import ValidationError
 
 from optima.comparison import BaselineComparison
 from optima.domain.execution import ModelRole
 from optima.domain.quality_contract import OptimizationMode, QualityProfile, RiskTier
 from optima.domain.request_profile import Complexity, TaskType
 from optima.domain.run import PricingProvenance, RunResult
-from ui.api_client import DEFAULT_API_BASE_URL, ApiClientError, OptimaApiClient
+from ui.api_client import ApiClientError, OptimaApiClient
 from ui.history import (
     HistoryEntry,
     add_entry,
@@ -162,14 +163,6 @@ def execute_page() -> None:
             )
             cache_eligible = st.checkbox("Cache eligible", value=False)
             has_large_context = st.checkbox("Has large context", value=False)
-            api_base_url = st.text_input(
-                "OPTIMA API base URL",
-                value=os.getenv("OPTIMA_API_BASE_URL", DEFAULT_API_BASE_URL),
-                help=(
-                    "Use the local demo API or another configured OPTIMA "
-                    "FastAPI instance."
-                ),
-            )
         submitted = st.form_submit_button(
             "Run with OPTIMA",
             type="primary",
@@ -184,27 +177,29 @@ def execute_page() -> None:
         elif grounding_required and not context.strip():
             st.error("Enter supporting context when grounding is required.")
         else:
-            request = ExecuteInputs(
-                input_text=input_text.strip(),
-                context=context.strip() or None,
-                reference_output=reference_output.strip() or None,
-                quality_profile=quality_profile,
-                optimization_mode=optimization_mode,
-                task_type=task_type,
-                complexity=complexity,
-                input_tokens=int(input_tokens),
-                profile_risk_tier=profile_risk,
-                contract_risk_tier=contract_risk,
-                grounding_required=grounding_required,
-                cache_eligible=cache_eligible,
-                has_large_context=has_large_context,
-            ).to_run_request()
             try:
+                request = ExecuteInputs(
+                    input_text=input_text.strip(),
+                    context=context.strip() or None,
+                    reference_output=reference_output.strip() or None,
+                    quality_profile=quality_profile,
+                    optimization_mode=optimization_mode,
+                    task_type=task_type,
+                    complexity=complexity,
+                    input_tokens=int(input_tokens),
+                    profile_risk_tier=profile_risk,
+                    contract_risk_tier=contract_risk,
+                    grounding_required=grounding_required,
+                    cache_eligible=cache_eligible,
+                    has_large_context=has_large_context,
+                ).to_run_request()
                 with st.status("Executing the selected OPTIMA plan...", expanded=True):
                     st.write("Submitting the supplied request and profile to FastAPI")
-                    result = OptimaApiClient(api_base_url).execute(request)
+                    result = OptimaApiClient.from_environment().execute(request)
                     st.write("Validating returned RunResult evidence")
                 _store_result(result)
+            except ValidationError:
+                st.error("The supplied request exceeds an API field limit.")
             except (ApiClientError, ValueError) as error:
                 _render_api_error(error)
 

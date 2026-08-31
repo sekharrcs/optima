@@ -18,6 +18,16 @@ param deployContainerApps bool = false
 @description('Create OPTIMA-owned runtime access assignments. Requires Azure RBAC administration on the registry.')
 param deployRuntimeAccess bool = false
 
+@description('Existing single-tenant Microsoft Entra application client ID for UI authentication.')
+param uiAuthClientId string
+
+@description('Microsoft Entra tenant ID that may authenticate to the public UI.')
+param uiAuthTenantId string
+
+@secure()
+@description('Confidential-client secret of the existing UI Entra app registration. Supplied at preflight; never committed to source or parameter files.')
+param uiAuthClientSecret string = ''
+
 @description('Immutable API image manifest digest produced by a later build slice.')
 @minLength(71)
 @maxLength(71)
@@ -185,6 +195,14 @@ var validatedApiImageDigest = !deployContainerApps || apiImageDigestIsDeployable
 var validatedUiImageDigest = !deployContainerApps || uiImageDigestIsDeployable
   ? uiImageDigest
   : fail('Container Apps deployment requires a non-placeholder UI sha256 digest.')
+var placeholderIdentity = '00000000-0000-0000-0000-000000000000'
+var uiAuthConfigurationIsDeployable = uiAuthClientId != placeholderIdentity && uiAuthTenantId != placeholderIdentity && !empty(uiAuthClientSecret)
+var validatedUiAuthClientId = !deployContainerApps || uiAuthConfigurationIsDeployable
+  ? uiAuthClientId
+  : fail('Container Apps deployment requires a non-placeholder UI Entra client ID, tenant ID, and confidential-client secret.')
+var validatedUiAuthTenantId = !deployContainerApps || uiAuthConfigurationIsDeployable
+  ? uiAuthTenantId
+  : fail('Container Apps deployment requires a non-placeholder UI Entra client ID, tenant ID, and confidential-client secret.')
 var uniqueSuffix = uniqueString(subscription().subscriptionId, environmentName)
 var resourceNames = {
   apiContainerApp: 'ca-optima-api-${environmentName}'
@@ -303,6 +321,9 @@ module containerApps 'modules/container-apps.bicep' = if (deployContainerApps) {
     redisIndexName: 'optima-cache-v1'
     registryLoginServer: registry.outputs.loginServer
     tags: tags
+    uiAuthClientId: validatedUiAuthClientId
+    uiAuthClientSecret: uiAuthClientSecret
+    uiAuthTenantId: validatedUiAuthTenantId
     uiContainerAppName: resourceNames.uiContainerApp
     uiIdentityResourceId: identities.outputs.uiResourceId
     uiImage: '${registry.outputs.loginServer}/optima-ui@${validatedUiImageDigest}'

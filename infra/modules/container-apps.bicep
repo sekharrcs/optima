@@ -34,6 +34,16 @@ param apiIdentityPrincipalId string
 @description('UI user-assigned managed identity resource ID.')
 param uiIdentityResourceId string
 
+@description('Existing single-tenant Microsoft Entra application client ID for UI authentication.')
+param uiAuthClientId string
+
+@description('Microsoft Entra tenant ID that may authenticate to the public UI.')
+param uiAuthTenantId string
+
+@secure()
+@description('Confidential-client secret of the existing UI Entra app registration. Enables the authorization-code (hybrid) flow instead of the implicit flow. Supplied at preflight; never committed.')
+param uiAuthClientSecret string
+
 @description('Cosmos DB HTTPS account endpoint.')
 param cosmosEndpoint string
 
@@ -88,7 +98,8 @@ param judgeTimeoutSeconds int
 @description('OAuth token scope accepted by the configured Foundry or APIM endpoint.')
 param foundryTokenScope string
 
-@description('Application Insights connection string.')
+@secure()
+@description('Application Insights connection string stored as a Container App secret.')
 param applicationInsightsConnectionString string
 
 @description('Root trace sampling ratio for Application Insights.')
@@ -142,6 +153,12 @@ resource api 'Microsoft.App/containerApps@2025-07-01' = {
         transport: 'auto'
       }
       maxInactiveRevisions: 2
+      secrets: [
+        {
+          name: 'application-insights-connection-string'
+          value: applicationInsightsConnectionString
+        }
+      ]
       registries: [
         {
           identity: apiIdentityResourceId
@@ -166,6 +183,14 @@ resource api 'Microsoft.App/containerApps@2025-07-01' = {
             {
               name: 'OPTIMA_PRODUCTION_REQUIRE_REFERENCE_OUTPUT'
               value: validatedEvaluatorMode == 'EXACT_REFERENCE' ? 'true' : 'false'
+            }
+            {
+              name: 'OPTIMA_EXECUTION_CONCURRENCY_LIMIT'
+              value: '4'
+            }
+            {
+              name: 'OPTIMA_EXECUTION_TIMEOUT_SECONDS'
+              value: '300'
             }
             {
               name: 'OPTIMA_FOUNDRY_BASE_URL'
@@ -224,6 +249,10 @@ resource api 'Microsoft.App/containerApps@2025-07-01' = {
               value: apiIdentityClientId
             }
             {
+              name: 'OPTIMA_COSMOS_TIMEOUT_SECONDS'
+              value: '10'
+            }
+            {
               name: 'OPTIMA_REDIS_HOST'
               value: redisHost
             }
@@ -261,7 +290,7 @@ resource api 'Microsoft.App/containerApps@2025-07-01' = {
             }
             {
               name: 'OPTIMA_APPLICATION_INSIGHTS_CONNECTION_STRING'
-              value: applicationInsightsConnectionString
+              secretRef: 'application-insights-connection-string'
             }
             {
               name: 'OPTIMA_APPLICATION_INSIGHTS_SERVICE_NAME'
@@ -330,7 +359,7 @@ resource api 'Microsoft.App/containerApps@2025-07-01' = {
             name: 'http'
             http: {
               metadata: {
-                concurrentRequests: '20'
+                concurrentRequests: '4'
               }
             }
           }
@@ -368,6 +397,12 @@ resource ui 'Microsoft.App/containerApps@2025-07-01' = {
         transport: 'auto'
       }
       maxInactiveRevisions: 2
+      secrets: [
+        {
+          name: 'ui-auth-client-secret'
+          value: uiAuthClientSecret
+        }
+      ]
       registries: [
         {
           identity: uiIdentityResourceId
@@ -386,12 +421,20 @@ resource ui 'Microsoft.App/containerApps@2025-07-01' = {
               value: environmentName
             }
             {
+              name: 'OPTIMA_UI_PRODUCTION_MODE'
+              value: 'true'
+            }
+            {
               name: 'OPTIMA_REQUIRE_REFERENCE_OUTPUT'
               value: validatedEvaluatorMode == 'EXACT_REFERENCE' ? 'true' : 'false'
             }
             {
               name: 'OPTIMA_API_BASE_URL'
               value: 'https://${api.properties.configuration.ingress.fqdn}'
+            }
+            {
+              name: 'OPTIMA_API_TIMEOUT_SECONDS'
+              value: '315'
             }
           ]
           probes: [
@@ -439,6 +482,53 @@ resource ui 'Microsoft.App/containerApps@2025-07-01' = {
         ]
       }
       terminationGracePeriodSeconds: 30
+    }
+  }
+}
+
+resource uiAuthentication 'Microsoft.App/containerApps/authConfigs@2025-07-01' = {
+  parent: ui
+  name: 'current'
+  properties: {
+    globalValidation: {
+      redirectToProvider: 'azureActiveDirectory'
+      unauthenticatedClientAction: 'RedirectToLoginPage'
+    }
+    httpSettings: {
+      requireHttps: true
+      routes: {
+        apiPrefix: '/.auth'
+      }
+    }
+    identityProviders: {
+      azureActiveDirectory: {
+        enabled: true
+        registration: {
+          clientId: uiAuthClientId
+          clientSecretSettingName: 'ui-auth-client-secret'
+          openIdIssuer: '${environment().authentication.loginEndpoint}${uiAuthTenantId}/v2.0'
+        }
+        validation: {
+          allowedAudiences: [
+            uiAuthClientId
+            'api://${uiAuthClientId}'
+          ]
+        }
+      }
+    }
+    login: {
+      nonce: {
+        nonceExpirationInterval: '00:05:00'
+        validateNonce: true
+      }
+      // OPTIMA only authenticates the user; it never calls downstream APIs with a
+      // delegated user token, so no access/refresh token is persisted.
+      tokenStore: {
+        enabled: false
+      }
+    }
+    platform: {
+      enabled: true
     }
   }
 }

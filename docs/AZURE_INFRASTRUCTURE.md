@@ -11,7 +11,8 @@ description: Slice 11A and 11B Azure topology, runtime composition, deployment c
 > Slices 11A and 11B define infrastructure and deployment readiness only. They do not
 > deploy, update, or delete Azure resources. It defines optional runtime access
 > assignments, but it does not create federated credentials, GitHub
-> environments, or GitHub secrets.
+> environments, or GitHub secrets. Slice 11B-S adds credential-free, read-only
+> pull-request verification; it has no Azure identity or deployment capability.
 
 The reviewed target metadata is:
 
@@ -55,7 +56,7 @@ images and completes live access and regional preflight.
 ## Azure topology
 
 ```text
-GitHub Actions (later slice)
+GitHub Actions deployment (Slice 11C)
         |
         | OIDC federation
         v
@@ -70,7 +71,7 @@ Azure Resource Manager
                 +-- ACR Basic
                 +-- Container Apps Consumption environment
                 |       +-- internal OPTIMA API
-                |       +-- public OPTIMA Streamlit UI
+                |       +-- Entra-protected public OPTIMA Streamlit UI
                 +-- Cosmos DB for NoSQL serverless
                 +-- Azure Managed Redis Balanced B0
                 +-- Log Analytics workspace
@@ -93,7 +94,7 @@ OPTIMA UI  --HTTPS-------------> internal OPTIMA API
 | Azure Container Registry       | Basic, public endpoint, admin disabled, no dedicated data endpoint                     | Store API and UI images                      |
 | Container Apps environment     | Consumption-only, non-zone-redundant, no VNet, platform logs disabled                 | Host separate API and UI apps                |
 | API Container App              | Internal ingress, `0.5` vCPU/`1.0Gi`, min `0`, max `3`, HTTP health probes            | Execute OPTIMA and own Azure integrations    |
-| UI Container App               | External HTTPS ingress, `0.5` vCPU/`1.0Gi`, min `0`, max `2`, TCP health probes       | Serve the Streamlit experience               |
+| UI Container App               | External HTTPS ingress, tenant-restricted Entra auth, `0.5` vCPU/`1.0Gi`, min `0`, max `2` | Serve the Streamlit experience               |
 | Cosmos DB account              | NoSQL, serverless, one region, Session consistency, local auth disabled               | Persist immutable run history                |
 | Cosmos database/container      | `optima` / `runs`, partition key `/id`, consistent default index                      | Satisfy the existing storage adapter         |
 | Azure Managed Redis            | Balanced B0, HA disabled, TLS 1.2, public endpoint, access keys disabled               | Host semantic-cache evidence                 |
@@ -107,7 +108,9 @@ The API and UI remain separate deployment units because the UI is an HTTP
 client of the API, they use different ports and processes, and only the API
 needs model, Cosmos, Redis, and telemetry configuration. The API has internal
 Container Apps ingress because the current API has no caller authentication.
-The UI is the only public application endpoint.
+The UI is the only public application endpoint. Container Apps built-in
+authentication redirects every anonymous browser request to the configured
+single-tenant Microsoft Entra provider before Streamlit receives it.
 
 ## Deliberate omissions
 
@@ -131,10 +134,11 @@ No static Azure service credential remains in the proposed runtime:
 Application Insights still uses its generated connection string because the
 installed exporter does not accept a managed-identity credential. Microsoft
 documents the contained instrumentation key as a resource identifier, not a
-security token or key. The value is passed as ordinary Container Apps
-configuration and is never returned by the root template. Adding Key Vault for
-this generated destination value would add lifecycle and access complexity
-without improving the current threat boundary.
+security token or key. The value is a secure Bicep module output and input,
+stored as a Container Apps secret, referenced by the API environment, and never
+returned by the root template. Adding Key Vault for this generated destination
+value would add lifecycle and access complexity without improving the current
+threat boundary.
 
 ### Networking stack
 
@@ -204,8 +208,10 @@ contractless index fails closed once no active creator owns the lock.
 | Application setting   | Azure source                    | Secret | Identity alternative | Owner          |
 |-----------------------|---------------------------------|--------|----------------------|----------------|
 | `OPTIMA_API_BASE_URL` | Internal API Container App FQDN | No     | Not applicable       | Container Apps |
+| `OPTIMA_API_TIMEOUT_SECONDS` | Literal `315`                | No     | Not applicable       | IaC            |
 | `OPTIMA_DEPLOYMENT_ENVIRONMENT` | Literal `hackathon`       | No     | Not applicable       | IaC            |
 | `OPTIMA_REQUIRE_REFERENCE_OUTPUT` | Derived from evaluator mode | No   | Not applicable       | IaC            |
+| `OPTIMA_UI_PRODUCTION_MODE` | Literal `true`              | No     | Not applicable       | IaC            |
 
 The UI receives no Foundry, Cosmos, Redis, or Application Insights setting.
 
@@ -216,6 +222,8 @@ The UI receives no Foundry, Cosmos, Redis, or Application Insights setting.
 | `OPTIMA_DEPLOYMENT_ENVIRONMENT`                     | Literal `hackathon`                             | No     | Not applicable                 | IaC                |
 | `OPTIMA_PRODUCTION_EVALUATOR_MODE`                  | Reviewed `EXACT_REFERENCE` or `LLM_JUDGE` parameter | No | Not applicable                 | AI/model slice     |
 | `OPTIMA_PRODUCTION_REQUIRE_REFERENCE_OUTPUT`        | Derived from evaluator mode                    | No     | Not applicable                 | IaC                |
+| `OPTIMA_EXECUTION_CONCURRENCY_LIMIT`                | Literal `4`                                    | No     | Not applicable                 | IaC                |
+| `OPTIMA_EXECUTION_TIMEOUT_SECONDS`                  | Literal `300`                                  | No     | Not applicable                 | IaC                |
 | `OPTIMA_FOUNDRY_BASE_URL`                           | Reviewed Foundry/APIM parameter                | No     | Not applicable                 | AI/gateway slice   |
 | `OPTIMA_FOUNDRY_SMALL_DEPLOYMENT`                   | Reviewed model deployment parameter            | No     | Not applicable                 | AI/model slice     |
 | `OPTIMA_FOUNDRY_STRONG_DEPLOYMENT`                  | Reviewed model deployment parameter            | No     | Not applicable                 | AI/model slice     |
@@ -230,6 +238,7 @@ The UI receives no Foundry, Cosmos, Redis, or Application Insights setting.
 | `OPTIMA_COSMOS_CONTAINER_NAME`                      | Literal `runs`                                 | No     | Not applicable                 | IaC                |
 | `OPTIMA_COSMOS_AUTH_MODE`                           | Literal `MANAGED_IDENTITY`                     | No     | Replaces account key           | IaC                |
 | `OPTIMA_COSMOS_MANAGED_IDENTITY_CLIENT_ID`          | API identity client ID                         | No     | Selects user-assigned identity | IaC                |
+| `OPTIMA_COSMOS_TIMEOUT_SECONDS`                     | Literal `10`                                   | No     | Not applicable                 | IaC                |
 | `OPTIMA_REDIS_HOST`                                 | Derived Managed Redis hostname                 | No     | Not applicable                 | IaC                |
 | `OPTIMA_REDIS_INDEX_NAME`                           | Literal `optima-cache-v1`                      | No     | Not applicable                 | IaC/data bootstrap |
 | `OPTIMA_REDIS_EMBEDDING_DIMENSION`                  | Reviewed embedding parameter                   | No     | Not applicable                 | AI/cache slice     |
@@ -239,7 +248,7 @@ The UI receives no Foundry, Cosmos, Redis, or Application Insights setting.
 | `OPTIMA_REDIS_OBJECT_ID`                            | API identity principal/object ID               | No     | Redis AUTH username            | IaC                |
 | `OPTIMA_REDIS_MANAGED_IDENTITY_CLIENT_ID`           | API identity client ID                         | No     | Selects user-assigned identity | IaC                |
 | `OPTIMA_APPLICATION_INSIGHTS_ENABLED`               | Literal `true`                                 | No     | Not applicable                 | IaC                |
-| `OPTIMA_APPLICATION_INSIGHTS_CONNECTION_STRING`     | Application Insights connection string         | No     | None in current exporter       | IaC                |
+| `OPTIMA_APPLICATION_INSIGHTS_CONNECTION_STRING`     | Container Apps secret reference                | Yes    | None in current exporter       | IaC                |
 | `OPTIMA_APPLICATION_INSIGHTS_SERVICE_NAME`          | Literal `optima-api`                           | No     | Not applicable                 | IaC                |
 | `OPTIMA_APPLICATION_INSIGHTS_DEPLOYMENT_ENVIRONMENT`| Literal `hackathon`                             | No     | Not applicable                 | IaC                |
 | `OPTIMA_APPLICATION_INSIGHTS_SAMPLING_RATIO`        | Environment parameter, default `0.25`          | No     | Not applicable                 | IaC/operations     |
@@ -252,8 +261,9 @@ defaults unless benchmark calibration supplies an explicit override.
 
 No account key, Redis access key, Foundry API key, password, subscription
 credential, or tenant credential is present in a parameter file or template
-output. The generated Application Insights destination is passed between
-modules but is not exposed as a root output.
+output. The generated Application Insights destination uses secure module
+transport and a Container Apps secret reference and is not exposed as a root
+output.
 
 ## Runtime identity model
 
@@ -401,18 +411,40 @@ Resource deletion must be a separate reviewed action.
 Container Apps deployment is gated by `deployContainerApps=false`. Before
 setting it to `true`, all of these conditions must hold:
 
-1. API and UI Linux AMD64 images exist at the configured immutable manifest digests.
-2. The API image exposes a production entry point that composes all required
+1. The exact commit passed the Slice 11B-S read-only Linux AMD64 workflow,
+  including API and UI runtime smoke tests, non-root and native checks, rootfs
+  inspection, separate final-image SBOM generation, vulnerability policy, and
+  secret scanning.
+2. Slice 11C published the API and UI images to ACR, and both exist at the
+  configured immutable registry manifest digests. Local Docker image IDs are not
+  registry manifest digests.
+3. The API image exposes a production entry point that composes all required
    providers, evaluator, cost catalog, store, cache, and lifecycle owners.
-3. The API lifespan flushes and closes observability, Foundry transports,
+4. The API lifespan flushes and closes observability, Foundry transports,
    Cosmos resources, Redis renewal/client resources, and embedding resources.
-4. OPTIMA runtime access was bootstrapped with `deployRuntimeAccess=true`, then
+5. OPTIMA runtime access was bootstrapped with `deployRuntimeAccess=true`, then
   returned to `false`; external Foundry access was applied and verified.
-5. Redis bootstrap can inspect or create `optima-cache-v1` with the reviewed profile.
-6. Placeholder Foundry and embedding parameters have been replaced.
-7. The API health endpoint and UI startup have passed container smoke tests.
+6. Redis bootstrap can inspect or create `optima-cache-v1` with the reviewed profile.
+7. Placeholder Foundry and embedding parameters have been replaced.
+8. The production API health endpoint and UI startup pass with live configuration.
+9. Placeholder UI Entra client and tenant IDs have been replaced, a client secret
+  is supplied through the secure `uiAuthClientSecret` parameter, and the exact
+  `/.auth/login/aad/callback` URI is registered.
+10. Live Entra checks confirm authorized and unauthorized behavior, Streamlit
+   access, API internality, acceptable session and logout behavior, secret
+   non-disclosure, and explicit user restriction or application assignment.
+
+Exact-head workflow evidence is valid only for the commit recorded by that run.
+No hosted result, ACR publication, Azure deployment, production authentication,
+or live authorization result is claimed here.
 
 ## Future deployment flow
+
+The Slice 11B-S workflow is a separate pre-merge path. It runs untrusted
+pull-request code with `contents: read`, no persisted checkout credential, no
+secret or Azure identity, and no deployment command. Its Docker socket reaches
+only the ephemeral hosted runner. Slice 11C will add the distinct trusted OIDC
+deployment path shown below.
 
 ```text
 GitHub Actions
@@ -436,7 +468,8 @@ Build and push immutable API/UI images
 Enable Container Apps after access and runtime gates pass
 ```
 
-No workflow is implemented in Slice 11A or Slice 11B.
+A successful Slice 11B-S run may make PR #20 merge-ready for its exact head. It
+does not authorize merge and cannot declare Slice 11C deployed or successful.
 
 ## Risks and deployment blockers
 
@@ -453,6 +486,11 @@ No workflow is implemented in Slice 11A or Slice 11B.
 * RediSearch bootstrap requires authenticated live validation on first startup.
 * B0 Redis availability in East US 2 and subscription quota must be confirmed
   before deployment.
-* Public UI access has no application authentication, as specified for the MVP.
+* The UI Entra app registration and user-assignment policy are external tenant
+  prerequisites. Placeholder IDs block Container Apps deployment.
+* The shared backend history endpoints remain internal and have no per-user
+  ownership model. The public UI exposes only session-local history.
+* A successful hosted exact-head Slice 11B-S final-image build and scan remains
+  mandatory before deployment; no hosted result is recorded yet.
 * Scale-to-zero introduces API/UI cold starts and may affect demo latency.
 * The Log Analytics cap is an emergency brake, not a precise billing limit.

@@ -2,8 +2,10 @@
 
 from pathlib import Path
 
+import pytest
 from streamlit.testing.v1 import AppTest
 
+from optima.api.models import MAX_INPUT_TEXT_CHARACTERS
 from optima.domain.quality_contract import OptimizationMode, QualityProfile
 from ui.app import PRIMARY_VIEWS
 
@@ -20,6 +22,7 @@ def test_streamlit_app_starts_without_network_calls() -> None:
     assert app.selectbox[0].value is QualityProfile.HIGH
     assert app.selectbox[1].value is OptimizationMode.COST
     assert app.text_area[2].label == "Reference output (optional benchmark input)"
+    assert not app.text_input
     assert app.button[0].label == "Run with OPTIMA"
 
 
@@ -39,6 +42,22 @@ execute_page()
         app.text_area[2].label
         == "Reference output (required for exact-reference benchmark)"
     )
+
+
+def test_oversized_execute_input_renders_controlled_validation_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep local UI validation failures inside the display-safe boundary."""
+    monkeypatch.setenv("OPTIMA_REQUIRE_REFERENCE_OUTPUT", "false")
+    app = AppTest.from_file(str(APP_PATH), default_timeout=10).run()
+
+    app.text_area[0].input("x" * (MAX_INPUT_TEXT_CHARACTERS + 1))
+    app.button[0].click().run()
+
+    assert not app.exception
+    assert [error.value for error in app.error] == [
+        "The supplied request exceeds an API field limit."
+    ]
 
 
 def test_empty_dashboard_and_history_views_start() -> None:
