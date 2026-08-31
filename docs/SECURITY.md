@@ -327,9 +327,12 @@ is present:
 
 A GO recommendation does not change the pull request's draft state and does not
 authorize merge. Exact-head green evidence is necessary pre-merge evidence only.
-It does not declare Slice 11C deployed or successful. Slice 11C retains ACR
-publication, OIDC and deployment, production runtime startup, managed-identity
-access, regional checks, and live Entra acceptance.
+It does not declare Slice 11C deployed or successful. The separate manual Slice
+11C workflow retains ACR publication, OIDC and deployment, production runtime
+startup, managed-identity access, regional checks, and live Entra acceptance.
+It accepts no automatic pull-request or push trigger, and its validation job has
+no OIDC permission. See the
+[production deployment runbook](PRODUCTION_DEPLOYMENT.md).
 
 ## Unresolved security backlog
 

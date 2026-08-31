@@ -56,7 +56,9 @@ def isolate_settings_sources(
         "OPTIMA_HISTORY_SMALL_AVOID_PASS_RATE",
         "OPTIMA_FOUNDRY_BASE_URL",
         "OPTIMA_FOUNDRY_SMALL_DEPLOYMENT",
+        "OPTIMA_FOUNDRY_SMALL_MODEL",
         "OPTIMA_FOUNDRY_STRONG_DEPLOYMENT",
+        "OPTIMA_FOUNDRY_STRONG_MODEL",
         "OPTIMA_FOUNDRY_AUTH_MODE",
         "OPTIMA_FOUNDRY_API_KEY",
         "OPTIMA_FOUNDRY_TOKEN_SCOPE",
@@ -192,7 +194,9 @@ def test_settings_accept_explicit_injection() -> None:
         "history_small_avoid_pass_rate": 0.70,
         "foundry_base_url": None,
         "foundry_small_deployment": None,
+        "foundry_small_model": None,
         "foundry_strong_deployment": None,
+        "foundry_strong_model": None,
         "foundry_auth_mode": None,
         "foundry_api_key": None,
         "foundry_token_scope": None,
@@ -249,7 +253,9 @@ def production_settings(**updates: object) -> AppSettings:
         "production_require_reference_output": True,
         "foundry_base_url": "https://optima.openai.azure.com/openai/v1",
         "foundry_small_deployment": "small",
+        "foundry_small_model": "small-model",
         "foundry_strong_deployment": "strong",
+        "foundry_strong_model": "strong-model",
         "foundry_auth_mode": FoundryAuthMode.MANAGED_IDENTITY,
         "foundry_token_scope": "https://cognitiveservices.azure.com/.default",
         "foundry_managed_identity_client_id": "api-client-id",
@@ -370,7 +376,9 @@ def test_production_runtime_rejects_invalid_llm_judge_configuration(
             {
                 "foundry_base_url": None,
                 "foundry_small_deployment": None,
+                "foundry_small_model": None,
                 "foundry_strong_deployment": None,
+                "foundry_strong_model": None,
                 "foundry_auth_mode": None,
                 "foundry_token_scope": None,
                 "foundry_managed_identity_client_id": None,
@@ -982,7 +990,9 @@ def test_settings_build_explicit_foundry_authentication_modes(
     values: dict[str, object] = {
         "foundry_base_url": "https://gateway.example/openai/v1",
         "foundry_small_deployment": "small-deployment",
+        "foundry_small_model": "small-model",
         "foundry_strong_deployment": "strong-deployment",
+        "foundry_strong_model": "strong-model",
         "foundry_auth_mode": auth_mode,
     }
     values.update(auth_values)
@@ -993,7 +1003,9 @@ def test_settings_build_explicit_foundry_authentication_modes(
     assert configuration is not None
     assert configuration.auth_mode is auth_mode
     assert configuration.small_deployment == "small-deployment"
+    assert configuration.small_model == "small-model"
     assert configuration.strong_deployment == "strong-deployment"
+    assert configuration.strong_model == "strong-model"
     assert isinstance(configuration.api_key, SecretStr) or configuration.api_key is None
 
 
@@ -1006,7 +1018,9 @@ def test_settings_read_foundry_api_key_without_exposing_it(
         "https://gateway.example/openai/v1",
     )
     monkeypatch.setenv("OPTIMA_FOUNDRY_SMALL_DEPLOYMENT", "small-deployment")
+    monkeypatch.setenv("OPTIMA_FOUNDRY_SMALL_MODEL", "small-model")
     monkeypatch.setenv("OPTIMA_FOUNDRY_STRONG_DEPLOYMENT", "strong-deployment")
+    monkeypatch.setenv("OPTIMA_FOUNDRY_STRONG_MODEL", "strong-model")
     monkeypatch.setenv("OPTIMA_FOUNDRY_AUTH_MODE", "API_KEY")
     monkeypatch.setenv("OPTIMA_FOUNDRY_API_KEY", "configured-secret")
 

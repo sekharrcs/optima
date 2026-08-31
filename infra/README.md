@@ -1,14 +1,15 @@
 ---
 title: OPTIMA Azure Infrastructure
-description: Offline validation and deployment boundaries for the Slice 11A Bicep foundation
+description: Validation, deployment entry points, and safety boundaries for OPTIMA Azure resources
 ---
 
 # OPTIMA Azure Infrastructure
 
 > [!IMPORTANT]
-> Slices 11A and 11B do not perform an Azure deployment. Do not run deployment commands
-> until the architecture, costs, identity bootstrap, and application blockers in
-> [the Azure infrastructure design](../docs/AZURE_INFRASTRUCTURE.md) are reviewed.
+> Slices 11A and 11B did not perform an Azure deployment. Use the manual protected
+> workflow and [production deployment runbook](../docs/PRODUCTION_DEPLOYMENT.md)
+> for Slice 11C. Do not bypass its preflight, what-if, access, or immutable-image
+> gates with ad hoc deployment commands.
 
 ## Entry points
 
@@ -23,6 +24,12 @@ description: Offline validation and deployment boundaries for the Slice 11A Bice
 Both parameter files contain non-deployable model and image placeholders. Both
 keep `deployContainerApps=false` and `deployRuntimeAccess=false`. These values
 are deliberate deployment gates.
+
+The Container Apps environment is part of foundation convergence even while
+`deployContainerApps=false`. The API, UI, and UI authentication resources remain
+conditional. This allows the first reviewed run to discover the environment
+default domain and stop before public exposure while the exact Entra callback is
+registered.
 
 Application resources target East US 2 (`eastus2`). The existing bootstrap
 resource group and deployment identity may remain in East US because they are

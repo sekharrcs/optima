@@ -252,7 +252,9 @@ class FoundryProviderConfiguration(ImmutableModel):
 
     base_url: NonEmptyString
     small_deployment: NonEmptyString
+    small_model: NonEmptyString
     strong_deployment: NonEmptyString
+    strong_model: NonEmptyString
     auth_mode: FoundryAuthMode
     api_key: SecretStr | None = None
     token_scope: NonEmptyString | None = None
@@ -480,7 +482,9 @@ class AppSettings(BaseSettings):
     history_small_avoid_pass_rate: ConfiguredQualityScore = 0.70
     foundry_base_url: str | None = None
     foundry_small_deployment: str | None = None
+    foundry_small_model: str | None = None
     foundry_strong_deployment: str | None = None
+    foundry_strong_model: str | None = None
     foundry_auth_mode: FoundryAuthMode | None = None
     foundry_api_key: SecretStr | None = None
     foundry_token_scope: str | None = None
@@ -575,7 +579,9 @@ class AppSettings(BaseSettings):
         optional_values = (
             self.foundry_base_url,
             self.foundry_small_deployment,
+            self.foundry_small_model,
             self.foundry_strong_deployment,
+            self.foundry_strong_model,
             self.foundry_auth_mode,
             self.foundry_api_key,
             self.foundry_token_scope,
@@ -586,16 +592,21 @@ class AppSettings(BaseSettings):
         if (
             self.foundry_base_url is None
             or self.foundry_small_deployment is None
+            or self.foundry_small_model is None
             or self.foundry_strong_deployment is None
+            or self.foundry_strong_model is None
             or self.foundry_auth_mode is None
         ):
             raise ValueError(
-                "Foundry composition requires base URL, both deployments, and auth mode"
+                "Foundry composition requires base URL, SMALL and STRONG deployment "
+                "and model identities, and auth mode"
             )
         return FoundryProviderConfiguration(
             base_url=self.foundry_base_url,
             small_deployment=self.foundry_small_deployment,
+            small_model=self.foundry_small_model,
             strong_deployment=self.foundry_strong_deployment,
+            strong_model=self.foundry_strong_model,
             auth_mode=self.foundry_auth_mode,
             api_key=self.foundry_api_key,
             token_scope=self.foundry_token_scope,

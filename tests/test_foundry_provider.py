@@ -82,6 +82,7 @@ def successful_response(**updates: object) -> dict[str, object]:
     """Build one Azure OpenAI chat-completion response."""
     response: dict[str, object] = {
         "id": "chatcmpl-provider-1",
+        "model": "generator-response-model",
         "choices": [{"message": {"role": "assistant", "content": "Result"}}],
         "usage": {
             "prompt_tokens": 17,
@@ -573,7 +574,9 @@ def foundry_settings(
     values: dict[str, object] = {
         "foundry_base_url": "https://gateway.example/openai/v1",
         "foundry_small_deployment": "small-deployment",
+        "foundry_small_model": "generator-response-model",
         "foundry_strong_deployment": "strong-deployment",
+        "foundry_strong_model": "generator-response-model",
         "foundry_auth_mode": auth_mode,
     }
     values.update(updates)
@@ -617,6 +620,26 @@ def test_api_key_composition_creates_no_azure_credential(
         "strong-deployment",
     ]
     assert all(request.headers["api-key"] == "fake-key" for request in requests)
+
+
+def test_generator_composition_rejects_unexpected_response_model() -> None:
+    """Fail a generator call when the provider model identity drifts."""
+    pair = build_foundry_provider_pair(
+        foundry_settings(FoundryAuthMode.API_KEY, foundry_api_key="fake-key"),
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                json=successful_response(model="unexpected-model"),
+            )
+        ),
+    )
+
+    async def execute() -> None:
+        with pytest.raises(FoundryProviderError, match="invalid model response"):
+            await pair.small_provider.generate(provider_request(ModelRole.SMALL))
+        await pair.aclose()
+
+    asyncio.run(execute())
 
 
 @pytest.mark.parametrize(

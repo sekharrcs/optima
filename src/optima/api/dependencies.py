@@ -144,6 +144,7 @@ def build_foundry_provider_pair(
             model_role=ModelRole.SMALL,
             authentication=authentication,
             client=client,
+            expected_response_model=configuration.small_model,
             clock=monotonic_clock,
         ),
         strong_provider=FoundryModelProvider(
@@ -152,6 +153,7 @@ def build_foundry_provider_pair(
             model_role=ModelRole.STRONG,
             authentication=authentication,
             client=client,
+            expected_response_model=configuration.strong_model,
             clock=monotonic_clock,
         ),
         http_client=client,

@@ -4,6 +4,18 @@ param location string
 @description('Deployment environment name.')
 param environmentName string
 
+@description('Full Git commit SHA shared by both production images.')
+param deploymentCommitSha string
+
+@description('GitHub Actions workflow run identifier recorded on the deployed revisions.')
+param deploymentWorkflowRunId string
+
+@description('Deploy API and UI only after publication, access, and authentication gates pass.')
+param deployApplications bool
+
+@description('Expose UI ingress only after the deployed authentication child resource is verified.')
+param exposePublicUi bool
+
 @description('Container Apps managed environment name.')
 param containerAppsEnvironmentName string
 
@@ -74,8 +86,14 @@ param foundryBaseUrl string
 @description('Foundry deployment mapped to the OPTIMA SMALL role.')
 param foundrySmallDeployment string
 
+@description('Provider model identity expected from the OPTIMA SMALL deployment.')
+param foundrySmallModel string
+
 @description('Foundry deployment mapped to the OPTIMA STRONG role.')
 param foundryStrongDeployment string
+
+@description('Provider model identity expected from the OPTIMA STRONG deployment.')
+param foundryStrongModel string
 
 @description('Production quality evaluator mode.')
 @allowed([
@@ -105,18 +123,85 @@ param applicationInsightsConnectionString string
 @description('Root trace sampling ratio for Application Insights.')
 param applicationInsightsSamplingRatio string
 
+@description('Reviewed pricing catalog version that identifies the exact model-rate source.')
+param pricingCatalogVersion string
+
+@description('Shared ISO 4217 currency used by every reviewed model rate.')
+param pricingCurrency string
+
+@description('Reviewed SMALL input price per million tokens.')
+param pricingSmallInputRatePerMillionTokens string
+
+@description('Reviewed SMALL output price per million tokens.')
+param pricingSmallOutputRatePerMillionTokens string
+
+@description('Reviewed SMALL cached-input price per million tokens when the selected model has a distinct rate.')
+param pricingSmallCachedInputRatePerMillionTokens string?
+
+@description('Reviewed STRONG input price per million tokens.')
+param pricingStrongInputRatePerMillionTokens string
+
+@description('Reviewed STRONG output price per million tokens.')
+param pricingStrongOutputRatePerMillionTokens string
+
+@description('Reviewed STRONG cached-input price per million tokens when the selected model has a distinct rate.')
+param pricingStrongCachedInputRatePerMillionTokens string?
+
+@description('Reviewed JUDGE input price per million tokens in LLM_JUDGE mode.')
+param pricingJudgeInputRatePerMillionTokens string
+
+@description('Reviewed JUDGE output price per million tokens in LLM_JUDGE mode.')
+param pricingJudgeOutputRatePerMillionTokens string
+
+@description('Reviewed JUDGE cached-input price per million tokens when the selected model has a distinct rate.')
+param pricingJudgeCachedInputRatePerMillionTokens string?
+
+@description('Reviewed embedding input price per million tokens.')
+param pricingEmbeddingInputRatePerMillionTokens string
+
 @description('Common resource tags.')
 param tags object
 
 var judgeConfigurationIsDeployable = !empty(judgeDeployment) && !empty(judgeModel) && judgeDeployment != 'replace-judge-deployment' && judgeModel != 'replace-judge-model'
-var validatedEvaluatorMode = productionEvaluatorMode != 'LLM_JUDGE' || judgeConfigurationIsDeployable
+var validatedEvaluatorMode = !deployApplications || productionEvaluatorMode != 'LLM_JUDGE' || judgeConfigurationIsDeployable
   ? productionEvaluatorMode
   : fail('LLM_JUDGE Container Apps deployment requires deployable judge identities.')
+var optionalPricingEnvironment = concat(
+  !empty(pricingSmallCachedInputRatePerMillionTokens)
+    ? [
+        {
+          name: 'OPTIMA_PRICING_SMALL_CACHED_INPUT_RATE_PER_MILLION_TOKENS'
+          value: pricingSmallCachedInputRatePerMillionTokens!
+        }
+      ]
+    : [],
+  !empty(pricingStrongCachedInputRatePerMillionTokens)
+    ? [
+        {
+          name: 'OPTIMA_PRICING_STRONG_CACHED_INPUT_RATE_PER_MILLION_TOKENS'
+          value: pricingStrongCachedInputRatePerMillionTokens!
+        }
+      ]
+    : [],
+  !empty(pricingJudgeCachedInputRatePerMillionTokens)
+    ? [
+        {
+          name: 'OPTIMA_PRICING_JUDGE_CACHED_INPUT_RATE_PER_MILLION_TOKENS'
+          value: pricingJudgeCachedInputRatePerMillionTokens!
+        }
+      ]
+    : []
+)
+var deploymentTags = union(tags, {
+  sourceCommit: deploymentCommitSha
+  workflowRun: deploymentWorkflowRunId
+})
+var revisionSuffix = 'r-${take(deploymentCommitSha, 12)}-${take(deploymentWorkflowRunId, 20)}'
 
 resource managedEnvironment 'Microsoft.App/managedEnvironments@2025-07-01' = {
   name: containerAppsEnvironmentName
   location: location
-  tags: tags
+  tags: deploymentTags
   properties: {
     appLogsConfiguration: {
       destination: 'none'
@@ -126,10 +211,10 @@ resource managedEnvironment 'Microsoft.App/managedEnvironments@2025-07-01' = {
   }
 }
 
-resource api 'Microsoft.App/containerApps@2025-07-01' = {
+resource api 'Microsoft.App/containerApps@2025-07-01' = if (deployApplications) {
   name: apiContainerAppName
   location: location
-  tags: tags
+  tags: deploymentTags
   identity: {
     type: 'UserAssigned'
     userAssignedIdentities: {
@@ -167,156 +252,212 @@ resource api 'Microsoft.App/containerApps@2025-07-01' = {
       ]
     }
     template: {
+      revisionSuffix: revisionSuffix
       containers: [
         {
           name: 'api'
           image: apiImage
-          env: [
-            {
-              name: 'OPTIMA_DEPLOYMENT_ENVIRONMENT'
-              value: environmentName
-            }
-            {
-              name: 'OPTIMA_PRODUCTION_EVALUATOR_MODE'
-              value: validatedEvaluatorMode
-            }
-            {
-              name: 'OPTIMA_PRODUCTION_REQUIRE_REFERENCE_OUTPUT'
-              value: validatedEvaluatorMode == 'EXACT_REFERENCE' ? 'true' : 'false'
-            }
-            {
-              name: 'OPTIMA_EXECUTION_CONCURRENCY_LIMIT'
-              value: '4'
-            }
-            {
-              name: 'OPTIMA_EXECUTION_TIMEOUT_SECONDS'
-              value: '300'
-            }
-            {
-              name: 'OPTIMA_FOUNDRY_BASE_URL'
-              value: foundryBaseUrl
-            }
-            {
-              name: 'OPTIMA_FOUNDRY_SMALL_DEPLOYMENT'
-              value: foundrySmallDeployment
-            }
-            {
-              name: 'OPTIMA_FOUNDRY_STRONG_DEPLOYMENT'
-              value: foundryStrongDeployment
-            }
-            {
-              name: 'OPTIMA_JUDGE_DEPLOYMENT'
-              value: validatedEvaluatorMode == 'LLM_JUDGE' ? judgeDeployment! : 'not-applicable'
-            }
-            {
-              name: 'OPTIMA_JUDGE_MODEL'
-              value: validatedEvaluatorMode == 'LLM_JUDGE' ? judgeModel! : 'not-applicable'
-            }
-            {
-              name: 'OPTIMA_JUDGE_TIMEOUT_SECONDS'
-              value: string(judgeTimeoutSeconds)
-            }
-            {
-              name: 'OPTIMA_FOUNDRY_AUTH_MODE'
-              value: 'MANAGED_IDENTITY'
-            }
-            {
-              name: 'OPTIMA_FOUNDRY_TOKEN_SCOPE'
-              value: foundryTokenScope
-            }
-            {
-              name: 'OPTIMA_FOUNDRY_MANAGED_IDENTITY_CLIENT_ID'
-              value: apiIdentityClientId
-            }
-            {
-              name: 'OPTIMA_COSMOS_ENDPOINT'
-              value: cosmosEndpoint
-            }
-            {
-              name: 'OPTIMA_COSMOS_DATABASE_NAME'
-              value: cosmosDatabaseName
-            }
-            {
-              name: 'OPTIMA_COSMOS_CONTAINER_NAME'
-              value: cosmosContainerName
-            }
-            {
-              name: 'OPTIMA_COSMOS_AUTH_MODE'
-              value: 'MANAGED_IDENTITY'
-            }
-            {
-              name: 'OPTIMA_COSMOS_MANAGED_IDENTITY_CLIENT_ID'
-              value: apiIdentityClientId
-            }
-            {
-              name: 'OPTIMA_COSMOS_TIMEOUT_SECONDS'
-              value: '10'
-            }
-            {
-              name: 'OPTIMA_REDIS_HOST'
-              value: redisHost
-            }
-            {
-              name: 'OPTIMA_REDIS_INDEX_NAME'
-              value: redisIndexName
-            }
-            {
-              name: 'OPTIMA_REDIS_EMBEDDING_DIMENSION'
-              value: string(redisEmbeddingDimension)
-            }
-            {
-              name: 'OPTIMA_REDIS_EMBEDDING_MODEL'
-              value: redisEmbeddingModel
-            }
-            {
-              name: 'OPTIMA_REDIS_EMBEDDING_DEPLOYMENT'
-              value: redisEmbeddingDeployment
-            }
-            {
-              name: 'OPTIMA_REDIS_AUTH_MODE'
-              value: 'MANAGED_IDENTITY'
-            }
-            {
-              name: 'OPTIMA_REDIS_OBJECT_ID'
-              value: apiIdentityPrincipalId
-            }
-            {
-              name: 'OPTIMA_REDIS_MANAGED_IDENTITY_CLIENT_ID'
-              value: apiIdentityClientId
-            }
-            {
-              name: 'OPTIMA_APPLICATION_INSIGHTS_ENABLED'
-              value: 'true'
-            }
-            {
-              name: 'OPTIMA_APPLICATION_INSIGHTS_CONNECTION_STRING'
-              secretRef: 'application-insights-connection-string'
-            }
-            {
-              name: 'OPTIMA_APPLICATION_INSIGHTS_SERVICE_NAME'
-              value: 'optima-api'
-            }
-            {
-              name: 'OPTIMA_APPLICATION_INSIGHTS_DEPLOYMENT_ENVIRONMENT'
-              value: environmentName
-            }
-            {
-              name: 'OPTIMA_APPLICATION_INSIGHTS_SAMPLING_RATIO'
-              value: applicationInsightsSamplingRatio
-            }
-            {
-              name: 'OPTIMA_APPLICATION_INSIGHTS_LIVE_METRICS_ENABLED'
-              value: 'false'
-            }
-            {
-              name: 'OPTIMA_APPLICATION_INSIGHTS_PERFORMANCE_COUNTERS_ENABLED'
-              value: 'false'
-            }
-            {
-              name: 'OPTIMA_APPLICATION_INSIGHTS_OFFLINE_STORAGE_ENABLED'
-              value: 'false'
-            }
-          ]
+          env: concat(
+            [
+              {
+                name: 'OPTIMA_DEPLOYMENT_ENVIRONMENT'
+                value: environmentName
+              }
+              {
+                name: 'OPTIMA_PRODUCTION_EVALUATOR_MODE'
+                value: validatedEvaluatorMode
+              }
+              {
+                name: 'OPTIMA_PRODUCTION_REQUIRE_REFERENCE_OUTPUT'
+                value: validatedEvaluatorMode == 'EXACT_REFERENCE' ? 'true' : 'false'
+              }
+              {
+                name: 'OPTIMA_EXECUTION_CONCURRENCY_LIMIT'
+                value: '4'
+              }
+              {
+                name: 'OPTIMA_EXECUTION_TIMEOUT_SECONDS'
+                value: '300'
+              }
+              {
+                name: 'OPTIMA_FOUNDRY_BASE_URL'
+                value: foundryBaseUrl
+              }
+              {
+                name: 'OPTIMA_FOUNDRY_SMALL_DEPLOYMENT'
+                value: foundrySmallDeployment
+              }
+              {
+                name: 'OPTIMA_FOUNDRY_SMALL_MODEL'
+                value: foundrySmallModel
+              }
+              {
+                name: 'OPTIMA_FOUNDRY_STRONG_DEPLOYMENT'
+                value: foundryStrongDeployment
+              }
+              {
+                name: 'OPTIMA_FOUNDRY_STRONG_MODEL'
+                value: foundryStrongModel
+              }
+              {
+                name: 'OPTIMA_JUDGE_DEPLOYMENT'
+                value: validatedEvaluatorMode == 'LLM_JUDGE' ? judgeDeployment! : 'not-applicable'
+              }
+              {
+                name: 'OPTIMA_JUDGE_MODEL'
+                value: validatedEvaluatorMode == 'LLM_JUDGE' ? judgeModel! : 'not-applicable'
+              }
+              {
+                name: 'OPTIMA_JUDGE_TIMEOUT_SECONDS'
+                value: string(judgeTimeoutSeconds)
+              }
+              {
+                name: 'OPTIMA_FOUNDRY_AUTH_MODE'
+                value: 'MANAGED_IDENTITY'
+              }
+              {
+                name: 'OPTIMA_FOUNDRY_TOKEN_SCOPE'
+                value: foundryTokenScope
+              }
+              {
+                name: 'OPTIMA_FOUNDRY_MANAGED_IDENTITY_CLIENT_ID'
+                value: apiIdentityClientId
+              }
+              {
+                name: 'OPTIMA_COSMOS_ENDPOINT'
+                value: cosmosEndpoint
+              }
+              {
+                name: 'OPTIMA_COSMOS_DATABASE_NAME'
+                value: cosmosDatabaseName
+              }
+              {
+                name: 'OPTIMA_COSMOS_CONTAINER_NAME'
+                value: cosmosContainerName
+              }
+              {
+                name: 'OPTIMA_COSMOS_AUTH_MODE'
+                value: 'MANAGED_IDENTITY'
+              }
+              {
+                name: 'OPTIMA_COSMOS_MANAGED_IDENTITY_CLIENT_ID'
+                value: apiIdentityClientId
+              }
+              {
+                name: 'OPTIMA_COSMOS_TIMEOUT_SECONDS'
+                value: '10'
+              }
+              {
+                name: 'OPTIMA_REDIS_HOST'
+                value: redisHost
+              }
+              {
+                name: 'OPTIMA_REDIS_INDEX_NAME'
+                value: redisIndexName
+              }
+              {
+                name: 'OPTIMA_REDIS_EMBEDDING_DIMENSION'
+                value: string(redisEmbeddingDimension)
+              }
+              {
+                name: 'OPTIMA_REDIS_EMBEDDING_MODEL'
+                value: redisEmbeddingModel
+              }
+              {
+                name: 'OPTIMA_REDIS_EMBEDDING_DEPLOYMENT'
+                value: redisEmbeddingDeployment
+              }
+              {
+                name: 'OPTIMA_REDIS_AUTH_MODE'
+                value: 'MANAGED_IDENTITY'
+              }
+              {
+                name: 'OPTIMA_REDIS_OBJECT_ID'
+                value: apiIdentityPrincipalId
+              }
+              {
+                name: 'OPTIMA_REDIS_MANAGED_IDENTITY_CLIENT_ID'
+                value: apiIdentityClientId
+              }
+              {
+                name: 'OPTIMA_APPLICATION_INSIGHTS_ENABLED'
+                value: 'true'
+              }
+              {
+                name: 'OPTIMA_APPLICATION_INSIGHTS_CONNECTION_STRING'
+                secretRef: 'application-insights-connection-string'
+              }
+              {
+                name: 'OPTIMA_APPLICATION_INSIGHTS_SERVICE_NAME'
+                value: 'optima-api'
+              }
+              {
+                name: 'OPTIMA_APPLICATION_INSIGHTS_SERVICE_VERSION'
+                value: deploymentCommitSha
+              }
+              {
+                name: 'OPTIMA_APPLICATION_INSIGHTS_DEPLOYMENT_ENVIRONMENT'
+                value: environmentName
+              }
+              {
+                name: 'OPTIMA_APPLICATION_INSIGHTS_SAMPLING_RATIO'
+                value: applicationInsightsSamplingRatio
+              }
+              {
+                name: 'OPTIMA_APPLICATION_INSIGHTS_LIVE_METRICS_ENABLED'
+                value: 'false'
+              }
+              {
+                name: 'OPTIMA_APPLICATION_INSIGHTS_PERFORMANCE_COUNTERS_ENABLED'
+                value: 'false'
+              }
+              {
+                name: 'OPTIMA_APPLICATION_INSIGHTS_OFFLINE_STORAGE_ENABLED'
+                value: 'false'
+              }
+              {
+                name: 'OPTIMA_PRODUCTION_COST_MEASUREMENT_REQUIRED'
+                value: 'true'
+              }
+              {
+                name: 'OPTIMA_PRICING_CATALOG_VERSION'
+                value: pricingCatalogVersion
+              }
+              {
+                name: 'OPTIMA_PRICING_CURRENCY'
+                value: pricingCurrency
+              }
+              {
+                name: 'OPTIMA_PRICING_SMALL_INPUT_RATE_PER_MILLION_TOKENS'
+                value: pricingSmallInputRatePerMillionTokens
+              }
+              {
+                name: 'OPTIMA_PRICING_SMALL_OUTPUT_RATE_PER_MILLION_TOKENS'
+                value: pricingSmallOutputRatePerMillionTokens
+              }
+              {
+                name: 'OPTIMA_PRICING_STRONG_INPUT_RATE_PER_MILLION_TOKENS'
+                value: pricingStrongInputRatePerMillionTokens
+              }
+              {
+                name: 'OPTIMA_PRICING_STRONG_OUTPUT_RATE_PER_MILLION_TOKENS'
+                value: pricingStrongOutputRatePerMillionTokens
+              }
+              {
+                name: 'OPTIMA_PRICING_JUDGE_INPUT_RATE_PER_MILLION_TOKENS'
+                value: pricingJudgeInputRatePerMillionTokens
+              }
+              {
+                name: 'OPTIMA_PRICING_JUDGE_OUTPUT_RATE_PER_MILLION_TOKENS'
+                value: pricingJudgeOutputRatePerMillionTokens
+              }
+              {
+                name: 'OPTIMA_PRICING_EMBEDDING_INPUT_RATE_PER_MILLION_TOKENS'
+                value: pricingEmbeddingInputRatePerMillionTokens
+              }
+            ],
+            optionalPricingEnvironment
+          )
           probes: [
             {
               type: 'Liveness'
@@ -370,10 +511,10 @@ resource api 'Microsoft.App/containerApps@2025-07-01' = {
   }
 }
 
-resource ui 'Microsoft.App/containerApps@2025-07-01' = {
+resource ui 'Microsoft.App/containerApps@2025-07-01' = if (deployApplications) {
   name: uiContainerAppName
   location: location
-  tags: tags
+  tags: deploymentTags
   identity: {
     type: 'UserAssigned'
     userAssignedIdentities: {
@@ -386,7 +527,7 @@ resource ui 'Microsoft.App/containerApps@2025-07-01' = {
       activeRevisionsMode: 'Single'
       ingress: {
         allowInsecure: false
-        external: true
+        external: exposePublicUi
         targetPort: 8501
         traffic: [
           {
@@ -411,6 +552,7 @@ resource ui 'Microsoft.App/containerApps@2025-07-01' = {
       ]
     }
     template: {
+      revisionSuffix: revisionSuffix
       containers: [
         {
           name: 'ui'
@@ -430,7 +572,7 @@ resource ui 'Microsoft.App/containerApps@2025-07-01' = {
             }
             {
               name: 'OPTIMA_API_BASE_URL'
-              value: 'https://${api.properties.configuration.ingress.fqdn}'
+              value: 'https://${api!.properties.configuration.ingress.fqdn}'
             }
             {
               name: 'OPTIMA_API_TIMEOUT_SECONDS'
@@ -486,7 +628,7 @@ resource ui 'Microsoft.App/containerApps@2025-07-01' = {
   }
 }
 
-resource uiAuthentication 'Microsoft.App/containerApps/authConfigs@2025-07-01' = {
+resource uiAuthentication 'Microsoft.App/containerApps/authConfigs@2025-07-01' = if (deployApplications) {
   parent: ui
   name: 'current'
   properties: {
@@ -534,7 +676,10 @@ resource uiAuthentication 'Microsoft.App/containerApps/authConfigs@2025-07-01' =
 }
 
 output environmentResourceId string = managedEnvironment.id
-output apiResourceId string = api.id
-output apiUrl string = 'https://${api.properties.configuration.ingress.fqdn}'
-output uiResourceId string = ui.id
-output uiUrl string = 'https://${ui.properties.configuration.ingress.fqdn}'
+output environmentDefaultDomain string = managedEnvironment.properties.defaultDomain
+output apiResourceId string = deployApplications ? api!.id : ''
+output apiRevisionName string = deployApplications ? api!.properties.latestRevisionName : ''
+output apiUrl string = deployApplications ? 'https://${api!.properties.configuration.ingress.fqdn}' : ''
+output uiResourceId string = deployApplications ? ui!.id : ''
+output uiRevisionName string = deployApplications ? ui!.properties.latestRevisionName : ''
+output uiUrl string = deployApplications ? 'https://${ui!.properties.configuration.ingress.fqdn}' : ''

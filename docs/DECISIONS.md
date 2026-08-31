@@ -584,3 +584,33 @@ non-editable installation is mandatory. Each image embeds a CycloneDX inventory
 of its exact installed Python environment. A final image build, smoke test,
 content inspection, and advisory/secret scan remain deployment gates whenever
 the current workstation cannot provide an OCI builder.
+
+## ADR-037: Use phased OIDC deployment with immutable revision provenance
+
+Status: Accepted
+
+Production deployment is manual, serialized, and gated by the protected GitHub
+`hackathon` environment. The validation job has no Azure identity. A later job
+receives `id-token: write`, authenticates through the environment-scoped
+federated credential, and performs read-only preflight before each authorized
+mutation boundary. Long-lived Azure client secrets are prohibited.
+
+The initial foundation creates the existing Consumption Container Apps
+environment while API and UI resources remain disabled. This exposes the stable
+default domain required to register the exact UI Entra callback without first
+creating a publicly reachable unauthenticated application. A later run verifies
+the callback, user-assignment requirement, external Foundry access, runtime
+assignments, and registry manifests before enabling both applications. The UI is
+first deployed with internal ingress; external ingress is a second deployment
+allowed only after the Easy Auth child is read back and verified.
+
+The unprivileged job scans one exact API/UI image pair and transfers those image
+objects to the deployment job without rebuilding. The images share one full Git
+commit tag for publication but deploy only by separate ACR-generated manifest
+digests. Resource tags, revision suffixes,
+Application Insights service version, ARM deployment records, and the workflow
+summary retain commit or workflow-run provenance. Reviewed catalog rates are
+required in production; incomplete or placeholder model/pricing configuration
+fails before application deployment or startup. The routine identity never
+bootstraps runtime RBAC. Any attempted rollout failure disables public UI ingress
+and restores the captured ready API/UI revision pair when one exists.
