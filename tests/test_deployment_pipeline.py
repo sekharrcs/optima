@@ -55,7 +55,10 @@ def test_all_actions_are_pinned_to_full_commit_shas() -> None:
         re.fullmatch(r"[^@]+@[0-9a-f]{40}", reference)
         for reference in action_references
     )
-    assert "azure/login@eec3c95657c1536435858eda1f3ff5437fee8474" in (action_references)
+    assert "azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5" in action_references
+    # eec3c95 is the v2.3.0 annotated tag object, not a commit; GitHub resolves
+    # a `uses:` SHA as a commit, so an unpeeled tag-object pin must never return.
+    assert "eec3c95657c1536435858eda1f3ff5437fee8474" not in workflow()
 
 
 def test_preflight_and_mutation_order_is_fail_closed() -> None:
@@ -112,10 +115,10 @@ def test_rollout_records_source_and_verifies_runtime_contracts() -> None:
     assert 'test "$ui_health" = "Healthy"' in content
     assert 'test "$external_api" = "false"' in content
     assert 'test "$configured_api_url" = "$API_URL"' in content
-    assert "az containerapp exec" in content
-    assert "python -m ui.deployment_smoke" in content
-    assert 'tee "$smoke_log"' in content
-    assert "grep -F 'OPTIMA_DEPLOYMENT_SMOKE_PASSED'" in content
+    assert "az containerapp exec" not in content
+    assert "az containerapp job start" in content
+    assert "az containerapp job execution list" in content
+    assert 'test "$smoke_status" = "Succeeded"' in content
     assert "az monitor app-insights query" in content
     assert "operation_Id == '$trace_id'" in content
     assert "small_roles != {ModelRole.SMALL, ModelRole.JUDGE}" in smoke
@@ -133,7 +136,7 @@ def test_ui_is_internal_until_easy_auth_is_verified() -> None:
     content = workflow()
     internal = content.index("exposePublicUi=false", content.index("--phase rollout"))
     auth = content.index("authConfigs/current", internal)
-    live_execution = content.index("python -m ui.deployment_smoke", auth)
+    live_execution = content.index("az containerapp job start", auth)
     telemetry = content.index("operation_Id == '$trace_id'", live_execution)
     public = content.index("exposePublicUi=true", auth)
 
@@ -144,12 +147,34 @@ def test_ui_is_internal_until_easy_auth_is_verified() -> None:
     assert 'test "$contained" = "true"' in content
 
 
+def test_pre_exposure_smoke_uses_a_container_apps_job() -> None:
+    """Gate exposure on a job execution status, not a shell exec into distroless.
+
+    The UI runtime image is distroless (no shell), so ``az containerapp exec``
+    cannot run the smoke inside it. The workflow starts a one-shot job and
+    requires a ``Succeeded`` execution before enabling external ingress.
+    """
+    content = workflow()
+
+    assert "az containerapp exec" not in content
+    assert '"smokeTraceparent=00-$trace_id-$parent_id-01"' in content
+    assert '"smokeRunMarker=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"' in content
+    assert "properties.outputs.smokeJobName.value" in content
+    start = content.index("az containerapp job start")
+    status = content.index("properties.status", start)
+    gate = content.index('test "$smoke_status" = "Succeeded"', status)
+    telemetry = content.index("operation_Id == '$trace_id'", gate)
+    public = content.index("exposePublicUi=true", gate)
+    assert start < status < gate < telemetry < public
+
+
 def test_failed_rollout_restores_previous_revision_pair() -> None:
     """Contain first failures and reactivate both prior immutable revisions."""
     content = workflow()
 
     assert "Capture the active revision pair for automatic rollback" in content
     assert "Restore the previous ready revision pair" in content
+    assert "UI container app is absent" in content
     assert content.count("failure() || cancelled()") == 2
     assert content.count("az containerapp revision copy") == 2
     assert '--from-revision "$PREVIOUS_API_REVISION"' in content

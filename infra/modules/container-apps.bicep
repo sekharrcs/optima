@@ -10,6 +10,12 @@ param deploymentCommitSha string
 @description('GitHub Actions workflow run identifier recorded on the deployed revisions.')
 param deploymentWorkflowRunId string
 
+@description('W3C traceparent the pre-exposure smoke job sends so its API request is correlated in Application Insights.')
+param smokeTraceparent string
+
+@description('Unique per-run marker the pre-exposure smoke job records on its request.')
+param smokeRunMarker string
+
 @description('Deploy API and UI only after publication, access, and authentication gates pass.')
 param deployApplications bool
 
@@ -24,6 +30,9 @@ param apiContainerAppName string
 
 @description('UI Container App name.')
 param uiContainerAppName string
+
+@description('Pre-exposure deployment smoke Container Apps job name.')
+param smokeJobName string
 
 @description('Immutable API image reference.')
 param apiImage string
@@ -671,6 +680,74 @@ resource uiAuthentication 'Microsoft.App/containerApps/authConfigs@2025-07-01' =
     }
     platform: {
       enabled: true
+    }
+  }
+}
+
+// The UI runtime image is distroless (no shell), so the pre-exposure smoke runs
+// as a one-shot Container Apps job that execs the image's own Python entrypoint
+// inside the environment. `az containerapp exec` cannot target a shell-less
+// container. Success is proven by the job execution exit status, not stdout,
+// because the environment ships no container console logs.
+resource deploymentSmokeJob 'Microsoft.App/jobs@2025-07-01' = if (deployApplications) {
+  name: smokeJobName
+  location: location
+  tags: deploymentTags
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${uiIdentityResourceId}': {}
+    }
+  }
+  properties: {
+    environmentId: managedEnvironment.id
+    configuration: {
+      triggerType: 'Manual'
+      replicaTimeout: 600
+      replicaRetryLimit: 0
+      manualTriggerConfig: {
+        parallelism: 1
+        replicaCompletionCount: 1
+      }
+      registries: [
+        {
+          identity: uiIdentityResourceId
+          server: registryLoginServer
+        }
+      ]
+    }
+    template: {
+      containers: [
+        {
+          name: 'smoke'
+          image: uiImage
+          command: [
+            'python'
+          ]
+          args: [
+            '-m'
+            'ui.deployment_smoke'
+            '--traceparent'
+            smokeTraceparent
+            '--run-marker'
+            smokeRunMarker
+          ]
+          env: [
+            {
+              name: 'OPTIMA_API_BASE_URL'
+              value: 'https://${api!.properties.configuration.ingress.fqdn}'
+            }
+            {
+              name: 'OPTIMA_API_TIMEOUT_SECONDS'
+              value: '315'
+            }
+          ]
+          resources: {
+            cpu: json('0.5')
+            memory: '1.0Gi'
+          }
+        }
+      ]
     }
   }
 }

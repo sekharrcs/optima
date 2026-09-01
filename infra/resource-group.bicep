@@ -20,6 +20,12 @@ param deploymentCommitSha string
 @description('GitHub Actions workflow run identifier recorded on the deployed revisions.')
 param deploymentWorkflowRunId string
 
+@description('W3C traceparent the pre-exposure smoke job sends so its API request is correlated in Application Insights. Required when Container Apps deploy.')
+param smokeTraceparent string = ''
+
+@description('Unique per-run marker the pre-exposure smoke job records. Required when Container Apps deploy.')
+param smokeRunMarker string = ''
+
 @description('Deploy API and UI only after images, runtime composition, and data-plane access are ready.')
 param deployContainerApps bool = false
 
@@ -364,6 +370,10 @@ var validatedDeploymentCommitSha = !deployContainerApps || deploymentProvenanceI
 var validatedExposePublicUi = !exposePublicUi || deployContainerApps
   ? exposePublicUi
   : fail('Public UI exposure requires Container Apps deployment.')
+var smokeConfigurationIsDeployable = !empty(smokeTraceparent) && !empty(smokeRunMarker)
+var validatedSmokeTraceparent = !deployContainerApps || smokeConfigurationIsDeployable
+  ? smokeTraceparent
+  : fail('Container Apps deployment requires a pre-exposure smoke traceparent and run marker.')
 var uniqueSuffix = uniqueString(subscription().subscriptionId, environmentName)
 var resourceNames = {
   apiContainerApp: 'ca-optima-api-${environmentName}'
@@ -374,6 +384,7 @@ var resourceNames = {
   cosmosAccount: 'cosmos-optima-${uniqueSuffix}'
   logAnalyticsWorkspace: 'law-optima-${environmentName}'
   redis: 'redis-optima-${uniqueSuffix}'
+  smokeJob: 'caj-optima-smoke-${environmentName}'
   uiContainerApp: 'ca-optima-ui-${environmentName}'
   uiIdentity: 'id-optima-ui-${environmentName}'
 }
@@ -499,6 +510,9 @@ module containerApps 'modules/container-apps.bicep' = {
     redisHost: redis.outputs.hostName
     redisIndexName: 'optima-cache-v1'
     registryLoginServer: registry.outputs.loginServer
+    smokeJobName: resourceNames.smokeJob
+    smokeRunMarker: smokeRunMarker
+    smokeTraceparent: validatedSmokeTraceparent
     tags: tags
     uiAuthClientId: validatedUiAuthClientId
     uiAuthClientSecret: uiAuthClientSecret
@@ -518,6 +532,7 @@ output apiUrl string = containerApps.outputs.apiUrl
 output uiContainerAppName string = resourceNames.uiContainerApp
 output uiRevisionName string = deployContainerApps ? containerApps!.outputs.uiRevisionName : ''
 output uiUrl string = containerApps.outputs.uiUrl
+output smokeJobName string = resourceNames.smokeJob
 output cosmosAccountName string = resourceNames.cosmosAccount
 output cosmosEndpoint string = cosmos.outputs.endpoint
 output cosmosDatabaseName string = cosmos.outputs.databaseName

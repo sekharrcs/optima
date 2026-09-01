@@ -52,6 +52,36 @@ def test_container_apps_require_separate_immutable_image_digests() -> None:
     assert "uiImageDigest == toLower(uiImageDigest)" in resources
 
 
+def test_pre_exposure_smoke_runs_as_a_distroless_safe_job() -> None:
+    """Run the pre-exposure smoke as a job because the UI image has no shell.
+
+    The UI runtime image is distroless, so ``az containerapp exec`` cannot open a
+    shell in it. The smoke must run the image's own Python entrypoint as a
+    one-shot manual Container Apps job that is gated on its execution status.
+    """
+    module = read("infra/modules/container-apps.bicep")
+    resources = read("infra/resource-group.bicep")
+
+    assert "resource deploymentSmokeJob 'Microsoft.App/jobs@" in module
+    assert "= if (deployApplications) {" in module
+    assert "triggerType: 'Manual'" in module
+    assert "replicaRetryLimit: 0" in module
+    assert "image: uiImage" in module
+    assert "'ui.deployment_smoke'" in module
+    assert "'--traceparent'" in module
+    assert "'--run-marker'" in module
+    assert "value: 'https://${api!.properties.configuration.ingress.fqdn}'" in module
+    assert "param smokeTraceparent string" in module
+    assert "param smokeRunMarker string" in module
+    assert "param smokeJobName string" in module
+
+    assert "smokeJob: 'caj-optima-smoke-${environmentName}'" in resources
+    assert "smokeJobName: resourceNames.smokeJob" in resources
+    assert "smokeTraceparent: validatedSmokeTraceparent" in resources
+    assert "fail('Container Apps deployment requires a pre-exposure smoke" in resources
+    assert "output smokeJobName string = resourceNames.smokeJob" in resources
+
+
 def test_bicep_entry_points_restrict_application_location_to_eastus2() -> None:
     """Reject an unreviewed application region instead of falling back silently."""
     for relative_path in ("infra/main.bicep", "infra/resource-group.bicep"):

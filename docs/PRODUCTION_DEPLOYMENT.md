@@ -279,9 +279,12 @@ release and commit, then update the pin and comment together.
 The workflow waits for both active revisions to report `Healthy`, then verifies
 their exact digest-qualified image references. It confirms the API ingress is
 internal, the UI contains the deployed HTTPS API URL rather than localhost, and
-the UI container can complete one bounded SMALL/JUDGE production run with
-measured pricing. The run carries a unique W3C trace ID that the workflow finds
-in Application Insights by `operation_Id`.
+a one-shot Container Apps job running the UI runtime image completes one bounded
+SMALL/JUDGE production run with measured pricing. The UI image is distroless and
+has no shell, so the smoke runs the image's own Python entrypoint as a job and is
+gated on the `Succeeded` execution status rather than `az containerapp exec`. The
+run carries a unique W3C trace ID that the workflow finds in Application Insights
+by `operation_Id`.
 
 Use these read-only checks when investigating a rollout:
 
@@ -298,9 +301,9 @@ az containerapp revision list --resource-group rg-optima-hackathon \
 
 An anonymous UI request must redirect to Entra or return `401`/`403`. The API
 must not be reachable from the public internet. A run-specific API request made
-from the UI container must appear in Application Insights within the workflow
-timeout. Do not print prompts, outputs, connection strings, tokens, or secret
-values while inspecting logs or telemetry.
+by the pre-exposure smoke job must appear in Application Insights within the
+workflow timeout. Do not print prompts, outputs, connection strings, tokens, or
+secret values while inspecting logs or telemetry.
 
 ## Safe rollback
 

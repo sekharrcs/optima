@@ -351,8 +351,9 @@ jobs:
           test "$GITHUB_REF" = "refs/heads/main"
           test "$OPTIMA_GITHUB_ENVIRONMENT" = "hackathon"
 
-      # Azure/login v2.3.0, resolved from the upstream tag with git ls-remote.
-      - uses: azure/login@eec3c95657c1536435858eda1f3ff5437fee8474
+      # Azure/login v2.3.0 commit (refs/tags/v2.3.0^{}); the annotated tag object
+      # eec3c95 is not a commit, so pin the peeled commit that Actions can resolve.
+      - uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5
         with:
           client-id: "${{ vars.AZURE_CLIENT_ID }}"
           tenant-id: "${{ vars.AZURE_TENANT_ID }}"
@@ -533,11 +534,15 @@ jobs:
           UI_DIGEST: "${{ steps.images.outputs.ui_digest }}"
         run: |
           set -euo pipefail
+          trace_id="$(printf '%s' "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" | sha256sum | cut -c1-32)"
+          parent_id="$(printf '%s' "$GITHUB_SHA" | sha256sum | cut -c1-16)"
           parameters=(
             "deployRuntimeAccess=false"
             "deployContainerApps=true"
             "deploymentCommitSha=$GITHUB_SHA"
             "deploymentWorkflowRunId=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+            "smokeTraceparent=00-$trace_id-$parent_id-01"
+            "smokeRunMarker=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
             "apiImageDigest=$API_DIGEST"
             "uiImageDigest=$UI_DIGEST"
             "uiAuthClientId=$OPTIMA_UI_AUTH_CLIENT_ID"
@@ -611,14 +616,21 @@ jobs:
           test "$(az containerapp show --name "$ui_name" \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --query properties.configuration.ingress.external --output tsv)" = "false"
-          trace_id="$(printf '%s' "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" | sha256sum | cut -c1-32)"
-          parent_id="$(printf '%s' "$GITHUB_SHA" | sha256sum | cut -c1-16)"
-          smoke_log="$RUNNER_TEMP/deployment-smoke.log"
-            timeout 660s az containerapp exec --name "$ui_name" \
-            --resource-group "$AZURE_RESOURCE_GROUP" --container ui \
-            --command "python -m ui.deployment_smoke --traceparent 00-$trace_id-$parent_id-01 --run-marker $GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
-            | tee "$smoke_log"
-          grep -F 'OPTIMA_DEPLOYMENT_SMOKE_PASSED' "$smoke_log"
+          smoke_job="$(az deployment group show --name "$deployment_name" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --query properties.outputs.smokeJobName.value --output tsv)"
+          smoke_execution="$(az containerapp job start --name "$smoke_job" \
+            --resource-group "$AZURE_RESOURCE_GROUP" --query name --output tsv)"
+          smoke_status=Running
+          for attempt in $(seq 1 66); do
+            smoke_status="$(az containerapp job execution list --name "$smoke_job" \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --query "[?name=='$smoke_execution'].properties.status | [0]" \
+              --output tsv 2>/dev/null || true)"
+            case "$smoke_status" in Succeeded | Failed | Degraded | Stopped) break ;; esac
+            sleep 10
+          done
+          test "$smoke_status" = "Succeeded"
           az extension add --name application-insights \
             --version "$APPLICATION_INSIGHTS_EXTENSION_VERSION" --only-show-errors
           telemetry_seen=false
@@ -706,6 +718,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          if ! az containerapp show --name ca-optima-ui-hackathon \
+            --resource-group "$AZURE_RESOURCE_GROUP" >/dev/null 2>&1; then
+            echo "UI container app is absent; a failure before its creation exposed nothing" >&2
+            exit 0
+          fi
           contained=false
           for attempt in 1 2 3; do
             if az containerapp ingress update --name ca-optima-ui-hackathon \

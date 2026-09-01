@@ -889,6 +889,7 @@ def _check_iac_representation(repository_root: Path) -> None:
         ),
         "infra/modules/container-apps.bicep": (
             "Microsoft.App/managedEnvironments@",
+            "Microsoft.App/jobs@",
             "OPTIMA_PRODUCTION_COST_MEASUREMENT_REQUIRED",
             "OPTIMA_API_BASE_URL",
         ),
