@@ -1,0 +1,831 @@
+name: Deploy production
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_commit_sha:
+        description: Full commit SHA authorized for production
+        required: true
+        type: string
+      confirm_deployment:
+        description: Type DEPLOY to authorize Azure mutation
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: optima-production
+  cancel-in-progress: false
+
+env:
+  UV_NO_CACHE: "1"
+  APPLICATION_INSIGHTS_EXTENSION_VERSION: "1.2.3"
+  BICEP_VERSION: "0.46.1"
+  GITLEAKS_VERSION: "8.30.1"
+  GITLEAKS_ARCHIVE: gitleaks_8.30.1_linux_x64.tar.gz
+  GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+  SYFT_VERSION: "1.51.1"
+  SYFT_ARCHIVE: syft_1.51.1_linux_amd64.tar.gz
+  SYFT_SHA256: 8fcb33017a0dc1058298c923c436d19dfa68ae93968e0b423248542e3afb9fc3
+  TRIVY_VERSION: "0.74.0"
+  TRIVY_ARCHIVE: trivy_0.74.0_Linux-64bit.tar.gz
+  TRIVY_SHA256: 2ae6fe3ee734b7fdf11335663e18c75ea12dccc76062f09f164a3b0f8be4371a
+
+jobs:
+  validate:
+    name: Validate exact production source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      # actions/checkout v7.0.1, resolved from the upstream tag with git ls-remote.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: "${{ github.sha }}"
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify explicit immutable source authorization
+        shell: bash
+        env:
+          CONFIRMED_SHA: "${{ inputs.confirm_commit_sha }}"
+          CONFIRM_DEPLOYMENT: "${{ inputs.confirm_deployment }}"
+        run: |
+          set -euo pipefail
+          test "$CONFIRMED_SHA" = "$GITHUB_SHA"
+          test "$CONFIRMED_SHA" = "$(git rev-parse HEAD)"
+          test "${#CONFIRMED_SHA}" -eq 40
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$CONFIRM_DEPLOYMENT" = "DEPLOY"
+          if git config --local --get-regexp '^http\..*\.extraheader$'; then
+            echo "Checkout credentials remain configured" >&2
+            exit 1
+          fi
+
+      # astral-sh/setup-uv v10.0.1, resolved from the upstream tag with git ls-remote.
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
+        with:
+          version: "0.12.5"
+          enable-cache: false
+          python-version: "3.12"
+
+      - name: Run application quality gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv lock --check
+          uv sync --frozen --all-groups
+          uv run ruff format --check .
+          uv run ruff check .
+          uv run mypy src tests
+          uv run pytest
+          git diff --check origin/main...HEAD
+
+      - name: Validate all Bicep entry points
+        shell: bash
+        run: |
+          set -euo pipefail
+          az bicep install --version "v$BICEP_VERSION"
+          test "$(az bicep version | sed -n 's/.*Bicep CLI version \([^ ]*\).*/\1/p')" = "$BICEP_VERSION"
+          for file in infra/main.bicep infra/resource-group.bicep infra/modules/*.bicep; do
+            az bicep build --file "$file" --stdout >/dev/null
+            diff --unified "$file" <(az bicep format --file "$file" --stdout)
+          done
+          for file in infra/environments/*.bicepparam; do
+            az bicep build-params --file "$file" --stdout >/dev/null
+            diff --unified "$file" <(az bicep format --file "$file" --stdout)
+          done
+
+      - name: Scan the Slice 11C diff for secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/$GITLEAKS_ARCHIVE"
+          tools="$RUNNER_TEMP/gitleaks"
+          mkdir -p "$tools"
+          curl --fail --location --proto '=https' --tlsv1.2 --retry 3 --retry-all-errors \
+            --connect-timeout 10 --max-time 120 \
+            --output "$archive" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v$GITLEAKS_VERSION/$GITLEAKS_ARCHIVE"
+          printf '%s  %s\n' "$GITLEAKS_SHA256" "$archive" | sha256sum --check --strict
+          tar -xzf "$archive" -C "$tools" gitleaks
+          "$tools/gitleaks" version
+          "$tools/gitleaks" git --redact=100 .
+
+      - name: Build Linux AMD64 production images
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "x86_64"
+          docker build --pull --no-cache --platform linux/amd64 \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --file Dockerfile.api --tag optima-api:production-check .
+          docker build --pull --no-cache --platform linux/amd64 \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --file Dockerfile.ui --tag optima-ui:production-check .
+          test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' optima-api:production-check)" = "linux/amd64"
+          test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' optima-ui:production-check)" = "linux/amd64"
+
+      - name: Smoke test API health and UI health
+        shell: bash
+        run: |
+          set -euo pipefail
+          cleanup() {
+            docker rm --force optima-api-production-check optima-ui-production-check >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          docker run --detach --name optima-api-production-check \
+            --publish 127.0.0.1::8000 \
+            --entrypoint uvicorn optima-api:production-check \
+            optima.api.app:app --host 0.0.0.0 --port 8000
+          api_port="$(docker port optima-api-production-check 8000/tcp | awk -F: 'END {print $NF}')"
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent --show-error --connect-timeout 2 --max-time 3 \
+              "http://127.0.0.1:$api_port/api/v1/health" | grep -F '"status":"ok"'; then
+              api_ready=true
+              break
+            fi
+            sleep 2
+          done
+          test "${api_ready:-false}" = "true"
+          docker run --detach --name optima-ui-production-check \
+            --publish 127.0.0.1::8501 \
+            --env OPTIMA_API_BASE_URL=https://api.invalid \
+            --env OPTIMA_UI_PRODUCTION_MODE=true \
+            optima-ui:production-check
+          ui_port="$(docker port optima-ui-production-check 8501/tcp | awk -F: 'END {print $NF}')"
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent --show-error --connect-timeout 2 --max-time 3 \
+              "http://127.0.0.1:$ui_port/_stcore/health" | grep -F 'ok'; then
+              ui_ready=true
+              break
+            fi
+            sleep 2
+          done
+          test "${ui_ready:-false}" = "true"
+
+      - name: Download checksum-verified final-image scanners
+        shell: bash
+        run: |
+          set -euo pipefail
+          downloads="$RUNNER_TEMP/scanner-downloads"
+          tools="$RUNNER_TEMP/scanner-tools"
+          mkdir -p "$downloads" "$tools"
+          curl --fail --location --proto '=https' --tlsv1.2 --retry 3 --retry-all-errors \
+            --connect-timeout 10 --max-time 120 \
+            --output "$downloads/$SYFT_ARCHIVE" \
+            "https://github.com/anchore/syft/releases/download/v$SYFT_VERSION/$SYFT_ARCHIVE"
+          curl --fail --location --proto '=https' --tlsv1.2 --retry 3 --retry-all-errors \
+            --connect-timeout 10 --max-time 120 \
+            --output "$downloads/$TRIVY_ARCHIVE" \
+            "https://github.com/aquasecurity/trivy/releases/download/v$TRIVY_VERSION/$TRIVY_ARCHIVE"
+          cd "$downloads"
+          printf '%s  %s\n' "$SYFT_SHA256" "$SYFT_ARCHIVE" | sha256sum --check --strict
+          printf '%s  %s\n' "$TRIVY_SHA256" "$TRIVY_ARCHIVE" | sha256sum --check --strict
+          tar -xzf "$SYFT_ARCHIVE" -C "$tools" syft
+          tar -xzf "$TRIVY_ARCHIVE" -C "$tools" trivy
+          test -x "$tools/syft"
+          test -x "$tools/trivy"
+
+      - name: Inspect and scan the exact deployable images
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/exact-images"
+          tools="$RUNNER_TEMP/scanner-tools"
+          mkdir -p "$evidence"
+          docker tag optima-api:production-check optima-api:pr
+          docker tag optima-ui:production-check optima-ui:pr
+          for component in api ui; do
+            docker image save --output "$evidence/$component-image.tar" "optima-$component:pr"
+            docker create --name "optima-$component-rootfs" "optima-$component:pr" >/dev/null
+            docker export --output "$evidence/$component-rootfs.tar" "optima-$component-rootfs"
+            docker rm "optima-$component-rootfs" >/dev/null
+            uv run --no-project --python 3.12 python scripts/verify_container_artifacts.py attest-base \
+              --component "$component" \
+              --image-archive "$evidence/$component-image.tar" \
+              --rootfs-archive "$evidence/$component-rootfs.tar" \
+              --trusted-manifest security/config/pinned-runtime-base.json \
+              --dockerfile "Dockerfile.$component" \
+              --output "$evidence/$component-base-attestation.json"
+            uv run --no-project --python 3.12 python scripts/verify_container_artifacts.py rootfs \
+              --component "$component" \
+              --archive "$evidence/$component-rootfs.tar" \
+              --attestation "$evidence/$component-base-attestation.json" \
+              --output "$evidence/$component-rootfs-summary.json"
+            "$tools/syft" "docker:optima-$component:production-check" \
+              --output "cyclonedx-json=$evidence/$component-final-image.cdx.json"
+            "$tools/trivy" image --scanners vuln,secret --severity HIGH,CRITICAL \
+              --exit-code 1 --format json --output "$evidence/$component-trivy.json" \
+              "optima-$component:production-check"
+            docker image inspect --format '{{.Id}}' "optima-$component:production-check" \
+              > "$evidence/$component-image-id.txt"
+          done
+          rm -f "$evidence/api-image.tar" "$evidence/api-rootfs.tar" \
+            "$evidence/ui-image.tar" "$evidence/ui-rootfs.tar"
+
+      - name: Archive exact verified image objects
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/exact-images"
+          docker image save --output "$evidence/exact-images.tar" \
+            optima-api:production-check optima-ui:production-check
+          cd "$evidence"
+          sha256sum exact-images.tar > exact-images.sha256
+          {
+            printf '## Exact production image evidence\n\n'
+            printf -- '- Source commit: `%s`\n' "$GITHUB_SHA"
+            printf -- '- Platform: `linux/amd64`\n'
+            printf -- '- API image ID: `%s`\n' "$(tr -d '\r\n' < api-image-id.txt)"
+            printf -- '- UI image ID: `%s`\n' "$(tr -d '\r\n' < ui-image-id.txt)"
+            printf -- '- Base attestation, rootfs policy, CycloneDX SBOM, and HIGH/CRITICAL Trivy gates: `passed`\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # actions/upload-artifact v7.0.1, resolved from the upstream tag with git ls-remote.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: exact-production-images-${{ github.sha }}
+          path: ${{ runner.temp }}/exact-images
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+
+  deploy:
+    name: Preflight, publish, and deploy
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    environment: hackathon
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AZURE_CLIENT_ID: "${{ vars.AZURE_CLIENT_ID }}"
+      AZURE_CONTAINER_REGISTRY_NAME: "${{ vars.AZURE_CONTAINER_REGISTRY_NAME }}"
+      AZURE_DEPLOYMENT_IDENTITY_RESOURCE_ID: "${{ vars.AZURE_DEPLOYMENT_IDENTITY_RESOURCE_ID }}"
+      AZURE_LOCATION: "${{ vars.AZURE_LOCATION }}"
+      AZURE_OPENAI_RESOURCE_ID: "${{ vars.AZURE_OPENAI_RESOURCE_ID }}"
+      AZURE_RESOURCE_GROUP: "${{ vars.AZURE_RESOURCE_GROUP }}"
+      AZURE_SUBSCRIPTION_ID: "${{ vars.AZURE_SUBSCRIPTION_ID }}"
+      AZURE_TENANT_ID: "${{ vars.AZURE_TENANT_ID }}"
+      OPTIMA_COST_REVIEWED_ON: "${{ vars.OPTIMA_COST_REVIEWED_ON }}"
+      OPTIMA_EXPECTED_FIXED_MONTHLY_COST_INR: "${{ vars.OPTIMA_EXPECTED_FIXED_MONTHLY_COST_INR }}"
+      OPTIMA_FOUNDRY_BASE_URL: "${{ vars.OPTIMA_FOUNDRY_BASE_URL }}"
+      OPTIMA_FOUNDRY_SMALL_DEPLOYMENT: "${{ vars.OPTIMA_FOUNDRY_SMALL_DEPLOYMENT }}"
+      OPTIMA_FOUNDRY_SMALL_MODEL: "${{ vars.OPTIMA_FOUNDRY_SMALL_MODEL }}"
+      OPTIMA_FOUNDRY_SMALL_MODEL_VERSION: "${{ vars.OPTIMA_FOUNDRY_SMALL_MODEL_VERSION }}"
+      OPTIMA_FOUNDRY_STRONG_DEPLOYMENT: "${{ vars.OPTIMA_FOUNDRY_STRONG_DEPLOYMENT }}"
+      OPTIMA_FOUNDRY_STRONG_MODEL: "${{ vars.OPTIMA_FOUNDRY_STRONG_MODEL }}"
+      OPTIMA_FOUNDRY_STRONG_MODEL_VERSION: "${{ vars.OPTIMA_FOUNDRY_STRONG_MODEL_VERSION }}"
+      OPTIMA_GITHUB_ENVIRONMENT: hackathon
+      OPTIMA_JUDGE_DEPLOYMENT: "${{ vars.OPTIMA_JUDGE_DEPLOYMENT }}"
+      OPTIMA_JUDGE_MODEL: "${{ vars.OPTIMA_JUDGE_MODEL }}"
+      OPTIMA_JUDGE_MODEL_VERSION: "${{ vars.OPTIMA_JUDGE_MODEL_VERSION }}"
+      OPTIMA_PRICING_CATALOG_VERSION: "${{ vars.OPTIMA_PRICING_CATALOG_VERSION }}"
+      OPTIMA_PRICING_BINDING_SHA256: "${{ vars.OPTIMA_PRICING_BINDING_SHA256 }}"
+      OPTIMA_PRICING_CURRENCY: "${{ vars.OPTIMA_PRICING_CURRENCY }}"
+      OPTIMA_PRICING_SOURCE_URL: "${{ vars.OPTIMA_PRICING_SOURCE_URL }}"
+      OPTIMA_PRICING_EMBEDDING_INPUT_RATE_PER_MILLION_TOKENS: "${{ vars.OPTIMA_PRICING_EMBEDDING_INPUT_RATE_PER_MILLION_TOKENS }}"
+      OPTIMA_PRICING_EMBEDDING_MODEL: "${{ vars.OPTIMA_PRICING_EMBEDDING_MODEL }}"
+      OPTIMA_PRICING_EMBEDDING_MODEL_VERSION: "${{ vars.OPTIMA_PRICING_EMBEDDING_MODEL_VERSION }}"
+      OPTIMA_PRICING_JUDGE_CACHED_INPUT_RATE_PER_MILLION_TOKENS: "${{ vars.OPTIMA_PRICING_JUDGE_CACHED_INPUT_RATE_PER_MILLION_TOKENS }}"
+      OPTIMA_PRICING_JUDGE_INPUT_RATE_PER_MILLION_TOKENS: "${{ vars.OPTIMA_PRICING_JUDGE_INPUT_RATE_PER_MILLION_TOKENS }}"
+      OPTIMA_PRICING_JUDGE_MODEL: "${{ vars.OPTIMA_PRICING_JUDGE_MODEL }}"
+      OPTIMA_PRICING_JUDGE_MODEL_VERSION: "${{ vars.OPTIMA_PRICING_JUDGE_MODEL_VERSION }}"
+      OPTIMA_PRICING_JUDGE_OUTPUT_RATE_PER_MILLION_TOKENS: "${{ vars.OPTIMA_PRICING_JUDGE_OUTPUT_RATE_PER_MILLION_TOKENS }}"
+      OPTIMA_PRICING_SMALL_CACHED_INPUT_RATE_PER_MILLION_TOKENS: "${{ vars.OPTIMA_PRICING_SMALL_CACHED_INPUT_RATE_PER_MILLION_TOKENS }}"
+      OPTIMA_PRICING_SMALL_INPUT_RATE_PER_MILLION_TOKENS: "${{ vars.OPTIMA_PRICING_SMALL_INPUT_RATE_PER_MILLION_TOKENS }}"
+      OPTIMA_PRICING_SMALL_MODEL: "${{ vars.OPTIMA_PRICING_SMALL_MODEL }}"
+      OPTIMA_PRICING_SMALL_MODEL_VERSION: "${{ vars.OPTIMA_PRICING_SMALL_MODEL_VERSION }}"
+      OPTIMA_PRICING_SMALL_OUTPUT_RATE_PER_MILLION_TOKENS: "${{ vars.OPTIMA_PRICING_SMALL_OUTPUT_RATE_PER_MILLION_TOKENS }}"
+      OPTIMA_PRICING_STRONG_CACHED_INPUT_RATE_PER_MILLION_TOKENS: "${{ vars.OPTIMA_PRICING_STRONG_CACHED_INPUT_RATE_PER_MILLION_TOKENS }}"
+      OPTIMA_PRICING_STRONG_INPUT_RATE_PER_MILLION_TOKENS: "${{ vars.OPTIMA_PRICING_STRONG_INPUT_RATE_PER_MILLION_TOKENS }}"
+      OPTIMA_PRICING_STRONG_MODEL: "${{ vars.OPTIMA_PRICING_STRONG_MODEL }}"
+      OPTIMA_PRICING_STRONG_MODEL_VERSION: "${{ vars.OPTIMA_PRICING_STRONG_MODEL_VERSION }}"
+      OPTIMA_PRICING_STRONG_OUTPUT_RATE_PER_MILLION_TOKENS: "${{ vars.OPTIMA_PRICING_STRONG_OUTPUT_RATE_PER_MILLION_TOKENS }}"
+      OPTIMA_REDIS_EMBEDDING_DEPLOYMENT: "${{ vars.OPTIMA_REDIS_EMBEDDING_DEPLOYMENT }}"
+      OPTIMA_REDIS_EMBEDDING_DIMENSION: "${{ vars.OPTIMA_REDIS_EMBEDDING_DIMENSION }}"
+      OPTIMA_REDIS_EMBEDDING_MODEL: "${{ vars.OPTIMA_REDIS_EMBEDDING_MODEL }}"
+      OPTIMA_REDIS_EMBEDDING_MODEL_VERSION: "${{ vars.OPTIMA_REDIS_EMBEDDING_MODEL_VERSION }}"
+      OPTIMA_RUNTIME_ACCESS_BOOTSTRAPPED: "${{ vars.OPTIMA_RUNTIME_ACCESS_BOOTSTRAPPED }}"
+      OPTIMA_UI_AUTH_CLIENT_ID: "${{ vars.OPTIMA_UI_AUTH_CLIENT_ID }}"
+      OPTIMA_UI_AUTH_REDIRECT_URI: "${{ vars.OPTIMA_UI_AUTH_REDIRECT_URI }}"
+      OPTIMA_UI_AUTH_CLIENT_SECRET: "${{ secrets.OPTIMA_UI_AUTH_CLIENT_SECRET }}"
+      OPTIMA_UI_AUTH_TENANT_ID: "${{ vars.OPTIMA_UI_AUTH_TENANT_ID }}"
+    steps:
+      # actions/checkout v7.0.1, resolved from the upstream tag with git ls-remote.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: "${{ github.sha }}"
+          fetch-depth: 1
+          persist-credentials: false
+
+      # actions/download-artifact v8.0.1, resolved from the upstream tag with git ls-remote.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: exact-production-images-${{ github.sha }}
+          path: ${{ runner.temp }}/exact-images
+
+      - name: Load the exact verified image objects
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/exact-images"
+          cd "$evidence"
+          sha256sum --check --strict exact-images.sha256
+          docker image load --input exact-images.tar
+          for component in api ui; do
+            expected_id="$(tr -d '\r\n' < "$component-image-id.txt")"
+            actual_id="$(docker image inspect --format '{{.Id}}' "optima-$component:production-check")"
+            test "$actual_id" = "$expected_id"
+            test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "optima-$component:production-check")" = "linux/amd64"
+            test "$(docker image inspect --format '{{index .Config.Labels \"org.opencontainers.image.revision\"}}' "optima-$component:production-check")" = "$GITHUB_SHA"
+          done
+
+      - name: Verify protected main deployment context
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$OPTIMA_GITHUB_ENVIRONMENT" = "hackathon"
+
+      # Azure/login v2.3.0 commit (refs/tags/v2.3.0^{}); the annotated tag object
+      # eec3c95 is not a commit, so pin the peeled commit that Actions can resolve.
+      - uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5
+        with:
+          client-id: "${{ vars.AZURE_CLIENT_ID }}"
+          tenant-id: "${{ vars.AZURE_TENANT_ID }}"
+          subscription-id: "${{ vars.AZURE_SUBSCRIPTION_ID }}"
+
+      - name: Run foundation preflight before Azure mutation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/azure_preflight.py --phase foundation \
+            --output "$RUNNER_TEMP/foundation-preflight.json"
+
+      - name: What-if and converge the Azure foundation
+        shell: bash
+        run: |
+          set -euo pipefail
+          parameters=(
+            "location=$AZURE_LOCATION"
+            "environmentName=hackathon"
+            "deploymentCommitSha=$GITHUB_SHA"
+            "deploymentWorkflowRunId=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+            "deployContainerApps=false"
+            "exposePublicUi=false"
+            "deployRuntimeAccess=false"
+            "uiAuthClientId=$OPTIMA_UI_AUTH_CLIENT_ID"
+            "uiAuthTenantId=$OPTIMA_UI_AUTH_TENANT_ID"
+            "foundryBaseUrl=$OPTIMA_FOUNDRY_BASE_URL"
+            "foundrySmallDeployment=$OPTIMA_FOUNDRY_SMALL_DEPLOYMENT"
+            "foundrySmallModel=$OPTIMA_FOUNDRY_SMALL_MODEL"
+            "foundryStrongDeployment=$OPTIMA_FOUNDRY_STRONG_DEPLOYMENT"
+            "foundryStrongModel=$OPTIMA_FOUNDRY_STRONG_MODEL"
+            "productionEvaluatorMode=LLM_JUDGE"
+            "judgeDeployment=$OPTIMA_JUDGE_DEPLOYMENT"
+            "judgeModel=$OPTIMA_JUDGE_MODEL"
+            "redisEmbeddingDeployment=$OPTIMA_REDIS_EMBEDDING_DEPLOYMENT"
+            "redisEmbeddingModel=$OPTIMA_REDIS_EMBEDDING_MODEL"
+            "redisEmbeddingDimension=$OPTIMA_REDIS_EMBEDDING_DIMENSION"
+            "pricingCatalogVersion=$OPTIMA_PRICING_CATALOG_VERSION"
+            "pricingCurrency=$OPTIMA_PRICING_CURRENCY"
+            "pricingSmallInputRatePerMillionTokens=$OPTIMA_PRICING_SMALL_INPUT_RATE_PER_MILLION_TOKENS"
+            "pricingSmallOutputRatePerMillionTokens=$OPTIMA_PRICING_SMALL_OUTPUT_RATE_PER_MILLION_TOKENS"
+            "pricingStrongInputRatePerMillionTokens=$OPTIMA_PRICING_STRONG_INPUT_RATE_PER_MILLION_TOKENS"
+            "pricingStrongOutputRatePerMillionTokens=$OPTIMA_PRICING_STRONG_OUTPUT_RATE_PER_MILLION_TOKENS"
+            "pricingJudgeInputRatePerMillionTokens=$OPTIMA_PRICING_JUDGE_INPUT_RATE_PER_MILLION_TOKENS"
+            "pricingJudgeOutputRatePerMillionTokens=$OPTIMA_PRICING_JUDGE_OUTPUT_RATE_PER_MILLION_TOKENS"
+            "pricingEmbeddingInputRatePerMillionTokens=$OPTIMA_PRICING_EMBEDDING_INPUT_RATE_PER_MILLION_TOKENS"
+          )
+          if az group show --name "$AZURE_RESOURCE_GROUP" >/dev/null 2>&1; then
+            az deployment group what-if --name optima-foundation-what-if \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --template-file infra/resource-group.bicep \
+              --parameters infra/environments/hackathon.runtime.bicepparam \
+              --parameters "${parameters[@]}"
+            az deployment group create --name "optima-foundation-$GITHUB_RUN_ID" \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --template-file infra/resource-group.bicep \
+              --parameters infra/environments/hackathon.runtime.bicepparam \
+              --parameters "${parameters[@]}" >/dev/null
+          else
+            az deployment sub what-if --name optima-foundation-what-if \
+              --location "$AZURE_LOCATION" --template-file infra/main.bicep \
+              --parameters infra/environments/hackathon.bicepparam \
+              --parameters "${parameters[@]}"
+            az deployment sub create --name "optima-foundation-$GITHUB_RUN_ID" \
+              --location "$AZURE_LOCATION" --template-file infra/main.bicep \
+              --parameters infra/environments/hackathon.bicepparam \
+              --parameters "${parameters[@]}" >/dev/null
+          fi
+
+      - name: Require foundation resources and ACR publication access
+        shell: bash
+        run: |
+          set -euo pipefail
+          default_domain="$(az containerapp env show --name cae-optima-hackathon \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --query properties.defaultDomain --output tsv)"
+          expected_callback="https://ca-optima-ui-hackathon.$default_domain/.auth/login/aad/callback"
+          {
+            printf '## UI authentication callback gate\n\n'
+            printf -- '- Register this exact Web redirect URI before publication: `%s`\n' "$expected_callback"
+          } >> "$GITHUB_STEP_SUMMARY"
+          test "$OPTIMA_UI_AUTH_REDIRECT_URI" = "$expected_callback"
+          test "$OPTIMA_RUNTIME_ACCESS_BOOTSTRAPPED" = "true"
+          python scripts/azure_preflight.py --phase publish \
+            --output "$RUNNER_TEMP/publish-preflight.json"
+
+      - name: Push the exact verified images with immutable commit tags
+        id: images
+        shell: bash
+        run: |
+          set -euo pipefail
+          az acr login --name "$AZURE_CONTAINER_REGISTRY_NAME"
+          registry="$(az acr show --name "$AZURE_CONTAINER_REGISTRY_NAME" --query loginServer --output tsv)"
+          api_image="$registry/optima-api:$GITHUB_SHA"
+          ui_image="$registry/optima-ui:$GITHUB_SHA"
+          docker tag optima-api:production-check "$api_image"
+          docker tag optima-ui:production-check "$ui_image"
+          docker push "$api_image"
+          docker push "$ui_image"
+          api_digest="$(az acr manifest show-metadata --registry "$AZURE_CONTAINER_REGISTRY_NAME" \
+            --name "optima-api:$GITHUB_SHA" --query digest --output tsv)"
+          ui_digest="$(az acr manifest show-metadata --registry "$AZURE_CONTAINER_REGISTRY_NAME" \
+            --name "optima-ui:$GITHUB_SHA" --query digest --output tsv)"
+          [[ "$api_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$ui_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          test "$api_digest" != "$ui_digest"
+          docker image inspect --format '{{join .RepoDigests "\n"}}' "$api_image" \
+            | grep -Fx "$registry/optima-api@$api_digest"
+          docker image inspect --format '{{join .RepoDigests "\n"}}' "$ui_image" \
+            | grep -Fx "$registry/optima-ui@$ui_digest"
+          printf 'registry=%s\napi_digest=%s\nui_digest=%s\n' \
+            "$registry" "$api_digest" "$ui_digest" >> "$GITHUB_OUTPUT"
+
+      - name: Verify published manifests before infrastructure mutation
+        shell: bash
+        env:
+          API_DIGEST: "${{ steps.images.outputs.api_digest }}"
+          UI_DIGEST: "${{ steps.images.outputs.ui_digest }}"
+        run: |
+          set -euo pipefail
+          python scripts/azure_preflight.py --phase artifacts \
+            --api-digest "$API_DIGEST" --ui-digest "$UI_DIGEST" \
+            --output "$RUNNER_TEMP/artifact-preflight.json"
+
+      - name: Verify all runtime access before rollout
+        shell: bash
+        env:
+          API_DIGEST: "${{ steps.images.outputs.api_digest }}"
+          UI_DIGEST: "${{ steps.images.outputs.ui_digest }}"
+        run: |
+          set -euo pipefail
+          python scripts/azure_preflight.py --phase rollout \
+            --api-digest "$API_DIGEST" --ui-digest "$UI_DIGEST" \
+            --output "$RUNNER_TEMP/rollout-preflight.json"
+
+      - name: Capture the active revision pair for automatic rollback
+        id: previous
+        shell: bash
+        run: |
+          set -euo pipefail
+          api_name=ca-optima-api-hackathon
+          ui_name=ca-optima-ui-hackathon
+          printf 'had_pair=false\n' >> "$GITHUB_OUTPUT"
+          if ! az containerapp show --name "$api_name" --resource-group "$AZURE_RESOURCE_GROUP" >/dev/null 2>&1; then
+            exit 0
+          fi
+          if ! az containerapp show --name "$ui_name" --resource-group "$AZURE_RESOURCE_GROUP" >/dev/null 2>&1; then
+            exit 0
+          fi
+          api_revision="$(az containerapp show --name "$api_name" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --query properties.latestReadyRevisionName --output tsv)"
+          ui_revision="$(az containerapp show --name "$ui_name" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --query properties.latestReadyRevisionName --output tsv)"
+          api_image="$(az containerapp revision show --name "$api_name" \
+            --revision "$api_revision" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --query properties.template.containers[0].image --output tsv)"
+          ui_image="$(az containerapp revision show --name "$ui_name" \
+            --revision "$ui_revision" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --query properties.template.containers[0].image --output tsv)"
+          [[ "$api_image" =~ @sha256:[0-9a-f]{64}$ ]]
+          [[ "$ui_image" =~ @sha256:[0-9a-f]{64}$ ]]
+          public_ui="$(az containerapp show --name "$ui_name" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --query properties.configuration.ingress.external --output tsv)"
+          printf 'had_pair=true\napi_revision=%s\nui_revision=%s\napi_image=%s\nui_image=%s\npublic_ui=%s\n' \
+            "$api_revision" "$ui_revision" "$api_image" "$ui_image" "$public_ui" \
+            >> "$GITHUB_OUTPUT"
+
+      - name: What-if and deploy digest-qualified Container Apps
+        id: rollout
+        shell: bash
+        env:
+          API_DIGEST: "${{ steps.images.outputs.api_digest }}"
+          UI_DIGEST: "${{ steps.images.outputs.ui_digest }}"
+        run: |
+          set -euo pipefail
+          trace_id="$(printf '%s' "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" | sha256sum | cut -c1-32)"
+          parent_id="$(printf '%s' "$GITHUB_SHA" | sha256sum | cut -c1-16)"
+          parameters=(
+            "deployRuntimeAccess=false"
+            "deployContainerApps=true"
+            "deploymentCommitSha=$GITHUB_SHA"
+            "deploymentWorkflowRunId=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+            "smokeTraceparent=00-$trace_id-$parent_id-01"
+            "smokeRunMarker=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+            "apiImageDigest=$API_DIGEST"
+            "uiImageDigest=$UI_DIGEST"
+            "uiAuthClientId=$OPTIMA_UI_AUTH_CLIENT_ID"
+            "uiAuthTenantId=$OPTIMA_UI_AUTH_TENANT_ID"
+            "uiAuthClientSecret=$OPTIMA_UI_AUTH_CLIENT_SECRET"
+            "foundryBaseUrl=$OPTIMA_FOUNDRY_BASE_URL"
+            "foundrySmallDeployment=$OPTIMA_FOUNDRY_SMALL_DEPLOYMENT"
+            "foundrySmallModel=$OPTIMA_FOUNDRY_SMALL_MODEL"
+            "foundryStrongDeployment=$OPTIMA_FOUNDRY_STRONG_DEPLOYMENT"
+            "foundryStrongModel=$OPTIMA_FOUNDRY_STRONG_MODEL"
+            "productionEvaluatorMode=LLM_JUDGE"
+            "judgeDeployment=$OPTIMA_JUDGE_DEPLOYMENT"
+            "judgeModel=$OPTIMA_JUDGE_MODEL"
+            "redisEmbeddingDeployment=$OPTIMA_REDIS_EMBEDDING_DEPLOYMENT"
+            "redisEmbeddingModel=$OPTIMA_REDIS_EMBEDDING_MODEL"
+            "redisEmbeddingDimension=$OPTIMA_REDIS_EMBEDDING_DIMENSION"
+            "pricingCatalogVersion=$OPTIMA_PRICING_CATALOG_VERSION"
+            "pricingCurrency=$OPTIMA_PRICING_CURRENCY"
+            "pricingSmallInputRatePerMillionTokens=$OPTIMA_PRICING_SMALL_INPUT_RATE_PER_MILLION_TOKENS"
+            "pricingSmallOutputRatePerMillionTokens=$OPTIMA_PRICING_SMALL_OUTPUT_RATE_PER_MILLION_TOKENS"
+            "pricingStrongInputRatePerMillionTokens=$OPTIMA_PRICING_STRONG_INPUT_RATE_PER_MILLION_TOKENS"
+            "pricingStrongOutputRatePerMillionTokens=$OPTIMA_PRICING_STRONG_OUTPUT_RATE_PER_MILLION_TOKENS"
+            "pricingJudgeInputRatePerMillionTokens=$OPTIMA_PRICING_JUDGE_INPUT_RATE_PER_MILLION_TOKENS"
+            "pricingJudgeOutputRatePerMillionTokens=$OPTIMA_PRICING_JUDGE_OUTPUT_RATE_PER_MILLION_TOKENS"
+            "pricingEmbeddingInputRatePerMillionTokens=$OPTIMA_PRICING_EMBEDDING_INPUT_RATE_PER_MILLION_TOKENS"
+          )
+          if test -n "$OPTIMA_PRICING_SMALL_CACHED_INPUT_RATE_PER_MILLION_TOKENS"; then
+            parameters+=("pricingSmallCachedInputRatePerMillionTokens=$OPTIMA_PRICING_SMALL_CACHED_INPUT_RATE_PER_MILLION_TOKENS")
+          fi
+          if test -n "$OPTIMA_PRICING_STRONG_CACHED_INPUT_RATE_PER_MILLION_TOKENS"; then
+            parameters+=("pricingStrongCachedInputRatePerMillionTokens=$OPTIMA_PRICING_STRONG_CACHED_INPUT_RATE_PER_MILLION_TOKENS")
+          fi
+          if test -n "$OPTIMA_PRICING_JUDGE_CACHED_INPUT_RATE_PER_MILLION_TOKENS"; then
+            parameters+=("pricingJudgeCachedInputRatePerMillionTokens=$OPTIMA_PRICING_JUDGE_CACHED_INPUT_RATE_PER_MILLION_TOKENS")
+          fi
+          az deployment group what-if --name optima-rollout-what-if \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --template-file infra/resource-group.bicep \
+            --parameters infra/environments/hackathon.runtime.bicepparam \
+            --parameters "${parameters[@]}" exposePublicUi=false
+          deployment_name="optima-internal-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          az deployment group create --name "$deployment_name" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --template-file infra/resource-group.bicep \
+            --parameters infra/environments/hackathon.runtime.bicepparam \
+            --parameters "${parameters[@]}" exposePublicUi=false >/dev/null
+          api_name="$(az deployment group show --name "$deployment_name" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --query properties.outputs.apiContainerAppName.value --output tsv)"
+          ui_name="$(az deployment group show --name "$deployment_name" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --query properties.outputs.uiContainerAppName.value --output tsv)"
+          api_url="$(az deployment group show --name "$deployment_name" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --query properties.outputs.apiUrl.value --output tsv)"
+          ui_url="$(az deployment group show --name "$deployment_name" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --query properties.outputs.uiUrl.value --output tsv)"
+          ui_resource_id="$(az containerapp show --name "$ui_name" \
+            --resource-group "$AZURE_RESOURCE_GROUP" --query id --output tsv)"
+          auth_json="$(az rest --method get \
+            --url "https://management.azure.com$ui_resource_id/authConfigs/current?api-version=2025-07-01")"
+          jq -e --arg client "$OPTIMA_UI_AUTH_CLIENT_ID" --arg tenant "$OPTIMA_UI_AUTH_TENANT_ID" '
+            .properties.platform.enabled == true and
+            .properties.globalValidation.unauthenticatedClientAction == "RedirectToLoginPage" and
+            .properties.identityProviders.azureActiveDirectory.registration.clientId == $client and
+            .properties.identityProviders.azureActiveDirectory.registration.clientSecretSettingName == "ui-auth-client-secret" and
+            (.properties.identityProviders.azureActiveDirectory.registration.openIdIssuer | endswith("/" + $tenant + "/v2.0")) and
+            .properties.login.tokenStore.enabled == false
+          ' <<<"$auth_json" >/dev/null
+          test "$(az containerapp show --name "$ui_name" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --query properties.configuration.ingress.external --output tsv)" = "false"
+          smoke_job="$(az deployment group show --name "$deployment_name" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --query properties.outputs.smokeJobName.value --output tsv)"
+          smoke_execution="$(az containerapp job start --name "$smoke_job" \
+            --resource-group "$AZURE_RESOURCE_GROUP" --query name --output tsv)"
+          smoke_status=Running
+          for attempt in $(seq 1 66); do
+            smoke_status="$(az containerapp job execution list --name "$smoke_job" \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --query "[?name=='$smoke_execution'].properties.status | [0]" \
+              --output tsv 2>/dev/null || true)"
+            case "$smoke_status" in Succeeded | Failed | Degraded | Stopped) break ;; esac
+            sleep 10
+          done
+          test "$smoke_status" = "Succeeded"
+          az extension add --name application-insights \
+            --version "$APPLICATION_INSIGHTS_EXTENSION_VERSION" --only-show-errors
+          telemetry_seen=false
+          for attempt in $(seq 1 12); do
+            count="$(az monitor app-insights query --app appi-optima-hackathon \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --analytics-query "requests | where timestamp > ago(20m) | where operation_Id == '$trace_id' | count" \
+              --query 'tables[0].rows[0][0]' --output tsv 2>/dev/null || printf '0')"
+            if test "${count:-0}" -gt 0; then telemetry_seen=true; break; fi
+            sleep 10
+          done
+          test "$telemetry_seen" = "true"
+          az deployment group what-if --name optima-public-ui-what-if \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --template-file infra/resource-group.bicep \
+            --parameters infra/environments/hackathon.runtime.bicepparam \
+            --parameters "${parameters[@]}" exposePublicUi=true
+          deployment_name="optima-rollout-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          az deployment group create --name "$deployment_name" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --template-file infra/resource-group.bicep \
+            --parameters infra/environments/hackathon.runtime.bicepparam \
+            --parameters "${parameters[@]}" exposePublicUi=true >/dev/null
+          printf 'deployment_name=%s\napi_name=%s\nui_name=%s\napi_url=%s\nui_url=%s\n' \
+            "$deployment_name" "$api_name" "$ui_name" "$api_url" "$ui_url" \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Verify active revisions, internal API, UI connectivity, and telemetry
+        id: smoke
+        shell: bash
+        env:
+          API_DIGEST: "${{ steps.images.outputs.api_digest }}"
+          API_NAME: "${{ steps.rollout.outputs.api_name }}"
+          API_URL: "${{ steps.rollout.outputs.api_url }}"
+          REGISTRY: "${{ steps.images.outputs.registry }}"
+          UI_DIGEST: "${{ steps.images.outputs.ui_digest }}"
+          UI_NAME: "${{ steps.rollout.outputs.ui_name }}"
+          UI_URL: "${{ steps.rollout.outputs.ui_url }}"
+        run: |
+          set -euo pipefail
+          api_revision="$(az containerapp show --name "$API_NAME" \
+            --resource-group "$AZURE_RESOURCE_GROUP" --query properties.latestRevisionName --output tsv)"
+          ui_revision="$(az containerapp show --name "$UI_NAME" \
+            --resource-group "$AZURE_RESOURCE_GROUP" --query properties.latestRevisionName --output tsv)"
+          api_health="$(az containerapp revision show --name "$API_NAME" \
+            --revision "$api_revision" --resource-group "$AZURE_RESOURCE_GROUP" \
+            --query properties.healthState --output tsv)"
+          ui_health="$(az containerapp revision show --name "$UI_NAME" \
+            --revision "$ui_revision" --resource-group "$AZURE_RESOURCE_GROUP" \
+            --query properties.healthState --output tsv)"
+          test "$api_health" = "Healthy"
+          test "$ui_health" = "Healthy"
+          api_image="$(az containerapp revision show --name "$API_NAME" \
+            --revision "$api_revision" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --query properties.template.containers[0].image --output tsv)"
+          ui_image="$(az containerapp revision show --name "$UI_NAME" \
+            --revision "$ui_revision" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --query properties.template.containers[0].image --output tsv)"
+          test "$api_image" = "$REGISTRY/optima-api@$API_DIGEST"
+          test "$ui_image" = "$REGISTRY/optima-ui@$UI_DIGEST"
+          external_api="$(az containerapp show --name "$API_NAME" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --query properties.configuration.ingress.external --output tsv)"
+          test "$external_api" = "false"
+          configured_api_url="$(az containerapp revision show --name "$UI_NAME" \
+            --revision "$ui_revision" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --query "properties.template.containers[0].env[?name=='OPTIMA_API_BASE_URL'].value | [0]" \
+            --output tsv)"
+          test "$configured_api_url" = "$API_URL"
+          [[ "$configured_api_url" == https://* ]]
+          [[ "$configured_api_url" != *localhost* ]]
+          test "$OPTIMA_UI_AUTH_REDIRECT_URI" = "$UI_URL/.auth/login/aad/callback"
+          response_headers="$RUNNER_TEMP/ui-response-headers.txt"
+          status="$(curl --silent --show-error --head --connect-timeout 10 --max-time 30 \
+            --output "$response_headers" --write-out '%{http_code}' "$UI_URL/")"
+          case "$status" in 302|401|403) ;; *) exit 1 ;; esac
+          printf 'api_revision=%s\nui_revision=%s\n' "$api_revision" "$ui_revision" \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Contain a failed rollout
+        if: ${{ always() && (failure() || cancelled()) && steps.rollout.outcome != 'skipped' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! az containerapp show --name ca-optima-ui-hackathon \
+            --resource-group "$AZURE_RESOURCE_GROUP" >/dev/null 2>&1; then
+            echo "UI container app is absent; a failure before its creation exposed nothing" >&2
+            exit 0
+          fi
+          contained=false
+          for attempt in 1 2 3; do
+            if az containerapp ingress update --name ca-optima-ui-hackathon \
+                --resource-group "$AZURE_RESOURCE_GROUP" --type internal && \
+              test "$(az containerapp show --name ca-optima-ui-hackathon \
+                --resource-group "$AZURE_RESOURCE_GROUP" \
+                --query properties.configuration.ingress.external --output tsv)" = "false"; then
+              contained=true
+              break
+            fi
+          done
+          test "$contained" = "true"
+
+      - name: Restore the previous ready revision pair
+        if: ${{ always() && (failure() || cancelled()) && steps.rollout.outcome != 'skipped' && steps.previous.outputs.had_pair == 'true' }}
+        shell: bash
+        env:
+          PREVIOUS_API_IMAGE: "${{ steps.previous.outputs.api_image }}"
+          PREVIOUS_API_REVISION: "${{ steps.previous.outputs.api_revision }}"
+          PREVIOUS_UI_IMAGE: "${{ steps.previous.outputs.ui_image }}"
+          PREVIOUS_UI_REVISION: "${{ steps.previous.outputs.ui_revision }}"
+        run: |
+          set -euo pipefail
+          rollback_suffix="rb-$(printf '%s' "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            | sha256sum | cut -c1-20)"
+          restored_api_revision="ca-optima-api-hackathon--$rollback_suffix"
+          restored_ui_revision="ca-optima-ui-hackathon--$rollback_suffix"
+          az containerapp revision copy --name ca-optima-api-hackathon \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --from-revision "$PREVIOUS_API_REVISION" \
+            --revision-suffix "$rollback_suffix" --output none
+          az containerapp revision copy --name ca-optima-ui-hackathon \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --from-revision "$PREVIOUS_UI_REVISION" \
+            --revision-suffix "$rollback_suffix" --output none
+          for contract in \
+              "ca-optima-api-hackathon|$restored_api_revision" \
+              "ca-optima-ui-hackathon|$restored_ui_revision"; do
+            app_name="${contract%%|*}"
+            revision_name="${contract#*|}"
+            healthy=false
+            for attempt in $(seq 1 60); do
+              state="$(az containerapp revision show --name "$app_name" \
+                --revision "$revision_name" \
+                --resource-group "$AZURE_RESOURCE_GROUP" \
+                --query "join('|', [properties.provisioningState, properties.healthState])" \
+                --output tsv 2>/dev/null || true)"
+              if test "$state" = "Succeeded|Healthy"; then
+                healthy=true
+                break
+              fi
+              sleep 5
+            done
+            test "$healthy" = "true"
+          done
+          test "$(az containerapp revision show --name ca-optima-api-hackathon \
+            --revision "$restored_api_revision" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --query properties.template.containers[0].image --output tsv)" = "$PREVIOUS_API_IMAGE"
+          test "$(az containerapp revision show --name ca-optima-ui-hackathon \
+            --revision "$restored_ui_revision" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --query properties.template.containers[0].image --output tsv)" = "$PREVIOUS_UI_IMAGE"
+          test "$(az containerapp show --name ca-optima-ui-hackathon \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --query properties.configuration.ingress.external --output tsv)" = "false"
+
+      # actions/upload-artifact v7.0.1, resolved from the upstream tag with git ls-remote.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: production-preflight-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/foundation-preflight.json
+            ${{ runner.temp }}/publish-preflight.json
+            ${{ runner.temp }}/artifact-preflight.json
+            ${{ runner.temp }}/rollout-preflight.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Publish immutable deployment summary
+        if: always()
+        shell: bash
+        env:
+          API_DIGEST: "${{ steps.images.outputs.api_digest }}"
+          API_NAME: "${{ steps.rollout.outputs.api_name }}"
+          API_REVISION: "${{ steps.smoke.outputs.api_revision }}"
+          API_URL: "${{ steps.rollout.outputs.api_url }}"
+          DEPLOYMENT_NAME: "${{ steps.rollout.outputs.deployment_name }}"
+          UI_DIGEST: "${{ steps.images.outputs.ui_digest }}"
+          UI_NAME: "${{ steps.rollout.outputs.ui_name }}"
+          UI_REVISION: "${{ steps.smoke.outputs.ui_revision }}"
+          UI_URL: "${{ steps.rollout.outputs.ui_url }}"
+        run: |
+          {
+            printf '## OPTIMA production deployment\n\n'
+            printf -- '- Commit: `%s`\n' "$GITHUB_SHA"
+            printf -- '- Workflow run: `%s/%s`\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+            printf -- '- ARM deployment: `%s`\n' "${DEPLOYMENT_NAME:-unavailable}"
+            printf -- '- API image digest: `%s`\n' "${API_DIGEST:-unavailable}"
+            printf -- '- UI image digest: `%s`\n' "${UI_DIGEST:-unavailable}"
+            printf -- '- API app/revision: `%s` / `%s`\n' "${API_NAME:-unavailable}" "${API_REVISION:-unavailable}"
+            printf -- '- UI app/revision: `%s` / `%s`\n' "${UI_NAME:-unavailable}" "${UI_REVISION:-unavailable}"
+            printf -- '- API endpoint: `%s`\n' "${API_URL:-unavailable}"
+            printf -- '- UI endpoint: `%s`\n' "${UI_URL:-unavailable}"
+          } >> "$GITHUB_STEP_SUMMARY"

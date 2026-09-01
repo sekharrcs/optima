@@ -438,13 +438,15 @@ Exact-head workflow evidence is valid only for the commit recorded by that run.
 No hosted result, ACR publication, Azure deployment, production authentication,
 or live authorization result is claimed here.
 
-## Future deployment flow
+## Production deployment flow
 
 The Slice 11B-S workflow is a separate pre-merge path. It runs untrusted
 pull-request code with `contents: read`, no persisted checkout credential, no
 secret or Azure identity, and no deployment command. Its Docker socket reaches
-only the ephemeral hosted runner. Slice 11C will add the distinct trusted OIDC
-deployment path shown below.
+only the ephemeral hosted runner. Slice 11C adds a distinct manually dispatched,
+protected `hackathon` environment path. See the
+[production deployment runbook](PRODUCTION_DEPLOYMENT.md) for exact configuration,
+preflight, verification, and rollback procedures.
 
 ```text
 GitHub Actions
@@ -456,6 +458,8 @@ OIDC federated deployment identity
 Azure Resource Manager
       |
       +-- first bootstrap: subscription-scope main.bicep
+  |      +-- create the managed environment without public apps
+  |      +-- report exact UI callback and stop until it is registered
       |
       +-- routine: resource-group.bicep
       |
@@ -467,6 +471,16 @@ Build and push immutable API/UI images
       v
 Enable Container Apps after access and runtime gates pass
 ```
+
+The deployment workflow validates application code, Bicep, the Slice 11C diff,
+and one exact Linux AMD64 image pair before Azure login. It transfers those
+scanned image objects to the OIDC job without rebuilding. Read-only preflight proves OIDC,
+providers, region, Redis SKU/quota, model/version bindings, reviewed pricing,
+cost posture, Entra configuration, ACR permissions, runtime assignments, and
+registry manifests at the phase where each becomes available. API and UI deploy
+from separate registry digests produced from one source commit. The first app
+deployment keeps the UI internal until the Easy Auth child is verified; failed
+rollouts close UI ingress and reactivate the captured prior revision pair.
 
 A successful Slice 11B-S run may make PR #20 merge-ready for its exact head. It
 does not authorize merge and cannot declare Slice 11C deployed or successful.

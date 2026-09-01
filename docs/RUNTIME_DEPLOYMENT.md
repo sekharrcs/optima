@@ -34,6 +34,11 @@ Slice 11C owns:
 * Reviewed SMALL, STRONG, JUDGE, and embedding pricing inputs when monetary cost
   measurement is required
 
+Slice 11C implements these responsibilities through the manually dispatched
+`Deploy production` workflow and `scripts/azure_preflight.py`. Live values remain
+deployment gates rather than checked-in defaults. See the
+[production deployment runbook](PRODUCTION_DEPLOYMENT.md).
+
 Slice 11E owns:
 
 * Explicit `EXACT_REFERENCE` and `LLM_JUDGE` production modes
@@ -177,8 +182,10 @@ ACR.
 
 Container Apps owns `OPTIMA_DEPLOYMENT_ENVIRONMENT`, managed-identity IDs,
 Cosmos resource values, Redis endpoint values, Application Insights values, and
-the UI API URL. The AI/model owner supplies the Foundry endpoint and deployment
-identities.
+the UI API URL. It also requires reviewed pricing and sets
+`OPTIMA_PRODUCTION_COST_MEASUREMENT_REQUIRED=true`. The AI/model owner supplies
+the Foundry endpoint, deployment identities, exact live model/version evidence,
+and matching price-catalog provenance.
 
 The deployed UI sets `OPTIMA_UI_PRODUCTION_MODE=true`. This requires an explicit
 HTTPS `OPTIMA_API_BASE_URL`; the Streamlit form exposes no destination override,
@@ -211,7 +218,9 @@ Required external Foundry values are:
 
 * HTTPS Azure OpenAI v1 root ending in `/openai/v1`
 * SMALL chat-completions deployment name
+* SMALL provider-reported model identity
 * STRONG chat-completions deployment name
+* STRONG provider-reported model identity
 * JUDGE chat-completions deployment and provider model identity
 * Embedding deployment name and provider-reported model identity
 * Exact embedding vector dimension
@@ -260,6 +269,13 @@ Before Bicep execution, Slice 11C must validate as far as Azure APIs allow:
   secret as the secure `uiAuthClientSecret` parameter, and verification of the
   exact callback URI and user-assignment policy
 
+The preflight CLI exposes `foundation`, `publish`, `artifacts`, and `rollout`
+phases. Foundation checks occur before any Azure mutation. Publication requires
+the converged resource inventory, Entra callback, `AcrPush`, and Foundry runtime
+grant. Rollout additionally re-reads both `AcrPull` assignments, the
+container-scoped Cosmos assignment, the Redis access policy, Foundry access, and
+both ACR manifest digests before enabling applications.
+
 Valid SKU metadata and quota do not guarantee regional allocation capacity.
 Allocation failure must stop deployment with a clear error. It must not place
 Redis in East US or another fallback region.
@@ -287,8 +303,8 @@ deployed UI and its exact configuration:
 ## Remaining Slice 11C inputs
 
 Reference-free production evaluation is implemented but not deployed. Slice 11C
-must replace every image, endpoint, deployment, model, and pricing placeholder
-with reviewed live values before enabling Container Apps.
+must replace every image, endpoint, deployment, model, pricing, and provenance
+placeholder with reviewed live values before enabling Container Apps.
 
 The runtime central cost calculator assembles its versioned catalog from
 configured rates. When no rates are configured, it uses an explicit unpriced
@@ -302,6 +318,8 @@ runtime to provider `microsoft-foundry-apim` and the exact SMALL, STRONG, JUDGE,
 and embedding deployment names already configured for the runtime:
 
 * `OPTIMA_PRICING_CATALOG_VERSION` — provenance/version identifier
+* `OPTIMA_PRICING_BINDING_SHA256` — canonical digest of the reviewed source,
+  currency, exact model/version bindings, and rates
 * `OPTIMA_PRICING_CURRENCY` — shared currency code, default `USD`
 * `OPTIMA_PRICING_SMALL_INPUT_RATE_PER_MILLION_TOKENS`
 * `OPTIMA_PRICING_SMALL_OUTPUT_RATE_PER_MILLION_TOKENS`

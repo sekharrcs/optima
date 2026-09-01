@@ -21,6 +21,7 @@ def test_application_parameter_files_target_eastus2_with_deployment_disabled() -
         assert "param location = 'eastus2'" in content
         assert "param location = 'eastus'" not in content
         assert "param deployContainerApps = false" in content
+        assert "param exposePublicUi = false" in content
         assert "param deployRuntimeAccess = false" in content
 
 
@@ -51,6 +52,36 @@ def test_container_apps_require_separate_immutable_image_digests() -> None:
     assert "uiImageDigest == toLower(uiImageDigest)" in resources
 
 
+def test_pre_exposure_smoke_runs_as_a_distroless_safe_job() -> None:
+    """Run the pre-exposure smoke as a job because the UI image has no shell.
+
+    The UI runtime image is distroless, so ``az containerapp exec`` cannot open a
+    shell in it. The smoke must run the image's own Python entrypoint as a
+    one-shot manual Container Apps job that is gated on its execution status.
+    """
+    module = read("infra/modules/container-apps.bicep")
+    resources = read("infra/resource-group.bicep")
+
+    assert "resource deploymentSmokeJob 'Microsoft.App/jobs@" in module
+    assert "= if (deployApplications) {" in module
+    assert "triggerType: 'Manual'" in module
+    assert "replicaRetryLimit: 0" in module
+    assert "image: uiImage" in module
+    assert "'ui.deployment_smoke'" in module
+    assert "'--traceparent'" in module
+    assert "'--run-marker'" in module
+    assert "value: 'https://${api!.properties.configuration.ingress.fqdn}'" in module
+    assert "param smokeTraceparent string" in module
+    assert "param smokeRunMarker string" in module
+    assert "param smokeJobName string" in module
+
+    assert "smokeJob: 'caj-optima-smoke-${environmentName}'" in resources
+    assert "smokeJobName: resourceNames.smokeJob" in resources
+    assert "smokeTraceparent: validatedSmokeTraceparent" in resources
+    assert "fail('Container Apps deployment requires a pre-exposure smoke" in resources
+    assert "output smokeJobName string = resourceNames.smokeJob" in resources
+
+
 def test_bicep_entry_points_restrict_application_location_to_eastus2() -> None:
     """Reject an unreviewed application region instead of falling back silently."""
     for relative_path in ("infra/main.bicep", "infra/resource-group.bicep"):
@@ -75,6 +106,8 @@ def test_container_apps_map_production_runtime_environment_contract() -> None:
     assert "name: 'OPTIMA_JUDGE_TIMEOUT_SECONDS'" in module
     assert "validatedEvaluatorMode == 'EXACT_REFERENCE' ? 'true' : 'false'" in module
     assert "name: 'OPTIMA_FOUNDRY_MANAGED_IDENTITY_CLIENT_ID'" in module
+    assert "name: 'OPTIMA_FOUNDRY_SMALL_MODEL'" in module
+    assert "name: 'OPTIMA_FOUNDRY_STRONG_MODEL'" in module
     assert "name: 'OPTIMA_COSMOS_MANAGED_IDENTITY_CLIENT_ID'" in module
     assert "name: 'OPTIMA_REDIS_MANAGED_IDENTITY_CLIENT_ID'" in module
     assert "name: 'OPTIMA_API_BASE_URL'" in module
@@ -119,7 +152,7 @@ def test_public_ui_requires_tenant_restricted_entra_authentication() -> None:
     )
     assert "unauthenticatedClientAction: 'RedirectToLoginPage'" in module
     assert "requireHttps: true" in module
-    assert "allowInsecure: false\n        external: true" in module
+    assert "allowInsecure: false\n        external: exposePublicUi" in module
     assert "allowInsecure: false\n        external: false" in module
     # A confidential-client secret is required: without it Container Apps falls back
     # to the weaker implicit flow, so the secret reference is a security control.
@@ -218,3 +251,71 @@ def test_container_apps_reject_checked_in_judge_placeholders() -> None:
     assert "judgeDeployment != 'replace-judge-deployment'" in module
     assert "judgeModel != 'replace-judge-model'" in module
     assert "requires deployable judge identities" in module
+
+
+def test_container_apps_environment_precedes_gated_applications() -> None:
+    """Create the environment before callback-gated API and UI resources."""
+    resources = read("infra/resource-group.bicep")
+    module = read("infra/modules/container-apps.bicep")
+
+    assert "module containerApps 'modules/container-apps.bicep' = {" in resources
+    assert "deployApplications: deployContainerApps" in resources
+    assert "exposePublicUi: validatedExposePublicUi" in resources
+    assert "resource managedEnvironment 'Microsoft.App/managedEnvironments@" in module
+    assert (
+        "resource api 'Microsoft.App/containerApps@2025-07-01' = if "
+        "(deployApplications)" in module
+    )
+    assert (
+        "resource ui 'Microsoft.App/containerApps@2025-07-01' = if "
+        "(deployApplications)" in module
+    )
+    assert "output environmentDefaultDomain string" in module
+    assert "Public UI exposure requires Container Apps deployment" in resources
+
+
+def test_container_apps_require_complete_reviewed_production_pricing() -> None:
+    """Supply every required role rate and reject deployment placeholders."""
+    module = read("infra/modules/container-apps.bicep")
+    resources = read("infra/resource-group.bicep")
+    main = read("infra/main.bicep")
+
+    required_environment_names = (
+        "OPTIMA_PRODUCTION_COST_MEASUREMENT_REQUIRED",
+        "OPTIMA_PRICING_CATALOG_VERSION",
+        "OPTIMA_PRICING_CURRENCY",
+        "OPTIMA_PRICING_SMALL_INPUT_RATE_PER_MILLION_TOKENS",
+        "OPTIMA_PRICING_SMALL_OUTPUT_RATE_PER_MILLION_TOKENS",
+        "OPTIMA_PRICING_STRONG_INPUT_RATE_PER_MILLION_TOKENS",
+        "OPTIMA_PRICING_STRONG_OUTPUT_RATE_PER_MILLION_TOKENS",
+        "OPTIMA_PRICING_JUDGE_INPUT_RATE_PER_MILLION_TOKENS",
+        "OPTIMA_PRICING_JUDGE_OUTPUT_RATE_PER_MILLION_TOKENS",
+        "OPTIMA_PRICING_EMBEDDING_INPUT_RATE_PER_MILLION_TOKENS",
+    )
+    for name in required_environment_names:
+        assert f"name: '{name}'" in module
+
+    assert "value: 'true'" in module
+    assert "pricingConfigurationIsDeployable" in resources
+    assert "!deployContainerApps || pricingConfigurationIsDeployable" in resources
+    assert "requires complete reviewed pricing" in resources
+    assert "!empty(pricingCatalogVersion)" in resources
+    assert "!empty(pricingEmbeddingInputRatePerMillionTokens)" in resources
+    assert "!empty(deploymentWorkflowRunId)" in resources
+    assert "deploymentCommitInvalidCharacters" in resources
+    assert "deploymentWorkflowRunInvalidCharacters" in resources
+    assert "contains(deploymentWorkflowRunId,'-')" in re.sub(r"\s+", "", resources)
+    for parameter in (
+        "pricingCatalogVersion",
+        "pricingCurrency",
+        "pricingSmallInputRatePerMillionTokens",
+        "pricingSmallOutputRatePerMillionTokens",
+        "pricingStrongInputRatePerMillionTokens",
+        "pricingStrongOutputRatePerMillionTokens",
+        "pricingJudgeInputRatePerMillionTokens",
+        "pricingJudgeOutputRatePerMillionTokens",
+        "pricingEmbeddingInputRatePerMillionTokens",
+    ):
+        assert f"param {parameter} string" in main
+        assert f"{parameter}: {parameter}" in main
+        assert f"param {parameter} string" in resources

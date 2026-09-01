@@ -362,7 +362,9 @@ def _embedding_settings(**updates: object) -> AppSettings:
     values: dict[str, object] = {
         "foundry_base_url": BASE_URL,
         "foundry_small_deployment": "small",
+        "foundry_small_model": "generator-model",
         "foundry_strong_deployment": "strong",
+        "foundry_strong_model": "generator-model",
         "foundry_auth_mode": FoundryAuthMode.API_KEY,
         "foundry_api_key": "fake-key",
         "redis_host": "optima.eastus.redis.azure.net",

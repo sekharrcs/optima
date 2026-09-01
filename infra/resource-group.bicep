@@ -12,8 +12,25 @@ param location string = 'eastus2'
 ])
 param environmentName string = 'hackathon'
 
+@description('Full Git commit SHA shared by both production images.')
+@minLength(40)
+@maxLength(40)
+param deploymentCommitSha string
+
+@description('GitHub Actions workflow run identifier recorded on the deployed revisions.')
+param deploymentWorkflowRunId string
+
+@description('W3C traceparent the pre-exposure smoke job sends so its API request is correlated in Application Insights. Required when Container Apps deploy.')
+param smokeTraceparent string = ''
+
+@description('Unique per-run marker the pre-exposure smoke job records. Required when Container Apps deploy.')
+param smokeRunMarker string = ''
+
 @description('Deploy API and UI only after images, runtime composition, and data-plane access are ready.')
 param deployContainerApps bool = false
+
+@description('Expose the UI only after its deployed Entra authentication configuration is verified.')
+param exposePublicUi bool = false
 
 @description('Create OPTIMA-owned runtime access assignments. Requires Azure RBAC administration on the registry.')
 param deployRuntimeAccess bool = false
@@ -44,8 +61,14 @@ param foundryBaseUrl string
 @description('Foundry deployment mapped to the OPTIMA SMALL role.')
 param foundrySmallDeployment string
 
+@description('Provider model identity expected from the OPTIMA SMALL deployment.')
+param foundrySmallModel string
+
 @description('Foundry deployment mapped to the OPTIMA STRONG role.')
 param foundryStrongDeployment string
+
+@description('Provider model identity expected from the OPTIMA STRONG deployment.')
+param foundryStrongModel string
 
 @description('Production quality evaluator mode.')
 @allowed([
@@ -87,6 +110,42 @@ param redisEmbeddingDimension int
   '1.0'
 ])
 param applicationInsightsSamplingRatio string = '0.25'
+
+@description('Reviewed pricing catalog version that identifies the exact model-rate source.')
+param pricingCatalogVersion string
+
+@description('Shared ISO 4217 currency used by every reviewed model rate.')
+param pricingCurrency string
+
+@description('Reviewed SMALL input price per million tokens.')
+param pricingSmallInputRatePerMillionTokens string
+
+@description('Reviewed SMALL output price per million tokens.')
+param pricingSmallOutputRatePerMillionTokens string
+
+@description('Reviewed SMALL cached-input price per million tokens when the selected model has a distinct rate.')
+param pricingSmallCachedInputRatePerMillionTokens string?
+
+@description('Reviewed STRONG input price per million tokens.')
+param pricingStrongInputRatePerMillionTokens string
+
+@description('Reviewed STRONG output price per million tokens.')
+param pricingStrongOutputRatePerMillionTokens string
+
+@description('Reviewed STRONG cached-input price per million tokens when the selected model has a distinct rate.')
+param pricingStrongCachedInputRatePerMillionTokens string?
+
+@description('Reviewed JUDGE input price per million tokens in LLM_JUDGE mode.')
+param pricingJudgeInputRatePerMillionTokens string
+
+@description('Reviewed JUDGE output price per million tokens in LLM_JUDGE mode.')
+param pricingJudgeOutputRatePerMillionTokens string
+
+@description('Reviewed JUDGE cached-input price per million tokens when the selected model has a distinct rate.')
+param pricingJudgeCachedInputRatePerMillionTokens string?
+
+@description('Reviewed embedding input price per million tokens.')
+param pricingEmbeddingInputRatePerMillionTokens string
 
 var placeholderImageDigest = 'sha256:0000000000000000000000000000000000000000000000000000000000000000'
 var apiDigestHex = substring(apiImageDigest, 7, 64)
@@ -203,6 +262,118 @@ var validatedUiAuthClientId = !deployContainerApps || uiAuthConfigurationIsDeplo
 var validatedUiAuthTenantId = !deployContainerApps || uiAuthConfigurationIsDeployable
   ? uiAuthTenantId
   : fail('Container Apps deployment requires a non-placeholder UI Entra client ID, tenant ID, and confidential-client secret.')
+var pricingConfigurationIsDeployable = !empty(pricingCatalogVersion) && !startsWith(pricingCatalogVersion, 'replace-') && !empty(pricingCurrency) && !startsWith(
+  pricingCurrency,
+  'replace-'
+) && !empty(pricingSmallInputRatePerMillionTokens) && !startsWith(pricingSmallInputRatePerMillionTokens, 'replace-') && !empty(pricingSmallOutputRatePerMillionTokens) && !startsWith(
+  pricingSmallOutputRatePerMillionTokens,
+  'replace-'
+) && !empty(pricingStrongInputRatePerMillionTokens) && !startsWith(pricingStrongInputRatePerMillionTokens, 'replace-') && !empty(pricingStrongOutputRatePerMillionTokens) && !startsWith(
+  pricingStrongOutputRatePerMillionTokens,
+  'replace-'
+) && !empty(pricingJudgeInputRatePerMillionTokens) && !startsWith(pricingJudgeInputRatePerMillionTokens, 'replace-') && !empty(pricingJudgeOutputRatePerMillionTokens) && !startsWith(
+  pricingJudgeOutputRatePerMillionTokens,
+  'replace-'
+) && !empty(pricingEmbeddingInputRatePerMillionTokens) && !startsWith(
+  pricingEmbeddingInputRatePerMillionTokens,
+  'replace-'
+)
+var validatedPricingCatalogVersion = !deployContainerApps || pricingConfigurationIsDeployable
+  ? pricingCatalogVersion
+  : fail('Container Apps deployment requires complete reviewed pricing for SMALL, STRONG, JUDGE, and embedding roles.')
+var placeholderCommitSha = '0000000000000000000000000000000000000000'
+var deploymentCommitInvalidCharacters = replace(
+  replace(
+    replace(
+      replace(
+        replace(
+          replace(
+            replace(
+              replace(
+                replace(
+                  replace(
+                    replace(
+                      replace(
+                        replace(replace(replace(replace(deploymentCommitSha, '0', ''), '1', ''), '2', ''), '3', ''),
+                        '4',
+                        ''
+                      ),
+                      '5',
+                      ''
+                    ),
+                    '6',
+                    ''
+                  ),
+                  '7',
+                  ''
+                ),
+                '8',
+                ''
+              ),
+              '9',
+              ''
+            ),
+            'a',
+            ''
+          ),
+          'b',
+          ''
+        ),
+        'c',
+        ''
+      ),
+      'd',
+      ''
+    ),
+    'e',
+    ''
+  ),
+  'f',
+  ''
+)
+var deploymentWorkflowRunInvalidCharacters = replace(
+  replace(
+    replace(
+      replace(
+        replace(
+          replace(
+            replace(
+              replace(replace(replace(replace(deploymentWorkflowRunId, '0', ''), '1', ''), '2', ''), '3', ''),
+              '4',
+              ''
+            ),
+            '5',
+            ''
+          ),
+          '6',
+          ''
+        ),
+        '7',
+        ''
+      ),
+      '8',
+      ''
+    ),
+    '9',
+    ''
+  ),
+  '-',
+  ''
+)
+var deploymentProvenanceIsDeployable = deploymentCommitSha != placeholderCommitSha && empty(deploymentCommitInvalidCharacters) && !empty(deploymentWorkflowRunId) && contains(
+  deploymentWorkflowRunId,
+  '-'
+) && empty(deploymentWorkflowRunInvalidCharacters) && !startsWith(deploymentWorkflowRunId, 'replace-')
+var validatedDeploymentCommitSha = !deployContainerApps || deploymentProvenanceIsDeployable
+  ? deploymentCommitSha
+  : fail('Container Apps deployment requires an exact commit SHA and workflow run ID.')
+var validatedExposePublicUi = !exposePublicUi || deployContainerApps
+  ? exposePublicUi
+  : fail('Public UI exposure requires Container Apps deployment.')
+var smokeConfigurationIsDeployable = !empty(smokeTraceparent) && !empty(smokeRunMarker)
+var validatedSmokeTraceparent = !deployContainerApps || smokeConfigurationIsDeployable
+  ? smokeTraceparent
+  : fail('Container Apps deployment requires a pre-exposure smoke traceparent and run marker.')
 var uniqueSuffix = uniqueString(subscription().subscriptionId, environmentName)
 var resourceNames = {
   apiContainerApp: 'ca-optima-api-${environmentName}'
@@ -213,6 +384,7 @@ var resourceNames = {
   cosmosAccount: 'cosmos-optima-${uniqueSuffix}'
   logAnalyticsWorkspace: 'law-optima-${environmentName}'
   redis: 'redis-optima-${uniqueSuffix}'
+  smokeJob: 'caj-optima-smoke-${environmentName}'
   uiContainerApp: 'ca-optima-ui-${environmentName}'
   uiIdentity: 'id-optima-ui-${environmentName}'
 }
@@ -290,7 +462,7 @@ module runtimeAccess 'modules/runtime-access.bicep' = if (deployRuntimeAccess) {
   ]
 }
 
-module containerApps 'modules/container-apps.bicep' = if (deployContainerApps) {
+module containerApps 'modules/container-apps.bicep' = {
   name: 'optima-container-apps'
   params: {
     apiContainerAppName: resourceNames.apiContainerApp
@@ -304,15 +476,33 @@ module containerApps 'modules/container-apps.bicep' = if (deployContainerApps) {
     cosmosContainerName: cosmos.outputs.containerName
     cosmosDatabaseName: cosmos.outputs.databaseName
     cosmosEndpoint: cosmos.outputs.endpoint
+    deploymentCommitSha: validatedDeploymentCommitSha
+    deploymentWorkflowRunId: deploymentWorkflowRunId
+    deployApplications: deployContainerApps
     environmentName: environmentName
+    exposePublicUi: validatedExposePublicUi
     foundryBaseUrl: foundryBaseUrl
     foundrySmallDeployment: foundrySmallDeployment
+    foundrySmallModel: foundrySmallModel
     foundryStrongDeployment: foundryStrongDeployment
+    foundryStrongModel: foundryStrongModel
     foundryTokenScope: foundryTokenScope
     judgeDeployment: judgeDeployment
     judgeModel: judgeModel
     judgeTimeoutSeconds: judgeTimeoutSeconds
     location: location
+    pricingCatalogVersion: validatedPricingCatalogVersion
+    pricingCurrency: pricingCurrency
+    pricingEmbeddingInputRatePerMillionTokens: pricingEmbeddingInputRatePerMillionTokens
+    pricingJudgeCachedInputRatePerMillionTokens: pricingJudgeCachedInputRatePerMillionTokens
+    pricingJudgeInputRatePerMillionTokens: pricingJudgeInputRatePerMillionTokens
+    pricingJudgeOutputRatePerMillionTokens: pricingJudgeOutputRatePerMillionTokens
+    pricingSmallCachedInputRatePerMillionTokens: pricingSmallCachedInputRatePerMillionTokens
+    pricingSmallInputRatePerMillionTokens: pricingSmallInputRatePerMillionTokens
+    pricingSmallOutputRatePerMillionTokens: pricingSmallOutputRatePerMillionTokens
+    pricingStrongCachedInputRatePerMillionTokens: pricingStrongCachedInputRatePerMillionTokens
+    pricingStrongInputRatePerMillionTokens: pricingStrongInputRatePerMillionTokens
+    pricingStrongOutputRatePerMillionTokens: pricingStrongOutputRatePerMillionTokens
     productionEvaluatorMode: productionEvaluatorMode
     redisEmbeddingDeployment: redisEmbeddingDeployment
     redisEmbeddingDimension: redisEmbeddingDimension
@@ -320,6 +510,9 @@ module containerApps 'modules/container-apps.bicep' = if (deployContainerApps) {
     redisHost: redis.outputs.hostName
     redisIndexName: 'optima-cache-v1'
     registryLoginServer: registry.outputs.loginServer
+    smokeJobName: resourceNames.smokeJob
+    smokeRunMarker: smokeRunMarker
+    smokeTraceparent: validatedSmokeTraceparent
     tags: tags
     uiAuthClientId: validatedUiAuthClientId
     uiAuthClientSecret: uiAuthClientSecret
@@ -332,10 +525,14 @@ module containerApps 'modules/container-apps.bicep' = if (deployContainerApps) {
 
 output registryName string = resourceNames.containerRegistry
 output registryLoginServer string = registry.outputs.loginServer
+output containerAppsEnvironmentDefaultDomain string = containerApps.outputs.environmentDefaultDomain
 output apiContainerAppName string = resourceNames.apiContainerApp
-output apiUrl string = deployContainerApps ? containerApps!.outputs.apiUrl : ''
+output apiRevisionName string = deployContainerApps ? containerApps!.outputs.apiRevisionName : ''
+output apiUrl string = containerApps.outputs.apiUrl
 output uiContainerAppName string = resourceNames.uiContainerApp
-output uiUrl string = deployContainerApps ? containerApps!.outputs.uiUrl : ''
+output uiRevisionName string = deployContainerApps ? containerApps!.outputs.uiRevisionName : ''
+output uiUrl string = containerApps.outputs.uiUrl
+output smokeJobName string = resourceNames.smokeJob
 output cosmosAccountName string = resourceNames.cosmosAccount
 output cosmosEndpoint string = cosmos.outputs.endpoint
 output cosmosDatabaseName string = cosmos.outputs.databaseName
