@@ -521,8 +521,12 @@ Application resources target East US 2 (`eastus2`). The existing bootstrap
 resource group and deployment identity may remain in East US. Container Apps
 remain disabled by default and accept separate API and UI manifest digests,
 never a shared mutable tag. Slice 11C must preflight Managed Redis registration,
-Balanced B0 support, quota, and service availability in East US 2. Allocation
-failure stops deployment; no fallback region is selected automatically.
+regional resource-type advertisement, exact subscription Balanced B0
+advertisement, applicable restrictions, and authoritative quota only when Azure
+exposes a documented surface. Quota non-exposure remains explicit unknown
+evidence and is never called available. Metadata does not prove physical
+capacity. Allocation failure stops deployment; no fallback region or SKU is
+selected automatically.
 
 ## ADR-034: Require reference evidence for the initial production evaluator
 

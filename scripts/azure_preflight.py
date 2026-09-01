@@ -13,9 +13,10 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal, InvalidOperation
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol, cast
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 EXIT_SUCCESS = 0
 EXIT_FAILURE = 1
@@ -24,6 +25,12 @@ EXPECTED_ENVIRONMENT = "hackathon"
 EXPECTED_REPOSITORY = "sekharrcs/optima"
 MAX_FIXED_MONTHLY_COST_INR = Decimal("5000")
 MAX_COST_REVIEW_AGE_DAYS = 31
+REDIS_API_VERSION = "2025-07-01"
+REDIS_RESOURCE_TYPE = "redisEnterprise"
+REDIS_SKU_NAME = "Balanced_B0"
+REDIS_SKU_TIER = "Balanced"
+REDIS_MAX_RESPONSE_PAGES = 32
+REDIS_ARM_HOST = "management.azure.com"
 ACR_PUSH_ROLE_ID = "8311e382-0749-4cb8-b61a-304f252e45ec"
 ACR_PULL_ROLE_ID = "7f951dda-4ed3-4680-a7ca-43fe172d538d"
 CONTRIBUTOR_ROLE_ID = "b24988ac-6180-42a0-ab88-20f7382dd24c"
@@ -59,6 +66,63 @@ REQUIRED_FOUNDATION_RESOURCE_TYPES = {
 
 class PreflightError(RuntimeError):
     """A deployment prerequisite is missing or cannot be proven."""
+
+
+class AzureQueryFailureKind(StrEnum):
+    """Sanitized failure categories retained at the Azure query boundary."""
+
+    NOT_FOUND = "NOT_FOUND"
+    UNAUTHORIZED = "UNAUTHORIZED"
+    TRANSIENT = "TRANSIENT"
+    MALFORMED = "MALFORMED"
+    OTHER = "OTHER"
+
+
+class AzureQueryError(PreflightError):
+    """A sanitized Azure query failure with no response body or identifiers."""
+
+    def __init__(self, kind: AzureQueryFailureKind, operation: str) -> None:
+        self.kind = kind
+        self.operation = operation
+        super().__init__(f"Azure {operation} query failed ({kind.value})")
+
+
+class RedisPreflightErrorCode(StrEnum):
+    """Stable fail-closed outcome codes for Managed Redis preflight."""
+
+    PROVIDER_METADATA_MALFORMED = "REDIS_PROVIDER_METADATA_MALFORMED"
+    PROVIDER_NOT_REGISTERED = "REDIS_PROVIDER_NOT_REGISTERED"
+    RESOURCE_TYPE_NOT_ADVERTISED = "REDIS_RESOURCE_TYPE_NOT_ADVERTISED"
+    REGION_NOT_ADVERTISED = "REDIS_REGION_NOT_ADVERTISED"
+    API_VERSION_NOT_ADVERTISED = "REDIS_API_VERSION_NOT_ADVERTISED"
+    SKU_QUERY_NOT_FOUND = "REDIS_SKU_QUERY_NOT_FOUND"
+    SKU_QUERY_UNAUTHORIZED = "REDIS_SKU_QUERY_UNAUTHORIZED"
+    SKU_QUERY_TRANSIENT = "REDIS_SKU_QUERY_TRANSIENT"
+    SKU_QUERY_FAILED = "REDIS_SKU_QUERY_FAILED"
+    SKU_RESPONSE_MALFORMED = "REDIS_SKU_RESPONSE_MALFORMED"
+    SKU_PAGINATION_INVALID = "REDIS_SKU_PAGINATION_INVALID"
+    REQUESTED_SKU_ABSENT = "REDIS_REQUESTED_SKU_ABSENT"
+    REQUESTED_SKU_REGION_ABSENT = "REDIS_REQUESTED_SKU_REGION_ABSENT"
+    RESTRICTION_MALFORMED = "REDIS_RESTRICTION_MALFORMED"
+    RESTRICTION_UNKNOWN = "REDIS_RESTRICTION_UNKNOWN"
+    TARGET_REGION_RESTRICTED = "REDIS_TARGET_REGION_RESTRICTED"
+    SUBSCRIPTION_RESTRICTED = "REDIS_SUBSCRIPTION_RESTRICTED"
+    QUOTA_RESTRICTED = "REDIS_QUOTA_RESTRICTED"
+    QUOTA_API_VERSION_NOT_ADVERTISED = "REDIS_QUOTA_API_VERSION_NOT_ADVERTISED"
+    QUOTA_QUERY_UNAUTHORIZED = "REDIS_QUOTA_QUERY_UNAUTHORIZED"
+    QUOTA_QUERY_TRANSIENT = "REDIS_QUOTA_QUERY_TRANSIENT"
+    QUOTA_QUERY_FAILED = "REDIS_QUOTA_QUERY_FAILED"
+    QUOTA_RESPONSE_MALFORMED = "REDIS_QUOTA_RESPONSE_MALFORMED"
+    QUOTA_PAGINATION_INVALID = "REDIS_QUOTA_PAGINATION_INVALID"
+    QUOTA_EXHAUSTED = "REDIS_QUOTA_EXHAUSTED"
+
+
+class RedisPreflightError(PreflightError):
+    """A hard-blocking Managed Redis outcome with a stable error code."""
+
+    def __init__(self, code: RedisPreflightErrorCode, message: str) -> None:
+        self.code = code
+        super().__init__(f"{code.value}: {message}")
 
 
 class AzureQuery(Protocol):
@@ -150,22 +214,55 @@ class AzureCli:
         except FileNotFoundError as error:
             raise PreflightError("Azure CLI is required for live preflight") from error
         except subprocess.TimeoutExpired as error:
-            raise PreflightError(
-                f"Azure CLI {arguments[0]} query exceeded 90 seconds"
+            raise AzureQueryError(
+                AzureQueryFailureKind.TRANSIENT, arguments[0]
             ) from error
         if completed.returncode != 0:
             if allow_missing and completed.returncode in {3, 4}:
                 return None
-            raise PreflightError(
-                f"Azure CLI {arguments[0]} query failed; inspect the runner's "
-                "redacted Azure diagnostics"
+            raise AzureQueryError(
+                _classify_azure_query_failure(completed.stderr), arguments[0]
             )
         try:
             return json.loads(completed.stdout)
         except json.JSONDecodeError as error:
-            raise PreflightError(
-                f"Azure CLI {arguments[0]} returned malformed JSON"
+            raise AzureQueryError(
+                AzureQueryFailureKind.MALFORMED, arguments[0]
             ) from error
+
+
+def _classify_azure_query_failure(stderr: str) -> AzureQueryFailureKind:
+    """Classify an Azure CLI failure without retaining diagnostic content."""
+    normalized = stderr.casefold()
+    status_match = re.search(
+        r"(?:http\s+)?status(?:\s+code)?[^0-9]{0,12}(401|403|404|408|429|5\d\d)\b",
+        normalized,
+    )
+    status = status_match.group(1) if status_match is not None else None
+    if status in {"401", "403"} or any(
+        code in normalized
+        for code in ("authorizationfailed", "authenticationfailed", "unauthorized")
+    ):
+        return AzureQueryFailureKind.UNAUTHORIZED
+    if status == "404" or any(
+        code in normalized
+        for code in ("resource not found", "resourcenotfound", "not found", "notfound")
+    ):
+        return AzureQueryFailureKind.NOT_FOUND
+    if status in {"408", "429"} or (status is not None and status.startswith("5")):
+        return AzureQueryFailureKind.TRANSIENT
+    if any(
+        code in normalized
+        for code in (
+            "gatewaytimeout",
+            "internalservererror",
+            "requesttimeout",
+            "serviceunavailable",
+            "toomanyrequests",
+        )
+    ):
+        return AzureQueryFailureKind.TRANSIENT
+    return AzureQueryFailureKind.OTHER
 
 
 def _required(environment: Mapping[str, str], name: str) -> str:
@@ -565,16 +662,46 @@ def _check_account(configuration: DeploymentConfiguration, azure: AzureQuery) ->
         raise PreflightError("Azure subscription is not enabled")
 
 
-def _check_providers(azure: AzureQuery) -> None:
+def _check_providers(azure: AzureQuery) -> dict[str, Any]:
+    cache_provider: dict[str, Any] | None = None
     for namespace in REQUIRED_PROVIDERS:
         provider = azure.json("provider", "show", "--namespace", namespace)
-        if (
-            not isinstance(provider, dict)
-            or provider.get("registrationState") != "Registered"
-        ):
+        if not isinstance(provider, dict):
+            if namespace == "Microsoft.Cache":
+                raise RedisPreflightError(
+                    RedisPreflightErrorCode.PROVIDER_METADATA_MALFORMED,
+                    "Microsoft.Cache provider metadata is malformed",
+                )
+            raise PreflightError(
+                f"Required resource provider {namespace} response is malformed"
+            )
+        registration_state = provider.get("registrationState")
+        if not isinstance(registration_state, str) or not registration_state.strip():
+            if namespace == "Microsoft.Cache":
+                raise RedisPreflightError(
+                    RedisPreflightErrorCode.PROVIDER_METADATA_MALFORMED,
+                    "Microsoft.Cache registration state is malformed",
+                )
+            raise PreflightError(
+                f"Required resource provider {namespace} response is malformed"
+            )
+        if registration_state.strip().casefold() != "registered":
+            if namespace == "Microsoft.Cache":
+                raise RedisPreflightError(
+                    RedisPreflightErrorCode.PROVIDER_NOT_REGISTERED,
+                    "Microsoft.Cache is not registered",
+                )
             raise PreflightError(
                 f"Required resource provider {namespace} is not registered"
             )
+        if namespace == "Microsoft.Cache":
+            cache_provider = provider
+    if cache_provider is None:
+        raise RedisPreflightError(
+            RedisPreflightErrorCode.PROVIDER_METADATA_MALFORMED,
+            "Microsoft.Cache provider metadata is unavailable",
+        )
+    return cache_provider
 
 
 def _identity_parts(resource_id: str) -> tuple[str, str]:
@@ -740,67 +867,595 @@ def _check_ui_authentication(
         )
 
 
-def _check_redis_availability(
-    configuration: DeploymentConfiguration, azure: AzureQuery
-) -> None:
-    subscription = configuration.subscription_id
-    sku_url = (
-        "https://management.azure.com/subscriptions/"
-        f"{subscription}/providers/Microsoft.Cache/skus?api-version=2024-11-01"
-    )
-    sku_document = azure.json("rest", "--method", "get", "--url", sku_url)
-    sku_items = sku_document.get("value") if isinstance(sku_document, dict) else None
-    if not isinstance(sku_items, list):
-        raise PreflightError("Microsoft.Cache SKU response is malformed")
-    expected_location = _normalized_location(configuration.location)
-    matches = [
-        item
-        for item in sku_items
-        if isinstance(item, dict)
-        and item.get("name") == "Balanced_B0"
-        and str(item.get("resourceType", "")).casefold()
-        in {"redisenterprise", "redisenterprise/databases"}
-        and expected_location
-        in {
-            _normalized_location(str(location))
-            for location in item.get("locations", [])
-        }
+def _normalized_exact_token(value: object) -> str:
+    return value.strip().casefold() if isinstance(value, str) else ""
+
+
+def _string_list(
+    value: object,
+    *,
+    code: RedisPreflightErrorCode,
+    field: str,
+) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or any(
+        not isinstance(item, str) or not item.strip() for item in value
+    ):
+        raise RedisPreflightError(code, f"Microsoft.Cache {field} is malformed")
+    return [item.strip() for item in value]
+
+
+def _provider_resource_types(provider: Mapping[str, Any]) -> list[dict[str, Any]]:
+    resource_types = provider.get("resourceTypes")
+    if not isinstance(resource_types, list) or any(
+        not isinstance(resource_type, dict) for resource_type in resource_types
+    ):
+        raise RedisPreflightError(
+            RedisPreflightErrorCode.PROVIDER_METADATA_MALFORMED,
+            "Microsoft.Cache resource type metadata is malformed",
+        )
+    return cast(list[dict[str, Any]], resource_types)
+
+
+def _provider_zone_evidence(
+    resource_type: Mapping[str, Any], expected_location: str
+) -> list[str]:
+    zone_mappings = resource_type.get("zoneMappings")
+    if zone_mappings is None:
+        return []
+    if not isinstance(zone_mappings, list) or any(
+        not isinstance(mapping, dict) for mapping in zone_mappings
+    ):
+        raise RedisPreflightError(
+            RedisPreflightErrorCode.PROVIDER_METADATA_MALFORMED,
+            "Microsoft.Cache provider zone mappings are malformed",
+        )
+    zones: set[str] = set()
+    for mapping in zone_mappings:
+        location = mapping.get("location")
+        if not isinstance(location, str) or not location.strip():
+            raise RedisPreflightError(
+                RedisPreflightErrorCode.PROVIDER_METADATA_MALFORMED,
+                "Microsoft.Cache provider zone mapping location is malformed",
+            )
+        mapping_zones = _string_list(
+            mapping.get("zones"),
+            code=RedisPreflightErrorCode.PROVIDER_METADATA_MALFORMED,
+            field="provider zone mapping zones",
+        )
+        if _normalized_location(location) == expected_location:
+            zones.update(mapping_zones)
+    return sorted(zones)
+
+
+def _validate_redis_page_url(
+    candidate: str,
+    *,
+    subscription: str,
+    expected_path: str,
+    pagination_code: RedisPreflightErrorCode,
+) -> str:
+    try:
+        absolute = urljoin(f"https://{REDIS_ARM_HOST}", candidate)
+        parsed = urlparse(absolute)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError as error:
+        raise RedisPreflightError(
+            pagination_code,
+            "Microsoft.Cache pagination continuation is malformed",
+        ) from error
+    expected_prefix = f"/subscriptions/{subscription}/providers/Microsoft.Cache/"
+    if (
+        parsed.scheme.casefold() != "https"
+        or hostname is None
+        or hostname.casefold() != REDIS_ARM_HOST
+        or port is not None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+        or not parsed.path.casefold().startswith(expected_prefix.casefold())
+        or parsed.path.rstrip("/").casefold() != expected_path.casefold()
+    ):
+        raise RedisPreflightError(
+            pagination_code,
+            "Microsoft.Cache pagination continuation is outside the approved route",
+        )
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    api_versions = [
+        value
+        for key, values in query.items()
+        if key.casefold() == "api-version"
+        for value in values
     ]
-    if len(matches) != 1:
-        raise PreflightError(
-            "Managed Redis Balanced_B0 availability in eastus2 was not proven"
+    if api_versions != [REDIS_API_VERSION]:
+        raise RedisPreflightError(
+            pagination_code,
+            "Microsoft.Cache pagination changed the approved API version",
         )
-    restrictions = matches[0].get("restrictions", [])
-    if restrictions:
-        raise PreflightError(
-            "Managed Redis Balanced_B0 has an active eastus2 restriction"
+    return absolute
+
+
+def _redis_query_error_code(
+    kind: AzureQueryFailureKind,
+    *,
+    quota: bool,
+) -> RedisPreflightErrorCode:
+    if kind == AzureQueryFailureKind.UNAUTHORIZED:
+        return (
+            RedisPreflightErrorCode.QUOTA_QUERY_UNAUTHORIZED
+            if quota
+            else RedisPreflightErrorCode.SKU_QUERY_UNAUTHORIZED
         )
-    usage_url = (
-        "https://management.azure.com/subscriptions/"
-        f"{subscription}/providers/Microsoft.Cache/locations/"
-        f"{configuration.location}/usages?api-version=2024-11-01"
+    if kind == AzureQueryFailureKind.TRANSIENT:
+        return (
+            RedisPreflightErrorCode.QUOTA_QUERY_TRANSIENT
+            if quota
+            else RedisPreflightErrorCode.SKU_QUERY_TRANSIENT
+        )
+    if kind == AzureQueryFailureKind.MALFORMED:
+        return (
+            RedisPreflightErrorCode.QUOTA_RESPONSE_MALFORMED
+            if quota
+            else RedisPreflightErrorCode.SKU_RESPONSE_MALFORMED
+        )
+    if kind == AzureQueryFailureKind.NOT_FOUND and not quota:
+        return RedisPreflightErrorCode.SKU_QUERY_NOT_FOUND
+    return (
+        RedisPreflightErrorCode.QUOTA_QUERY_FAILED
+        if quota
+        else RedisPreflightErrorCode.SKU_QUERY_FAILED
     )
-    usage_document = azure.json("rest", "--method", "get", "--url", usage_url)
-    usages = usage_document.get("value") if isinstance(usage_document, dict) else None
-    if not isinstance(usages, list):
-        raise PreflightError("Microsoft.Cache quota response is malformed")
-    quota_matches = []
+
+
+def _read_redis_pages(
+    azure: AzureQuery,
+    *,
+    initial_url: str,
+    subscription: str,
+    expected_path: str,
+    quota: bool,
+    allow_not_found: bool = False,
+) -> tuple[list[dict[str, Any]], int] | None:
+    malformed_code = (
+        RedisPreflightErrorCode.QUOTA_RESPONSE_MALFORMED
+        if quota
+        else RedisPreflightErrorCode.SKU_RESPONSE_MALFORMED
+    )
+    pagination_code = (
+        RedisPreflightErrorCode.QUOTA_PAGINATION_INVALID
+        if quota
+        else RedisPreflightErrorCode.SKU_PAGINATION_INVALID
+    )
+    items: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    url = initial_url
+    page_count = 0
+    while True:
+        if page_count >= REDIS_MAX_RESPONSE_PAGES:
+            raise RedisPreflightError(
+                pagination_code,
+                "Microsoft.Cache response exceeded the bounded page limit",
+            )
+        url = _validate_redis_page_url(
+            url,
+            subscription=subscription,
+            expected_path=expected_path,
+            pagination_code=pagination_code,
+        )
+        if url in seen_urls:
+            raise RedisPreflightError(
+                pagination_code,
+                "Microsoft.Cache response contains a pagination cycle",
+            )
+        seen_urls.add(url)
+        page_count += 1
+        try:
+            document = azure.json("rest", "--method", "get", "--url", url)
+        except AzureQueryError as error:
+            if (
+                allow_not_found
+                and page_count == 1
+                and error.kind == AzureQueryFailureKind.NOT_FOUND
+            ):
+                return None
+            raise RedisPreflightError(
+                _redis_query_error_code(error.kind, quota=quota),
+                "Microsoft.Cache query did not return usable evidence",
+            ) from error
+        values = document.get("value") if isinstance(document, dict) else None
+        if not isinstance(values, list) or any(
+            not isinstance(value, dict) for value in values
+        ):
+            raise RedisPreflightError(
+                malformed_code, "Microsoft.Cache response value is malformed"
+            )
+        items.extend(cast(list[dict[str, Any]], values))
+        next_link = document.get("nextLink")
+        if next_link is None:
+            return items, page_count
+        if not isinstance(next_link, str) or not next_link.strip():
+            raise RedisPreflightError(
+                pagination_code,
+                "Microsoft.Cache response nextLink is malformed",
+            )
+        url = next_link.strip()
+
+
+def _sku_locations_and_zones(
+    item: Mapping[str, Any], expected_location: str
+) -> tuple[set[str], set[str]]:
+    if "locations" in item and item.get("locations") is None:
+        raise RedisPreflightError(
+            RedisPreflightErrorCode.SKU_RESPONSE_MALFORMED,
+            "Microsoft.Cache SKU locations is malformed",
+        )
+    locations = {
+        _normalized_location(location)
+        for location in _string_list(
+            item.get("locations"),
+            code=RedisPreflightErrorCode.SKU_RESPONSE_MALFORMED,
+            field="SKU locations",
+        )
+    }
+    location_info = item.get("locationInfo")
+    if "locationInfo" not in item:
+        return locations, set()
+    if not isinstance(location_info, list) or any(
+        not isinstance(detail, dict) for detail in location_info
+    ):
+        raise RedisPreflightError(
+            RedisPreflightErrorCode.SKU_RESPONSE_MALFORMED,
+            "Microsoft.Cache SKU locationInfo is malformed",
+        )
+    zones: set[str] = set()
+    for detail in location_info:
+        location = detail.get("location")
+        if not isinstance(location, str) or not location.strip():
+            raise RedisPreflightError(
+                RedisPreflightErrorCode.SKU_RESPONSE_MALFORMED,
+                "Microsoft.Cache SKU locationInfo location is malformed",
+            )
+        normalized_location = _normalized_location(location)
+        locations.add(normalized_location)
+        detail_zones = _string_list(
+            detail.get("zones"),
+            code=RedisPreflightErrorCode.SKU_RESPONSE_MALFORMED,
+            field="SKU locationInfo zones",
+        )
+        if normalized_location == expected_location:
+            zones.update(detail_zones)
+    return locations, zones
+
+
+def _restriction_scope(
+    restriction: Mapping[str, Any], expected_location: str
+) -> tuple[bool, bool, str]:
+    restriction_type = _normalized_exact_token(restriction.get("type"))
+    reason = _normalized_exact_token(restriction.get("reasonCode"))
+    if not restriction_type or not reason:
+        raise RedisPreflightError(
+            RedisPreflightErrorCode.RESTRICTION_MALFORMED,
+            "Managed Redis restriction type or reason is malformed",
+        )
+    values = _string_list(
+        restriction.get("values"),
+        code=RedisPreflightErrorCode.RESTRICTION_MALFORMED,
+        field="restriction values",
+    )
+    restriction_info = restriction.get("restrictionInfo")
+    if restriction_info is None:
+        restriction_info = {}
+    if not isinstance(restriction_info, dict):
+        raise RedisPreflightError(
+            RedisPreflightErrorCode.RESTRICTION_MALFORMED,
+            "Managed Redis restrictionInfo is malformed",
+        )
+    locations = _string_list(
+        restriction_info.get("locations"),
+        code=RedisPreflightErrorCode.RESTRICTION_MALFORMED,
+        field="restriction locations",
+    )
+    zones = _string_list(
+        restriction_info.get("zones"),
+        code=RedisPreflightErrorCode.RESTRICTION_MALFORMED,
+        field="restriction zones",
+    )
+    if restriction_type == "location":
+        locations.extend(values)
+    elif restriction_type == "zone":
+        zones.extend(values)
+    else:
+        locations.extend(values)
+    normalized_locations = {_normalized_location(location) for location in locations}
+    global_scope = not normalized_locations and not zones
+    target_region_scope = expected_location in normalized_locations and not zones
+    applicable = global_scope or target_region_scope
+    return applicable, target_region_scope, reason
+
+
+def _check_sku_restrictions(
+    items: Sequence[Mapping[str, Any]], expected_location: str
+) -> int:
+    ignored = 0
+    for item in items:
+        restrictions = item.get("restrictions")
+        if "restrictions" not in item:
+            restrictions = []
+        if not isinstance(restrictions, list) or any(
+            not isinstance(restriction, dict) for restriction in restrictions
+        ):
+            raise RedisPreflightError(
+                RedisPreflightErrorCode.RESTRICTION_MALFORMED,
+                "Managed Redis restrictions are malformed",
+            )
+        for restriction in restrictions:
+            applicable, target_region_scope, reason = _restriction_scope(
+                restriction, expected_location
+            )
+            if not applicable:
+                ignored += 1
+                continue
+            if reason == "notavailableforsubscription":
+                raise RedisPreflightError(
+                    RedisPreflightErrorCode.SUBSCRIPTION_RESTRICTED,
+                    "Managed Redis is not available for this subscription",
+                )
+            if reason == "quotaid":
+                raise RedisPreflightError(
+                    RedisPreflightErrorCode.QUOTA_RESTRICTED,
+                    "Managed Redis has an applicable quota restriction",
+                )
+            if target_region_scope:
+                raise RedisPreflightError(
+                    RedisPreflightErrorCode.TARGET_REGION_RESTRICTED,
+                    "Managed Redis has an explicit target-region restriction",
+                )
+            raise RedisPreflightError(
+                RedisPreflightErrorCode.RESTRICTION_UNKNOWN,
+                "Managed Redis has an applicable unrecognized restriction",
+            )
+    return ignored
+
+
+def _quota_evidence(
+    configuration: DeploymentConfiguration,
+    azure: AzureQuery,
+    quota_resource_type: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    if quota_resource_type is None:
+        return {
+            "status": "NOT_EXPOSED",
+            "source": "PROVIDER_METADATA",
+        }
+    api_versions = _string_list(
+        quota_resource_type.get("apiVersions"),
+        code=RedisPreflightErrorCode.PROVIDER_METADATA_MALFORMED,
+        field="quota resource type API versions",
+    )
+    if REDIS_API_VERSION.casefold() not in {
+        api_version.casefold() for api_version in api_versions
+    }:
+        raise RedisPreflightError(
+            RedisPreflightErrorCode.QUOTA_API_VERSION_NOT_ADVERTISED,
+            "The advertised quota route does not support the approved API version",
+        )
+    subscription = configuration.subscription_id
+    expected_path = (
+        f"/subscriptions/{subscription}/providers/Microsoft.Cache/locations/"
+        f"{configuration.location}/usages"
+    )
+    usage_url = (
+        f"https://{REDIS_ARM_HOST}{expected_path}?api-version={REDIS_API_VERSION}"
+    )
+    page_result = _read_redis_pages(
+        azure,
+        initial_url=usage_url,
+        subscription=subscription,
+        expected_path=expected_path,
+        quota=True,
+        allow_not_found=True,
+    )
+    if page_result is None:
+        return {
+            "status": "NOT_EXPOSED",
+            "source": "ADVERTISED_ROUTE_NOT_FOUND",
+        }
+    usages, page_count = page_result
+    quota_matches: list[dict[str, Any]] = []
     for usage in usages:
-        if not isinstance(usage, dict):
-            continue
-        name = usage.get("name", {})
-        names = name.values() if isinstance(name, dict) else (name,)
-        if any("balancedb0" in _normalized_location(str(value)) for value in names):
+        name = usage.get("name")
+        if not isinstance(name, dict) or not isinstance(name.get("value"), str):
+            raise RedisPreflightError(
+                RedisPreflightErrorCode.QUOTA_RESPONSE_MALFORMED,
+                "Microsoft.Cache quota meter identity is malformed",
+            )
+        if _normalized_exact_token(name["value"]) == REDIS_SKU_NAME.casefold():
             quota_matches.append(usage)
     if len(quota_matches) != 1:
-        raise PreflightError(
-            "Managed Redis Balanced_B0 eastus2 quota could not be identified"
+        raise RedisPreflightError(
+            RedisPreflightErrorCode.QUOTA_RESPONSE_MALFORMED,
+            "Microsoft.Cache quota response lacks one exact Balanced_B0 meter",
         )
-    usage = quota_matches[0]
-    current = usage.get("currentValue")
-    limit = usage.get("limit")
-    if not isinstance(current, int) or not isinstance(limit, int) or current >= limit:
-        raise PreflightError("Managed Redis Balanced_B0 eastus2 quota is exhausted")
+    current = quota_matches[0].get("currentValue")
+    limit = quota_matches[0].get("limit")
+    if (
+        not isinstance(current, int)
+        or isinstance(current, bool)
+        or not isinstance(limit, int)
+        or isinstance(limit, bool)
+        or current < 0
+        or limit < 0
+    ):
+        raise RedisPreflightError(
+            RedisPreflightErrorCode.QUOTA_RESPONSE_MALFORMED,
+            "Microsoft.Cache quota values must be non-negative integers",
+        )
+    if current >= limit:
+        raise RedisPreflightError(
+            RedisPreflightErrorCode.QUOTA_EXHAUSTED,
+            "Managed Redis Balanced_B0 quota is exhausted",
+        )
+    return {
+        "current_value": current,
+        "limit": limit,
+        "page_count": page_count,
+        "status": "AVAILABLE",
+        "source": "MICROSOFT_CACHE_LOCATIONS_USAGES",
+    }
+
+
+def _check_redis_availability(
+    configuration: DeploymentConfiguration,
+    azure: AzureQuery,
+    provider: Mapping[str, Any],
+) -> dict[str, Any]:
+    resource_types = _provider_resource_types(provider)
+    redis_resource_types = [
+        resource_type
+        for resource_type in resource_types
+        if _normalized_exact_token(resource_type.get("resourceType"))
+        == REDIS_RESOURCE_TYPE.casefold()
+    ]
+    if not redis_resource_types:
+        raise RedisPreflightError(
+            RedisPreflightErrorCode.RESOURCE_TYPE_NOT_ADVERTISED,
+            "Microsoft.Cache does not advertise the redisEnterprise type",
+        )
+    if len(redis_resource_types) > 1:
+        raise RedisPreflightError(
+            RedisPreflightErrorCode.PROVIDER_METADATA_MALFORMED,
+            "Microsoft.Cache advertises duplicate redisEnterprise resource types",
+        )
+    redis_resource_type = redis_resource_types[0]
+    expected_location = _normalized_location(configuration.location)
+    if not isinstance(redis_resource_type.get("locations"), list):
+        raise RedisPreflightError(
+            RedisPreflightErrorCode.PROVIDER_METADATA_MALFORMED,
+            "Microsoft.Cache redisEnterprise locations are malformed",
+        )
+    provider_locations = _string_list(
+        redis_resource_type.get("locations"),
+        code=RedisPreflightErrorCode.PROVIDER_METADATA_MALFORMED,
+        field="redisEnterprise locations",
+    )
+    if expected_location not in {
+        _normalized_location(location) for location in provider_locations
+    }:
+        raise RedisPreflightError(
+            RedisPreflightErrorCode.REGION_NOT_ADVERTISED,
+            "Microsoft.Cache does not advertise redisEnterprise in the target region",
+        )
+    if not isinstance(redis_resource_type.get("apiVersions"), list):
+        raise RedisPreflightError(
+            RedisPreflightErrorCode.PROVIDER_METADATA_MALFORMED,
+            "Microsoft.Cache redisEnterprise API versions are malformed",
+        )
+    redis_api_versions = _string_list(
+        redis_resource_type.get("apiVersions"),
+        code=RedisPreflightErrorCode.PROVIDER_METADATA_MALFORMED,
+        field="redisEnterprise API versions",
+    )
+    if REDIS_API_VERSION.casefold() not in {
+        api_version.casefold() for api_version in redis_api_versions
+    }:
+        raise RedisPreflightError(
+            RedisPreflightErrorCode.API_VERSION_NOT_ADVERTISED,
+            "Microsoft.Cache does not advertise the approved stable API version",
+        )
+    provider_zones = _provider_zone_evidence(redis_resource_type, expected_location)
+    subscription = configuration.subscription_id
+    sku_path = f"/subscriptions/{subscription}/providers/Microsoft.Cache/skus"
+    sku_url = f"https://{REDIS_ARM_HOST}{sku_path}?api-version={REDIS_API_VERSION}"
+    page_result = _read_redis_pages(
+        azure,
+        initial_url=sku_url,
+        subscription=subscription,
+        expected_path=sku_path,
+        quota=False,
+    )
+    assert page_result is not None
+    sku_items, sku_page_count = page_result
+    exact_items = [
+        item
+        for item in sku_items
+        if _normalized_exact_token(item.get("resourceType"))
+        == REDIS_RESOURCE_TYPE.casefold()
+        and _normalized_exact_token(item.get("name")) == REDIS_SKU_NAME.casefold()
+        and _normalized_exact_token(item.get("tier")) == REDIS_SKU_TIER.casefold()
+    ]
+    if not exact_items:
+        raise RedisPreflightError(
+            RedisPreflightErrorCode.REQUESTED_SKU_ABSENT,
+            "The exact redisEnterprise Balanced_B0 Balanced SKU is absent",
+        )
+    advertised_locations: set[str] = set()
+    target_zones: set[str] = set()
+    target_items: list[dict[str, Any]] = []
+    for item in exact_items:
+        locations, zones = _sku_locations_and_zones(item, expected_location)
+        advertised_locations.update(locations)
+        if expected_location in locations:
+            target_items.append(item)
+            target_zones.update(zones)
+    if not target_items:
+        raise RedisPreflightError(
+            RedisPreflightErrorCode.REQUESTED_SKU_REGION_ABSENT,
+            "The exact Balanced_B0 SKU is not advertised in the target region",
+        )
+    ignored_restrictions = _check_sku_restrictions(exact_items, expected_location)
+    quota_resource_types = [
+        resource_type
+        for resource_type in resource_types
+        if _normalized_exact_token(resource_type.get("resourceType"))
+        == "locations/usages"
+    ]
+    if len(quota_resource_types) > 1:
+        raise RedisPreflightError(
+            RedisPreflightErrorCode.PROVIDER_METADATA_MALFORMED,
+            "Microsoft.Cache advertises duplicate quota resource types",
+        )
+    quota = _quota_evidence(
+        configuration,
+        azure,
+        quota_resource_types[0] if quota_resource_types else None,
+    )
+    return {
+        "allocation": {
+            "status": "NOT_PROVABLE_BEFORE_CREATION",
+            "statement": (
+                "Provider and SKU metadata do not reserve or guarantee current "
+                "physical capacity."
+            ),
+        },
+        "api_version": REDIS_API_VERSION,
+        "provider": {
+            "namespace": "Microsoft.Cache",
+            "registration": "REGISTERED",
+            "regional_support": "ADVERTISED",
+            "resource_type": REDIS_RESOURCE_TYPE,
+            "target_region": configuration.location,
+            "target_region_zones": provider_zones,
+        },
+        "quota": quota,
+        "restrictions": {
+            "applicable": 0,
+            "ignored_unrelated": ignored_restrictions,
+            "status": "NONE_APPLICABLE",
+        },
+        "sku": {
+            "advertised_locations": sorted(advertised_locations),
+            "catalog_item_count": len(sku_items),
+            "catalog_page_count": sku_page_count,
+            "matched_entry_count": len(exact_items),
+            "name": REDIS_SKU_NAME,
+            "resource_type": REDIS_RESOURCE_TYPE,
+            "status": "ADVERTISED",
+            "target_region_zones": sorted(target_zones),
+            "tier": REDIS_SKU_TIER,
+        },
+    }
 
 
 def _openai_account_parts(resource_id: str) -> tuple[str, str]:
@@ -1211,9 +1866,9 @@ def run_preflight(
         raise PreflightError(f"Unsupported preflight phase {phase}")
     _check_iac_representation(repository_root)
     _check_account(configuration, azure)
-    _check_providers(azure)
+    cache_provider = _check_providers(azure)
     _check_oidc_federation(configuration, azure)
-    _check_redis_availability(configuration, azure)
+    redis_evidence = _check_redis_availability(configuration, azure, cache_provider)
     model_evidence = _check_model_deployments(configuration, azure)
     require_foundation = phase in {"publish", "artifacts", "rollout"}
     resources = _check_resource_group(
@@ -1255,7 +1910,12 @@ def run_preflight(
             "account",
             "providers",
             "github_oidc_federation",
-            "redis_balanced_b0_availability_and_quota",
+            "redis_provider_registration",
+            "redis_regional_resource_type",
+            "redis_exact_sku_advertisement",
+            "redis_applicable_restrictions",
+            "redis_quota_exposure",
+            "redis_allocation_not_provable",
             "model_deployments",
             "iac_representation",
             *(
@@ -1283,6 +1943,7 @@ def run_preflight(
         "location": configuration.location,
         "models": model_evidence,
         "phase": phase,
+        "redis": redis_evidence,
         "resource_group": configuration.resource_group,
         "subscription_id": _redact_identifier(configuration.subscription_id),
         "tenant_id": _redact_identifier(configuration.tenant_id),

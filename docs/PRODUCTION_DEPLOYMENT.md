@@ -207,17 +207,29 @@ python scripts/azure_preflight.py --phase rollout \
 The phases prove these progressively stronger conditions:
 
 * `foundation`: tenant, subscription, OIDC federation, Contributor scope,
-  providers, East US 2, Balanced B0 metadata and quota, existing Azure OpenAI
-  deployments, pricing provenance, budget, and checked-in IaC representation
+  providers, East US 2 Redis Enterprise resource-type advertisement, exact
+  Balanced B0 subscription SKU advertisement, applicable restrictions, Redis
+  quota-exposure status, existing Azure OpenAI deployments, pricing provenance,
+  budget, and checked-in IaC representation
 * `publish`: foundation resources, exact UI callback and assignment policy,
   `AcrPush`, and external Foundry access for the API identity
 * `artifacts`: separate API and UI registry manifest digests
 * `rollout`: artifacts plus API/UI `AcrPull`, container-scoped Cosmos data
   contribution, Redis `default` policy, and Foundry inference access
 
-SKU metadata and quota do not guarantee physical regional allocation. An
-allocation failure stops the workflow. No code selects another region, Redis
-SKU, model, deployment, service, or authentication mechanism.
+The stable Redis Enterprise API does not expose a documented regional quota
+operation, and the Azure Quota API does not advertise Microsoft.Cache support.
+When provider metadata exposes no authoritative quota surface, preflight records
+`NOT_EXPOSED`; this is neither quota availability nor quota exhaustion and does
+not independently block the exact reviewed deployment. If Azure later advertises
+an authoritative quota operation, unavailable query evidence blocks, an exact
+exhausted quota blocks, and an exact available quota remains only quota evidence.
+
+Provider, SKU, restriction, and quota metadata do not guarantee physical
+regional allocation. Preflight always records allocation as
+`NOT_PROVABLE_BEFORE_CREATION`. An `AllocationFailed` response during an exact
+deployment stops the workflow. No code selects another region, Redis SKU, model,
+deployment, service, or authentication mechanism.
 
 ## Model and pricing binding
 
@@ -344,9 +356,18 @@ Distinguish a local image ID from the ACR manifest digest.
 
 ### Managed Redis
 
-Confirm `Microsoft.Cache` registration, `Balanced_B0` metadata and quota in
-`eastus2`, and absence of active restrictions. Capacity failure after a green
-metadata check is still a hard stop. Do not change SKU or region automatically.
+Confirm `Microsoft.Cache` registration, regional `redisEnterprise` advertisement,
+an exact `Balanced_B0` and `Balanced` subscription SKU entry for `eastus2`, and
+the absence of applicable regional, subscription, or quota restrictions. Review
+the reported quota status: `NOT_EXPOSED` is an explicit unknown, not available
+quota. Unauthorized, transient, malformed, and unclassified queries are blockers.
+
+On 2026-09-01, the verified subscription response advertised `redisEnterprise`
+in East US 2 but returned the only exact `Balanced_B0` entry for Australia
+Central. It returned no East US 2 match, so preflight remains blocked. Azure
+Support must resolve the subscription SKU advertisement, or the user must approve
+an architecture change. Do not change SKU or region automatically. A later
+`AllocationFailed` response remains a hard stop even after all metadata gates pass.
 
 ### Missing model deployment or pricing
 
