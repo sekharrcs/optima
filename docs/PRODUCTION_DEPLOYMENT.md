@@ -40,23 +40,27 @@ publish a native ARM build as an Azure runtime image.
 
 ## Selected East US 2 cache profile
 
-The current workflow owns one canonical production decision:
-`OPTIMA_SEMANTIC_CACHE_ENABLED=false`. The Bicep entry points receive the same
-Boolean and omit Azure Managed Redis, Redis access assignments, endpoint values,
+The workflow reads one protected canonical production decision from the
+`OPTIMA_SEMANTIC_CACHE_ENABLED` environment variable and passes it unchanged to
+preflight, both Bicep entry points, Container Apps, and smoke. The selected East
+US 2 profile sets that variable to `false`. Disabled mode makes the Bicep entry
+points omit Azure Managed Redis, Redis access assignments, endpoint values,
 embedding settings, and embedding pricing. The API then omits embedding, Redis,
 token renewal, and index bootstrap from its lifespan.
 
-This temporary profile retains model routing, Quality Contract enforcement,
+The disabled profile retains model routing, Quality Contract enforcement,
 LLM-judge evaluation, escalation, context reduction, exact active-role cost
 accounting, Cosmos history, Application Insights, Entra UI authentication,
 immutable publication, and paired rollback. Smoke uses a cache-eligible request
 and requires typed disabled evidence with no cache step or embedding usage. No
 cache hit or cache-savings claim is permitted.
 
-Changing this profile to true is a reviewed code change. It reactivates every
-existing Redis and embedding input, provider/SKU/restriction/quota preflight,
-runtime assignment, index bootstrap, pricing, and smoke gate. It does not select
-a different SKU or region.
+Changing the mode to `true` is a reviewed configuration change to the protected
+environment variable and its approval gate, not a workflow-code change. Enabled
+mode reactivates every required Redis and embedding input,
+provider/SKU/restriction/quota preflight, runtime assignment, index bootstrap,
+pricing, and smoke gate, and fails closed when any of them is missing. Neither
+mode selects a different SKU or region.
 
 ## Protected GitHub environment
 
@@ -97,6 +101,7 @@ login.
 | `OPTIMA_JUDGE_DEPLOYMENT` | Exact dedicated JUDGE deployment name |
 | `OPTIMA_JUDGE_MODEL` | Live JUDGE model name reported by Azure |
 | `OPTIMA_JUDGE_MODEL_VERSION` | Live JUDGE model version reported by Azure |
+| `OPTIMA_SEMANTIC_CACHE_ENABLED` | Exactly `true` or `false`; selects cache-enabled or cache-disabled production and gates every cache-only variable below |
 | `OPTIMA_REDIS_EMBEDDING_DEPLOYMENT` | Required only in cache-enabled mode; absent in the selected profile |
 | `OPTIMA_REDIS_EMBEDDING_MODEL` | Required only in cache-enabled mode; absent in the selected profile |
 | `OPTIMA_REDIS_EMBEDDING_MODEL_VERSION` | Required only in cache-enabled mode; absent in the selected profile |
@@ -133,9 +138,11 @@ login.
 Do not place connection strings, access keys, tokens, passwords, or client
 secrets in repository or environment variables.
 
-The workflow supplies the semantic-cache Boolean directly rather than reading a
-GitHub variable. Cache-only GitHub variables must remain absent or empty while
-the selected value is false. Preflight rejects any stale nonempty value.
+The workflow reads the semantic-cache Boolean from the protected
+`OPTIMA_SEMANTIC_CACHE_ENABLED` environment variable and rejects any value other
+than exactly `true` or `false` before Azure login. Cache-only GitHub variables
+must remain absent or empty while the selected value is `false`. Preflight
+rejects any stale nonempty value.
 
 ### Secret
 

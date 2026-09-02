@@ -310,7 +310,7 @@ jobs:
       OPTIMA_REDIS_EMBEDDING_MODEL: "${{ vars.OPTIMA_REDIS_EMBEDDING_MODEL }}"
       OPTIMA_REDIS_EMBEDDING_MODEL_VERSION: "${{ vars.OPTIMA_REDIS_EMBEDDING_MODEL_VERSION }}"
       OPTIMA_RUNTIME_ACCESS_BOOTSTRAPPED: "${{ vars.OPTIMA_RUNTIME_ACCESS_BOOTSTRAPPED }}"
-      OPTIMA_SEMANTIC_CACHE_ENABLED: "false"
+      OPTIMA_SEMANTIC_CACHE_ENABLED: "${{ vars.OPTIMA_SEMANTIC_CACHE_ENABLED }}"
       OPTIMA_UI_AUTH_CLIENT_ID: "${{ vars.OPTIMA_UI_AUTH_CLIENT_ID }}"
       OPTIMA_UI_AUTH_REDIRECT_URI: "${{ vars.OPTIMA_UI_AUTH_REDIRECT_URI }}"
       OPTIMA_UI_AUTH_CLIENT_SECRET: "${{ secrets.OPTIMA_UI_AUTH_CLIENT_SECRET }}"
@@ -351,7 +351,13 @@ jobs:
           set -euo pipefail
           test "$GITHUB_REF" = "refs/heads/main"
           test "$OPTIMA_GITHUB_ENVIRONMENT" = "hackathon"
-          test "$OPTIMA_SEMANTIC_CACHE_ENABLED" = "false"
+          case "$OPTIMA_SEMANTIC_CACHE_ENABLED" in
+            true | false) ;;
+            *)
+              echo "OPTIMA_SEMANTIC_CACHE_ENABLED must be exactly true or false" >&2
+              exit 1
+              ;;
+          esac
 
       # Azure/login v2.3.0 commit (refs/tags/v2.3.0^{}); the annotated tag object
       # eec3c95 is not a commit, so pin the peeled commit that Actions can resolve.

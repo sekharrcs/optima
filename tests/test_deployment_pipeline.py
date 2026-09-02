@@ -79,12 +79,16 @@ def test_preflight_and_mutation_order_is_fail_closed() -> None:
     assert "az deployment sub what-if" in content
 
 
-def test_cache_mode_is_fixed_and_propagated_without_stale_cache_inputs() -> None:
-    """Pass one canonical false mode and add cache-only values only when enabled."""
+def test_cache_mode_is_configuration_controlled_and_propagated() -> None:
+    """Read one protected canonical Boolean; add cache-only values only when enabled."""
     content = workflow()
 
-    assert 'OPTIMA_SEMANTIC_CACHE_ENABLED: "false"' in content
-    assert 'test "$OPTIMA_SEMANTIC_CACHE_ENABLED" = "false"' in content
+    assert (
+        'OPTIMA_SEMANTIC_CACHE_ENABLED: "${{ vars.OPTIMA_SEMANTIC_CACHE_ENABLED }}"'
+        in content
+    )
+    assert 'OPTIMA_SEMANTIC_CACHE_ENABLED: "false"' not in content
+    assert 'OPTIMA_SEMANTIC_CACHE_ENABLED: "true"' not in content
     assert content.count('"semanticCacheEnabled=$OPTIMA_SEMANTIC_CACHE_ENABLED"') == 2
     assert content.count('if test "$OPTIMA_SEMANTIC_CACHE_ENABLED" = "true"; then') == 3
     for parameter in (
@@ -106,6 +110,45 @@ def test_cache_mode_is_fixed_and_propagated_without_stale_cache_inputs() -> None
         )
         < foundation_cache_branch
     )
+
+
+def test_cache_mode_is_not_hardcoded_to_a_literal_boolean() -> None:
+    """Reject any workflow-owned cache mode that would need a code edit to change."""
+    content = workflow()
+
+    literal_mode = re.search(
+        r'OPTIMA_SEMANTIC_CACHE_ENABLED:\s*"(?:true|false)"', content
+    )
+    assert literal_mode is None
+    assert re.search(
+        r"OPTIMA_SEMANTIC_CACHE_ENABLED:\s*"
+        r'"\$\{\{\s*vars\.OPTIMA_SEMANTIC_CACHE_ENABLED\s*\}\}"',
+        content,
+    )
+    # A bare `test ... = "true|false"` assertion would force one mode; the
+    # conditional `if test ... = "true"; then` branch that adds cache-only
+    # parameters is mode-generic and must remain allowed.
+    forced_mode = re.search(
+        r'^\s*test "\$OPTIMA_SEMANTIC_CACHE_ENABLED" = "(?:true|false)"',
+        content,
+        re.MULTILINE,
+    )
+    assert forced_mode is None
+
+
+def test_cache_mode_is_strictly_canonically_validated_before_azure_login() -> None:
+    """Fail closed on any non-canonical cache mode before Azure identity or mutation."""
+    content = workflow()
+
+    assert content.count('case "$OPTIMA_SEMANTIC_CACHE_ENABLED" in') == 1
+    canonical_gate = content.index('case "$OPTIMA_SEMANTIC_CACHE_ENABLED" in')
+    error_message = content.index(
+        "OPTIMA_SEMANTIC_CACHE_ENABLED must be exactly true or false",
+        canonical_gate,
+    )
+    assert canonical_gate < error_message
+    assert canonical_gate < content.index("azure/login@")
+    assert canonical_gate < content.index("--phase foundation")
 
 
 def test_disabled_cache_is_verified_before_pre_exposure_smoke() -> None:

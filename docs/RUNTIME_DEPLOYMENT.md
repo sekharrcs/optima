@@ -50,12 +50,13 @@ Neither slice may silently select another Azure region.
 
 ## Temporary cache-disabled production profile
 
-The selected East US 2 hackathon profile sets
-`OPTIMA_SEMANTIC_CACHE_ENABLED=false` explicitly. Production accepts disabled
-mode only when every Redis, embedding, cache-tuning, and embedding-pricing value
-is absent. It rejects an omitted decision and contradictory cache-only values
-before constructing any provider resource. Enabled mode still requires the
-complete Azure Managed Redis and embedding configuration.
+The selected East US 2 hackathon profile sets the protected
+`OPTIMA_SEMANTIC_CACHE_ENABLED` environment variable to `false`. Production
+accepts disabled mode only when every Redis, embedding, cache-tuning, and
+embedding-pricing value is absent. It rejects an omitted decision and
+contradictory cache-only values before constructing any provider resource.
+Enabled mode still requires the complete Azure Managed Redis and embedding
+configuration.
 
 Disabled mode retains Quality Contract enforcement, SMALL and STRONG routing,
 evaluation, escalation, context reduction, exact SMALL, STRONG, and JUDGE cost

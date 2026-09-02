@@ -244,7 +244,7 @@ The UI receives no Foundry, Cosmos, Redis, or Application Insights setting.
 | `OPTIMA_DEPLOYMENT_ENVIRONMENT`                     | Literal `hackathon`                             | No     | Not applicable                 | IaC                |
 | `OPTIMA_PRODUCTION_EVALUATOR_MODE`                  | Reviewed `EXACT_REFERENCE` or `LLM_JUDGE` parameter | No | Not applicable                 | AI/model slice     |
 | `OPTIMA_PRODUCTION_REQUIRE_REFERENCE_OUTPUT`        | Derived from evaluator mode                    | No     | Not applicable                 | IaC                |
-| `OPTIMA_SEMANTIC_CACHE_ENABLED`                     | Explicit literal `false` in the selected profile | No   | Not applicable                 | IaC                |
+| `OPTIMA_SEMANTIC_CACHE_ENABLED`                     | Protected `OPTIMA_SEMANTIC_CACHE_ENABLED` deployment variable, exactly `true` or `false` | No | Not applicable                 | IaC                |
 | `OPTIMA_EXECUTION_CONCURRENCY_LIMIT`                | Literal `4`                                    | No     | Not applicable                 | IaC                |
 | `OPTIMA_EXECUTION_TIMEOUT_SECONDS`                  | Literal `300`                                  | No     | Not applicable                 | IaC                |
 | `OPTIMA_FOUNDRY_BASE_URL`                           | Reviewed Foundry/APIM parameter                | No     | Not applicable                 | AI/gateway slice   |
