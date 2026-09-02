@@ -38,6 +38,26 @@ target `linux/amd64`. Native wheels such as `cryptography`, `pandas`, `Pillow`,
 and `pyarrow` are selected inside the AMD64 builder. An ARM workstation must not
 publish a native ARM build as an Azure runtime image.
 
+## Selected East US 2 cache profile
+
+The current workflow owns one canonical production decision:
+`OPTIMA_SEMANTIC_CACHE_ENABLED=false`. The Bicep entry points receive the same
+Boolean and omit Azure Managed Redis, Redis access assignments, endpoint values,
+embedding settings, and embedding pricing. The API then omits embedding, Redis,
+token renewal, and index bootstrap from its lifespan.
+
+This temporary profile retains model routing, Quality Contract enforcement,
+LLM-judge evaluation, escalation, context reduction, exact active-role cost
+accounting, Cosmos history, Application Insights, Entra UI authentication,
+immutable publication, and paired rollback. Smoke uses a cache-eligible request
+and requires typed disabled evidence with no cache step or embedding usage. No
+cache hit or cache-savings claim is permitted.
+
+Changing this profile to true is a reviewed code change. It reactivates every
+existing Redis and embedding input, provider/SKU/restriction/quota preflight,
+runtime assignment, index bootstrap, pricing, and smoke gate. It does not select
+a different SKU or region.
+
 ## Protected GitHub environment
 
 Configure the `hackathon` environment before dispatching the workflow:
@@ -77,10 +97,10 @@ login.
 | `OPTIMA_JUDGE_DEPLOYMENT` | Exact dedicated JUDGE deployment name |
 | `OPTIMA_JUDGE_MODEL` | Live JUDGE model name reported by Azure |
 | `OPTIMA_JUDGE_MODEL_VERSION` | Live JUDGE model version reported by Azure |
-| `OPTIMA_REDIS_EMBEDDING_DEPLOYMENT` | Exact embedding deployment name |
-| `OPTIMA_REDIS_EMBEDDING_MODEL` | Live embedding model name reported by Azure |
-| `OPTIMA_REDIS_EMBEDDING_MODEL_VERSION` | Live embedding model version reported by Azure |
-| `OPTIMA_REDIS_EMBEDDING_DIMENSION` | Exact output dimension required by the selected embedding deployment |
+| `OPTIMA_REDIS_EMBEDDING_DEPLOYMENT` | Required only in cache-enabled mode; absent in the selected profile |
+| `OPTIMA_REDIS_EMBEDDING_MODEL` | Required only in cache-enabled mode; absent in the selected profile |
+| `OPTIMA_REDIS_EMBEDDING_MODEL_VERSION` | Required only in cache-enabled mode; absent in the selected profile |
+| `OPTIMA_REDIS_EMBEDDING_DIMENSION` | Required only in cache-enabled mode; absent in the selected profile |
 | `OPTIMA_PRICING_CATALOG_VERSION` | Immutable catalog or pricing-snapshot identifier |
 | `OPTIMA_PRICING_BINDING_SHA256` | Canonical digest of source, currency, model/version bindings, and exact rates |
 | `OPTIMA_PRICING_SOURCE_URL` | Public HTTPS source used for the reviewed rates |
@@ -100,9 +120,9 @@ login.
 | `OPTIMA_PRICING_JUDGE_INPUT_RATE_PER_MILLION_TOKENS` | Positive exact Decimal rate |
 | `OPTIMA_PRICING_JUDGE_OUTPUT_RATE_PER_MILLION_TOKENS` | Positive exact Decimal rate |
 | `OPTIMA_PRICING_JUDGE_CACHED_INPUT_RATE_PER_MILLION_TOKENS` | Optional non-negative exact Decimal rate |
-| `OPTIMA_PRICING_EMBEDDING_MODEL` | Exact model name priced by the embedding rate |
-| `OPTIMA_PRICING_EMBEDDING_MODEL_VERSION` | Exact model version priced by the embedding rate |
-| `OPTIMA_PRICING_EMBEDDING_INPUT_RATE_PER_MILLION_TOKENS` | Positive exact Decimal rate |
+| `OPTIMA_PRICING_EMBEDDING_MODEL` | Required only in cache-enabled mode; absent in the selected profile |
+| `OPTIMA_PRICING_EMBEDDING_MODEL_VERSION` | Required only in cache-enabled mode; absent in the selected profile |
+| `OPTIMA_PRICING_EMBEDDING_INPUT_RATE_PER_MILLION_TOKENS` | Required only in cache-enabled mode; absent in the selected profile |
 | `OPTIMA_COST_REVIEWED_ON` | Review date in `YYYY-MM-DD`, no more than 31 days old |
 | `OPTIMA_EXPECTED_FIXED_MONTHLY_COST_INR` | Reviewed fixed estimate not exceeding the `5000` infrastructure allocation |
 | `OPTIMA_UI_AUTH_CLIENT_ID` | Existing single-tenant Entra application client ID |
@@ -112,6 +132,10 @@ login.
 
 Do not place connection strings, access keys, tokens, passwords, or client
 secrets in repository or environment variables.
+
+The workflow supplies the semantic-cache Boolean directly rather than reading a
+GitHub variable. Cache-only GitHub variables must remain absent or empty while
+the selected value is false. Preflight rejects any stale nonempty value.
 
 ### Secret
 
@@ -173,8 +197,9 @@ contains the Container Apps environment default domain.
    redirect URI on the UI Entra application, require user assignment, and set
    `OPTIMA_UI_AUTH_REDIRECT_URI` to that exact value.
 6. Grant Cognitive Services OpenAI User to the API identity. Grant the publisher
-   `AcrPush`. Apply runtime access with the separate reviewed bootstrap principal;
-   the routine workflow never requests RBAC administration.
+  `AcrPush`. Apply ACR and Cosmos runtime access with the separate reviewed
+  bootstrap principal; disabled mode creates no Redis assignment. The routine
+  workflow never requests RBAC administration.
 7. Set `OPTIMA_RUNTIME_ACCESS_BOOTSTRAPPED=true` only after the assignments are
    present. Remove temporary subscription or RBAC-administration permissions.
 8. Dispatch the workflow again for the same exact commit. It transfers the exact
@@ -207,15 +232,21 @@ python scripts/azure_preflight.py --phase rollout \
 The phases prove these progressively stronger conditions:
 
 * `foundation`: tenant, subscription, OIDC federation, Contributor scope,
-  providers, East US 2 Redis Enterprise resource-type advertisement, exact
-  Balanced B0 subscription SKU advertisement, applicable restrictions, Redis
-  quota-exposure status, existing Azure OpenAI deployments, pricing provenance,
-  budget, and checked-in IaC representation
+  providers, active Azure OpenAI deployments, active-role pricing provenance,
+  budget, checked-in IaC representation, explicit disabled mode, and absent
+  Redis and embedding configuration. Cache-enabled mode additionally requires
+  the East US 2 Redis Enterprise resource type, exact Balanced B0 advertisement,
+  applicable restrictions, quota exposure, and allocation-unknown evidence
 * `publish`: foundation resources, exact UI callback and assignment policy,
   `AcrPush`, and external Foundry access for the API identity
 * `artifacts`: separate API and UI registry manifest digests
 * `rollout`: artifacts plus API/UI `AcrPull`, container-scoped Cosmos data
-  contribution, Redis `default` policy, and Foundry inference access
+  contribution, and Foundry inference access. Cache-enabled mode also requires
+  the Redis `default` policy
+
+The following Redis quota and allocation behavior applies only to cache-enabled
+mode. Disabled mode does not query `Microsoft.Cache` and instead proves that the
+resource and embedding configuration are absent.
 
 The stable Redis Enterprise API does not expose a documented regional quota
 operation, and the Azure Quota API does not advertise Microsoft.Cache support.
@@ -236,7 +267,9 @@ deployment, service, or authentication mechanism.
 List the existing deployments from the selected Azure OpenAI account. For each
 logical role, review the exact deployment name, model name, model version, SKU,
 capacity, region availability, context limits, response-format support, and
-quota. The four deployment names must be distinct.
+quota. The selected profile requires distinct SMALL, STRONG, and JUDGE
+deployments. Cache-enabled mode additionally requires a distinct embedding
+deployment.
 
 Do not derive a deployment name from a model name. Do not create a missing
 deployment until the owner has reviewed regional availability, quota, and
@@ -255,6 +288,11 @@ binding. Store that lowercase digest as `OPTIMA_PRICING_BINDING_SHA256`; changin
 any source, currency, model/version, or rate invalidates preflight. Runtime sets
 `OPTIMA_PRODUCTION_COST_MEASUREMENT_REQUIRED=true`, so incomplete pricing also
 fails application startup.
+
+The selected disabled profile hashes SMALL, STRONG, and JUDGE pricing. Enabled
+mode adds the embedding model, version, and input rate to the same canonical
+binding. Supplying any embedding pricing or identity while the mode is false is
+a configuration error, not ignored metadata.
 
 ## Immutable artifact rules
 
@@ -296,7 +334,9 @@ SMALL/JUDGE production run with measured pricing. The UI image is distroless and
 has no shell, so the smoke runs the image's own Python entrypoint as a job and is
 gated on the `Succeeded` execution status rather than `az containerapp exec`. The
 run carries a unique W3C trace ID that the workflow finds in Application Insights
-by `operation_Id`.
+by `operation_Id`. Before starting the job, the workflow reads the deployed API
+revision and requires cache mode `false` with zero Redis or embedding-price
+environment values.
 
 Use these read-only checks when investigating a rollout:
 
@@ -319,12 +359,13 @@ secret values while inspecting logs or telemetry.
 
 ## Safe rollback
 
-The workflow captures both ready revision names and immutable image references
-before mutation. Any rollout or smoke failure makes UI ingress internal first. If a
-prior pair exists, the workflow creates a new single-mode revision from each
-captured ready revision, waits for both exact revisions to become healthy, and
-verifies both image references. Manual cancellation after rollout mutation uses
-the same containment path. It deliberately leaves
+The workflow captures both ready revision names, immutable image references, and
+the prior API cache mode before mutation. Any rollout or smoke failure makes UI
+ingress internal first. If a prior pair exists, the workflow creates a new
+single-mode revision from each captured ready revision, waits for both exact
+revisions to become healthy, and verifies the image references and restored cache
+mode. Manual cancellation after rollout mutation uses the same containment path.
+It deliberately leaves
 UI ingress internal because revision activation cannot restore or prove the
 prior app-level client secret and Easy Auth configuration. A first deployment
 failure also leaves the UI internal.
@@ -356,6 +397,10 @@ Distinguish a local image ID from the ACR manifest digest.
 
 ### Managed Redis
 
+This troubleshooting path applies only after an explicit reviewed switch to
+cache-enabled production. The selected disabled profile does not query
+`Microsoft.Cache`, require Redis access, or accept embedding configuration.
+
 Confirm `Microsoft.Cache` registration, regional `redisEnterprise` advertisement,
 an exact `Balanced_B0` and `Balanced` subscription SKU entry for `eastus2`, and
 the absence of applicable regional, subscription, or quota restrictions. Review
@@ -379,9 +424,10 @@ all role rates under one catalog version and currency.
 ### Failed readiness
 
 Inspect the revision provisioning and system logs. Production health cannot pass
-until settings validation, telemetry composition, model clients, Redis index
-bootstrap, and Cosmos composition complete. Correct the failing dependency; do
-not switch to in-memory stores, fake providers, access keys, or local services.
+until settings validation, telemetry composition, model clients, and Cosmos
+composition complete. Cache-enabled mode additionally requires Redis index
+bootstrap. Correct the failing dependency; do not switch to in-memory stores,
+fake providers, access keys, or local services.
 
 ### UI-to-API connectivity
 
@@ -391,10 +437,12 @@ DNS and ingress before changing application configuration.
 
 ## Cost boundary
 
-The reference fixed floor is approximately INR 1,600 per month for ACR Basic and
-Managed Redis Balanced B0. Log Analytics at the configured cap is approximately
-INR 1,650 per 30 days. Container Apps active time, Cosmos requests and storage,
-telemetry ingestion, and model calls remain variable.
+The prior approximately INR 3,250 fixed estimate included approximately INR
+1,117 per month for Balanced B0. Omitting Redis reduces the comparable fixed
+estimate to approximately INR 2,133 per month before tax. Log Analytics at the
+configured cap is approximately INR 1,650 per 30 days. Container Apps active
+time, Cosmos requests and storage, telemetry ingestion, and model calls remain
+variable.
 
 Refresh the estimate before every deployment. Preflight requires a review no
 more than 31 days old and rejects a fixed estimate above the INR 5,000

@@ -87,6 +87,12 @@ def isolate_settings_sources(
         "OPTIMA_REDIS_MANAGED_IDENTITY_CLIENT_ID",
         "OPTIMA_REDIS_TIMEOUT_SECONDS",
         "OPTIMA_REDIS_MAX_CONNECTIONS",
+        "OPTIMA_REDIS_TOKEN_RENEWAL_ATTEMPTS",
+        "OPTIMA_REDIS_TOKEN_RETRY_BACKOFF_SECONDS",
+        "OPTIMA_REDIS_TOKEN_RETRY_BACKOFF_CAP_SECONDS",
+        "OPTIMA_REDIS_TOKEN_ACQUISITION_TIMEOUT_SECONDS",
+        "OPTIMA_REDIS_TOKEN_REAUTH_TIMEOUT_SECONDS",
+        "OPTIMA_REDIS_TOKEN_EXPIRY_SAFETY_MARGIN_SECONDS",
         "OPTIMA_APPLICATION_INSIGHTS_ENABLED",
         "OPTIMA_APPLICATION_INSIGHTS_CONNECTION_STRING",
         "OPTIMA_APPLICATION_INSIGHTS_SERVICE_NAME",
@@ -247,10 +253,12 @@ def test_settings_accept_explicit_injection() -> None:
 
 def production_settings(**updates: object) -> AppSettings:
     """Build complete production settings with user-assigned identities."""
+    semantic_cache_enabled = updates.get("semantic_cache_enabled", True)
     values: dict[str, object] = {
         "deployment_environment": "hackathon",
         "production_evaluator_mode": ProductionEvaluatorMode.EXACT_REFERENCE,
         "production_require_reference_output": True,
+        "semantic_cache_enabled": semantic_cache_enabled,
         "foundry_base_url": "https://optima.openai.azure.com/openai/v1",
         "foundry_small_deployment": "small",
         "foundry_small_model": "small-model",
@@ -264,14 +272,6 @@ def production_settings(**updates: object) -> AppSettings:
         "cosmos_container_name": "runs",
         "cosmos_auth_mode": CosmosAuthMode.MANAGED_IDENTITY,
         "cosmos_managed_identity_client_id": "api-client-id",
-        "redis_host": "optima.eastus2.redis.azure.net",
-        "redis_index_name": "optima-cache-v1",
-        "redis_embedding_dimension": 1536,
-        "redis_embedding_model": "text-embedding-3-small",
-        "redis_embedding_deployment": "embedding",
-        "redis_auth_mode": RedisAuthMode.MANAGED_IDENTITY,
-        "redis_object_id": "api-object-id",
-        "redis_managed_identity_client_id": "api-client-id",
         "application_insights_enabled": True,
         "application_insights_connection_string": (
             "InstrumentationKey=00000000-0000-0000-0000-000000000001;"
@@ -279,8 +279,100 @@ def production_settings(**updates: object) -> AppSettings:
         ),
         "application_insights_deployment_environment": "hackathon",
     }
+    if semantic_cache_enabled is True:
+        values.update(
+            {
+                "redis_host": "optima.eastus2.redis.azure.net",
+                "redis_index_name": "optima-cache-v1",
+                "redis_embedding_dimension": 1536,
+                "redis_embedding_model": "text-embedding-3-small",
+                "redis_embedding_deployment": "embedding",
+                "redis_auth_mode": RedisAuthMode.MANAGED_IDENTITY,
+                "redis_object_id": "api-object-id",
+                "redis_managed_identity_client_id": "api-client-id",
+            }
+        )
     values.update(updates)
     return AppSettings.model_validate(values)
+
+
+def test_production_runtime_requires_explicit_semantic_cache_decision() -> None:
+    """Reject a defaulted cache mode before constructing production resources."""
+    values = production_settings().model_dump(exclude={"semantic_cache_enabled"})
+    settings = AppSettings.model_validate(values)
+
+    with pytest.raises(ValueError, match="explicit semantic_cache_enabled decision"):
+        settings.validate_production_runtime()
+
+
+def test_production_runtime_accepts_disabled_cache_without_cache_only_settings() -> (
+    None
+):
+    """Accept the explicit cache-disabled production profile without Redis inputs."""
+    settings = production_settings(semantic_cache_enabled=False)
+
+    assert settings.validate_production_runtime() is settings
+    assert settings.redis_semantic_cache_configuration() is None
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "judge_deployment",
+        "judge_model",
+        "judge_timeout_seconds",
+        "pricing_judge_cached_input_rate_per_million_tokens",
+        "pricing_judge_input_rate_per_million_tokens",
+        "pricing_judge_output_rate_per_million_tokens",
+    ],
+)
+def test_exact_reference_production_rejects_inactive_judge_field(
+    field_name: str,
+) -> None:
+    """Reject stale JUDGE identity, timeout, and pricing in benchmark mode."""
+    settings = production_settings().model_copy(
+        update={field_name: getattr(production_settings(), field_name)}
+    )
+
+    with pytest.raises(ValueError, match=f"inactive JUDGE fields: {field_name}"):
+        settings.validate_production_runtime()
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "cache_similarity_threshold",
+        "pricing_embedding_input_rate_per_million_tokens",
+        "redis_access_key",
+        "redis_auth_mode",
+        "redis_embedding_deployment",
+        "redis_embedding_dimension",
+        "redis_embedding_model",
+        "redis_host",
+        "redis_index_name",
+        "redis_managed_identity_client_id",
+        "redis_max_connections",
+        "redis_object_id",
+        "redis_timeout_seconds",
+        "redis_token_acquisition_timeout_seconds",
+        "redis_token_expiry_safety_margin_seconds",
+        "redis_token_reauth_timeout_seconds",
+        "redis_token_renewal_attempts",
+        "redis_token_retry_backoff_cap_seconds",
+        "redis_token_retry_backoff_seconds",
+    ],
+)
+def test_disabled_production_rejects_every_explicit_cache_only_field(
+    field_name: str,
+) -> None:
+    """Reject stale cache inputs even when their explicit value equals a default."""
+    settings = production_settings(semantic_cache_enabled=False)
+    contradictory = settings.model_copy(
+        update={field_name: getattr(settings, field_name)}
+    )
+
+    with pytest.raises(ValueError, match=f"cache-only fields: {field_name}"):
+        contradictory.validate_production_runtime()
 
 
 def test_production_runtime_accepts_complete_azure_configuration() -> None:
@@ -564,6 +656,32 @@ def test_production_runtime_accepts_required_cost_measurement_with_pricing() -> 
     assert settings.validate_production_runtime() is settings
 
 
+def test_cache_disabled_pricing_requires_only_active_model_and_judge_roles() -> None:
+    """Build complete model-only pricing without an unreachable embedding rate."""
+    settings = production_settings(
+        semantic_cache_enabled=False,
+        production_evaluator_mode=ProductionEvaluatorMode.LLM_JUDGE,
+        production_require_reference_output=False,
+        production_cost_measurement_required=True,
+        judge_deployment="judge-deployment",
+        judge_model="judge-model-v1",
+        pricing_catalog_version="foundry-apim-2026-01-01",
+        pricing_small_input_rate_per_million_tokens=Decimal("0.15"),
+        pricing_small_output_rate_per_million_tokens=Decimal("0.60"),
+        pricing_strong_input_rate_per_million_tokens=Decimal("2.50"),
+        pricing_strong_output_rate_per_million_tokens=Decimal("10.00"),
+        pricing_judge_input_rate_per_million_tokens=Decimal("0.25"),
+        pricing_judge_output_rate_per_million_tokens=Decimal("1.25"),
+    )
+
+    pricing = settings.production_pricing_inputs()
+
+    assert settings.validate_production_runtime() is settings
+    assert pricing is not None
+    assert pricing.embedding_input_rate_per_million_tokens is None
+    assert pricing.judge is not None
+
+
 def test_settings_read_prefixed_environment_variables(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -579,6 +697,7 @@ def test_settings_read_prefixed_environment_variables(
     assert settings.context_reduction_enabled is False
     assert settings.historical_policy_enabled is False
     assert settings.foundry_router_comparator_enabled is True
+    assert "semantic_cache_enabled" in settings.model_fields_set
 
 
 def test_explicit_settings_take_precedence_over_environment(

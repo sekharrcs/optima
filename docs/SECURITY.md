@@ -146,15 +146,18 @@ IDs or unprotected headers are not an acceptable boundary.
 
 ## Managed identity and network boundary
 
-The API user-assigned managed identity accesses Foundry, Cosmos DB, Azure Managed
-Redis, and ACR. The UI identity pulls only its ACR image. Cosmos local auth,
-Redis access keys, and ACR admin credentials remain disabled; Redis and Cosmos
-require TLS.
+The API user-assigned managed identity accesses Foundry, Cosmos DB, and ACR. It
+accesses Azure Managed Redis only in cache-enabled production. The selected
+disabled profile deploys no Redis resource or assignment and starts no Redis
+authentication or token renewal. The UI identity pulls only its ACR image.
+Cosmos local auth and ACR admin credentials remain disabled. Cache-enabled mode
+also disables Redis access keys and requires TLS.
 
-Cosmos and Redis retain public service endpoints for the hackathon. Private
-endpoints, VNet integration, private DNS, and egress filtering remain production
-hardening backlog items because they add cost and deployment complexity. Their
-absence does not change the Entra-only data-plane authentication requirement.
+Cosmos retains a public service endpoint for the hackathon. Cache-enabled mode
+also uses a public Redis endpoint. Private endpoints, VNet integration, private
+DNS, and egress filtering remain production hardening backlog items because they
+add cost and deployment complexity. Their absence does not change the Entra-only
+data-plane authentication requirement for configured services.
 
 ## Request and cost-abuse controls
 

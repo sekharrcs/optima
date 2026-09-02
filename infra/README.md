@@ -22,8 +22,9 @@ description: Validation, deployment entry points, and safety boundaries for OPTI
   deployments.
 
 Both parameter files contain non-deployable model and image placeholders. Both
-keep `deployContainerApps=false` and `deployRuntimeAccess=false`. These values
-are deliberate deployment gates.
+keep `deployContainerApps=false` and `deployRuntimeAccess=false`, and both set
+`semanticCacheEnabled=false` explicitly. These values are deliberate deployment
+gates.
 
 The Container Apps environment is part of foundation convergence even while
 `deployContainerApps=false`. The API, UI, and UI authentication resources remain
@@ -45,14 +46,15 @@ placeholders only after the corresponding ACR manifests exist.
 | `container-registry.bicep` | Basic ACR without admin credentials               |
 | `monitoring.bicep`         | Log Analytics and Application Insights           |
 | `cosmos.bicep`             | Serverless NoSQL account, database, and container|
-| `managed-redis.bicep`      | B0 Redis and RediSearch-capable database          |
-| `runtime-access.bicep`     | Conditional ACR, Cosmos, and Redis runtime grants |
+| `managed-redis.bicep`      | Cache-enabled B0 Redis and RediSearch database    |
+| `runtime-access.bicep`     | ACR and Cosmos grants plus optional Redis access  |
 | `container-apps.bicep`     | Gated API/UI Container Apps definitions           |
 
 The runtime-access module uses deterministic names and exact scopes. It grants
-`AcrPull` to the API and UI identities, Cosmos data contribution to the API on
-`optima/runs`, and the stable Redis `default` policy to the API. It is disabled
-for routine deployments because its ACR assignments require a reviewed
+`AcrPull` to the API and UI identities and Cosmos data contribution to the API
+on `optima/runs`. It adds the stable Redis `default` policy only when cache is
+enabled. It is disabled for routine deployments because its ACR assignments
+require a reviewed
 principal with Role Based Access Control Administrator on the exact registry.
 Foundry access, image-publisher `AcrPush`, deployment scripts, federated
 credentials, and provider registration remain outside this template graph.
@@ -76,8 +78,11 @@ Compilation reads local files only. It does not prove regional SKU availability,
 subscription quota, provider registration, RBAC, data-plane access, image
 availability, or model availability.
 
-Slice 11C must preflight `Microsoft.Cache` registration, Azure Managed Redis
-availability in `eastus2`, Balanced B0 SKU support, and relevant subscription
-quota before deployment. Regional allocation can still fail after metadata and
+The selected profile omits Managed Redis, all Redis outputs and assignments, and
+all cache-only Container Apps values. Preflight emits explicit disabled evidence
+and rejects stale embedding or Redis settings. Restoring cache requires a
+reviewed true value plus `Microsoft.Cache` registration, Azure Managed Redis
+availability in `eastus2`, exact Balanced B0 SKU support, restrictions, and
+relevant quota evidence. Regional allocation can still fail after metadata and
 quota checks pass. That failure must stop deployment; no automatic fallback to
 East US or another region is allowed.

@@ -95,7 +95,7 @@ Subscription-scope Bicep
                 |     |- internal OPTIMA FastAPI API
                 |     |- Entra-protected public OPTIMA Streamlit UI
                 +--> Azure Cosmos DB for NoSQL serverless
-                +--> Azure Managed Redis Balanced B0
+                +--> Azure Managed Redis Balanced B0 (cache-enabled profile only)
                 +--> Log Analytics + Application Insights
                 +--> separate API and UI managed identities
                 +--> optional runtime access assignments
@@ -121,6 +121,14 @@ request reaches Streamlit.
 See `docs/AZURE_INFRASTRUCTURE.md` for resource configuration, configuration
 mapping, identity scopes, provider registrations, cost controls, and deployment
 gates.
+
+The selected East US 2 production profile explicitly disables semantic cache.
+Its Bicep graph omits Managed Redis and Redis access, and its API lifespan omits
+embedding, Redis, token renewal, and index bootstrap. Planner and runtime
+evidence still record the disabled module state. Cache hits, cache savings, and
+embedding usage are unavailable in this profile rather than inferred or reported
+as zero-cost optimization work. The cache-enabled profile remains defined behind
+the same typed Boolean and retains the exact fail-closed Redis contract.
 
 ## Design boundaries
 
@@ -507,20 +515,19 @@ other owned resources, allowing cleanup failures to remain observable.
 
 ### Production runtime composition
 
-`create_production_app()` validates complete Foundry, Cosmos, Redis, managed
-identity, and Application Insights settings before resource construction. It
-creates one app-local dependency graph with no fake fallback. The graph contains
-Foundry SMALL and STRONG providers, an optional separately timed Foundry JUDGE
-provider, the Foundry embedding provider, semantic cache, Cosmos run history,
-deterministic context reduction, explicitly selected exact-reference or LLM-judge
-evaluation, centralized pricing, and observability.
+`create_production_app()` requires an explicit production cache decision before
+resource construction. It always validates Foundry, Cosmos, managed identity,
+Application Insights, and active model-role pricing. Enabled mode additionally
+requires complete Redis and embedding settings and pricing. Disabled mode rejects
+contradictory cache-only values. The factory creates one app-local dependency
+graph with no fake fallback.
 
-Construction order is telemetry, SMALL/STRONG Foundry, optional JUDGE, embedding,
-Redis, Redis index bootstrap, and Cosmos. Shutdown closes Cosmos, Redis,
-embedding, optional JUDGE, shared Foundry, and telemetry. Partial startup uses
-the same reverse cleanup, suppresses cleanup errors after recording their type,
-and re-raises the original startup error. Uvicorn does not serve health or run
-routes until the lifespan yields.
+Construction order is telemetry, SMALL/STRONG Foundry, optional JUDGE, optional
+embedding and Redis with index bootstrap, then Cosmos. Shutdown closes only the
+resources that were constructed, in reverse order. Partial startup uses the same
+reverse cleanup, suppresses cleanup errors after recording their type, and
+re-raises the original startup error. Uvicorn does not serve health or run routes
+until the selected lifespan graph yields.
 
 ## Module configuration
 

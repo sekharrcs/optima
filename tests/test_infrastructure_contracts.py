@@ -23,6 +23,14 @@ def test_application_parameter_files_target_eastus2_with_deployment_disabled() -
         assert "param deployContainerApps = false" in content
         assert "param exposePublicUi = false" in content
         assert "param deployRuntimeAccess = false" in content
+        assert "param semanticCacheEnabled = false" in content
+        for cache_parameter in (
+            "redisEmbeddingDeployment",
+            "redisEmbeddingModel",
+            "redisEmbeddingDimension",
+            "pricingEmbeddingInputRatePerMillionTokens",
+        ):
+            assert f"param {cache_parameter} =" not in content
 
 
 def test_container_apps_require_separate_immutable_image_digests() -> None:
@@ -74,6 +82,9 @@ def test_pre_exposure_smoke_runs_as_a_distroless_safe_job() -> None:
     assert "param smokeTraceparent string" in module
     assert "param smokeRunMarker string" in module
     assert "param smokeJobName string" in module
+    smoke_job = module[module.index("resource deploymentSmokeJob") :]
+    assert "name: 'OPTIMA_SEMANTIC_CACHE_ENABLED'" in smoke_job
+    assert "value: validatedSemanticCacheEnabled ? 'true' : 'false'" in smoke_job
 
     assert "smokeJob: 'caj-optima-smoke-${environmentName}'" in resources
     assert "smokeJobName: resourceNames.smokeJob" in resources
@@ -98,6 +109,8 @@ def test_container_apps_map_production_runtime_environment_contract() -> None:
     assert module.count("name: 'OPTIMA_DEPLOYMENT_ENVIRONMENT'") == 2
     assert "name: 'OPTIMA_PRODUCTION_EVALUATOR_MODE'" in module
     assert "name: 'OPTIMA_PRODUCTION_REQUIRE_REFERENCE_OUTPUT'" in module
+    assert "name: 'OPTIMA_SEMANTIC_CACHE_ENABLED'" in module
+    assert "value: validatedSemanticCacheEnabled ? 'true' : 'false'" in module
     assert "name: 'OPTIMA_EXECUTION_CONCURRENCY_LIMIT'" in module
     assert "name: 'OPTIMA_EXECUTION_TIMEOUT_SECONDS'" in module
     assert "name: 'OPTIMA_REQUIRE_REFERENCE_OUTPUT'" in module
@@ -113,6 +126,63 @@ def test_container_apps_map_production_runtime_environment_contract() -> None:
     assert "name: 'OPTIMA_API_BASE_URL'" in module
     assert "name: 'OPTIMA_API_TIMEOUT_SECONDS'" in module
     assert "name: 'OPTIMA_UI_PRODUCTION_MODE'" in module
+
+
+def test_semantic_cache_bicep_source_is_explicit_and_conditionally_composed() -> None:
+    """Guard every cache-only resource, value, and output behind one Boolean."""
+    main = read("infra/main.bicep")
+    resources = read("infra/resource-group.bicep")
+    access = read("infra/modules/runtime-access.bicep")
+    apps = read("infra/modules/container-apps.bicep")
+
+    for entry in (main, resources, access, apps):
+        assert "param semanticCacheEnabled bool" in entry
+
+    assert (
+        "module redis 'modules/managed-redis.bicep' = if "
+        "(validatedSemanticCacheEnabled)" in resources
+    )
+    assert access.count("= if (validatedSemanticCacheEnabled) {") == 3
+    assert (
+        "redisName: validatedSemanticCacheEnabled ? resourceNames.redis : null"
+        in resources
+    )
+    assert "semanticCacheEnvironment = validatedSemanticCacheEnabled" in apps
+    assert "semanticCacheEnvironment," in apps
+    for output_name, output_type in (
+        ("redisName", "string?"),
+        ("redisHost", "string?"),
+        ("redisPort", "int?"),
+        ("redisIndexName", "string?"),
+    ):
+        assert f"output {output_name} {output_type}" in main
+        assert f"output {output_name} {output_type}" in resources
+    assert "redisHost string? = validatedSemanticCacheEnabled ?" in resources
+    assert "redisPort int? = validatedSemanticCacheEnabled ?" in resources
+
+
+def test_cache_parameter_matrix_fails_closed_at_bicep_boundaries() -> None:
+    """Reject incomplete enabled mode and all non-null disabled cache values."""
+    for relative_path in (
+        "infra/main.bicep",
+        "infra/resource-group.bicep",
+    ):
+        entry = read(relative_path)
+        assert "var cacheConfigurationIsComplete" in entry
+        assert "var cacheConfigurationIsAbsent" in entry
+        assert "redisEmbeddingDimension ?? 0) >= 1" in entry
+        assert "redisEmbeddingDimension ?? 0) <= 32768" in entry
+        assert "Enabled semantic cache requires deployable embedding" in entry
+        assert "Disabled semantic cache rejects Redis, embedding" in entry
+
+    access = read("infra/modules/runtime-access.bicep")
+    apps = read("infra/modules/container-apps.bicep")
+    assert "var redisConfigurationIsComplete" in access
+    assert "var redisConfigurationIsAbsent" in access
+    assert "Disabled semantic cache runtime access rejects" in access
+    assert "var semanticCacheConfigurationIsComplete" in apps
+    assert "var semanticCacheConfigurationIsAbsent" in apps
+    assert "Disabled semantic cache rejects Redis, embedding" in apps
 
 
 def test_ui_transport_timeout_exceeds_server_execution_and_persistence_budgets() -> (
@@ -247,10 +317,14 @@ def test_container_apps_reject_checked_in_judge_placeholders() -> None:
     """Block LLM_JUDGE deployment until Slice 11C supplies real identities."""
     module = read("infra/modules/container-apps.bicep")
 
-    assert "judgeConfigurationIsDeployable" in module
-    assert "judgeDeployment != 'replace-judge-deployment'" in module
-    assert "judgeModel != 'replace-judge-model'" in module
-    assert "requires deployable judge identities" in module
+    assert "judgeConfigurationIsComplete" in module
+    assert "judgeConfigurationIsAbsent" in module
+    assert "toLower(judgeDeployment ?? '')" in module
+    assert "toLower(judgeModel ?? '')" in module
+    assert "requires deployable judge identity and pricing values" in module
+    assert "EXACT_REFERENCE Container Apps deployment rejects inactive JUDGE" in module
+    assert "var judgeEnvironment = validatedEvaluatorMode == 'LLM_JUDGE'" in module
+    assert "judgeEnvironment," in module
 
 
 def test_container_apps_environment_precedes_gated_applications() -> None:
@@ -274,8 +348,8 @@ def test_container_apps_environment_precedes_gated_applications() -> None:
     assert "Public UI exposure requires Container Apps deployment" in resources
 
 
-def test_container_apps_require_complete_reviewed_production_pricing() -> None:
-    """Supply every required role rate and reject deployment placeholders."""
+def test_container_apps_require_active_role_production_pricing() -> None:
+    """Always require model-role rates and condition embedding price on cache."""
     module = read("infra/modules/container-apps.bicep")
     resources = read("infra/resource-group.bicep")
     main = read("infra/main.bicep")
@@ -296,11 +370,13 @@ def test_container_apps_require_complete_reviewed_production_pricing() -> None:
         assert f"name: '{name}'" in module
 
     assert "value: 'true'" in module
-    assert "pricingConfigurationIsDeployable" in resources
-    assert "!deployContainerApps || pricingConfigurationIsDeployable" in resources
+    assert "basePricingConfigurationIsDeployable" in resources
+    assert "!deployContainerApps || basePricingConfigurationIsDeployable" in resources
     assert "requires complete reviewed pricing" in resources
     assert "!empty(pricingCatalogVersion)" in resources
-    assert "!empty(pricingEmbeddingInputRatePerMillionTokens)" in resources
+    assert "!empty(trim(pricingEmbeddingInputRatePerMillionTokens ?? ''))" in resources
+    assert "semanticCacheEnvironment = validatedSemanticCacheEnabled" in module
+    assert "name: 'OPTIMA_PRICING_EMBEDDING_INPUT_RATE_PER_MILLION_TOKENS'" in module
     assert "!empty(deploymentWorkflowRunId)" in resources
     assert "deploymentCommitInvalidCharacters" in resources
     assert "deploymentWorkflowRunInvalidCharacters" in resources

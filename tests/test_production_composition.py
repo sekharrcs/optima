@@ -44,40 +44,49 @@ from optima.providers import (
 from optima.storage import InMemoryRunHistoryStore
 
 
-def production_settings() -> AppSettings:
+def production_settings(**updates: object) -> AppSettings:
     """Build complete production settings without reading ambient values."""
-    return AppSettings(
-        deployment_environment="hackathon",
-        production_evaluator_mode=ProductionEvaluatorMode.EXACT_REFERENCE,
-        production_require_reference_output=True,
-        foundry_base_url="https://optima.openai.azure.com/openai/v1",
-        foundry_small_deployment="small",
-        foundry_small_model="small-model",
-        foundry_strong_deployment="strong",
-        foundry_strong_model="strong-model",
-        foundry_auth_mode=FoundryAuthMode.MANAGED_IDENTITY,
-        foundry_token_scope="https://cognitiveservices.azure.com/.default",
-        foundry_managed_identity_client_id="api-client-id",
-        cosmos_endpoint="https://optima.documents.azure.com:443/",
-        cosmos_database_name="optima",
-        cosmos_container_name="runs",
-        cosmos_auth_mode=CosmosAuthMode.MANAGED_IDENTITY,
-        cosmos_managed_identity_client_id="api-client-id",
-        redis_host="optima.eastus2.redis.azure.net",
-        redis_index_name="optima-cache-v1",
-        redis_embedding_dimension=3,
-        redis_embedding_model="embed-model",
-        redis_embedding_deployment="embed-deployment",
-        redis_auth_mode=RedisAuthMode.MANAGED_IDENTITY,
-        redis_object_id="api-object-id",
-        redis_managed_identity_client_id="api-client-id",
-        application_insights_enabled=True,
-        application_insights_connection_string=SecretStr(
+    semantic_cache_enabled = updates.get("semantic_cache_enabled", True)
+    values: dict[str, object] = {
+        "deployment_environment": "hackathon",
+        "production_evaluator_mode": ProductionEvaluatorMode.EXACT_REFERENCE,
+        "production_require_reference_output": True,
+        "semantic_cache_enabled": semantic_cache_enabled,
+        "foundry_base_url": "https://optima.openai.azure.com/openai/v1",
+        "foundry_small_deployment": "small",
+        "foundry_small_model": "small-model",
+        "foundry_strong_deployment": "strong",
+        "foundry_strong_model": "strong-model",
+        "foundry_auth_mode": FoundryAuthMode.MANAGED_IDENTITY,
+        "foundry_token_scope": "https://cognitiveservices.azure.com/.default",
+        "foundry_managed_identity_client_id": "api-client-id",
+        "cosmos_endpoint": "https://optima.documents.azure.com:443/",
+        "cosmos_database_name": "optima",
+        "cosmos_container_name": "runs",
+        "cosmos_auth_mode": CosmosAuthMode.MANAGED_IDENTITY,
+        "cosmos_managed_identity_client_id": "api-client-id",
+        "application_insights_enabled": True,
+        "application_insights_connection_string": SecretStr(
             "InstrumentationKey=00000000-0000-0000-0000-000000000001;"
             "IngestionEndpoint=https://eastus2-1.in.applicationinsights.azure.com/"
         ),
-        application_insights_deployment_environment="hackathon",
-    )
+        "application_insights_deployment_environment": "hackathon",
+    }
+    if semantic_cache_enabled is True:
+        values.update(
+            {
+                "redis_host": "optima.eastus2.redis.azure.net",
+                "redis_index_name": "optima-cache-v1",
+                "redis_embedding_dimension": 3,
+                "redis_embedding_model": "embed-model",
+                "redis_embedding_deployment": "embed-deployment",
+                "redis_auth_mode": RedisAuthMode.MANAGED_IDENTITY,
+                "redis_object_id": "api-object-id",
+                "redis_managed_identity_client_id": "api-client-id",
+            }
+        )
+    values.update(updates)
+    return AppSettings.model_validate(values)
 
 
 class RecordingObservability:
@@ -309,7 +318,7 @@ def llm_judge_settings(**updates: object) -> AppSettings:
         "judge_model": "judge-model-v1",
     }
     values.update(updates)
-    return production_settings().model_copy(update=values)
+    return production_settings(**values)
 
 
 def test_production_runtime_constructs_expected_graph_and_closes_once() -> None:
@@ -342,6 +351,58 @@ def test_production_runtime_constructs_expected_graph_and_closes_once() -> None:
         "close:cosmos",
         "close:redis",
         "close:embedding",
+        "close:foundry",
+        "close:telemetry",
+    ]
+
+
+def test_cache_disabled_runtime_never_builds_or_closes_cache_resources() -> None:
+    """Construct only active production resources and inject the no-cache path."""
+    events: list[str] = []
+    runtime = asyncio.run(
+        build_production_runtime(
+            production_settings(semantic_cache_enabled=False),
+            observability=RecordingObservability(events),
+            builders=component_builders(events),
+        )
+    )
+
+    assert events == ["build:foundry", "build:cosmos"]
+    assert runtime.dependencies.semantic_cache is None
+    assert runtime.dependencies.run_history_store is not None
+
+    asyncio.run(runtime.aclose())
+    asyncio.run(runtime.aclose())
+
+    assert events == [
+        "build:foundry",
+        "build:cosmos",
+        "close:cosmos",
+        "close:foundry",
+        "close:telemetry",
+    ]
+
+
+def test_cache_disabled_runtime_preserves_judge_and_non_cache_lifecycle() -> None:
+    """Keep JUDGE, Cosmos, Foundry, and telemetry ownership when cache is disabled."""
+    events: list[str] = []
+    runtime = asyncio.run(
+        build_production_runtime(
+            llm_judge_settings(semantic_cache_enabled=False),
+            observability=RecordingObservability(events),
+            builders=component_builders(events),
+        )
+    )
+
+    assert isinstance(runtime.dependencies.evaluator, LLMJudgeEvaluator)
+    assert runtime.dependencies.semantic_cache is None
+    assert events == ["build:foundry", "build:judge", "build:cosmos"]
+
+    asyncio.run(runtime.aclose())
+
+    assert events[-4:] == [
+        "close:cosmos",
+        "close:judge",
         "close:foundry",
         "close:telemetry",
     ]
@@ -597,6 +658,60 @@ def test_production_runtime_prices_judge_from_its_configured_deployment() -> Non
     assert calculated.amount == Decimal("1.50")
     assert calculated.provenance.catalog_version == "foundry-apim-2026-01-01"
     assert calculated.provenance.currency == "USD"
+
+
+def test_cache_disabled_runtime_prices_only_active_model_roles() -> None:
+    """Keep complete generator and judge cost without an embedding catalog entry."""
+    events: list[str] = []
+    settings = llm_judge_settings(
+        semantic_cache_enabled=False,
+        production_cost_measurement_required=True,
+        pricing_catalog_version="foundry-apim-2026-01-01",
+        pricing_small_input_rate_per_million_tokens=Decimal("0.15"),
+        pricing_small_output_rate_per_million_tokens=Decimal("0.60"),
+        pricing_strong_input_rate_per_million_tokens=Decimal("2.50"),
+        pricing_strong_output_rate_per_million_tokens=Decimal("10.00"),
+        pricing_judge_input_rate_per_million_tokens=Decimal("0.25"),
+        pricing_judge_output_rate_per_million_tokens=Decimal("1.25"),
+    )
+    runtime = asyncio.run(
+        build_production_runtime(
+            settings,
+            observability=RecordingObservability(events),
+            builders=component_builders(events),
+        )
+    )
+
+    strong = runtime.dependencies.cost_calculator.calculate(
+        ModelUsage(
+            run_id="run-cost",
+            provider=FOUNDRY_PROVIDER_NAME,
+            deployment="strong",
+            model_role=ModelRole.STRONG,
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+            latency_ms=5,
+        )
+    )
+    judge = runtime.dependencies.cost_calculator.calculate(
+        ModelUsage(
+            run_id="run-cost",
+            provider=FOUNDRY_PROVIDER_NAME,
+            deployment="judge",
+            model_role=ModelRole.JUDGE,
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+            latency_ms=5,
+        )
+    )
+    asyncio.run(runtime.aclose())
+
+    assert strong is not None
+    assert strong.amount == Decimal("12.50")
+    assert judge is not None
+    assert judge.amount == Decimal("1.50")
+    assert "build:embedding" not in events
+    assert "build:redis" not in events
 
 
 def test_production_pricing_names_colliding_role_deployments() -> None:

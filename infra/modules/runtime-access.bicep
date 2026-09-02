@@ -17,7 +17,20 @@ param cosmosDatabaseName string
 param cosmosContainerName string
 
 @description('Azure Managed Redis name.')
-param redisName string
+param redisName string?
+
+@description('Create Azure Managed Redis runtime access declarations.')
+param semanticCacheEnabled bool
+
+var redisConfigurationIsComplete = !empty(trim(redisName ?? ''))
+var redisConfigurationIsAbsent = redisName == null
+var validatedSemanticCacheEnabled = semanticCacheEnabled
+  ? redisConfigurationIsComplete
+      ? true
+      : fail('Enabled semantic cache runtime access requires an Azure Managed Redis name.')
+  : redisConfigurationIsAbsent
+      ? false
+      : fail('Disabled semantic cache runtime access rejects an Azure Managed Redis name.')
 
 var acrPullRoleDefinitionId = subscriptionResourceId(
   'Microsoft.Authorization/roleDefinitions',
@@ -70,16 +83,16 @@ resource apiCosmosDataContributor 'Microsoft.DocumentDB/databaseAccounts/sqlRole
   }
 }
 
-resource redis 'Microsoft.Cache/redisEnterprise@2025-07-01' existing = {
-  name: redisName
+resource redis 'Microsoft.Cache/redisEnterprise@2025-07-01' existing = if (validatedSemanticCacheEnabled) {
+  name: redisName!
 }
 
-resource redisDatabase 'Microsoft.Cache/redisEnterprise/databases@2025-07-01' existing = {
+resource redisDatabase 'Microsoft.Cache/redisEnterprise/databases@2025-07-01' existing = if (validatedSemanticCacheEnabled) {
   name: 'default'
   parent: redis
 }
 
-resource apiRedisAccess 'Microsoft.Cache/redisEnterprise/databases/accessPolicyAssignments@2025-07-01' = {
+resource apiRedisAccess 'Microsoft.Cache/redisEnterprise/databases/accessPolicyAssignments@2025-07-01' = if (validatedSemanticCacheEnabled) {
   name: replace(guid(redisDatabase.id, apiPrincipalId), '-', '')
   parent: redisDatabase
   properties: {
@@ -89,3 +102,5 @@ resource apiRedisAccess 'Microsoft.Cache/redisEnterprise/databases/accessPolicyA
     }
   }
 }
+
+// Disabled cache mode creates no Redis access-policy assignment.

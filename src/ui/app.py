@@ -373,6 +373,8 @@ def _render_semantic_cache(result: RunResult) -> None:
     columns[2].metric("Cache source run", cache.source_run_id)
     columns[3].metric("Cache lookup latency", cache.lookup_latency)
     st.caption(f"Planner cache reason: {cache.planner_reason}")
+    if cache.activity is not None:
+        st.info(cache.activity)
     if cache.error is not None:
         st.warning(cache.error)
     if cache.evaluator_type == "Unavailable":

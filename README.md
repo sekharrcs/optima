@@ -103,30 +103,34 @@ uv run streamlit run src/ui/app.py
 The UI uses `http://127.0.0.1:8000` by default. Set `OPTIMA_API_BASE_URL` or use
 the advanced demo input to target another configured OPTIMA API.
 
-The Azure-backed API uses a separate factory and fails startup unless Foundry,
-Cosmos, Redis, user-assigned identity, and Application Insights settings are
-complete:
+The Azure-backed API uses a separate factory and requires an explicit production
+semantic-cache decision. Foundry, Cosmos, user-assigned identity, Application
+Insights, evaluator, and active-role pricing settings remain mandatory. Redis
+and embedding settings are mandatory only when cache is enabled:
 
 ```powershell
 uv run uvicorn optima.api.production:create_production_app --factory --port 8000
 ```
 
-The production lifespan creates one dependency graph, validates or creates the
-Redis index before readiness, and closes Cosmos, Redis, embedding, Foundry, and
-telemetry resources in reverse ownership order.
+The production lifespan creates one dependency graph and closes constructed
+resources in reverse ownership order. Enabled mode validates or creates the
+Redis index before readiness. Disabled mode constructs no embedding or Redis
+resource and reports typed disabled evidence without cache-hit or cache-savings
+claims.
 
-The current production evaluator mode is `EXACT_REFERENCE`, a benchmark
-evaluation mode. It verifies only requests that already supply
-`reference_output` and rejects a missing reference before any cache or model
-call. Normal reference-free user-facing requests are not yet servable and await
-a separate reviewed natural-language evaluator. The Streamlit production form
-collects the reference value explicitly.
+Production selects one explicit evaluator mode. `EXACT_REFERENCE` remains a
+benchmark mode that requires `reference_output` before any paid work.
+`LLM_JUDGE` serves reference-free requests with a separately configured JUDGE
+deployment and fail-closed response evidence. The checked-in hackathon profile
+selects `LLM_JUDGE`; it does not infer or silently switch modes.
 
 Monetary cost measurement is optional. The runtime assembles its price catalog
-from configured SMALL, STRONG, and embedding rates; absent rates keep monetary
-cost unavailable while token usage stays measured, and partial rates are
-rejected. Enabling `OPTIMA_PRODUCTION_COST_MEASUREMENT_REQUIRED` makes startup
-fail closed unless a complete catalog is supplied.
+from configured SMALL and STRONG rates plus JUDGE rates in LLM-judge mode.
+Embedding pricing is included only when semantic cache is enabled. Absent rates
+keep monetary cost unavailable while token usage stays measured, and partial
+active-role rates are rejected. Enabling
+`OPTIMA_PRODUCTION_COST_MEASUREMENT_REQUIRED` makes startup fail closed unless a
+complete active-role catalog is supplied.
 
 ## Container images
 

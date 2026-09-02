@@ -456,7 +456,7 @@ This is a cost and delivery decision, not the production security target.
 
 ## ADR-028: Use serverless Cosmos DB and non-HA Balanced B0 Redis
 
-Status: Accepted
+Status: Accepted for cache-enabled production; temporarily inactive under ADR-038
 
 Cosmos DB for NoSQL uses serverless request-unit billing, one East US 2 region,
 Session consistency, database `optima`, container `runs`, and `/id` partitioning.
@@ -495,11 +495,12 @@ Status: Accepted
 Use a dedicated production factory instead of changing the explicit local and
 demo entry points. The factory validates complete Azure settings, constructs one
 app-local dependency graph, and exposes it to routes through an application
-resolver rather than process-global mutable state. Foundry, embedding, Redis,
-Cosmos, and telemetry resources close once in reverse ownership order. Partial
-startup closes every resource already acquired and preserves the original
-startup exception. Health cannot report ready before lifespan construction and
-Redis bootstrap complete.
+resolver rather than process-global mutable state. Foundry, Cosmos, and telemetry
+resources always close once in reverse ownership order. Embedding and Redis are
+constructed and closed only when the explicit production cache decision is true.
+Partial startup closes every resource already acquired and preserves the original
+startup exception. Health cannot report ready before the selected dependency
+graph, including Redis bootstrap when enabled, is complete.
 
 ## ADR-032: Bootstrap the Redis search index at application startup
 
@@ -618,3 +619,27 @@ required in production; incomplete or placeholder model/pricing configuration
 fails before application deployment or startup. The routine identity never
 bootstraps runtime RBAC. Any attempted rollout failure disables public UI ingress
 and restores the captured ready API/UI revision pair when one exists.
+
+## ADR-038: Temporarily deploy production with semantic cache disabled
+
+Status: Accepted
+
+The East US 2 production profile sets `semanticCacheEnabled=false` explicitly.
+It omits Azure Managed Redis, Redis runtime access, cache endpoint values,
+embedding configuration and pricing, embedding requests, token renewal, and
+RediSearch bootstrap. Production rejects an omitted cache decision, rejects any
+cache-only value supplied with disabled mode, and still requires complete Redis
+and embedding configuration when enabled.
+
+The temporary profile retains Quality Contract enforcement, SMALL and STRONG
+routing, mandatory evaluation, escalation, context reduction, active-role cost
+accounting, Cosmos run history, Application Insights, the Entra-protected UI,
+immutable image publication, and paired rollback. Planner, API, persisted, smoke,
+and UI evidence report semantic cache as disabled. They do not report cache hits,
+cache savings, or embedding usage.
+
+This decision does not weaken ADR-028, ADR-032, or ADR-033 for cache-enabled
+production. Restoring cache requires an explicit true mode plus the same exact
+East US 2 `Balanced_B0`, provider, SKU, restriction, quota, RediSearch, embedding,
+pricing, access, and smoke gates. The absent East US 2 SKU remains a hard blocker;
+no SKU, region, service, or authentication fallback is selected automatically.
