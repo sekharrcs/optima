@@ -14,9 +14,15 @@ from scripts.azure_preflight import (
     CONTRIBUTOR_ROLE_ID,
     OPENAI_USER_ROLE_ID,
     READER_ROLE_ID,
+    REDIS_API_VERSION,
     REQUIRED_PROVIDERS,
+    AzureQueryError,
+    AzureQueryFailureKind,
     DeploymentConfiguration,
     PreflightError,
+    RedisPreflightError,
+    RedisPreflightErrorCode,
+    _classify_azure_query_failure,
     load_configuration,
     run_preflight,
     validate_configuration,
@@ -32,6 +38,52 @@ OPENAI_RESOURCE_ID = (
     f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg-foundry/providers/"
     "Microsoft.CognitiveServices/accounts/aoai-optima"
 )
+REDIS_SKU_URL = (
+    f"https://management.azure.com/subscriptions/{SUBSCRIPTION_ID}/providers/"
+    f"Microsoft.Cache/skus?api-version={REDIS_API_VERSION}"
+)
+REDIS_USAGE_URL = (
+    f"https://management.azure.com/subscriptions/{SUBSCRIPTION_ID}/providers/"
+    "Microsoft.Cache/locations/eastus2/usages"
+    f"?api-version={REDIS_API_VERSION}"
+)
+
+
+def redis_provider_metadata(*, quota_advertised: bool = False) -> dict[str, Any]:
+    """Return stable Microsoft.Cache regional resource-type metadata."""
+    resource_types: list[dict[str, Any]] = [
+        {
+            "apiVersions": [REDIS_API_VERSION],
+            "locations": ["East US 2"],
+            "resourceType": "redisEnterprise",
+            "zoneMappings": [{"location": "East US 2", "zones": ["1", "2", "3"]}],
+        }
+    ]
+    if quota_advertised:
+        resource_types.append(
+            {
+                "apiVersions": [REDIS_API_VERSION],
+                "resourceType": "locations/usages",
+            }
+        )
+    return {
+        "registrationState": "Registered",
+        "resourceTypes": resource_types,
+    }
+
+
+def redis_sku_item(**overrides: Any) -> dict[str, Any]:
+    """Return one exact stable Redis Enterprise Balanced B0 SKU entry."""
+    item: dict[str, Any] = {
+        "locationInfo": [{"location": "East US 2", "zones": ["1", "2", "3"]}],
+        "locations": ["East US 2"],
+        "name": "Balanced_B0",
+        "resourceType": "redisEnterprise",
+        "restrictions": [],
+        "tier": "Balanced",
+    }
+    item.update(overrides)
+    return item
 
 
 def valid_environment() -> dict[str, str]:
@@ -130,6 +182,8 @@ class FakeAzure:
             }
         if arguments[:2] == ("provider", "show"):
             assert arguments[-1] in REQUIRED_PROVIDERS
+            if arguments[-1] == "Microsoft.Cache":
+                return redis_provider_metadata()
             return {"registrationState": "Registered"}
         if arguments[:2] == ("identity", "show"):
             identity_name = arguments[arguments.index("--name") + 1]
@@ -160,26 +214,8 @@ class FakeAzure:
         if arguments[:3] == ("rest", "--method", "get"):
             url = arguments[-1]
             if "/skus?" in url:
-                return {
-                    "value": [
-                        {
-                            "locations": ["East US 2"],
-                            "name": "Balanced_B0",
-                            "resourceType": "redisEnterprise",
-                            "restrictions": [],
-                        }
-                    ]
-                }
-            if "/usages?" in url:
-                return {
-                    "value": [
-                        {
-                            "currentValue": 0,
-                            "limit": 1,
-                            "name": {"value": "Balanced B0"},
-                        }
-                    ]
-                }
+                assert url == REDIS_SKU_URL
+                return {"value": [redis_sku_item()]}
             if "/sqlRoleAssignments?" in url:
                 cosmos_id = url.split("/sqlRoleAssignments?", maxsplit=1)[0]
                 return {
@@ -375,6 +411,72 @@ class FakeAzure:
         raise AssertionError(f"Unexpected Azure query: {arguments}")
 
 
+class RedisContractAzure(FakeAzure):
+    """Inject exact Redis metadata and failures without making live calls."""
+
+    def __init__(
+        self,
+        configuration: DeploymentConfiguration,
+        *,
+        provider: dict[str, Any] | None = None,
+        sku_documents: dict[str, Any] | None = None,
+        quota_document: Any = None,
+        quota_failure: AzureQueryFailureKind | None = None,
+        query_failures: dict[str, AzureQueryFailureKind] | None = None,
+    ) -> None:
+        super().__init__(configuration)
+        self.provider = provider if provider is not None else redis_provider_metadata()
+        self.sku_documents = (
+            sku_documents
+            if sku_documents is not None
+            else {REDIS_SKU_URL: {"value": [redis_sku_item()]}}
+        )
+        self.quota_document = quota_document
+        self.quota_failure = quota_failure
+        self.query_failures = query_failures or {}
+
+    def json(self, *arguments: str, allow_missing: bool = False) -> Any:
+        """Return focused Redis responses before using shared fake behavior."""
+        if arguments == ("provider", "show", "--namespace", "Microsoft.Cache"):
+            self.calls.append(arguments)
+            return self.provider
+        if arguments[:3] == ("rest", "--method", "get"):
+            url = arguments[-1]
+            if url in self.query_failures:
+                self.calls.append(arguments)
+                raise AzureQueryError(self.query_failures[url], "rest")
+            if url in self.sku_documents:
+                self.calls.append(arguments)
+                return self.sku_documents[url]
+            if url == REDIS_USAGE_URL:
+                self.calls.append(arguments)
+                if self.quota_failure is not None:
+                    raise AzureQueryError(self.quota_failure, "rest")
+                if self.quota_document is not None:
+                    return self.quota_document
+        return super().json(*arguments, allow_missing=allow_missing)
+
+
+def run_foundation_preflight(azure: FakeAzure) -> dict[str, Any]:
+    """Run the complete foundation preflight around one Redis test fixture."""
+    return run_preflight(
+        azure.configuration,
+        azure,
+        phase="foundation",
+        repository_root=ROOT,
+    )
+
+
+def assert_redis_failure(
+    azure: FakeAzure, expected_code: RedisPreflightErrorCode
+) -> RedisPreflightError:
+    """Assert one hard-blocking typed Redis outcome and return it."""
+    with pytest.raises(RedisPreflightError) as captured:
+        run_foundation_preflight(azure)
+    assert captured.value.code == expected_code
+    return captured.value
+
+
 def test_load_configuration_discards_secret_value() -> None:
     """Retain only secret presence so evidence cannot serialize the credential."""
     environment = valid_environment()
@@ -498,6 +600,18 @@ def test_foundation_preflight_is_read_only_and_redacts_identifiers() -> None:
     assert evidence["tenant_id"] == "aaaa...eeee"
     assert evidence["artifacts"] == {}
     assert set(evidence["models"]) == {"SMALL", "STRONG", "JUDGE", "EMBEDDING"}
+    assert evidence["redis"]["api_version"] == REDIS_API_VERSION
+    assert evidence["redis"]["quota"]["status"] == "NOT_EXPOSED"
+    assert evidence["redis"]["allocation"]["status"] == "NOT_PROVABLE_BEFORE_CREATION"
+    assert "redis_balanced_b0_availability_and_quota" not in evidence["checks"]
+    assert {
+        "redis_allocation_not_provable",
+        "redis_applicable_restrictions",
+        "redis_exact_sku_advertisement",
+        "redis_provider_registration",
+        "redis_quota_exposure",
+        "redis_regional_resource_type",
+    } <= set(evidence["checks"])
     assert not any(call[:2] == ("acr", "show") for call in azure.calls)
 
 
@@ -607,3 +721,803 @@ def test_artifact_preflight_rejects_image_id_or_shared_digest() -> None:
             api_digest=digest,
             ui_digest=digest,
         )
+
+
+def test_redis_sku_catalog_follows_safe_pagination() -> None:
+    """Search all bounded Microsoft.Cache SKU pages before deciding eligibility."""
+    configuration = load_configuration(valid_environment())
+    next_url = f"{REDIS_SKU_URL}&$skiptoken=page-2"
+    azure = RedisContractAzure(
+        configuration,
+        sku_documents={
+            REDIS_SKU_URL: {
+                "nextLink": next_url,
+                "value": [redis_sku_item(name="Balanced_B1")],
+            },
+            next_url: {"value": [redis_sku_item()]},
+        },
+    )
+
+    evidence = run_foundation_preflight(azure)
+
+    assert evidence["redis"]["sku"]["catalog_page_count"] == 2
+    assert evidence["redis"]["sku"]["catalog_item_count"] == 2
+    assert [
+        call[-1]
+        for call in azure.calls
+        if call[:3] == ("rest", "--method", "get") and "/skus?" in call[-1]
+    ] == [REDIS_SKU_URL, next_url]
+
+
+@pytest.mark.parametrize(
+    ("diagnostic", "expected_kind"),
+    [
+        ("ERROR: status code: 404", AzureQueryFailureKind.NOT_FOUND),
+        ("ERROR: Not Found", AzureQueryFailureKind.NOT_FOUND),
+        ("ERROR: status code: 403", AzureQueryFailureKind.UNAUTHORIZED),
+        ("ERROR: status code: 429", AzureQueryFailureKind.TRANSIENT),
+        ("ERROR: status code: 503", AzureQueryFailureKind.TRANSIENT),
+        ("ERROR: unexpected provider failure", AzureQueryFailureKind.OTHER),
+    ],
+    ids=(
+        "status-not-found",
+        "cli-not-found",
+        "unauthorized",
+        "throttled",
+        "server",
+        "other",
+    ),
+)
+def test_azure_query_failure_classification_is_sanitized_and_typed(
+    diagnostic: str, expected_kind: AzureQueryFailureKind
+) -> None:
+    """Classify status evidence without preserving response text in the outcome."""
+    assert _classify_azure_query_failure(diagnostic) == expected_kind
+
+
+@pytest.mark.parametrize(
+    "next_url",
+    [
+        (
+            "https://example.invalid/subscriptions/"
+            f"{SUBSCRIPTION_ID}/providers/Microsoft.Cache/skus"
+            f"?api-version={REDIS_API_VERSION}"
+        ),
+        REDIS_SKU_URL.replace("management.azure.com", "management.azure.com:8443"),
+        "https://[malformed/subscriptions/continuation",
+    ],
+    ids=("wrong-host", "non-default-port", "malformed-authority"),
+)
+def test_redis_sku_pagination_rejects_unapproved_continuation(
+    next_url: str,
+) -> None:
+    """Reject pagination that changes or malforms the approved ARM authority."""
+    configuration = load_configuration(valid_environment())
+    azure = RedisContractAzure(
+        configuration,
+        sku_documents={
+            REDIS_SKU_URL: {
+                "nextLink": next_url,
+                "value": [],
+            }
+        },
+    )
+
+    assert_redis_failure(azure, RedisPreflightErrorCode.SKU_PAGINATION_INVALID)
+
+
+def test_redis_sku_accepts_locations_field() -> None:
+    """Treat the exact SKU locations array as regional advertisement evidence."""
+    configuration = load_configuration(valid_environment())
+    item = redis_sku_item()
+    item.pop("locationInfo")
+    azure = RedisContractAzure(
+        configuration,
+        sku_documents={REDIS_SKU_URL: {"value": [item]}},
+    )
+
+    evidence = run_foundation_preflight(azure)
+
+    assert evidence["redis"]["sku"]["advertised_locations"] == ["eastus2"]
+    assert evidence["redis"]["sku"]["target_region_zones"] == []
+
+
+def test_redis_sku_accepts_location_info_and_preserves_zones() -> None:
+    """Use locationInfo regional evidence and retain zones only as metadata."""
+    configuration = load_configuration(valid_environment())
+    item = redis_sku_item()
+    item.pop("locations")
+    azure = RedisContractAzure(
+        configuration,
+        sku_documents={REDIS_SKU_URL: {"value": [item]}},
+    )
+
+    evidence = run_foundation_preflight(azure)
+
+    assert evidence["redis"]["sku"]["advertised_locations"] == ["eastus2"]
+    assert evidence["redis"]["sku"]["target_region_zones"] == ["1", "2", "3"]
+    assert evidence["redis"]["allocation"]["status"] == "NOT_PROVABLE_BEFORE_CREATION"
+
+
+def test_redis_exact_fields_are_case_normalized() -> None:
+    """Normalize casing and surrounding whitespace without weakening exact tokens."""
+    configuration = load_configuration(valid_environment())
+    provider = redis_provider_metadata()
+    provider["registrationState"] = " registered "
+    provider_resource_type = provider["resourceTypes"][0]
+    provider_resource_type["resourceType"] = " REDISENTERPRISE "
+    provider_resource_type["locations"] = [" EAST US 2 "]
+    azure = RedisContractAzure(
+        configuration,
+        provider=provider,
+        sku_documents={
+            REDIS_SKU_URL: {
+                "value": [
+                    redis_sku_item(
+                        locations=[" EAST US 2 "],
+                        locationInfo=[],
+                        name=" balanced_b0 ",
+                        resourceType=" REDISENTERPRISE ",
+                        tier=" balanced ",
+                    )
+                ]
+            }
+        },
+    )
+
+    evidence = run_foundation_preflight(azure)
+
+    assert evidence["redis"]["sku"]["name"] == "Balanced_B0"
+    assert evidence["redis"]["sku"]["tier"] == "Balanced"
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        redis_sku_item(name="Balanced_B01"),
+        redis_sku_item(resourceType="redisEnterprise/databases"),
+        redis_sku_item(tier="Premium"),
+    ],
+    ids=("substring-name", "database-child", "wrong-tier"),
+)
+def test_redis_requires_exact_cluster_sku_identity(item: dict[str, Any]) -> None:
+    """Reject substring names, child resources, alternate tiers, and other SKUs."""
+    configuration = load_configuration(valid_environment())
+    azure = RedisContractAzure(
+        configuration,
+        sku_documents={REDIS_SKU_URL: {"value": [item]}},
+    )
+
+    assert_redis_failure(azure, RedisPreflightErrorCode.REQUESTED_SKU_ABSENT)
+
+
+def test_redis_explicit_target_region_restriction_hard_blocks() -> None:
+    """Block an exact East US 2 location restriction with a typed code."""
+    configuration = load_configuration(valid_environment())
+    item = redis_sku_item(
+        restrictions=[
+            {
+                "reasonCode": "RestrictedByPolicy",
+                "type": "Location",
+                "values": ["East US 2"],
+            }
+        ]
+    )
+    azure = RedisContractAzure(
+        configuration,
+        sku_documents={REDIS_SKU_URL: {"value": [item]}},
+    )
+
+    assert_redis_failure(azure, RedisPreflightErrorCode.TARGET_REGION_RESTRICTED)
+
+
+def test_redis_unrelated_region_and_zone_restrictions_do_not_block() -> None:
+    """Ignore restrictions scoped to another region or to an unrequested zone."""
+    configuration = load_configuration(valid_environment())
+    item = redis_sku_item(
+        restrictions=[
+            {
+                "reasonCode": "NotAvailableForSubscription",
+                "type": "Location",
+                "values": ["West US"],
+            },
+            {
+                "reasonCode": "QuotaId",
+                "restrictionInfo": {
+                    "locations": ["East US 2"],
+                    "zones": ["1"],
+                },
+                "type": "Zone",
+                "values": ["1"],
+            },
+        ]
+    )
+    azure = RedisContractAzure(
+        configuration,
+        sku_documents={REDIS_SKU_URL: {"value": [item]}},
+    )
+
+    evidence = run_foundation_preflight(azure)
+
+    assert evidence["redis"]["restrictions"] == {
+        "applicable": 0,
+        "ignored_unrelated": 2,
+        "status": "NONE_APPLICABLE",
+    }
+
+
+@pytest.mark.parametrize(
+    ("restriction", "expected_code"),
+    [
+        (
+            {
+                "reasonCode": "NotAvailableForSubscription",
+                "type": "Location",
+                "values": [],
+            },
+            RedisPreflightErrorCode.SUBSCRIPTION_RESTRICTED,
+        ),
+        (
+            {
+                "reasonCode": "NotAvailableForSubscription",
+                "type": "Location",
+                "values": ["East US 2"],
+            },
+            RedisPreflightErrorCode.SUBSCRIPTION_RESTRICTED,
+        ),
+        (
+            {
+                "reasonCode": "QuotaId",
+                "type": "Location",
+                "values": ["East US 2"],
+            },
+            RedisPreflightErrorCode.QUOTA_RESTRICTED,
+        ),
+    ],
+    ids=("global-subscription", "regional-subscription", "regional-quota"),
+)
+def test_redis_subscription_and_quota_restrictions_hard_block(
+    restriction: dict[str, Any], expected_code: RedisPreflightErrorCode
+) -> None:
+    """Keep subscription and quota restriction outcomes typed and distinct."""
+    configuration = load_configuration(valid_environment())
+    azure = RedisContractAzure(
+        configuration,
+        sku_documents={
+            REDIS_SKU_URL: {"value": [redis_sku_item(restrictions=[restriction])]}
+        },
+    )
+
+    assert_redis_failure(azure, expected_code)
+
+
+def test_redis_exact_sku_absent_from_target_region_hard_blocks() -> None:
+    """Do not infer East US 2 eligibility from an exact SKU in another region."""
+    configuration = load_configuration(valid_environment())
+    item = redis_sku_item(
+        locations=["Australia Central"],
+        locationInfo=[{"location": "Australia Central", "zones": []}],
+    )
+    azure = RedisContractAzure(
+        configuration,
+        sku_documents={REDIS_SKU_URL: {"value": [item]}},
+    )
+
+    assert_redis_failure(azure, RedisPreflightErrorCode.REQUESTED_SKU_REGION_ABSENT)
+
+
+def test_redis_quota_route_is_not_queried_when_metadata_does_not_advertise_it() -> None:
+    """Report quota as not exposed without probing an unadvertised route."""
+    configuration = load_configuration(valid_environment())
+    azure = RedisContractAzure(configuration)
+
+    evidence = run_foundation_preflight(azure)
+
+    assert evidence["redis"]["quota"] == {
+        "source": "PROVIDER_METADATA",
+        "status": "NOT_EXPOSED",
+    }
+    assert not any("/usages?" in call[-1] for call in azure.calls)
+
+
+def test_redis_advertised_quota_route_404_is_not_exposed() -> None:
+    """Classify a typed 404 as non-exposure rather than available quota."""
+    configuration = load_configuration(valid_environment())
+    azure = RedisContractAzure(
+        configuration,
+        provider=redis_provider_metadata(quota_advertised=True),
+        quota_failure=AzureQueryFailureKind.NOT_FOUND,
+    )
+
+    evidence = run_foundation_preflight(azure)
+
+    assert evidence["redis"]["quota"] == {
+        "source": "ADVERTISED_ROUTE_NOT_FOUND",
+        "status": "NOT_EXPOSED",
+    }
+    assert REDIS_USAGE_URL in [call[-1] for call in azure.calls]
+
+
+def test_redis_quota_continuation_404_hard_blocks() -> None:
+    """Do not downgrade a failed continuation after receiving quota evidence."""
+    configuration = load_configuration(valid_environment())
+    next_url = f"{REDIS_USAGE_URL}&$skiptoken=page-2"
+    azure = RedisContractAzure(
+        configuration,
+        provider=redis_provider_metadata(quota_advertised=True),
+        quota_document={
+            "nextLink": next_url,
+            "value": [
+                {
+                    "currentValue": 0,
+                    "limit": 1,
+                    "name": {"value": "Balanced_B0"},
+                }
+            ],
+        },
+        query_failures={next_url: AzureQueryFailureKind.NOT_FOUND},
+    )
+
+    assert_redis_failure(azure, RedisPreflightErrorCode.QUOTA_QUERY_FAILED)
+
+
+def test_redis_authoritative_quota_available() -> None:
+    """Accept one exact invariant meter only when current usage is below limit."""
+    configuration = load_configuration(valid_environment())
+    azure = RedisContractAzure(
+        configuration,
+        provider=redis_provider_metadata(quota_advertised=True),
+        quota_document={
+            "value": [
+                {
+                    "currentValue": 1,
+                    "limit": 2,
+                    "name": {"localizedValue": "Balanced B0", "value": "Balanced_B0"},
+                }
+            ]
+        },
+    )
+
+    evidence = run_foundation_preflight(azure)
+
+    assert evidence["redis"]["quota"] == {
+        "current_value": 1,
+        "limit": 2,
+        "page_count": 1,
+        "source": "MICROSOFT_CACHE_LOCATIONS_USAGES",
+        "status": "AVAILABLE",
+    }
+
+
+@pytest.mark.parametrize(("current", "limit"), [(1, 1), (2, 1)])
+def test_redis_authoritative_quota_exhausted_hard_blocks(
+    current: int, limit: int
+) -> None:
+    """Block exact authoritative quota when current usage meets or exceeds limit."""
+    configuration = load_configuration(valid_environment())
+    azure = RedisContractAzure(
+        configuration,
+        provider=redis_provider_metadata(quota_advertised=True),
+        quota_document={
+            "value": [
+                {
+                    "currentValue": current,
+                    "limit": limit,
+                    "name": {"value": "Balanced_B0"},
+                }
+            ]
+        },
+    )
+
+    assert_redis_failure(azure, RedisPreflightErrorCode.QUOTA_EXHAUSTED)
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_code"),
+    [
+        (
+            AzureQueryFailureKind.UNAUTHORIZED,
+            RedisPreflightErrorCode.QUOTA_QUERY_UNAUTHORIZED,
+        ),
+        (
+            AzureQueryFailureKind.TRANSIENT,
+            RedisPreflightErrorCode.QUOTA_QUERY_TRANSIENT,
+        ),
+        (
+            AzureQueryFailureKind.OTHER,
+            RedisPreflightErrorCode.QUOTA_QUERY_FAILED,
+        ),
+    ],
+    ids=("unauthorized", "transient", "unclassified"),
+)
+def test_redis_quota_query_failures_hard_block_distinctly(
+    failure: AzureQueryFailureKind, expected_code: RedisPreflightErrorCode
+) -> None:
+    """Never convert authorization, transient, or unknown failures into availability."""
+    configuration = load_configuration(valid_environment())
+    azure = RedisContractAzure(
+        configuration,
+        provider=redis_provider_metadata(quota_advertised=True),
+        quota_failure=failure,
+    )
+
+    assert_redis_failure(azure, expected_code)
+
+
+@pytest.mark.parametrize(
+    "quota_document",
+    [
+        {
+            "value": [
+                {
+                    "currentValue": False,
+                    "limit": True,
+                    "name": {"value": "Balanced_B0"},
+                }
+            ]
+        },
+        {
+            "value": [
+                {
+                    "currentValue": 0,
+                    "limit": 1,
+                    "name": {"value": "Balanced_B01"},
+                }
+            ]
+        },
+        {
+            "value": [
+                {
+                    "currentValue": -1,
+                    "limit": 1,
+                    "name": {"value": "Balanced_B0"},
+                }
+            ]
+        },
+    ],
+    ids=("boolean-values", "substring-meter", "negative-value"),
+)
+def test_redis_malformed_quota_response_hard_blocks(
+    quota_document: dict[str, Any],
+) -> None:
+    """Reject non-integer, non-exact, and negative authoritative quota evidence."""
+    configuration = load_configuration(valid_environment())
+    azure = RedisContractAzure(
+        configuration,
+        provider=redis_provider_metadata(quota_advertised=True),
+        quota_document=quota_document,
+    )
+
+    assert_redis_failure(azure, RedisPreflightErrorCode.QUOTA_RESPONSE_MALFORMED)
+
+
+def test_redis_malformed_locations_hard_block() -> None:
+    """Do not treat a null regional location collection as absent evidence."""
+    configuration = load_configuration(valid_environment())
+    azure = RedisContractAzure(
+        configuration,
+        sku_documents={
+            REDIS_SKU_URL: {
+                "value": [redis_sku_item(locations=None, locationInfo=None)]
+            }
+        },
+    )
+
+    assert_redis_failure(azure, RedisPreflightErrorCode.SKU_RESPONSE_MALFORMED)
+
+
+def test_redis_provider_requires_target_region_and_stable_api() -> None:
+    """Block unsupported regions and API versions without probing fallbacks."""
+    configuration = load_configuration(valid_environment())
+    region_provider = redis_provider_metadata()
+    region_provider["resourceTypes"][0]["locations"] = ["West US"]
+    region_azure = RedisContractAzure(configuration, provider=region_provider)
+    version_provider = redis_provider_metadata()
+    version_provider["resourceTypes"][0]["apiVersions"] = ["2024-11-01"]
+    version_azure = RedisContractAzure(configuration, provider=version_provider)
+
+    assert_redis_failure(region_azure, RedisPreflightErrorCode.REGION_NOT_ADVERTISED)
+    assert_redis_failure(
+        version_azure, RedisPreflightErrorCode.API_VERSION_NOT_ADVERTISED
+    )
+    assert not any(call[:1] == ("rest",) for call in region_azure.calls)
+    assert not any(call[:1] == ("rest",) for call in version_azure.calls)
+
+
+@pytest.mark.parametrize(
+    ("provider", "expected_code"),
+    [
+        (
+            {**redis_provider_metadata(), "registrationState": "Unregistered"},
+            RedisPreflightErrorCode.PROVIDER_NOT_REGISTERED,
+        ),
+        (
+            {**redis_provider_metadata(), "registrationState": None},
+            RedisPreflightErrorCode.PROVIDER_METADATA_MALFORMED,
+        ),
+        (
+            {"registrationState": "Registered", "resourceTypes": []},
+            RedisPreflightErrorCode.RESOURCE_TYPE_NOT_ADVERTISED,
+        ),
+    ],
+    ids=("unregistered", "malformed-registration", "resource-type-absent"),
+)
+def test_redis_provider_registration_and_resource_type_fail_closed(
+    provider: dict[str, Any], expected_code: RedisPreflightErrorCode
+) -> None:
+    """Require registered, well-formed Microsoft.Cache Redis provider metadata."""
+    configuration = load_configuration(valid_environment())
+    azure = RedisContractAzure(configuration, provider=provider)
+
+    assert_redis_failure(azure, expected_code)
+
+
+def test_redis_evidence_never_claims_precreation_allocation() -> None:
+    """Keep catalog and zone evidence separate from physical capacity allocation."""
+    configuration = load_configuration(valid_environment())
+    azure = RedisContractAzure(configuration)
+
+    redis_evidence = run_foundation_preflight(azure)["redis"]
+
+    assert redis_evidence["provider"]["regional_support"] == "ADVERTISED"
+    assert redis_evidence["sku"]["status"] == "ADVERTISED"
+    assert redis_evidence["allocation"] == {
+        "statement": (
+            "Provider and SKU metadata do not reserve or guarantee current "
+            "physical capacity."
+        ),
+        "status": "NOT_PROVABLE_BEFORE_CREATION",
+    }
+
+
+def test_redis_failure_does_not_query_region_sku_service_or_version_fallbacks() -> None:
+    """Stop after the exact East US 2 B0 catalog result without fallback probes."""
+    configuration = load_configuration(valid_environment())
+    item = redis_sku_item(
+        locations=["Australia Central"],
+        locationInfo=[{"location": "Australia Central", "zones": []}],
+    )
+    azure = RedisContractAzure(
+        configuration,
+        sku_documents={REDIS_SKU_URL: {"value": [item]}},
+    )
+
+    assert_redis_failure(azure, RedisPreflightErrorCode.REQUESTED_SKU_REGION_ABSENT)
+
+    rest_urls = [
+        call[-1] for call in azure.calls if call[:3] == ("rest", "--method", "get")
+    ]
+    assert rest_urls == [REDIS_SKU_URL]
+    assert all("2024-11-01" not in url for url in rest_urls)
+    assert all("Microsoft.Compute" not in url for url in rest_urls)
+    assert all("/providers/Microsoft.Cache/redis?" not in url for url in rest_urls)
+
+
+def test_redis_sku_pagination_rejects_cycle() -> None:
+    """Refuse a continuation that returns to an already-read SKU page."""
+    configuration = load_configuration(valid_environment())
+    next_url = f"{REDIS_SKU_URL}&$skiptoken=page-2"
+    azure = RedisContractAzure(
+        configuration,
+        sku_documents={
+            REDIS_SKU_URL: {"nextLink": next_url, "value": []},
+            next_url: {"nextLink": REDIS_SKU_URL, "value": []},
+        },
+    )
+
+    assert_redis_failure(azure, RedisPreflightErrorCode.SKU_PAGINATION_INVALID)
+
+    sku_calls = [
+        call[-1]
+        for call in azure.calls
+        if call[:3] == ("rest", "--method", "get") and "/skus?" in call[-1]
+    ]
+    assert sku_calls == [REDIS_SKU_URL, next_url]
+
+
+def test_redis_sku_pagination_rejects_excessive_pages() -> None:
+    """Stop after the bounded page limit instead of following endless links."""
+    configuration = load_configuration(valid_environment())
+    urls = [REDIS_SKU_URL] + [
+        f"{REDIS_SKU_URL}&$skiptoken=page-{index}" for index in range(1, 40)
+    ]
+    sku_documents: dict[str, Any] = {
+        url: {"nextLink": urls[position + 1], "value": []}
+        for position, url in enumerate(urls[:-1])
+    }
+    sku_documents[urls[-1]] = {"value": []}
+    azure = RedisContractAzure(configuration, sku_documents=sku_documents)
+
+    assert_redis_failure(azure, RedisPreflightErrorCode.SKU_PAGINATION_INVALID)
+
+    sku_calls = [
+        call[-1]
+        for call in azure.calls
+        if call[:3] == ("rest", "--method", "get") and "/skus?" in call[-1]
+    ]
+    assert len(sku_calls) == 32
+
+
+@pytest.mark.parametrize(
+    "next_url",
+    [
+        (
+            "https://management.azure.com/subscriptions/"
+            "99999999-9999-9999-9999-999999999999/providers/Microsoft.Cache/skus"
+            f"?api-version={REDIS_API_VERSION}"
+        ),
+        (
+            f"https://management.azure.com/subscriptions/{SUBSCRIPTION_ID}/providers/"
+            f"Microsoft.Cache/redis?api-version={REDIS_API_VERSION}"
+        ),
+        (
+            f"https://management.azure.com/subscriptions/{SUBSCRIPTION_ID}/providers/"
+            "Microsoft.Cache/skus?api-version=2024-11-01"
+        ),
+    ],
+    ids=("cross-subscription", "route-mutation", "api-version-downgrade"),
+)
+def test_redis_sku_pagination_rejects_authority_preserving_mutations(
+    next_url: str,
+) -> None:
+    """Reject same-host continuations that change subscription, route, or version."""
+    configuration = load_configuration(valid_environment())
+    azure = RedisContractAzure(
+        configuration,
+        sku_documents={REDIS_SKU_URL: {"nextLink": next_url, "value": []}},
+    )
+
+    assert_redis_failure(azure, RedisPreflightErrorCode.SKU_PAGINATION_INVALID)
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_code"),
+    [
+        (
+            AzureQueryFailureKind.NOT_FOUND,
+            RedisPreflightErrorCode.SKU_QUERY_NOT_FOUND,
+        ),
+        (
+            AzureQueryFailureKind.UNAUTHORIZED,
+            RedisPreflightErrorCode.SKU_QUERY_UNAUTHORIZED,
+        ),
+        (
+            AzureQueryFailureKind.TRANSIENT,
+            RedisPreflightErrorCode.SKU_QUERY_TRANSIENT,
+        ),
+        (
+            AzureQueryFailureKind.OTHER,
+            RedisPreflightErrorCode.SKU_QUERY_FAILED,
+        ),
+    ],
+    ids=("not-found", "unauthorized", "transient", "unclassified"),
+)
+def test_redis_sku_query_failures_hard_block_distinctly(
+    failure: AzureQueryFailureKind, expected_code: RedisPreflightErrorCode
+) -> None:
+    """Never turn a failed SKU catalog query into regional eligibility evidence."""
+    configuration = load_configuration(valid_environment())
+    azure = RedisContractAzure(
+        configuration,
+        query_failures={REDIS_SKU_URL: failure},
+    )
+
+    assert_redis_failure(azure, expected_code)
+
+
+def _duplicate_redis_resource_type_provider() -> dict[str, Any]:
+    """Return provider metadata that advertises redisEnterprise twice."""
+    provider = redis_provider_metadata()
+    provider["resourceTypes"].append(
+        {
+            "apiVersions": [REDIS_API_VERSION],
+            "locations": ["East US 2"],
+            "resourceType": "redisEnterprise",
+        }
+    )
+    return provider
+
+
+def _duplicate_quota_resource_type_provider() -> dict[str, Any]:
+    """Return provider metadata that advertises the quota route twice."""
+    provider = redis_provider_metadata(quota_advertised=True)
+    provider["resourceTypes"].append(
+        {"apiVersions": [REDIS_API_VERSION], "resourceType": "locations/usages"}
+    )
+    return provider
+
+
+@pytest.mark.parametrize(
+    "provider_factory",
+    [
+        _duplicate_redis_resource_type_provider,
+        _duplicate_quota_resource_type_provider,
+    ],
+    ids=("duplicate-redis-enterprise", "duplicate-quota"),
+)
+def test_redis_duplicate_resource_types_fail_closed(
+    provider_factory: Any,
+) -> None:
+    """Refuse contradictory provider metadata that advertises a type twice."""
+    configuration = load_configuration(valid_environment())
+    azure = RedisContractAzure(configuration, provider=provider_factory())
+
+    assert_redis_failure(azure, RedisPreflightErrorCode.PROVIDER_METADATA_MALFORMED)
+
+
+def test_redis_global_unknown_restriction_hard_blocks() -> None:
+    """Block an applicable restriction whose reason code is not recognized."""
+    configuration = load_configuration(valid_environment())
+    item = redis_sku_item(
+        restrictions=[{"reasonCode": "SomeNewReason", "type": "Location", "values": []}]
+    )
+    azure = RedisContractAzure(
+        configuration,
+        sku_documents={REDIS_SKU_URL: {"value": [item]}},
+    )
+
+    assert_redis_failure(azure, RedisPreflightErrorCode.RESTRICTION_UNKNOWN)
+
+
+def test_redis_malformed_restriction_fails_closed() -> None:
+    """Reject a restriction that omits its type or reason code."""
+    configuration = load_configuration(valid_environment())
+    item = redis_sku_item(restrictions=[{"type": "Location", "values": ["East US 2"]}])
+    azure = RedisContractAzure(
+        configuration,
+        sku_documents={REDIS_SKU_URL: {"value": [item]}},
+    )
+
+    assert_redis_failure(azure, RedisPreflightErrorCode.RESTRICTION_MALFORMED)
+
+
+def test_redis_quota_route_wrong_api_version_fails_closed() -> None:
+    """Reject an advertised quota route that omits the approved API version."""
+    configuration = load_configuration(valid_environment())
+    provider = redis_provider_metadata(quota_advertised=True)
+    for resource_type in provider["resourceTypes"]:
+        if resource_type["resourceType"] == "locations/usages":
+            resource_type["apiVersions"] = ["2024-11-01"]
+    azure = RedisContractAzure(configuration, provider=provider)
+
+    assert_redis_failure(
+        azure, RedisPreflightErrorCode.QUOTA_API_VERSION_NOT_ADVERTISED
+    )
+
+
+def test_redis_quota_pagination_rejects_unapproved_continuation() -> None:
+    """Reject a quota continuation that leaves the approved usages route."""
+    configuration = load_configuration(valid_environment())
+    cross_route = (
+        f"https://management.azure.com/subscriptions/{SUBSCRIPTION_ID}/providers/"
+        f"Microsoft.Cache/skus?api-version={REDIS_API_VERSION}"
+    )
+    azure = RedisContractAzure(
+        configuration,
+        provider=redis_provider_metadata(quota_advertised=True),
+        quota_document={
+            "nextLink": cross_route,
+            "value": [
+                {"currentValue": 0, "limit": 1, "name": {"value": "Balanced_B0"}}
+            ],
+        },
+    )
+
+    assert_redis_failure(azure, RedisPreflightErrorCode.QUOTA_PAGINATION_INVALID)
+
+
+def test_redis_multiple_quota_meters_fail_closed() -> None:
+    """Refuse contradictory quota evidence that returns two exact B0 meters."""
+    configuration = load_configuration(valid_environment())
+    azure = RedisContractAzure(
+        configuration,
+        provider=redis_provider_metadata(quota_advertised=True),
+        quota_document={
+            "value": [
+                {"currentValue": 0, "limit": 1, "name": {"value": "Balanced_B0"}},
+                {"currentValue": 0, "limit": 2, "name": {"value": "Balanced_B0"}},
+            ]
+        },
+    )
+
+    assert_redis_failure(azure, RedisPreflightErrorCode.QUOTA_RESPONSE_MALFORMED)

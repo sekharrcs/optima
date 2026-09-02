@@ -260,9 +260,10 @@ are not logged. The judge performs no external web or factual lookup.
 Before Bicep execution, Slice 11C must validate as far as Azure APIs allow:
 
 1. `Microsoft.Cache` resource-provider registration
-2. Azure Managed Redis service availability in `eastus2`
-3. Balanced B0 SKU support in `eastus2`
-4. Relevant subscription quota and limits
+2. `redisEnterprise` resource-type advertisement in `eastus2`
+3. Exact Balanced B0 subscription SKU advertisement in `eastus2`
+4. Applicable regional, subscription, and quota restrictions plus authoritative
+  quota evidence when Azure exposes a documented surface
 5. Presence of immutable API and UI manifests in ACR
 6. Replacement of every Foundry, embedding, and digest placeholder
 7. Replacement of UI Entra client and tenant placeholders, provision of the client
@@ -276,9 +277,11 @@ grant. Rollout additionally re-reads both `AcrPull` assignments, the
 container-scoped Cosmos assignment, the Redis access policy, Foundry access, and
 both ACR manifest digests before enabling applications.
 
-Valid SKU metadata and quota do not guarantee regional allocation capacity.
+Quota non-exposure is explicit unknown evidence, not available quota, and does
+not independently block when no documented surface exists. Provider, SKU,
+restriction, and quota metadata do not guarantee regional allocation capacity.
 Allocation failure must stop deployment with a clear error. It must not place
-Redis in East US or another fallback region.
+Redis in East US or another fallback region or select another SKU.
 
 ## Slice 11C live Entra acceptance gate
 

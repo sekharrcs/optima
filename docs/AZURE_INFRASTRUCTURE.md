@@ -475,18 +475,34 @@ Enable Container Apps after access and runtime gates pass
 The deployment workflow validates application code, Bicep, the Slice 11C diff,
 and one exact Linux AMD64 image pair before Azure login. It transfers those
 scanned image objects to the OIDC job without rebuilding. Read-only preflight proves OIDC,
-providers, region, Redis SKU/quota, model/version bindings, reviewed pricing,
-cost posture, Entra configuration, ACR permissions, runtime assignments, and
-registry manifests at the phase where each becomes available. API and UI deploy
-from separate registry digests produced from one source commit. The first app
-deployment keeps the UI internal until the Easy Auth child is verified; failed
-rollouts close UI ingress and reactivate the captured prior revision pair.
+providers, regional Redis Enterprise advertisement, exact subscription SKU
+advertisement, applicable restrictions, Redis quota-exposure status,
+model/version bindings, reviewed pricing, cost posture, Entra configuration,
+ACR permissions, runtime assignments, and registry manifests at the phase where
+each becomes available. Redis Enterprise currently exposes no documented
+regional quota operation. `NOT_EXPOSED` is recorded as unknown rather than
+available and does not independently block when no other gate proves
+ineligibility. Metadata never proves physical allocation; an `AllocationFailed`
+response from an exact deployment remains authoritative and blocks without a
+region or SKU fallback. API and UI deploy from separate registry digests
+produced from one source commit. The first app deployment keeps the UI internal
+until the Easy Auth child is verified; failed rollouts close UI ingress and
+reactivate the captured prior revision pair.
 
 A successful Slice 11B-S run may make PR #20 merge-ready for its exact head. It
 does not authorize merge and cannot declare Slice 11C deployed or successful.
 
 ## Risks and deployment blockers
 
+* The 2026-09-01 subscription SKU response contained no exact East US 2
+  `Balanced_B0` entry, although provider metadata advertised `redisEnterprise`
+  in the region. The selected Redis deployment remains blocked pending Azure
+  Support resolution or a user-approved architecture change.
+* Redis Enterprise exposes no documented authoritative regional quota API.
+  Preflight reports this as unknown and relies on explicit restrictions plus the
+  exact provider allocation response; it never calls the unsupported
+  `Microsoft.Cache/locations/{location}/usages` route when provider metadata does
+  not advertise it.
 * Foundry resource, SMALL, STRONG, JUDGE, and embedding deployment names, quotas,
   and model pricing are unresolved.
 * Reference-free `LLM_JUDGE` composition is implemented but not deployed. The
@@ -498,8 +514,6 @@ does not authorize merge and cannot declare Slice 11C deployed or successful.
   access; custom module-compatible ACLs are unavailable and remain a residual
   risk.
 * RediSearch bootstrap requires authenticated live validation on first startup.
-* B0 Redis availability in East US 2 and subscription quota must be confirmed
-  before deployment.
 * The UI Entra app registration and user-assignment policy are external tenant
   prerequisites. Placeholder IDs block Container Apps deployment.
 * The shared backend history endpoints remain internal and have no per-user
