@@ -79,6 +79,102 @@ def test_preflight_and_mutation_order_is_fail_closed() -> None:
     assert "az deployment sub what-if" in content
 
 
+def test_cache_mode_is_configuration_controlled_and_propagated() -> None:
+    """Read one protected canonical Boolean; add cache-only values only when enabled."""
+    content = workflow()
+
+    assert (
+        'OPTIMA_SEMANTIC_CACHE_ENABLED: "${{ vars.OPTIMA_SEMANTIC_CACHE_ENABLED }}"'
+        in content
+    )
+    assert 'OPTIMA_SEMANTIC_CACHE_ENABLED: "false"' not in content
+    assert 'OPTIMA_SEMANTIC_CACHE_ENABLED: "true"' not in content
+    assert content.count('"semanticCacheEnabled=$OPTIMA_SEMANTIC_CACHE_ENABLED"') == 2
+    assert content.count('if test "$OPTIMA_SEMANTIC_CACHE_ENABLED" = "true"; then') == 3
+    for parameter in (
+        "redisEmbeddingDeployment",
+        "redisEmbeddingModel",
+        "redisEmbeddingDimension",
+        "pricingEmbeddingInputRatePerMillionTokens",
+    ):
+        assert content.count(f'"{parameter}=$OPTIMA_') == 2
+    foundation_parameters = content.index("parameters=(", content.index("What-if"))
+    foundation_cache_branch = content.index(
+        'if test "$OPTIMA_SEMANTIC_CACHE_ENABLED" = "true"; then',
+        foundation_parameters,
+    )
+    assert (
+        content.index(
+            '"semanticCacheEnabled=$OPTIMA_SEMANTIC_CACHE_ENABLED"',
+            foundation_parameters,
+        )
+        < foundation_cache_branch
+    )
+
+
+def test_cache_mode_is_not_hardcoded_to_a_literal_boolean() -> None:
+    """Reject any workflow-owned cache mode that would need a code edit to change."""
+    content = workflow()
+
+    literal_mode = re.search(
+        r'OPTIMA_SEMANTIC_CACHE_ENABLED:\s*"(?:true|false)"', content
+    )
+    assert literal_mode is None
+    assert re.search(
+        r"OPTIMA_SEMANTIC_CACHE_ENABLED:\s*"
+        r'"\$\{\{\s*vars\.OPTIMA_SEMANTIC_CACHE_ENABLED\s*\}\}"',
+        content,
+    )
+    # A bare `test ... = "true|false"` assertion would force one mode; the
+    # conditional `if test ... = "true"; then` branch that adds cache-only
+    # parameters is mode-generic and must remain allowed.
+    forced_mode = re.search(
+        r'^\s*test "\$OPTIMA_SEMANTIC_CACHE_ENABLED" = "(?:true|false)"',
+        content,
+        re.MULTILINE,
+    )
+    assert forced_mode is None
+
+
+def test_cache_mode_is_strictly_canonically_validated_before_azure_login() -> None:
+    """Fail closed on any non-canonical cache mode before Azure identity or mutation."""
+    content = workflow()
+
+    assert content.count('case "$OPTIMA_SEMANTIC_CACHE_ENABLED" in') == 1
+    canonical_gate = content.index('case "$OPTIMA_SEMANTIC_CACHE_ENABLED" in')
+    error_message = content.index(
+        "OPTIMA_SEMANTIC_CACHE_ENABLED must be exactly true or false",
+        canonical_gate,
+    )
+    assert canonical_gate < error_message
+    assert canonical_gate < content.index("azure/login@")
+    assert canonical_gate < content.index("--phase foundation")
+
+
+def test_disabled_cache_is_verified_before_pre_exposure_smoke() -> None:
+    """Inspect the deployed revision for exact mode and absent cache environment."""
+    content = workflow()
+    rollout = content.index("What-if and deploy digest-qualified Container Apps")
+    cache_mode = content.index('configured_cache_mode="$(az containerapp', rollout)
+    cache_environment = content.index(
+        'cache_environment_count="$(az containerapp', cache_mode
+    )
+    absent_gate = content.index(
+        'test "$cache_environment_count" -eq 0', cache_environment
+    )
+    smoke = content.index("az containerapp job start", absent_gate)
+    public = content.index("exposePublicUi=true", smoke)
+
+    assert cache_mode < cache_environment < absent_gate < smoke < public
+    assert (
+        "OPTIMA_PRICING_EMBEDDING_INPUT_RATE_PER_MILLION_TOKENS"
+        in content[cache_environment:absent_gate]
+    )
+    assert (
+        "starts_with(name, 'OPTIMA_REDIS_')" in content[cache_environment:absent_gate]
+    )
+
+
 def test_images_are_built_for_amd64_and_deployed_by_registry_digest() -> None:
     """Use one commit tag for publication and only manifest digests for rollout."""
     content = workflow()
@@ -124,6 +220,9 @@ def test_rollout_records_source_and_verifies_runtime_contracts() -> None:
     assert "small_roles != {ModelRole.SMALL, ModelRole.JUDGE}" in smoke
     assert "{ModelRole.STRONG, ModelRole.JUDGE}.issubset(strong_roles)" in smoke
     assert "embedding_attempt.usage is None" in smoke
+    assert "SemanticCacheOutcome.DISABLED_BYPASSED" in smoke
+    assert "ExecutionStepType.SEMANTIC_CACHE" in smoke
+    assert "strong.total_calculated_cost != sum" in smoke
     assert 'response.headers.get(PERSISTENCE_HEADER) != "PERSISTED"' in smoke
     assert "result.contract_met is not True" in smoke
     assert "result.final_evaluation.passed is not True" in smoke
@@ -190,6 +289,9 @@ def test_failed_rollout_restores_previous_revision_pair() -> None:
     assert 'test "$healthy" = "true"' in content
     assert "PREVIOUS_API_IMAGE" in content
     assert "PREVIOUS_UI_IMAGE" in content
+    assert "PREVIOUS_API_SEMANTIC_CACHE_ENABLED" in content
+    assert "api_semantic_cache_enabled" in content
+    assert "OPTIMA_SEMANTIC_CACHE_ENABLED'].value" in content
     rollback = content.index("Restore the previous ready revision pair")
     assert "az containerapp ingress enable" not in content[rollback:]
 
@@ -226,3 +328,15 @@ def test_bicep_revisions_share_commit_and_workflow_provenance() -> None:
     assert "external: exposePublicUi" in module
     assert "deploymentProvenanceIsDeployable" in resources
     assert "requires an exact commit SHA and workflow run ID" in resources
+
+
+def test_smoke_job_receives_the_same_explicit_cache_mode_as_api() -> None:
+    """Prevent the deployment verifier from assuming a cache mode default."""
+    module = (ROOT / "infra" / "modules" / "container-apps.bicep").read_text(
+        encoding="utf-8"
+    )
+    smoke_job = module[module.index("resource deploymentSmokeJob") :]
+
+    assert module.count("name: 'OPTIMA_SEMANTIC_CACHE_ENABLED'") == 2
+    assert "name: 'OPTIMA_SEMANTIC_CACHE_ENABLED'" in smoke_job
+    assert "value: validatedSemanticCacheEnabled ? 'true' : 'false'" in smoke_job

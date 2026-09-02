@@ -7,6 +7,7 @@ param deploymentWorkflowRunId = 'replace-workflow-run-id'
 param deployContainerApps = false
 param exposePublicUi = false
 param deployRuntimeAccess = false
+param semanticCacheEnabled = false
 
 // Slice 11C must replace these non-deployable digests and model placeholders.
 param uiAuthClientId = '00000000-0000-0000-0000-000000000000'
@@ -23,9 +24,6 @@ param judgeDeployment = 'replace-judge-deployment'
 param judgeModel = 'replace-judge-model'
 param judgeTimeoutSeconds = 30
 param foundryTokenScope = 'https://cognitiveservices.azure.com/.default'
-param redisEmbeddingDeployment = 'replace-embedding-deployment'
-param redisEmbeddingModel = 'replace-embedding-model'
-param redisEmbeddingDimension = 1536
 param pricingCatalogVersion = 'replace-pricing-catalog-version'
 param pricingCurrency = 'USD'
 param pricingSmallInputRatePerMillionTokens = 'replace-small-input-rate'
@@ -37,6 +35,5 @@ param pricingStrongCachedInputRatePerMillionTokens = null
 param pricingJudgeInputRatePerMillionTokens = 'replace-judge-input-rate'
 param pricingJudgeOutputRatePerMillionTokens = 'replace-judge-output-rate'
 param pricingJudgeCachedInputRatePerMillionTokens = null
-param pricingEmbeddingInputRatePerMillionTokens = 'replace-embedding-input-rate'
 
 param applicationInsightsSamplingRatio = '0.25'

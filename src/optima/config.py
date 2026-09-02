@@ -57,6 +57,40 @@ TelemetryResourceName = Annotated[
     ),
 ]
 
+_PRODUCTION_CACHE_ONLY_FIELDS = frozenset(
+    {
+        "cache_similarity_threshold",
+        "pricing_embedding_input_rate_per_million_tokens",
+        "redis_access_key",
+        "redis_auth_mode",
+        "redis_embedding_deployment",
+        "redis_embedding_dimension",
+        "redis_embedding_model",
+        "redis_host",
+        "redis_index_name",
+        "redis_managed_identity_client_id",
+        "redis_max_connections",
+        "redis_object_id",
+        "redis_timeout_seconds",
+        "redis_token_acquisition_timeout_seconds",
+        "redis_token_expiry_safety_margin_seconds",
+        "redis_token_reauth_timeout_seconds",
+        "redis_token_renewal_attempts",
+        "redis_token_retry_backoff_cap_seconds",
+        "redis_token_retry_backoff_seconds",
+    }
+)
+_PRODUCTION_JUDGE_ONLY_FIELDS = frozenset(
+    {
+        "judge_deployment",
+        "judge_model",
+        "judge_timeout_seconds",
+        "pricing_judge_cached_input_rate_per_million_tokens",
+        "pricing_judge_input_rate_per_million_tokens",
+        "pricing_judge_output_rate_per_million_tokens",
+    }
+)
+
 
 class FoundryAuthMode(StrEnum):
     """Explicit authentication source for the Foundry/APIM provider."""
@@ -111,7 +145,7 @@ class ProductionPricingInputs(ImmutableModel):
     small: ProductionModelRoleRate
     strong: ProductionModelRoleRate
     judge: ProductionModelRoleRate | None = None
-    embedding_input_rate_per_million_tokens: NonNegativeRate
+    embedding_input_rate_per_million_tokens: NonNegativeRate | None = None
 
 
 class JudgeProviderConfiguration(ImmutableModel):
@@ -539,7 +573,8 @@ class AppSettings(BaseSettings):
         self.foundry_provider_configuration()
         self.judge_provider_configuration()
         self.cosmos_run_history_configuration()
-        self.redis_semantic_cache_configuration()
+        if self.semantic_cache_enabled:
+            self.redis_semantic_cache_configuration()
         self.application_insights_configuration()
         self.production_pricing_inputs()
         return self
@@ -785,12 +820,13 @@ class AppSettings(BaseSettings):
             or small_output is None
             or strong_input is None
             or strong_output is None
-            or embedding_input is None
+            or (self.semantic_cache_enabled and embedding_input is None)
         ):
             raise ValueError(
                 "Production pricing requires a catalog version and SMALL, STRONG, "
-                "and embedding token rates; partial pricing cannot fabricate "
-                "monetary evidence"
+                "and active-role token rates; embedding pricing is required when "
+                "semantic cache is enabled; partial pricing cannot fabricate monetary "
+                "evidence"
             )
         if (judge_input is None) is not (judge_output is None):
             raise ValueError(
@@ -824,6 +860,20 @@ class AppSettings(BaseSettings):
 
     def validate_production_runtime(self) -> "AppSettings":
         """Require every dependency owned by the production API lifespan."""
+        if "semantic_cache_enabled" not in self.model_fields_set:
+            raise ValueError(
+                "Production runtime requires an explicit semantic_cache_enabled "
+                "decision"
+            )
+        if not self.semantic_cache_enabled:
+            supplied_cache_fields = sorted(
+                self.model_fields_set.intersection(_PRODUCTION_CACHE_ONLY_FIELDS)
+            )
+            if supplied_cache_fields:
+                raise ValueError(
+                    "Disabled production semantic cache cannot configure cache-only "
+                    f"fields: {', '.join(supplied_cache_fields)}"
+                )
         mode = self.production_evaluator_mode
         if mode is None:
             raise ValueError(
@@ -837,6 +887,15 @@ class AppSettings(BaseSettings):
             raise ValueError(
                 "EXACT_REFERENCE production evaluation requires reference output"
             )
+        if mode is ProductionEvaluatorMode.EXACT_REFERENCE:
+            supplied_judge_fields = sorted(
+                self.model_fields_set.intersection(_PRODUCTION_JUDGE_ONLY_FIELDS)
+            )
+            if supplied_judge_fields:
+                raise ValueError(
+                    "EXACT_REFERENCE production cannot configure inactive JUDGE "
+                    f"fields: {', '.join(supplied_judge_fields)}"
+                )
         judge = self.judge_provider_configuration()
         if mode is ProductionEvaluatorMode.LLM_JUDGE:
             if self.production_require_reference_output:
@@ -854,9 +913,11 @@ class AppSettings(BaseSettings):
         cosmos = self.cosmos_run_history_configuration()
         if cosmos is None:
             raise ValueError("Production runtime requires Cosmos configuration")
-        redis = self.redis_semantic_cache_configuration()
-        if redis is None:
-            raise ValueError("Production runtime requires Redis configuration")
+        redis: RedisSemanticCacheConfiguration | None = None
+        if self.semantic_cache_enabled:
+            redis = self.redis_semantic_cache_configuration()
+            if redis is None:
+                raise ValueError("Production runtime requires Redis configuration")
         if self.application_insights_configuration() is None:
             raise ValueError(
                 "Production runtime requires Application Insights configuration"
@@ -875,13 +936,14 @@ class AppSettings(BaseSettings):
             )
         if self.production_cost_measurement_required and pricing is None:
             raise ValueError(
-                "Production cost measurement requires reviewed SMALL, STRONG, and "
-                "embedding pricing rates, plus JUDGE rates in LLM_JUDGE mode; "
-                "configure the price catalog or disable "
+                "Production cost measurement requires reviewed SMALL and STRONG "
+                "pricing rates, plus JUDGE rates in LLM_JUDGE mode and embedding "
+                "pricing when semantic cache is enabled; configure the price catalog "
+                "or disable "
                 "production_cost_measurement_required"
             )
 
-        managed_identity_client_ids = (
+        managed_identity_client_ids = [
             (
                 foundry.auth_mode is FoundryAuthMode.MANAGED_IDENTITY,
                 foundry.managed_identity_client_id,
@@ -892,12 +954,15 @@ class AppSettings(BaseSettings):
                 cosmos.managed_identity_client_id,
                 "Cosmos",
             ),
-            (
-                redis.auth_mode is RedisAuthMode.MANAGED_IDENTITY,
-                redis.managed_identity_client_id,
-                "Redis",
-            ),
-        )
+        ]
+        if redis is not None:
+            managed_identity_client_ids.append(
+                (
+                    redis.auth_mode is RedisAuthMode.MANAGED_IDENTITY,
+                    redis.managed_identity_client_id,
+                    "Redis",
+                )
+            )
         for (
             managed_identity_selected,
             client_id,

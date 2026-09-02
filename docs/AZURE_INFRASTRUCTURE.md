@@ -31,6 +31,23 @@ subscription. Templates own only the deterministic OPTIMA resource group and
 resources declared beneath it. Unrelated subscription resources are outside the
 deployment boundary.
 
+## Selected temporary production profile
+
+The East US 2 hackathon profile explicitly sets `semanticCacheEnabled=false`.
+It omits Azure Managed Redis, the Redis database and access-policy assignment,
+all Redis endpoint settings, embedding identity and pricing, token renewal, and
+RediSearch bootstrap. The API still runs Quality Contract enforcement, SMALL and
+STRONG routing, LLM-judge evaluation, escalation, context reduction, active-role
+cost accounting, Cosmos run history, and Application Insights. The UI remains
+Entra protected and renders typed disabled cache evidence without cache-hit or
+cache-savings claims.
+
+This profile is temporary. Cache-enabled production remains represented by the
+same Bicep and application contracts and retains every exact Managed Redis,
+embedding, pricing, access, index, and preflight gate. The East US 2
+`Balanced_B0` advertisement remains blocked and receives no automatic region or
+SKU fallback.
+
 ## Repository findings
 
 The current application already defines the Azure data-plane contracts. The
@@ -40,16 +57,17 @@ infrastructure preserves them rather than introducing replacement services.
 |----------------------|--------------------------------------------------------------------------------------|---------------------------------------------------|
 | FastAPI API          | Factory `optima.api.production:create_production_app`, port `8000`, health at `/api/v1/health` | Lifespan composes Azure resources before readiness |
 | Streamlit UI         | `streamlit run src/ui/app.py`, port `8501`, `OPTIMA_API_BASE_URL`                    | Starts without an available API                   |
-| Foundry/APIM         | HTTPS Azure OpenAI v1 root ending `/openai/v1`; SMALL, STRONG, JUDGE, and embedding names | First model, judge, or embedding request performs I/O |
+| Foundry/APIM         | HTTPS Azure OpenAI v1 root ending `/openai/v1`; SMALL, STRONG, and JUDGE names; embedding only when cache is enabled | First active model, judge, or embedding request performs I/O |
 | Cosmos DB            | NoSQL API, database and container supplied by settings, partition key `/id`          | Client is lazy; database and container must exist |
-| Azure Managed Redis  | TLS port `10000`, RESP2, RediSearch HASH index, `FLOAT32`/COSINE, read-only lookup    | Lifespan validates or creates the index idempotently |
+| Azure Managed Redis  | Cache-enabled only: TLS port `10000`, RESP2, RediSearch HASH index, `FLOAT32`/COSINE | Enabled lifespan validates or creates the index idempotently |
 | Application Insights | Workspace-based connection string, local OpenTelemetry providers, explicit close     | Failure-isolated initialization during app build  |
 
 The default FastAPI export remains intentionally unconfigured for library and
 local health use. The production factory validates all Azure settings, composes
 Foundry generator and optional JUDGE resources, mode-selected evaluation,
-centralized pricing, context reduction, Redis, Cosmos, and observability, then
-owns cleanup through FastAPI lifespan. Separate API and UI image definitions now
+centralized active-role pricing, context reduction, Cosmos, and observability.
+It adds Redis and embedding only when explicitly enabled, then owns cleanup
+through FastAPI lifespan. Separate API and UI image definitions now
 exist. `deployContainerApps` remains `false` until Slice 11C publishes immutable
 images and completes live access and regional preflight.
 
@@ -73,7 +91,7 @@ Azure Resource Manager
                 |       +-- internal OPTIMA API
                 |       +-- Entra-protected public OPTIMA Streamlit UI
                 +-- Cosmos DB for NoSQL serverless
-                +-- Azure Managed Redis Balanced B0
+                +-- Azure Managed Redis Balanced B0 (cache-enabled only)
                 +-- Log Analytics workspace
                 +-- workspace-based Application Insights
                 +-- API user-assigned managed identity
@@ -82,7 +100,7 @@ Azure Resource Manager
 
 OPTIMA API --managed identity--> Foundry or APIM endpoint (external input)
 OPTIMA API --managed identity--> Cosmos DB
-OPTIMA API --managed identity--> Azure Managed Redis
+OPTIMA API --managed identity--> Azure Managed Redis (cache-enabled only)
 OPTIMA UI  --HTTPS-------------> internal OPTIMA API
 ```
 
@@ -97,8 +115,8 @@ OPTIMA UI  --HTTPS-------------> internal OPTIMA API
 | UI Container App               | External HTTPS ingress, tenant-restricted Entra auth, `0.5` vCPU/`1.0Gi`, min `0`, max `2` | Serve the Streamlit experience               |
 | Cosmos DB account              | NoSQL, serverless, one region, Session consistency, local auth disabled               | Persist immutable run history                |
 | Cosmos database/container      | `optima` / `runs`, partition key `/id`, consistent default index                      | Satisfy the existing storage adapter         |
-| Azure Managed Redis            | Balanced B0, HA disabled, TLS 1.2, public endpoint, access keys disabled               | Host semantic-cache evidence                 |
-| Redis database                 | Port `10000`, Enterprise clustering, NoEviction, RediSearch, no disk persistence       | Support filtered `FT.SEARCH` vector lookup   |
+| Azure Managed Redis            | Omitted in the selected profile; enabled mode uses Balanced B0, HA off, TLS 1.2, and disabled access keys | Host semantic-cache evidence when enabled |
+| Redis database                 | Omitted in the selected profile; enabled mode uses port `10000`, Enterprise clustering, NoEviction, and RediSearch | Support filtered `FT.SEARCH` when enabled |
 | Log Analytics workspace        | PerGB2018, 30-day immediate purge, 0.25 GB/day emergency cap                          | Store Application Insights telemetry         |
 | Application Insights           | Workspace-based, public ingestion, 30 days, local ingestion auth retained             | Preserve Slice 10D traces and metrics        |
 | API managed identity           | User-assigned                                                                          | Stable pre-assignable API runtime identity   |
@@ -106,7 +124,8 @@ OPTIMA UI  --HTTPS-------------> internal OPTIMA API
 
 The API and UI remain separate deployment units because the UI is an HTTP
 client of the API, they use different ports and processes, and only the API
-needs model, Cosmos, Redis, and telemetry configuration. The API has internal
+needs model, Cosmos, and telemetry configuration. Redis is conditional on the
+explicit cache mode. The API has internal
 Container Apps ingress because the current API has no caller authentication.
 The UI is the only public application endpoint. Container Apps built-in
 authentication redirects every anonymous browser request to the configured
@@ -170,6 +189,9 @@ first history operation. The application never creates them.
 
 ### Azure Managed Redis
 
+This section defines the preserved cache-enabled profile. The selected temporary
+profile does not deploy or connect to this service.
+
 Balanced B0 is the smallest Azure Managed Redis SKU and provides 0.5 GB,
 RediSearch, vector search, Microsoft Entra authentication, and the required TLS
 endpoint. High availability is disabled because the semantic cache is an
@@ -222,6 +244,7 @@ The UI receives no Foundry, Cosmos, Redis, or Application Insights setting.
 | `OPTIMA_DEPLOYMENT_ENVIRONMENT`                     | Literal `hackathon`                             | No     | Not applicable                 | IaC                |
 | `OPTIMA_PRODUCTION_EVALUATOR_MODE`                  | Reviewed `EXACT_REFERENCE` or `LLM_JUDGE` parameter | No | Not applicable                 | AI/model slice     |
 | `OPTIMA_PRODUCTION_REQUIRE_REFERENCE_OUTPUT`        | Derived from evaluator mode                    | No     | Not applicable                 | IaC                |
+| `OPTIMA_SEMANTIC_CACHE_ENABLED`                     | Protected `OPTIMA_SEMANTIC_CACHE_ENABLED` deployment variable, exactly `true` or `false` | No | Not applicable                 | IaC                |
 | `OPTIMA_EXECUTION_CONCURRENCY_LIMIT`                | Literal `4`                                    | No     | Not applicable                 | IaC                |
 | `OPTIMA_EXECUTION_TIMEOUT_SECONDS`                  | Literal `300`                                  | No     | Not applicable                 | IaC                |
 | `OPTIMA_FOUNDRY_BASE_URL`                           | Reviewed Foundry/APIM parameter                | No     | Not applicable                 | AI/gateway slice   |
@@ -239,14 +262,14 @@ The UI receives no Foundry, Cosmos, Redis, or Application Insights setting.
 | `OPTIMA_COSMOS_AUTH_MODE`                           | Literal `MANAGED_IDENTITY`                     | No     | Replaces account key           | IaC                |
 | `OPTIMA_COSMOS_MANAGED_IDENTITY_CLIENT_ID`          | API identity client ID                         | No     | Selects user-assigned identity | IaC                |
 | `OPTIMA_COSMOS_TIMEOUT_SECONDS`                     | Literal `10`                                   | No     | Not applicable                 | IaC                |
-| `OPTIMA_REDIS_HOST`                                 | Derived Managed Redis hostname                 | No     | Not applicable                 | IaC                |
-| `OPTIMA_REDIS_INDEX_NAME`                           | Literal `optima-cache-v1`                      | No     | Not applicable                 | IaC/data bootstrap |
-| `OPTIMA_REDIS_EMBEDDING_DIMENSION`                  | Reviewed embedding parameter                   | No     | Not applicable                 | AI/cache slice     |
-| `OPTIMA_REDIS_EMBEDDING_MODEL`                      | Reviewed embedding parameter                   | No     | Not applicable                 | AI/cache slice     |
-| `OPTIMA_REDIS_EMBEDDING_DEPLOYMENT`                 | Reviewed embedding parameter                   | No     | Not applicable                 | AI/cache slice     |
-| `OPTIMA_REDIS_AUTH_MODE`                            | Literal `MANAGED_IDENTITY`                     | No     | Replaces access key            | IaC                |
-| `OPTIMA_REDIS_OBJECT_ID`                            | API identity principal/object ID               | No     | Redis AUTH username            | IaC                |
-| `OPTIMA_REDIS_MANAGED_IDENTITY_CLIENT_ID`           | API identity client ID                         | No     | Selects user-assigned identity | IaC                |
+| `OPTIMA_REDIS_HOST`                                 | Cache-enabled only: derived Managed Redis hostname | No  | Not applicable                 | IaC                |
+| `OPTIMA_REDIS_INDEX_NAME`                           | Cache-enabled only: literal `optima-cache-v1`  | No     | Not applicable                 | IaC/data bootstrap |
+| `OPTIMA_REDIS_EMBEDDING_DIMENSION`                  | Cache-enabled only: reviewed embedding parameter | No   | Not applicable                 | AI/cache slice     |
+| `OPTIMA_REDIS_EMBEDDING_MODEL`                      | Cache-enabled only: reviewed embedding parameter | No   | Not applicable                 | AI/cache slice     |
+| `OPTIMA_REDIS_EMBEDDING_DEPLOYMENT`                 | Cache-enabled only: reviewed embedding parameter | No   | Not applicable                 | AI/cache slice     |
+| `OPTIMA_REDIS_AUTH_MODE`                            | Cache-enabled only: literal `MANAGED_IDENTITY` | No     | Replaces access key            | IaC                |
+| `OPTIMA_REDIS_OBJECT_ID`                            | Cache-enabled only: API identity object ID     | No     | Redis AUTH username            | IaC                |
+| `OPTIMA_REDIS_MANAGED_IDENTITY_CLIENT_ID`           | Cache-enabled only: API identity client ID     | No     | Selects user-assigned identity | IaC                |
 | `OPTIMA_APPLICATION_INSIGHTS_ENABLED`               | Literal `true`                                 | No     | Not applicable                 | IaC                |
 | `OPTIMA_APPLICATION_INSIGHTS_CONNECTION_STRING`     | Container Apps secret reference                | Yes    | None in current exporter       | IaC                |
 | `OPTIMA_APPLICATION_INSIGHTS_SERVICE_NAME`          | Literal `optima-api`                           | No     | Not applicable                 | IaC                |
@@ -276,7 +299,7 @@ Set `deployRuntimeAccess=true` only for a reviewed access-bootstrap deployment.
 |----------------------|-------------------------------|----------------------------------------------------|----------------------------------|----------------------------------------|
 | API managed identity | ACR                           | `AcrPull` (`7f951dda-4ed3-4680-a7ca-43fe172d538d`) | OPTIMA registry                  | Pull the API image                     |
 | API managed identity | Cosmos DB                     | Cosmos DB Built-in Data Contributor (`...0002`)    | `/dbs/optima/colls/runs`         | Create/read immutable runs and query   |
-| API managed identity | Managed Redis database        | Stable `default` access-policy assignment           | Managed Redis `default` database | Authenticate cache operations          |
+| API managed identity | Managed Redis database, cache-enabled only | Stable `default` access-policy assignment | Managed Redis `default` database | Authenticate cache operations |
 | API managed identity | Foundry Azure OpenAI resource | Cognitive Services OpenAI User                     | Exact Foundry/OpenAI resource    | Invoke model and embedding deployments |
 | UI managed identity  | ACR                           | `AcrPull` (`7f951dda-4ed3-4680-a7ca-43fe172d538d`) | OPTIMA registry                  | Pull the UI image                      |
 | UI managed identity  | Cosmos, Redis, Foundry        | None                                               | None                             | UI calls only the internal API         |
@@ -354,7 +377,7 @@ register them.
 | `Microsoft.ContainerRegistry`   | Azure Container Registry                            |
 | `Microsoft.App`                 | Container Apps environment and apps                 |
 | `Microsoft.DocumentDB`          | Cosmos DB account, database, and container          |
-| `Microsoft.Cache`               | Azure Managed Redis cluster and database            |
+| `Microsoft.Cache`               | Cache-enabled only: Azure Managed Redis cluster and database |
 | `Microsoft.OperationalInsights` | Log Analytics workspace                             |
 | `Microsoft.Insights`            | Application Insights component                      |
 
@@ -373,7 +396,7 @@ actual usage can change the bill. Recheck pricing before deployment.
 | Resource                  | Selected tier/configuration             | Billing behavior and reference driver                    | Cost posture                                | Expensive alternative avoided                 |
 |---------------------------|-----------------------------------------|----------------------------------------------------------|---------------------------------------------|-----------------------------------------------|
 | ACR                       | Basic, 10 GiB included                  | ₹15.9353/day; extra storage ₹9.565/GB-month              | About ₹478-₹494 for a 30-31 day month       | Standard/Premium and geo-replication          |
-| Managed Redis             | Balanced B0, HA off, 0.5 GB             | ₹1.5304 per cache hour                                   | About ₹1,117 for 730 hours                  | HA replica, B1+, persistence, geo-replication |
+| Managed Redis             | Omitted in selected profile; enabled contract remains Balanced B0, HA off | Prior reference was ₹1.5304 per cache hour | Saves about ₹1,117 for 730 hours while disabled | HA replica, B1+, persistence, geo-replication |
 | Cosmos DB                 | Serverless NoSQL                        | ₹23.9125/million RUs; ₹23.9125/GB-month data storage    | No idle throughput charge                  | Provisioned or autoscale RU/s                  |
 | Cosmos backup             | Periodic local redundancy               | Backup beyond included allowance at LRS storage meter    | Storage-driven and expected to be small    | Continuous PITR and geo-redundant backup      |
 | Container Apps            | Consumption, two 0.5-vCPU/1-GiB apps   | Active vCPU/GiB seconds and requests; zero at scale zero | Low for intermittent use; high if sustained| Dedicated profiles and minimum replicas       |
@@ -381,12 +404,12 @@ actual usage can change the bill. Recheck pricing before deployment.
 | Managed identities        | Two user-assigned identities            | No separate runtime meter                                | No direct charge                           | Secret-bearing service credentials            |
 | Container Apps environment| Consumption-only, no VNet               | No dedicated workload-profile floor                      | No fixed compute floor                     | Dedicated environment and network stack       |
 
-The predictable ACR and Redis floor is approximately ₹1,600/month. At the full
-workspace cap, ordinary Log Analytics ingestion is approximately ₹1,650 for 30
-days, although cap overshoot can be billed. That leaves roughly ₹1,750 of the
-₹5,000 infrastructure target for Container Apps, Cosmos requests/storage, and
-small variable charges. Intermittent scale-to-zero usage should remain below
-that remainder.
+The prior approximately ₹3,250 fixed estimate included about ₹1,117 per month
+for Balanced B0. Omitting Redis produces a comparable estimate of approximately
+₹2,133 per month before tax. At the full workspace cap, ordinary Log Analytics
+ingestion is approximately ₹1,650 for 30 days, although cap overshoot can be
+billed. Intermittent scale-to-zero usage should remain within the ₹5,000 fixed
+infrastructure target, but Container Apps and telemetry remain variable risks.
 
 The architecture is designed to fit the ₹5,000 infrastructure target, but it is
 not safe under sustained Container Apps load or sustained telemetry at the cap.
@@ -418,14 +441,17 @@ setting it to `true`, all of these conditions must hold:
 2. Slice 11C published the API and UI images to ACR, and both exist at the
   configured immutable registry manifest digests. Local Docker image IDs are not
   registry manifest digests.
-3. The API image exposes a production entry point that composes all required
-   providers, evaluator, cost catalog, store, cache, and lifecycle owners.
-4. The API lifespan flushes and closes observability, Foundry transports,
-   Cosmos resources, Redis renewal/client resources, and embedding resources.
+3. The API image exposes a production entry point that composes all active
+  providers, evaluator, cost catalog, store, and lifecycle owners.
+4. The API lifespan flushes and closes observability, Foundry transports, and
+  Cosmos resources. It also closes Redis and embedding resources when enabled.
 5. OPTIMA runtime access was bootstrapped with `deployRuntimeAccess=true`, then
-  returned to `false`; external Foundry access was applied and verified.
-6. Redis bootstrap can inspect or create `optima-cache-v1` with the reviewed profile.
-7. Placeholder Foundry and embedding parameters have been replaced.
+  returned to `false`; external Foundry access was applied and verified. Disabled
+  mode creates no Redis assignment.
+6. Cache-enabled mode proves Redis bootstrap can inspect or create
+  `optima-cache-v1` with the reviewed profile.
+7. Placeholder Foundry parameters have been replaced. Cache-enabled mode also
+  replaces embedding parameters.
 8. The production API health endpoint and UI startup pass with live configuration.
 9. Placeholder UI Entra client and tenant IDs have been replaced, a client secret
   is supplied through the secure `uiAuthClientSecret` parameter, and the exact
@@ -474,12 +500,13 @@ Enable Container Apps after access and runtime gates pass
 
 The deployment workflow validates application code, Bicep, the Slice 11C diff,
 and one exact Linux AMD64 image pair before Azure login. It transfers those
-scanned image objects to the OIDC job without rebuilding. Read-only preflight proves OIDC,
-providers, regional Redis Enterprise advertisement, exact subscription SKU
-advertisement, applicable restrictions, Redis quota-exposure status,
-model/version bindings, reviewed pricing, cost posture, Entra configuration,
-ACR permissions, runtime assignments, and registry manifests at the phase where
-each becomes available. Redis Enterprise currently exposes no documented
+scanned image objects to the OIDC job without rebuilding. Read-only preflight
+proves OIDC, active model/version bindings, reviewed pricing, cost posture, Entra
+configuration, ACR permissions, runtime assignments, registry manifests, and the
+explicit cache mode. Disabled mode proves Redis resources and embedding values
+are absent. Enabled mode additionally proves regional Redis Enterprise
+advertisement, exact subscription SKU advertisement, applicable restrictions,
+and Redis quota-exposure status. Redis Enterprise currently exposes no documented
 regional quota operation. `NOT_EXPOSED` is recorded as unknown rather than
 available and does not independently block when no other gate proves
 ineligibility. Metadata never proves physical allocation; an `AllocationFailed`
@@ -496,24 +523,22 @@ does not authorize merge and cannot declare Slice 11C deployed or successful.
 
 * The 2026-09-01 subscription SKU response contained no exact East US 2
   `Balanced_B0` entry, although provider metadata advertised `redisEnterprise`
-  in the region. The selected Redis deployment remains blocked pending Azure
-  Support resolution or a user-approved architecture change.
+  in the region. Cache-enabled production remains blocked. The selected disabled
+  profile does not bypass this gate because it cannot provision or contact Redis.
 * Redis Enterprise exposes no documented authoritative regional quota API.
   Preflight reports this as unknown and relies on explicit restrictions plus the
   exact provider allocation response; it never calls the unsupported
   `Microsoft.Cache/locations/{location}/usages` route when provider metadata does
   not advertise it.
-* Foundry resource, SMALL, STRONG, JUDGE, and embedding deployment names, quotas,
-  and model pricing are unresolved.
+* Foundry resource, SMALL, STRONG, and JUDGE deployment names, quotas, and model
+  pricing are unresolved. Embedding inputs remain required before restoring cache.
 * Reference-free `LLM_JUDGE` composition is implemented but not deployed. The
   first live deployment still requires reviewed judge identity, pricing, access,
   and JSON response-format validation.
 * The production price catalog is intentionally empty until reviewed deployment
   rates are supplied, so monetary cost remains unavailable rather than fabricated.
-* The stable Redis access policy grants the API identity full Redis data-plane
-  access; custom module-compatible ACLs are unavailable and remain a residual
-  risk.
-* RediSearch bootstrap requires authenticated live validation on first startup.
+* Cache-enabled mode retains the stable Redis access-policy and RediSearch
+  bootstrap risks. They are unreachable in the selected disabled profile.
 * The UI Entra app registration and user-assignment policy are external tenant
   prerequisites. Placeholder IDs block Container Apps deployment.
 * The shared backend history endpoints remain internal and have no per-user

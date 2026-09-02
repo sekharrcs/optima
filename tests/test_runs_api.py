@@ -1338,11 +1338,16 @@ def test_disabled_semantic_cache_bypasses_dependency_completely() -> None:
     body = response.json()
     assert body["semantic_cache"]["outcome"] == "DISABLED_BYPASSED"
     assert body["semantic_cache"]["lookup_latency_ms"] == 0
+    assert body["semantic_cache"]["embedding_attempt"] is None
+    assert body["semantic_cache"]["source_run_id"] is None
+    assert body["semantic_cache"]["similarity"] is None
     assert (
         PlannerReasonCode.SEMANTIC_CACHE_DISABLED
         in (body["execution_plan"]["reason_codes"])
     )
     assert all(step["step_type"] != "SEMANTIC_CACHE" for step in body["steps"])
+    assert body["total_calculated_cost"] == "0.001"
+    assert body["total_tokens"] == 120
     assert cache.calls == ()
     assert len(small.calls) == 1
 

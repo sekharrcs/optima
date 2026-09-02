@@ -885,6 +885,34 @@ def test_api_persists_completed_result_once_without_changing_execution() -> None
     assert len(evaluator.calls) == 1
 
 
+def test_api_persists_cache_disabled_evidence_without_embedding_usage() -> None:
+    """Store the exact disabled planner and runtime evidence without cache claims."""
+    configured, small, strong, evaluator = dependencies(0.93)
+    store = RecordingRunHistoryStore()
+    configured = replace(configured, run_history_store=store)
+
+    response = TestClient(create_app(execution_dependencies=configured)).post(
+        "/api/v1/runs",
+        json=request_payload(request_profile=cache_eligible_profile()),
+    )
+
+    assert response.status_code == 200
+    assert response.headers["X-OPTIMA-Run-History"] == "PERSISTED"
+    persisted = asyncio.run(store.get("run-api-1"))
+    assert persisted.semantic_cache is not None
+    assert persisted.semantic_cache.outcome.value == "DISABLED_BYPASSED"
+    assert persisted.semantic_cache.embedding_attempt is None
+    assert (
+        persisted.execution_plan.decision_evidence.module_states.semantic_cache_enabled
+        is False
+    )
+    assert all(step.step_type.value != "SEMANTIC_CACHE" for step in persisted.steps)
+    assert persisted.total_calculated_cost == Decimal("0.001000")
+    assert len(small.calls) == 1
+    assert len(strong.calls) == 0
+    assert len(evaluator.calls) == 1
+
+
 @pytest.mark.parametrize(
     ("provider", "expected_status"),
     [

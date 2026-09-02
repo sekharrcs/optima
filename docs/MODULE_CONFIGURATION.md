@@ -76,6 +76,12 @@ If `semantic_cache_enabled == false`:
 - planner skips cache lookup entirely
 - reason code may include `SEMANTIC_CACHE_DISABLED` in debug details
 
+Production requires this Boolean to be supplied explicitly. Disabled production
+rejects Redis, embedding, cache-tuning, and embedding-pricing values; constructs
+no cache-only resource; and emits no cache step or embedding attempt. Enabled
+production continues to require a complete semantic-cache dependency and fails
+before model execution when its Redis or embedding configuration is incomplete.
+
 When enabled, the application requires an injected semantic-cache dependency and
 performs one lookup before planning for cache-eligible requests. A missing enabled
 dependency is a structural configuration error. A healthy miss, operational

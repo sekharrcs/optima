@@ -10,11 +10,18 @@ from collections.abc import Mapping, Sequence
 
 import httpx
 
-from optima.domain.execution import ModelPolicy, ModelRole
+from optima.domain.execution import (
+    ExecutionStepType,
+    ModelPolicy,
+    ModelRole,
+    PlannerReasonCode,
+    SemanticCacheOutcome,
+)
 from optima.domain.run import RunResult, RunStatus
 from ui.api_client import API_BASE_URL_ENV, API_TIMEOUT_SECONDS_ENV
 
 PERSISTENCE_HEADER = "X-OPTIMA-Run-History"
+SEMANTIC_CACHE_ENABLED_ENV = "OPTIMA_SEMANTIC_CACHE_ENABLED"
 SUCCESS_MARKER = "OPTIMA_DEPLOYMENT_SMOKE_PASSED"
 TRACEPARENT_PATTERN = re.compile(r"^00-[0-9a-f]{32}-[0-9a-f]{16}-01$")
 
@@ -24,6 +31,16 @@ def _required(environment: Mapping[str, str], name: str) -> str:
     if not value:
         raise ValueError(f"{name} is required")
     return value
+
+
+def _required_boolean(environment: Mapping[str, str], name: str) -> bool:
+    """Parse one explicit canonical Boolean without choosing a default."""
+    value = _required(environment, name).casefold()
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    raise ValueError(f"{name} must be exactly true or false")
 
 
 def _request_payload(
@@ -89,8 +106,9 @@ def run_smoke(
     client: httpx.Client,
     traceparent: str,
     marker: str,
+    semantic_cache_enabled: bool,
 ) -> None:
-    """Exercise SMALL, STRONG, JUDGE, embedding, persistence, and pricing."""
+    """Exercise active roles, persistence, pricing, and explicit cache evidence."""
     if TRACEPARENT_PATTERN.fullmatch(traceparent) is None:
         raise ValueError("Production smoke traceparent is invalid")
     _, trace_id, parent_id, _ = traceparent.split("-")
@@ -124,16 +142,36 @@ def run_smoke(
     if strong.execution_plan.model_policy is not ModelPolicy.STRONG_DIRECT:
         raise RuntimeError("Production smoke HIGH request was not strong-direct")
     semantic_cache = strong.semantic_cache
-    embedding_attempt = (
-        semantic_cache.embedding_attempt if semantic_cache is not None else None
-    )
+    if semantic_cache_enabled:
+        embedding_attempt = (
+            semantic_cache.embedding_attempt if semantic_cache is not None else None
+        )
+        if (
+            embedding_attempt is None
+            or embedding_attempt.outbound_attempted is not True
+            or embedding_attempt.usage is None
+            or embedding_attempt.usage.calculated_cost is None
+        ):
+            raise RuntimeError("Production smoke embedding evidence is incomplete")
+        return
+
     if (
-        embedding_attempt is None
-        or embedding_attempt.outbound_attempted is not True
-        or embedding_attempt.usage is None
-        or embedding_attempt.usage.calculated_cost is None
+        semantic_cache is None
+        or semantic_cache.outcome is not SemanticCacheOutcome.DISABLED_BYPASSED
+        or semantic_cache.planner_reason_code
+        is not PlannerReasonCode.SEMANTIC_CACHE_DISABLED
+        or semantic_cache.lookup_latency_ms != 0
+        or semantic_cache.embedding_attempt is not None
     ):
-        raise RuntimeError("Production smoke embedding evidence is incomplete")
+        raise RuntimeError("Production smoke cache-disabled evidence is incomplete")
+    if any(step.step_type is ExecutionStepType.SEMANTIC_CACHE for step in strong.steps):
+        raise RuntimeError("Production smoke unexpectedly attempted semantic cache")
+    model_costs = tuple(usage.calculated_cost for usage in strong.model_usages)
+    if any(cost is None for cost in model_costs) or strong.total_calculated_cost != sum(
+        (cost for cost in model_costs if cost is not None),
+        start=0,
+    ):
+        raise RuntimeError("Production smoke model-only cost evidence is incomplete")
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -150,6 +188,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         base_url = _required(os.environ, API_BASE_URL_ENV)
         timeout_seconds = float(_required(os.environ, API_TIMEOUT_SECONDS_ENV))
+        semantic_cache_enabled = _required_boolean(
+            os.environ,
+            SEMANTIC_CACHE_ENABLED_ENV,
+        )
         with httpx.Client(
             base_url=base_url,
             timeout=httpx.Timeout(timeout_seconds, connect=10.0),
@@ -159,6 +201,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 client=client,
                 traceparent=arguments.traceparent,
                 marker=arguments.run_marker,
+                semantic_cache_enabled=semantic_cache_enabled,
             )
         print(SUCCESS_MARKER)
     except (ValueError, RuntimeError, httpx.HTTPError) as error:

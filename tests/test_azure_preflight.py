@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import date, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,7 @@ from scripts.azure_preflight import (
     ACR_PUSH_ROLE_ID,
     CONTRIBUTOR_ROLE_ID,
     OPENAI_USER_ROLE_ID,
+    PREFLIGHT_CACHE_ONLY_SETTINGS,
     READER_ROLE_ID,
     REDIS_API_VERSION,
     REQUIRED_PROVIDERS,
@@ -20,10 +22,12 @@ from scripts.azure_preflight import (
     AzureQueryFailureKind,
     DeploymentConfiguration,
     PreflightError,
+    PricingConfiguration,
     RedisPreflightError,
     RedisPreflightErrorCode,
     _classify_azure_query_failure,
     load_configuration,
+    pricing_binding_sha256,
     run_preflight,
     validate_configuration,
 )
@@ -137,6 +141,7 @@ def valid_environment() -> dict[str, str]:
         "OPTIMA_PRICING_STRONG_MODEL": "gpt-4.1",
         "OPTIMA_PRICING_STRONG_MODEL_VERSION": "2025-04-14",
         "OPTIMA_PRICING_STRONG_OUTPUT_RATE_PER_MILLION_TOKENS": "8.00",
+        "OPTIMA_SEMANTIC_CACHE_ENABLED": "true",
         "OPTIMA_REDIS_EMBEDDING_DEPLOYMENT": "optima-embedding",
         "OPTIMA_REDIS_EMBEDDING_DIMENSION": "1536",
         "OPTIMA_REDIS_EMBEDDING_MODEL": "text-embedding-3-small",
@@ -151,6 +156,61 @@ def valid_environment() -> dict[str, str]:
     }
 
 
+def disabled_environment() -> dict[str, str]:
+    """Return complete production inputs with cache-only values absent."""
+    environment = valid_environment()
+    environment["OPTIMA_SEMANTIC_CACHE_ENABLED"] = "false"
+    for name in (
+        "OPTIMA_PRICING_EMBEDDING_INPUT_RATE_PER_MILLION_TOKENS",
+        "OPTIMA_PRICING_EMBEDDING_MODEL",
+        "OPTIMA_PRICING_EMBEDDING_MODEL_VERSION",
+        "OPTIMA_REDIS_EMBEDDING_DEPLOYMENT",
+        "OPTIMA_REDIS_EMBEDDING_DIMENSION",
+        "OPTIMA_REDIS_EMBEDDING_MODEL",
+        "OPTIMA_REDIS_EMBEDDING_MODEL_VERSION",
+    ):
+        environment.pop(name)
+    environment["OPTIMA_PRICING_BINDING_SHA256"] = pricing_binding_sha256(
+        PricingConfiguration(
+            catalog_version=environment["OPTIMA_PRICING_CATALOG_VERSION"],
+            binding_sha256="0" * 64,
+            source_url=environment["OPTIMA_PRICING_SOURCE_URL"],
+            currency=environment["OPTIMA_PRICING_CURRENCY"],
+            small_model=environment["OPTIMA_PRICING_SMALL_MODEL"],
+            small_model_version=environment["OPTIMA_PRICING_SMALL_MODEL_VERSION"],
+            small_input=Decimal(
+                environment["OPTIMA_PRICING_SMALL_INPUT_RATE_PER_MILLION_TOKENS"]
+            ),
+            small_output=Decimal(
+                environment["OPTIMA_PRICING_SMALL_OUTPUT_RATE_PER_MILLION_TOKENS"]
+            ),
+            small_cached_input=None,
+            strong_model=environment["OPTIMA_PRICING_STRONG_MODEL"],
+            strong_model_version=environment["OPTIMA_PRICING_STRONG_MODEL_VERSION"],
+            strong_input=Decimal(
+                environment["OPTIMA_PRICING_STRONG_INPUT_RATE_PER_MILLION_TOKENS"]
+            ),
+            strong_output=Decimal(
+                environment["OPTIMA_PRICING_STRONG_OUTPUT_RATE_PER_MILLION_TOKENS"]
+            ),
+            strong_cached_input=None,
+            judge_model=environment["OPTIMA_PRICING_JUDGE_MODEL"],
+            judge_model_version=environment["OPTIMA_PRICING_JUDGE_MODEL_VERSION"],
+            judge_input=Decimal(
+                environment["OPTIMA_PRICING_JUDGE_INPUT_RATE_PER_MILLION_TOKENS"]
+            ),
+            judge_output=Decimal(
+                environment["OPTIMA_PRICING_JUDGE_OUTPUT_RATE_PER_MILLION_TOKENS"]
+            ),
+            judge_cached_input=None,
+            embedding_model=None,
+            embedding_model_version=None,
+            embedding_input=None,
+        )
+    )
+    return environment
+
+
 class FakeAzure:
     """Return deterministic Azure resource evidence for preflight tests."""
 
@@ -162,12 +222,14 @@ class FakeAzure:
         acr_push: bool = True,
         forbidden_deployment_role: bool = False,
         lingering_subscription_contributor: bool = False,
+        lingering_redis: bool = False,
     ) -> None:
         self.configuration = configuration
         self.foundation_exists = foundation_exists
         self.acr_push = acr_push
         self.forbidden_deployment_role = forbidden_deployment_role
         self.lingering_subscription_contributor = lingering_subscription_contributor
+        self.lingering_redis = lingering_redis
         self.calls: list[tuple[str, ...]] = []
 
     def json(self, *arguments: str, allow_missing: bool = False) -> Any:
@@ -276,20 +338,13 @@ class FakeAzure:
                 f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/"
                 "rg-optima-hackathon/providers"
             )
-            return [
+            resources = [
                 {
                     "id": (
                         f"{resource_prefix}/Microsoft.App/managedEnvironments/"
                         "cae-optima-hackathon"
                     ),
                     "type": "Microsoft.App/managedEnvironments",
-                },
-                {
-                    "id": (
-                        f"{resource_prefix}/Microsoft.Cache/redisEnterprise/"
-                        "redis-optima-test"
-                    ),
-                    "type": "Microsoft.Cache/redisEnterprise",
                 },
                 {
                     "id": (
@@ -327,6 +382,17 @@ class FakeAzure:
                     "type": "Microsoft.ManagedIdentity/userAssignedIdentities",
                 },
             ]
+            if self.configuration.semantic_cache_enabled or self.lingering_redis:
+                resources.append(
+                    {
+                        "id": (
+                            f"{resource_prefix}/Microsoft.Cache/redisEnterprise/"
+                            "redis-optima-test"
+                        ),
+                        "type": "Microsoft.Cache/redisEnterprise",
+                    }
+                )
+            return resources
         if arguments[:2] == ("acr", "show"):
             return {
                 "adminUserEnabled": False,
@@ -487,6 +553,44 @@ def test_load_configuration_discards_secret_value() -> None:
     assert not hasattr(configuration, "ui_auth_client_secret")
 
 
+def test_load_configuration_accepts_explicit_disabled_cache_profile() -> None:
+    """Keep only active model and pricing bindings when caching is disabled."""
+    configuration = load_configuration(disabled_environment())
+
+    assert configuration.semantic_cache_enabled is False
+    assert configuration.embedding_dimension is None
+    assert {binding.role for binding in configuration.models} == {
+        "SMALL",
+        "STRONG",
+        "JUDGE",
+    }
+    assert configuration.pricing.embedding_model is None
+    assert configuration.pricing.embedding_model_version is None
+    assert configuration.pricing.embedding_input is None
+
+
+def test_load_configuration_requires_explicit_cache_decision() -> None:
+    """Reject an omitted cache mode instead of inferring it from cache settings."""
+    environment = valid_environment()
+    environment.pop("OPTIMA_SEMANTIC_CACHE_ENABLED")
+
+    with pytest.raises(PreflightError, match="SEMANTIC_CACHE_ENABLED is missing"):
+        load_configuration(environment)
+
+
+@pytest.mark.parametrize(
+    "name",
+    sorted(PREFLIGHT_CACHE_ONLY_SETTINGS),
+)
+def test_disabled_configuration_rejects_cache_only_setting(name: str) -> None:
+    """Reject stale cache-only deployment inputs in the disabled profile."""
+    environment = disabled_environment()
+    environment[name] = "contradictory"
+
+    with pytest.raises(PreflightError, match=f"settings: {name}"):
+        load_configuration(environment)
+
+
 @pytest.mark.parametrize(
     ("name", "value", "message"),
     [
@@ -615,6 +719,60 @@ def test_foundation_preflight_is_read_only_and_redacts_identifiers() -> None:
     assert not any(call[:2] == ("acr", "show") for call in azure.calls)
 
 
+def test_disabled_foundation_preflight_skips_only_cache_dependencies() -> None:
+    """Prove Redis and embedding are unreachable while other gates still run."""
+    configuration = load_configuration(disabled_environment())
+    azure = FakeAzure(configuration)
+
+    evidence = run_foundation_preflight(azure)
+
+    assert evidence["semantic_cache"] == {
+        "embedding_configuration": "NOT_CONFIGURED",
+        "enabled": False,
+        "redis_resource": "NOT_PROVISIONED",
+        "status": "DISABLED",
+    }
+    assert evidence["redis"] is None
+    assert set(evidence["models"]) == {"SMALL", "STRONG", "JUDGE"}
+    assert {
+        "semantic_cache_explicitly_disabled",
+        "redis_resource_absent",
+        "embedding_configuration_absent",
+    } <= set(evidence["checks"])
+    assert not any(
+        call == ("provider", "show", "--namespace", "Microsoft.Cache")
+        for call in azure.calls
+    )
+    assert not any(
+        call[:3] == ("rest", "--method", "get") and "/skus?" in call[-1]
+        for call in azure.calls
+    )
+    deployment_calls = [
+        call
+        for call in azure.calls
+        if call[:4] == ("cognitiveservices", "account", "deployment", "show")
+    ]
+    assert len(deployment_calls) == 3
+
+
+def test_disabled_publish_preflight_rejects_lingering_redis_resource() -> None:
+    """Fail before incremental deployment when Redis is not actually absent."""
+    configuration = load_configuration(disabled_environment())
+    azure = FakeAzure(
+        configuration,
+        foundation_exists=True,
+        lingering_redis=True,
+    )
+
+    with pytest.raises(PreflightError, match="Managed Redis to be absent"):
+        run_preflight(
+            configuration,
+            azure,
+            phase="publish",
+            repository_root=ROOT,
+        )
+
+
 def test_foundation_preflight_rejects_forbidden_deployment_role() -> None:
     """Do not accept Owner or RBAC administration on the routine OIDC identity."""
     configuration = load_configuration(valid_environment())
@@ -702,6 +860,32 @@ def test_rollout_preflight_verifies_runtime_access_and_artifacts() -> None:
     assert "immutable_artifacts" in evidence["checks"]
     assert any(
         call[:3] == ("rest", "--method", "get") and "/sqlRoleAssignments?" in call[-1]
+        for call in azure.calls
+    )
+
+
+def test_disabled_rollout_omits_redis_resource_and_access_queries() -> None:
+    """Keep ACR and Cosmos access gates without requiring a Redis assignment."""
+    configuration = load_configuration(disabled_environment())
+    azure = FakeAzure(configuration, foundation_exists=True)
+
+    evidence = run_preflight(
+        configuration,
+        azure,
+        phase="rollout",
+        repository_root=ROOT,
+        api_digest="sha256:" + ("a" * 64),
+        ui_digest="sha256:" + ("b" * 64),
+    )
+
+    assert "runtime_access" in evidence["checks"]
+    assert any(
+        call[:3] == ("rest", "--method", "get") and "/sqlRoleAssignments?" in call[-1]
+        for call in azure.calls
+    )
+    assert not any(
+        call[:3] == ("rest", "--method", "get")
+        and "/accessPolicyAssignments?" in call[-1]
         for call in azure.calls
     )
 

@@ -1302,6 +1302,67 @@ def test_selected_context_reduction_creates_one_measured_span() -> None:
     assert len(reducer.calls) == 1
 
 
+def test_cache_disabled_run_emits_no_cache_lookup_observation() -> None:
+    """Observe active model work without inventing cache or embedding activity."""
+    observer = InMemoryObservability()
+    configured, _, _, _ = dependencies((0.93,), observability=observer)
+
+    response = TestClient(create_app(execution_dependencies=configured)).post(
+        "/api/v1/runs",
+        json=request_payload(
+            request_profile={
+                "task_type": "Q_AND_A",
+                "complexity": "LOW",
+                "input_tokens": 50,
+                "risk_tier": "LOW",
+                "cache_eligible": True,
+                "has_large_context": False,
+            }
+        ),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["semantic_cache"]["outcome"] == "DISABLED_BYPASSED"
+    assert response.json()["semantic_cache"]["embedding_attempt"] is None
+    observed_stages = {record.name for record in stage_records(observer)}
+    assert ObservationStage.SEMANTIC_CACHE_LOOKUP not in observed_stages
+    assert ObservationStage.MODEL_GENERATE in observed_stages
+    assert ObservationStage.EVALUATION_EVALUATE in observed_stages
+
+
+def test_otel_cache_disabled_run_emits_no_cache_or_embedding_metrics() -> None:
+    """Project model evidence without cache lookup or embedding measurements."""
+    observer, exporter, reader, _, _ = local_otel_observer()
+    configured, _, _, _ = dependencies((0.93,), observability=observer)
+
+    response = TestClient(create_app(execution_dependencies=configured)).post(
+        "/api/v1/runs",
+        json=request_payload(
+            request_profile={
+                "task_type": "Q_AND_A",
+                "complexity": "LOW",
+                "input_tokens": 50,
+                "risk_tier": "LOW",
+                "cache_eligible": True,
+                "has_large_context": False,
+            }
+        ),
+    )
+
+    metric_evidence = metric_points(reader)
+    metric_names = {name for name, _ in metric_evidence}
+    span_names = {span.name for span in exporter.get_finished_spans()}
+    assert response.status_code == 200
+    assert ObservationStage.SEMANTIC_CACHE_LOOKUP not in span_names
+    assert "optima.cache.lookups" not in metric_names
+    assert "optima.embedding.attempts" not in metric_names
+    assert not any(
+        name == "optima.tokens"
+        and point.attributes.get("optima.token.category") == "EMBEDDING"
+        for name, point in metric_evidence
+    )
+
+
 def test_cache_failure_is_child_failure_but_completed_run() -> None:
     """Keep a cache adapter failure separate from successful model execution."""
     observer = InMemoryObservability()

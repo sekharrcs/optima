@@ -310,6 +310,7 @@ jobs:
       OPTIMA_REDIS_EMBEDDING_MODEL: "${{ vars.OPTIMA_REDIS_EMBEDDING_MODEL }}"
       OPTIMA_REDIS_EMBEDDING_MODEL_VERSION: "${{ vars.OPTIMA_REDIS_EMBEDDING_MODEL_VERSION }}"
       OPTIMA_RUNTIME_ACCESS_BOOTSTRAPPED: "${{ vars.OPTIMA_RUNTIME_ACCESS_BOOTSTRAPPED }}"
+      OPTIMA_SEMANTIC_CACHE_ENABLED: "${{ vars.OPTIMA_SEMANTIC_CACHE_ENABLED }}"
       OPTIMA_UI_AUTH_CLIENT_ID: "${{ vars.OPTIMA_UI_AUTH_CLIENT_ID }}"
       OPTIMA_UI_AUTH_REDIRECT_URI: "${{ vars.OPTIMA_UI_AUTH_REDIRECT_URI }}"
       OPTIMA_UI_AUTH_CLIENT_SECRET: "${{ secrets.OPTIMA_UI_AUTH_CLIENT_SECRET }}"
@@ -350,6 +351,13 @@ jobs:
           set -euo pipefail
           test "$GITHUB_REF" = "refs/heads/main"
           test "$OPTIMA_GITHUB_ENVIRONMENT" = "hackathon"
+          case "$OPTIMA_SEMANTIC_CACHE_ENABLED" in
+            true | false) ;;
+            *)
+              echo "OPTIMA_SEMANTIC_CACHE_ENABLED must be exactly true or false" >&2
+              exit 1
+              ;;
+          esac
 
       # Azure/login v2.3.0 commit (refs/tags/v2.3.0^{}); the annotated tag object
       # eec3c95 is not a commit, so pin the peeled commit that Actions can resolve.
@@ -378,6 +386,7 @@ jobs:
             "deployContainerApps=false"
             "exposePublicUi=false"
             "deployRuntimeAccess=false"
+            "semanticCacheEnabled=$OPTIMA_SEMANTIC_CACHE_ENABLED"
             "uiAuthClientId=$OPTIMA_UI_AUTH_CLIENT_ID"
             "uiAuthTenantId=$OPTIMA_UI_AUTH_TENANT_ID"
             "foundryBaseUrl=$OPTIMA_FOUNDRY_BASE_URL"
@@ -388,9 +397,6 @@ jobs:
             "productionEvaluatorMode=LLM_JUDGE"
             "judgeDeployment=$OPTIMA_JUDGE_DEPLOYMENT"
             "judgeModel=$OPTIMA_JUDGE_MODEL"
-            "redisEmbeddingDeployment=$OPTIMA_REDIS_EMBEDDING_DEPLOYMENT"
-            "redisEmbeddingModel=$OPTIMA_REDIS_EMBEDDING_MODEL"
-            "redisEmbeddingDimension=$OPTIMA_REDIS_EMBEDDING_DIMENSION"
             "pricingCatalogVersion=$OPTIMA_PRICING_CATALOG_VERSION"
             "pricingCurrency=$OPTIMA_PRICING_CURRENCY"
             "pricingSmallInputRatePerMillionTokens=$OPTIMA_PRICING_SMALL_INPUT_RATE_PER_MILLION_TOKENS"
@@ -399,8 +405,15 @@ jobs:
             "pricingStrongOutputRatePerMillionTokens=$OPTIMA_PRICING_STRONG_OUTPUT_RATE_PER_MILLION_TOKENS"
             "pricingJudgeInputRatePerMillionTokens=$OPTIMA_PRICING_JUDGE_INPUT_RATE_PER_MILLION_TOKENS"
             "pricingJudgeOutputRatePerMillionTokens=$OPTIMA_PRICING_JUDGE_OUTPUT_RATE_PER_MILLION_TOKENS"
-            "pricingEmbeddingInputRatePerMillionTokens=$OPTIMA_PRICING_EMBEDDING_INPUT_RATE_PER_MILLION_TOKENS"
           )
+          if test "$OPTIMA_SEMANTIC_CACHE_ENABLED" = "true"; then
+            parameters+=(
+              "redisEmbeddingDeployment=$OPTIMA_REDIS_EMBEDDING_DEPLOYMENT"
+              "redisEmbeddingModel=$OPTIMA_REDIS_EMBEDDING_MODEL"
+              "redisEmbeddingDimension=$OPTIMA_REDIS_EMBEDDING_DIMENSION"
+              "pricingEmbeddingInputRatePerMillionTokens=$OPTIMA_PRICING_EMBEDDING_INPUT_RATE_PER_MILLION_TOKENS"
+            )
+          fi
           if az group show --name "$AZURE_RESOURCE_GROUP" >/dev/null 2>&1; then
             az deployment group what-if --name optima-foundation-what-if \
               --resource-group "$AZURE_RESOURCE_GROUP" \
@@ -517,13 +530,20 @@ jobs:
             --revision "$ui_revision" \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --query properties.template.containers[0].image --output tsv)"
+          api_semantic_cache_enabled="$(az containerapp revision show --name "$api_name" \
+            --revision "$api_revision" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --query "properties.template.containers[0].env[?name=='OPTIMA_SEMANTIC_CACHE_ENABLED'].value | [0]" \
+            --output tsv)"
           [[ "$api_image" =~ @sha256:[0-9a-f]{64}$ ]]
           [[ "$ui_image" =~ @sha256:[0-9a-f]{64}$ ]]
+          case "$api_semantic_cache_enabled" in true | false) ;; *) exit 1 ;; esac
           public_ui="$(az containerapp show --name "$ui_name" \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --query properties.configuration.ingress.external --output tsv)"
-          printf 'had_pair=true\napi_revision=%s\nui_revision=%s\napi_image=%s\nui_image=%s\npublic_ui=%s\n' \
-            "$api_revision" "$ui_revision" "$api_image" "$ui_image" "$public_ui" \
+          printf 'had_pair=true\napi_revision=%s\nui_revision=%s\napi_image=%s\nui_image=%s\napi_semantic_cache_enabled=%s\npublic_ui=%s\n' \
+            "$api_revision" "$ui_revision" "$api_image" "$ui_image" \
+            "$api_semantic_cache_enabled" "$public_ui" \
             >> "$GITHUB_OUTPUT"
 
       - name: What-if and deploy digest-qualified Container Apps
@@ -539,6 +559,7 @@ jobs:
           parameters=(
             "deployRuntimeAccess=false"
             "deployContainerApps=true"
+            "semanticCacheEnabled=$OPTIMA_SEMANTIC_CACHE_ENABLED"
             "deploymentCommitSha=$GITHUB_SHA"
             "deploymentWorkflowRunId=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
             "smokeTraceparent=00-$trace_id-$parent_id-01"
@@ -556,9 +577,6 @@ jobs:
             "productionEvaluatorMode=LLM_JUDGE"
             "judgeDeployment=$OPTIMA_JUDGE_DEPLOYMENT"
             "judgeModel=$OPTIMA_JUDGE_MODEL"
-            "redisEmbeddingDeployment=$OPTIMA_REDIS_EMBEDDING_DEPLOYMENT"
-            "redisEmbeddingModel=$OPTIMA_REDIS_EMBEDDING_MODEL"
-            "redisEmbeddingDimension=$OPTIMA_REDIS_EMBEDDING_DIMENSION"
             "pricingCatalogVersion=$OPTIMA_PRICING_CATALOG_VERSION"
             "pricingCurrency=$OPTIMA_PRICING_CURRENCY"
             "pricingSmallInputRatePerMillionTokens=$OPTIMA_PRICING_SMALL_INPUT_RATE_PER_MILLION_TOKENS"
@@ -567,8 +585,15 @@ jobs:
             "pricingStrongOutputRatePerMillionTokens=$OPTIMA_PRICING_STRONG_OUTPUT_RATE_PER_MILLION_TOKENS"
             "pricingJudgeInputRatePerMillionTokens=$OPTIMA_PRICING_JUDGE_INPUT_RATE_PER_MILLION_TOKENS"
             "pricingJudgeOutputRatePerMillionTokens=$OPTIMA_PRICING_JUDGE_OUTPUT_RATE_PER_MILLION_TOKENS"
-            "pricingEmbeddingInputRatePerMillionTokens=$OPTIMA_PRICING_EMBEDDING_INPUT_RATE_PER_MILLION_TOKENS"
           )
+          if test "$OPTIMA_SEMANTIC_CACHE_ENABLED" = "true"; then
+            parameters+=(
+              "redisEmbeddingDeployment=$OPTIMA_REDIS_EMBEDDING_DEPLOYMENT"
+              "redisEmbeddingModel=$OPTIMA_REDIS_EMBEDDING_MODEL"
+              "redisEmbeddingDimension=$OPTIMA_REDIS_EMBEDDING_DIMENSION"
+              "pricingEmbeddingInputRatePerMillionTokens=$OPTIMA_PRICING_EMBEDDING_INPUT_RATE_PER_MILLION_TOKENS"
+            )
+          fi
           if test -n "$OPTIMA_PRICING_SMALL_CACHED_INPUT_RATE_PER_MILLION_TOKENS"; then
             parameters+=("pricingSmallCachedInputRatePerMillionTokens=$OPTIMA_PRICING_SMALL_CACHED_INPUT_RATE_PER_MILLION_TOKENS")
           fi
@@ -603,6 +628,23 @@ jobs:
             --query properties.outputs.uiUrl.value --output tsv)"
           ui_resource_id="$(az containerapp show --name "$ui_name" \
             --resource-group "$AZURE_RESOURCE_GROUP" --query id --output tsv)"
+          api_revision="$(az containerapp show --name "$api_name" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --query properties.latestRevisionName --output tsv)"
+          configured_cache_mode="$(az containerapp revision show --name "$api_name" \
+            --revision "$api_revision" --resource-group "$AZURE_RESOURCE_GROUP" \
+            --query "properties.template.containers[0].env[?name=='OPTIMA_SEMANTIC_CACHE_ENABLED'].value | [0]" \
+            --output tsv)"
+          test "$configured_cache_mode" = "$OPTIMA_SEMANTIC_CACHE_ENABLED"
+          cache_environment_count="$(az containerapp revision show --name "$api_name" \
+            --revision "$api_revision" --resource-group "$AZURE_RESOURCE_GROUP" \
+            --query "length(properties.template.containers[0].env[?starts_with(name, 'OPTIMA_REDIS_') || name=='OPTIMA_PRICING_EMBEDDING_INPUT_RATE_PER_MILLION_TOKENS'])" \
+            --output tsv)"
+          if test "$OPTIMA_SEMANTIC_CACHE_ENABLED" = "true"; then
+            test "$cache_environment_count" -eq 9
+          else
+            test "$cache_environment_count" -eq 0
+          fi
           auth_json="$(az rest --method get \
             --url "https://management.azure.com$ui_resource_id/authConfigs/current?api-version=2025-07-01")"
           jq -e --arg client "$OPTIMA_UI_AUTH_CLIENT_ID" --arg tenant "$OPTIMA_UI_AUTH_TENANT_ID" '
@@ -742,6 +784,7 @@ jobs:
         env:
           PREVIOUS_API_IMAGE: "${{ steps.previous.outputs.api_image }}"
           PREVIOUS_API_REVISION: "${{ steps.previous.outputs.api_revision }}"
+          PREVIOUS_API_SEMANTIC_CACHE_ENABLED: "${{ steps.previous.outputs.api_semantic_cache_enabled }}"
           PREVIOUS_UI_IMAGE: "${{ steps.previous.outputs.ui_image }}"
           PREVIOUS_UI_REVISION: "${{ steps.previous.outputs.ui_revision }}"
         run: |
@@ -786,6 +829,11 @@ jobs:
             --revision "$restored_ui_revision" \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --query properties.template.containers[0].image --output tsv)" = "$PREVIOUS_UI_IMAGE"
+          test "$(az containerapp revision show --name ca-optima-api-hackathon \
+            --revision "$restored_api_revision" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --query "properties.template.containers[0].env[?name=='OPTIMA_SEMANTIC_CACHE_ENABLED'].value | [0]" \
+            --output tsv)" = "$PREVIOUS_API_SEMANTIC_CACHE_ENABLED"
           test "$(az containerapp show --name ca-optima-ui-hackathon \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --query properties.configuration.ingress.external --output tsv)" = "false"
@@ -826,6 +874,7 @@ jobs:
             printf -- '- UI image digest: `%s`\n' "${UI_DIGEST:-unavailable}"
             printf -- '- API app/revision: `%s` / `%s`\n' "${API_NAME:-unavailable}" "${API_REVISION:-unavailable}"
             printf -- '- UI app/revision: `%s` / `%s`\n' "${UI_NAME:-unavailable}" "${UI_REVISION:-unavailable}"
+            printf -- '- Semantic cache enabled: `%s`\n' "$OPTIMA_SEMANTIC_CACHE_ENABLED"
             printf -- '- API endpoint: `%s`\n' "${API_URL:-unavailable}"
             printf -- '- UI endpoint: `%s`\n' "${UI_URL:-unavailable}"
           } >> "$GITHUB_STEP_SUMMARY"

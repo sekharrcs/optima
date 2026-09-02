@@ -29,6 +29,9 @@ param exposePublicUi bool = false
 @description('Create OPTIMA-owned runtime access assignments. Requires Azure RBAC administration on the registry.')
 param deployRuntimeAccess bool = false
 
+@description('Provision and configure the semantic-cache infrastructure and runtime integration.')
+param semanticCacheEnabled bool
+
 @description('Existing single-tenant Microsoft Entra application client ID for UI authentication.')
 param uiAuthClientId string
 
@@ -86,15 +89,13 @@ param judgeTimeoutSeconds int = 30
 param foundryTokenScope string = 'https://cognitiveservices.azure.com/.default'
 
 @description('Foundry embedding deployment used by the semantic cache.')
-param redisEmbeddingDeployment string
+param redisEmbeddingDeployment string?
 
 @description('Provider-reported embedding model identity.')
-param redisEmbeddingModel string
+param redisEmbeddingModel string?
 
 @description('Embedding vector dimension shared by Foundry and RediSearch.')
-@minValue(1)
-@maxValue(32768)
-param redisEmbeddingDimension int
+param redisEmbeddingDimension int?
 
 @description('Root trace sampling ratio for Application Insights.')
 @allowed([
@@ -130,17 +131,32 @@ param pricingStrongOutputRatePerMillionTokens string
 param pricingStrongCachedInputRatePerMillionTokens string?
 
 @description('Reviewed JUDGE input price per million tokens in LLM_JUDGE mode.')
-param pricingJudgeInputRatePerMillionTokens string
+param pricingJudgeInputRatePerMillionTokens string?
 
 @description('Reviewed JUDGE output price per million tokens in LLM_JUDGE mode.')
-param pricingJudgeOutputRatePerMillionTokens string
+param pricingJudgeOutputRatePerMillionTokens string?
 
 @description('Reviewed JUDGE cached-input price per million tokens when the selected model has a distinct rate.')
 param pricingJudgeCachedInputRatePerMillionTokens string?
 
 @description('Reviewed embedding input price per million tokens.')
-param pricingEmbeddingInputRatePerMillionTokens string
+param pricingEmbeddingInputRatePerMillionTokens string?
 
+var cacheConfigurationIsComplete = !empty(trim(redisEmbeddingDeployment ?? '')) && !startsWith(
+  toLower(redisEmbeddingDeployment ?? ''),
+  'replace-'
+) && !empty(trim(redisEmbeddingModel ?? '')) && !startsWith(toLower(redisEmbeddingModel ?? ''), 'replace-') && (redisEmbeddingDimension ?? 0) >= 1 && (redisEmbeddingDimension ?? 0) <= 32768 && !empty(trim(pricingEmbeddingInputRatePerMillionTokens ?? '')) && !startsWith(
+  toLower(pricingEmbeddingInputRatePerMillionTokens ?? ''),
+  'replace-'
+)
+var cacheConfigurationIsAbsent = redisEmbeddingDeployment == null && redisEmbeddingModel == null && redisEmbeddingDimension == null && pricingEmbeddingInputRatePerMillionTokens == null
+var validatedSemanticCacheEnabled = semanticCacheEnabled
+  ? cacheConfigurationIsComplete
+      ? true
+      : fail('Enabled semantic cache requires deployable embedding deployment, model, dimension, and reviewed input pricing.')
+  : cacheConfigurationIsAbsent
+      ? false
+      : fail('Disabled semantic cache rejects Redis, embedding, and embedding-pricing parameters.')
 var placeholderImageDigest = 'sha256:0000000000000000000000000000000000000000000000000000000000000000'
 var apiDigestHex = substring(apiImageDigest, 7, 64)
 var uiDigestHex = substring(uiImageDigest, 7, 64)
@@ -300,6 +316,7 @@ module resources 'resource-group.bicep' = {
     redisEmbeddingDeployment: redisEmbeddingDeployment
     redisEmbeddingDimension: redisEmbeddingDimension
     redisEmbeddingModel: redisEmbeddingModel
+    semanticCacheEnabled: validatedSemanticCacheEnabled
     uiAuthClientId: uiAuthClientId
     uiAuthClientSecret: uiAuthClientSecret
     uiAuthTenantId: uiAuthTenantId
@@ -322,10 +339,10 @@ output cosmosAccountName string = resources.outputs.cosmosAccountName
 output cosmosEndpoint string = resources.outputs.cosmosEndpoint
 output cosmosDatabaseName string = resources.outputs.cosmosDatabaseName
 output cosmosContainerName string = resources.outputs.cosmosContainerName
-output redisName string = resources.outputs.redisName
-output redisHost string = resources.outputs.redisHost
-output redisPort int = resources.outputs.redisPort
-output redisIndexName string = resources.outputs.redisIndexName
+output redisName string? = resources.outputs.?redisName
+output redisHost string? = resources.outputs.?redisHost
+output redisPort int? = resources.outputs.?redisPort
+output redisIndexName string? = resources.outputs.?redisIndexName
 output applicationInsightsName string = resources.outputs.applicationInsightsName
 output apiIdentityResourceId string = resources.outputs.apiIdentityResourceId
 output apiIdentityPrincipalId string = resources.outputs.apiIdentityPrincipalId

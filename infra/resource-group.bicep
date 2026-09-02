@@ -35,6 +35,9 @@ param exposePublicUi bool = false
 @description('Create OPTIMA-owned runtime access assignments. Requires Azure RBAC administration on the registry.')
 param deployRuntimeAccess bool = false
 
+@description('Provision and configure the semantic-cache infrastructure and runtime integration.')
+param semanticCacheEnabled bool
+
 @description('Existing single-tenant Microsoft Entra application client ID for UI authentication.')
 param uiAuthClientId string
 
@@ -92,15 +95,13 @@ param judgeTimeoutSeconds int = 30
 param foundryTokenScope string = 'https://cognitiveservices.azure.com/.default'
 
 @description('Foundry embedding deployment used by the semantic cache.')
-param redisEmbeddingDeployment string
+param redisEmbeddingDeployment string?
 
 @description('Provider-reported embedding model identity.')
-param redisEmbeddingModel string
+param redisEmbeddingModel string?
 
 @description('Embedding vector dimension shared by Foundry and RediSearch.')
-@minValue(1)
-@maxValue(32768)
-param redisEmbeddingDimension int
+param redisEmbeddingDimension int?
 
 @description('Root trace sampling ratio for Application Insights.')
 @allowed([
@@ -136,16 +137,16 @@ param pricingStrongOutputRatePerMillionTokens string
 param pricingStrongCachedInputRatePerMillionTokens string?
 
 @description('Reviewed JUDGE input price per million tokens in LLM_JUDGE mode.')
-param pricingJudgeInputRatePerMillionTokens string
+param pricingJudgeInputRatePerMillionTokens string?
 
 @description('Reviewed JUDGE output price per million tokens in LLM_JUDGE mode.')
-param pricingJudgeOutputRatePerMillionTokens string
+param pricingJudgeOutputRatePerMillionTokens string?
 
 @description('Reviewed JUDGE cached-input price per million tokens when the selected model has a distinct rate.')
 param pricingJudgeCachedInputRatePerMillionTokens string?
 
 @description('Reviewed embedding input price per million tokens.')
-param pricingEmbeddingInputRatePerMillionTokens string
+param pricingEmbeddingInputRatePerMillionTokens string?
 
 var placeholderImageDigest = 'sha256:0000000000000000000000000000000000000000000000000000000000000000'
 var apiDigestHex = substring(apiImageDigest, 7, 64)
@@ -262,25 +263,52 @@ var validatedUiAuthClientId = !deployContainerApps || uiAuthConfigurationIsDeplo
 var validatedUiAuthTenantId = !deployContainerApps || uiAuthConfigurationIsDeployable
   ? uiAuthTenantId
   : fail('Container Apps deployment requires a non-placeholder UI Entra client ID, tenant ID, and confidential-client secret.')
-var pricingConfigurationIsDeployable = !empty(pricingCatalogVersion) && !startsWith(pricingCatalogVersion, 'replace-') && !empty(pricingCurrency) && !startsWith(
-  pricingCurrency,
+var basePricingConfigurationIsDeployable = !empty(pricingCatalogVersion) && !startsWith(
+  pricingCatalogVersion,
   'replace-'
-) && !empty(pricingSmallInputRatePerMillionTokens) && !startsWith(pricingSmallInputRatePerMillionTokens, 'replace-') && !empty(pricingSmallOutputRatePerMillionTokens) && !startsWith(
-  pricingSmallOutputRatePerMillionTokens,
+) && !empty(pricingCurrency) && !startsWith(pricingCurrency, 'replace-') && !empty(pricingSmallInputRatePerMillionTokens) && !startsWith(
+  pricingSmallInputRatePerMillionTokens,
   'replace-'
-) && !empty(pricingStrongInputRatePerMillionTokens) && !startsWith(pricingStrongInputRatePerMillionTokens, 'replace-') && !empty(pricingStrongOutputRatePerMillionTokens) && !startsWith(
-  pricingStrongOutputRatePerMillionTokens,
+) && !empty(pricingSmallOutputRatePerMillionTokens) && !startsWith(pricingSmallOutputRatePerMillionTokens, 'replace-') && !empty(pricingStrongInputRatePerMillionTokens) && !startsWith(
+  pricingStrongInputRatePerMillionTokens,
   'replace-'
-) && !empty(pricingJudgeInputRatePerMillionTokens) && !startsWith(pricingJudgeInputRatePerMillionTokens, 'replace-') && !empty(pricingJudgeOutputRatePerMillionTokens) && !startsWith(
-  pricingJudgeOutputRatePerMillionTokens,
+) && !empty(pricingStrongOutputRatePerMillionTokens) && !startsWith(pricingStrongOutputRatePerMillionTokens, 'replace-')
+var judgeConfigurationIsComplete = !empty(trim(judgeDeployment ?? '')) && !startsWith(
+  toLower(judgeDeployment ?? ''),
   'replace-'
-) && !empty(pricingEmbeddingInputRatePerMillionTokens) && !startsWith(
-  pricingEmbeddingInputRatePerMillionTokens,
+) && !empty(trim(judgeModel ?? '')) && !startsWith(toLower(judgeModel ?? ''), 'replace-') && !empty(trim(pricingJudgeInputRatePerMillionTokens ?? '')) && !startsWith(
+  toLower(pricingJudgeInputRatePerMillionTokens ?? ''),
+  'replace-'
+) && !empty(trim(pricingJudgeOutputRatePerMillionTokens ?? '')) && !startsWith(
+  toLower(pricingJudgeOutputRatePerMillionTokens ?? ''),
   'replace-'
 )
-var validatedPricingCatalogVersion = !deployContainerApps || pricingConfigurationIsDeployable
+var judgeConfigurationIsAbsent = judgeDeployment == null && judgeModel == null && pricingJudgeInputRatePerMillionTokens == null && pricingJudgeOutputRatePerMillionTokens == null && pricingJudgeCachedInputRatePerMillionTokens == null
+var validatedEvaluatorMode = productionEvaluatorMode == 'LLM_JUDGE'
+  ? judgeConfigurationIsComplete
+      ? productionEvaluatorMode
+      : fail('LLM_JUDGE requires deployable JUDGE identity and pricing values.')
+  : judgeConfigurationIsAbsent
+      ? productionEvaluatorMode
+      : fail('EXACT_REFERENCE rejects inactive JUDGE identity and pricing values.')
+var cacheConfigurationIsComplete = !empty(trim(redisEmbeddingDeployment ?? '')) && !startsWith(
+  toLower(redisEmbeddingDeployment ?? ''),
+  'replace-'
+) && !empty(trim(redisEmbeddingModel ?? '')) && !startsWith(toLower(redisEmbeddingModel ?? ''), 'replace-') && (redisEmbeddingDimension ?? 0) >= 1 && (redisEmbeddingDimension ?? 0) <= 32768 && !empty(trim(pricingEmbeddingInputRatePerMillionTokens ?? '')) && !startsWith(
+  toLower(pricingEmbeddingInputRatePerMillionTokens ?? ''),
+  'replace-'
+)
+var cacheConfigurationIsAbsent = redisEmbeddingDeployment == null && redisEmbeddingModel == null && redisEmbeddingDimension == null && pricingEmbeddingInputRatePerMillionTokens == null
+var validatedSemanticCacheEnabled = semanticCacheEnabled
+  ? cacheConfigurationIsComplete
+      ? true
+      : fail('Enabled semantic cache requires deployable embedding deployment, model, dimension, and reviewed input pricing.')
+  : cacheConfigurationIsAbsent
+      ? false
+      : fail('Disabled semantic cache rejects Redis, embedding, and embedding-pricing parameters.')
+var validatedPricingCatalogVersion = !deployContainerApps || basePricingConfigurationIsDeployable
   ? pricingCatalogVersion
-  : fail('Container Apps deployment requires complete reviewed pricing for SMALL, STRONG, JUDGE, and embedding roles.')
+  : fail('Container Apps deployment requires complete reviewed pricing for SMALL and STRONG roles.')
 var placeholderCommitSha = '0000000000000000000000000000000000000000'
 var deploymentCommitInvalidCharacters = replace(
   replace(
@@ -435,7 +463,7 @@ module cosmos 'modules/cosmos.bicep' = {
   }
 }
 
-module redis 'modules/managed-redis.bicep' = {
+module redis 'modules/managed-redis.bicep' = if (validatedSemanticCacheEnabled) {
   name: 'optima-managed-redis'
   params: {
     location: location
@@ -451,14 +479,15 @@ module runtimeAccess 'modules/runtime-access.bicep' = if (deployRuntimeAccess) {
     cosmosAccountName: resourceNames.cosmosAccount
     cosmosContainerName: 'runs'
     cosmosDatabaseName: 'optima'
-    redisName: resourceNames.redis
+    redisName: validatedSemanticCacheEnabled ? resourceNames.redis : null
     registryName: resourceNames.containerRegistry
+    semanticCacheEnabled: validatedSemanticCacheEnabled
     uiPrincipalId: identities.outputs.uiPrincipalId
   }
   dependsOn: [
     registry
     cosmos
-    redis
+    validatedSemanticCacheEnabled ? redis : cosmos
   ]
 }
 
@@ -503,13 +532,14 @@ module containerApps 'modules/container-apps.bicep' = {
     pricingStrongCachedInputRatePerMillionTokens: pricingStrongCachedInputRatePerMillionTokens
     pricingStrongInputRatePerMillionTokens: pricingStrongInputRatePerMillionTokens
     pricingStrongOutputRatePerMillionTokens: pricingStrongOutputRatePerMillionTokens
-    productionEvaluatorMode: productionEvaluatorMode
+    productionEvaluatorMode: validatedEvaluatorMode
     redisEmbeddingDeployment: redisEmbeddingDeployment
     redisEmbeddingDimension: redisEmbeddingDimension
     redisEmbeddingModel: redisEmbeddingModel
-    redisHost: redis.outputs.hostName
-    redisIndexName: 'optima-cache-v1'
+    redisHost: validatedSemanticCacheEnabled ? redis!.outputs.hostName : null
+    redisIndexName: validatedSemanticCacheEnabled ? 'optima-cache-v1' : null
     registryLoginServer: registry.outputs.loginServer
+    semanticCacheEnabled: validatedSemanticCacheEnabled
     smokeJobName: resourceNames.smokeJob
     smokeRunMarker: smokeRunMarker
     smokeTraceparent: validatedSmokeTraceparent
@@ -537,10 +567,10 @@ output cosmosAccountName string = resourceNames.cosmosAccount
 output cosmosEndpoint string = cosmos.outputs.endpoint
 output cosmosDatabaseName string = cosmos.outputs.databaseName
 output cosmosContainerName string = cosmos.outputs.containerName
-output redisName string = resourceNames.redis
-output redisHost string = redis.outputs.hostName
-output redisPort int = redis.outputs.port
-output redisIndexName string = 'optima-cache-v1'
+output redisName string? = validatedSemanticCacheEnabled ? resourceNames.redis : null
+output redisHost string? = validatedSemanticCacheEnabled ? redis!.outputs.hostName : null
+output redisPort int? = validatedSemanticCacheEnabled ? redis!.outputs.port : null
+output redisIndexName string? = validatedSemanticCacheEnabled ? 'optima-cache-v1' : null
 output applicationInsightsName string = resourceNames.applicationInsights
 output apiIdentityResourceId string = identities.outputs.apiResourceId
 output apiIdentityPrincipalId string = identities.outputs.apiPrincipalId

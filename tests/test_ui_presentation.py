@@ -103,6 +103,28 @@ def execute_cache_miss_result() -> RunResult:
     )
 
 
+def execute_cache_disabled_result() -> RunResult:
+    """Build valid disabled evidence from an equivalent non-attempted demo run."""
+    payload = execute_result().model_dump(
+        mode="json",
+        exclude_computed_fields=True,
+    )
+    payload["semantic_cache"].update(
+        {
+            "outcome": "DISABLED_BYPASSED",
+            "planner_reason_code": "SEMANTIC_CACHE_DISABLED",
+        }
+    )
+    reason_codes = payload["execution_plan"]["reason_codes"]
+    reason_codes[reason_codes.index("CACHE_REQUEST_NOT_ELIGIBLE")] = (
+        "SEMANTIC_CACHE_DISABLED"
+    )
+    payload["execution_plan"]["decision_evidence"]["module_states"][
+        "semantic_cache_enabled"
+    ] = False
+    return RunResult.model_validate(payload)
+
+
 def execute_reduced_strong_direct_result() -> RunResult:
     """Execute measured reduction plus direct STRONG through the real demo API."""
     return execute_result(
@@ -345,6 +367,25 @@ def test_cache_miss_projection_does_not_invent_source_facts() -> None:
     assert cache.error is None
     assert trace[0].step == "Semantic Cache"
     assert trace[1].step == "Model Call"
+
+
+def test_cache_disabled_projection_reports_no_lookup_or_embedding_request() -> None:
+    """Render typed disabled evidence as not attempted rather than zero latency."""
+    result = execute_cache_disabled_result()
+    cache = semantic_cache_view(result)
+
+    assert cache is not None
+    assert cache.outcome == "Disabled Bypassed"
+    assert cache.lookup_latency == "Not attempted"
+    assert cache.activity == (
+        "Semantic cache lookup and embedding request were not attempted because "
+        "semantic cache was disabled."
+    )
+    assert result.semantic_cache is not None
+    assert result.semantic_cache.embedding_attempt is None
+    assert all(
+        step.step_type is not ExecutionStepType.SEMANTIC_CACHE for step in result.steps
+    )
 
 
 def test_reduced_strong_direct_projects_backend_reduction_and_contract_evidence() -> (

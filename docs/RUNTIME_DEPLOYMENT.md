@@ -48,6 +48,25 @@ Slice 11E owns:
 
 Neither slice may silently select another Azure region.
 
+## Temporary cache-disabled production profile
+
+The selected East US 2 hackathon profile sets the protected
+`OPTIMA_SEMANTIC_CACHE_ENABLED` environment variable to `false`. Production
+accepts disabled mode only when every Redis, embedding, cache-tuning, and
+embedding-pricing value is absent. It rejects an omitted decision and
+contradictory cache-only values before constructing any provider resource.
+Enabled mode still requires the complete Azure Managed Redis and embedding
+configuration.
+
+Disabled mode retains Quality Contract enforcement, SMALL and STRONG routing,
+evaluation, escalation, context reduction, exact SMALL, STRONG, and JUDGE cost
+accounting, Cosmos history, Application Insights, and request controls. It
+constructs no embedding provider or Redis client, starts no token renewal, and
+runs no RediSearch bootstrap. Run evidence contains `DISABLED_BYPASSED` with
+`SEMANTIC_CACHE_DISABLED`, no cache execution step, and no embedding attempt.
+The UI presents lookup latency as not attempted. Cache-hit and cache-savings
+claims are prohibited.
+
 ## Production application
 
 The API image starts:
@@ -80,16 +99,16 @@ Construction proceeds in this order:
 1. Application Insights observability
 2. Shared Foundry SMALL and STRONG provider resources
 3. Separately timed Foundry JUDGE resources in `LLM_JUDGE` mode
-4. Foundry embedding resources
-5. Azure Managed Redis resources
-6. Redis index bootstrap
+4. Foundry embedding resources when semantic cache is enabled
+5. Azure Managed Redis resources when semantic cache is enabled
+6. Redis index bootstrap when semantic cache is enabled
 7. Cosmos run-history resources
 8. Immutable execution dependencies
 
-Shutdown proceeds in reverse resource order: Cosmos, Redis, embedding, optional
-JUDGE, shared Foundry, then telemetry. Each runtime closes once. Cleanup failures
-are recorded by type and do not skip later cleanup or mask an earlier startup
-failure.
+Shutdown proceeds in reverse resource order: Cosmos, optional Redis and embedding,
+optional JUDGE, shared Foundry, then telemetry. Each constructed runtime closes
+once. Cleanup failures are recorded by type and do not skip later cleanup or mask
+an earlier startup failure.
 
 The API health endpoint is `/api/v1/health`. Uvicorn does not accept traffic
 until FastAPI lifespan yields, so an index or configuration failure prevents a
@@ -105,6 +124,9 @@ validate Foundry, Redis, Cosmos, telemetry, pricing, managed identity, or Azure
 configuration. Those checks require Slice 11C.
 
 ## Redis index bootstrap
+
+This section applies only when semantic cache is explicitly enabled. Disabled
+production cannot construct the client or invoke any command in this section.
 
 Startup inspects `FT._LIST`. If `optima-cache-v1` is absent and no stale contract
 hash exists, it creates this schema:
@@ -181,8 +203,9 @@ ACR.
 ## Runtime configuration
 
 Container Apps owns `OPTIMA_DEPLOYMENT_ENVIRONMENT`, managed-identity IDs,
-Cosmos resource values, Redis endpoint values, Application Insights values, and
-the UI API URL. It also requires reviewed pricing and sets
+Cosmos resource values, the explicit semantic-cache Boolean, Application
+Insights values, and the UI API URL. It supplies Redis endpoint values only in
+enabled mode. It also requires reviewed pricing and sets
 `OPTIMA_PRODUCTION_COST_MEASUREMENT_REQUIRED=true`. The AI/model owner supplies
 the Foundry endpoint, deployment identities, exact live model/version evidence,
 and matching price-catalog provenance.
@@ -222,14 +245,15 @@ Required external Foundry values are:
 * STRONG chat-completions deployment name
 * STRONG provider-reported model identity
 * JUDGE chat-completions deployment and provider model identity
-* Embedding deployment name and provider-reported model identity
-* Exact embedding vector dimension
+* Embedding deployment name and provider-reported model identity when cache is enabled
+* Exact embedding vector dimension when cache is enabled
 * Token scope, normally `https://cognitiveservices.azure.com/.default`
 * Cognitive Services OpenAI User for the API identity on the exact Foundry resource
 
 Production Managed Identity mode requires the API user-assigned client ID for
-Foundry, Cosmos, and Redis. Redis additionally requires the identity principal
-ID as its AUTH username. Redis uses fixed Azure Managed Redis TLS port `10000`.
+Foundry and Cosmos. Enabled cache mode additionally requires it for Redis, plus
+the identity principal ID as the Redis AUTH username. Redis uses fixed Azure
+Managed Redis TLS port `10000`.
 
 Application Insights must be enabled with its connection string, service name,
 deployment environment, and sampling ratio. Live Metrics, performance counters,
@@ -257,7 +281,11 @@ are not logged. The judge performs no external web or factual lookup.
 
 ## East US 2 preflight
 
-Before Bicep execution, Slice 11C must validate as far as Azure APIs allow:
+Before Bicep execution, every profile validates account, OIDC, active model and
+pricing bindings, IaC representation, fixed cost, artifacts, application access,
+and UI authentication. Disabled mode additionally proves that Redis resources
+and embedding configuration are absent. Enabled mode must validate as far as
+Azure APIs allow:
 
 1. `Microsoft.Cache` resource-provider registration
 2. `redisEnterprise` resource-type advertisement in `eastus2`
@@ -274,8 +302,9 @@ The preflight CLI exposes `foundation`, `publish`, `artifacts`, and `rollout`
 phases. Foundation checks occur before any Azure mutation. Publication requires
 the converged resource inventory, Entra callback, `AcrPush`, and Foundry runtime
 grant. Rollout additionally re-reads both `AcrPull` assignments, the
-container-scoped Cosmos assignment, the Redis access policy, Foundry access, and
-both ACR manifest digests before enabling applications.
+container-scoped Cosmos assignment, Foundry access, and both ACR manifest digests
+before enabling applications. It reads the Redis access policy only in enabled
+mode.
 
 Quota non-exposure is explicit unknown evidence, not available quota, and does
 not independently block when no documented surface exists. Provider, SKU,
@@ -318,7 +347,7 @@ Slice 11C must supply the following reviewed pricing inputs as deployment
 configuration, because the model deployments are not yet selected. All rates are
 per-million-token `Decimal` values in one shared currency, keyed inside the
 runtime to provider `microsoft-foundry-apim` and the exact SMALL, STRONG, JUDGE,
-and embedding deployment names already configured for the runtime:
+and optional embedding deployment names configured for the runtime:
 
 * `OPTIMA_PRICING_CATALOG_VERSION` — provenance/version identifier
 * `OPTIMA_PRICING_BINDING_SHA256` — canonical digest of the reviewed source,
@@ -333,7 +362,7 @@ and embedding deployment names already configured for the runtime:
 * `OPTIMA_PRICING_JUDGE_INPUT_RATE_PER_MILLION_TOKENS`
 * `OPTIMA_PRICING_JUDGE_OUTPUT_RATE_PER_MILLION_TOKENS`
 * `OPTIMA_PRICING_JUDGE_CACHED_INPUT_RATE_PER_MILLION_TOKENS`, optional
-* `OPTIMA_PRICING_EMBEDDING_INPUT_RATE_PER_MILLION_TOKENS`
+* `OPTIMA_PRICING_EMBEDDING_INPUT_RATE_PER_MILLION_TOKENS`, required only when semantic cache is enabled
 
 Partial pricing is rejected at settings construction so incomplete configuration
 cannot fabricate monetary evidence. When
@@ -353,8 +382,8 @@ Slice 11C must also supply and verify:
 5. Managed-identity inference permission for the JUDGE deployment
 6. Live SMALL, STRONG, JUDGE, and embedding rates under one catalog version and
   currency when cost measurement is required
-7. Immutable API and UI image digests and all existing Redis, Cosmos,
-  Application Insights, and Foundry inputs
+7. Immutable API and UI image digests and all Cosmos, Application Insights, and
+  Foundry inputs, plus Redis and embedding inputs only when cache is enabled
 8. Existing single-tenant UI Entra app client ID, tenant ID, confidential-client
    secret supplied as the secure `uiAuthClientSecret` parameter, callback URI, and
    intended-user assignment

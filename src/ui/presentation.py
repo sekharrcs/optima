@@ -89,6 +89,7 @@ class SemanticCacheView:
     source_threshold: str
     source_passed: str
     planner_reason: str
+    activity: str | None
     error: str | None
 
 
@@ -334,9 +335,12 @@ def semantic_cache_view(result: RunResult) -> SemanticCacheView | None:
     if evidence is None:
         return None
     source = evidence.prior_evaluation
+    disabled = evidence.outcome is SemanticCacheOutcome.DISABLED_BYPASSED
     return SemanticCacheView(
         outcome=evidence.outcome.value.replace("_", " ").title(),
-        lookup_latency=f"{evidence.lookup_latency_ms} ms",
+        lookup_latency=(
+            "Not attempted" if disabled else f"{evidence.lookup_latency_ms} ms"
+        ),
         source_run_id=evidence.source_run_id or "Unavailable",
         similarity=(
             f"{evidence.similarity:.3f}"
@@ -354,6 +358,12 @@ def semantic_cache_view(result: RunResult) -> SemanticCacheView | None:
             else "Unavailable"
         ),
         planner_reason=evidence.planner_reason_code.value,
+        activity=(
+            "Semantic cache lookup and embedding request were not attempted because "
+            "semantic cache was disabled."
+            if disabled
+            else None
+        ),
         error=evidence.error,
     )
 

@@ -56,12 +56,38 @@ REQUIRED_PROVIDERS = (
 )
 REQUIRED_FOUNDATION_RESOURCE_TYPES = {
     "microsoft.app/managedenvironments": 1,
-    "microsoft.cache/redisenterprise": 1,
     "microsoft.containerregistry/registries": 1,
     "microsoft.documentdb/databaseaccounts": 1,
     "microsoft.insights/components": 1,
     "microsoft.managedidentity/userassignedidentities": 2,
 }
+REDIS_FOUNDATION_RESOURCE_TYPE = "microsoft.cache/redisenterprise"
+PREFLIGHT_CACHE_ONLY_SETTINGS = frozenset(
+    {
+        "OPTIMA_CACHE_SIMILARITY_THRESHOLD",
+        "OPTIMA_PRICING_EMBEDDING_INPUT_RATE_PER_MILLION_TOKENS",
+        "OPTIMA_PRICING_EMBEDDING_MODEL",
+        "OPTIMA_PRICING_EMBEDDING_MODEL_VERSION",
+        "OPTIMA_REDIS_ACCESS_KEY",
+        "OPTIMA_REDIS_AUTH_MODE",
+        "OPTIMA_REDIS_EMBEDDING_DEPLOYMENT",
+        "OPTIMA_REDIS_EMBEDDING_DIMENSION",
+        "OPTIMA_REDIS_EMBEDDING_MODEL",
+        "OPTIMA_REDIS_EMBEDDING_MODEL_VERSION",
+        "OPTIMA_REDIS_HOST",
+        "OPTIMA_REDIS_INDEX_NAME",
+        "OPTIMA_REDIS_MANAGED_IDENTITY_CLIENT_ID",
+        "OPTIMA_REDIS_MAX_CONNECTIONS",
+        "OPTIMA_REDIS_OBJECT_ID",
+        "OPTIMA_REDIS_TIMEOUT_SECONDS",
+        "OPTIMA_REDIS_TOKEN_ACQUISITION_TIMEOUT_SECONDS",
+        "OPTIMA_REDIS_TOKEN_EXPIRY_SAFETY_MARGIN_SECONDS",
+        "OPTIMA_REDIS_TOKEN_REAUTH_TIMEOUT_SECONDS",
+        "OPTIMA_REDIS_TOKEN_RENEWAL_ATTEMPTS",
+        "OPTIMA_REDIS_TOKEN_RETRY_BACKOFF_CAP_SECONDS",
+        "OPTIMA_REDIS_TOKEN_RETRY_BACKOFF_SECONDS",
+    }
+)
 
 
 class PreflightError(RuntimeError):
@@ -165,9 +191,9 @@ class PricingConfiguration:
     judge_input: Decimal
     judge_output: Decimal
     judge_cached_input: Decimal | None
-    embedding_model: str
-    embedding_model_version: str
-    embedding_input: Decimal
+    embedding_model: str | None
+    embedding_model_version: str | None
+    embedding_input: Decimal | None
 
 
 @dataclass(frozen=True)
@@ -187,7 +213,8 @@ class DeploymentConfiguration:
     ui_auth_tenant_id: str
     ui_auth_redirect_uri: str
     ui_auth_secret_present: bool
-    embedding_dimension: int
+    semantic_cache_enabled: bool
+    embedding_dimension: int | None
     models: tuple[ModelBinding, ...]
     pricing: PricingConfiguration
     expected_fixed_monthly_cost_inr: Decimal
@@ -276,6 +303,16 @@ def _required(environment: Mapping[str, str], name: str) -> str:
     return value
 
 
+def _required_boolean(environment: Mapping[str, str], name: str) -> bool:
+    """Parse one required canonical Boolean without inferring a default."""
+    value = _required(environment, name).casefold()
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    raise PreflightError(f"Deployment setting {name} must be exactly true or false")
+
+
 def _decimal(
     environment: Mapping[str, str],
     name: str,
@@ -323,18 +360,33 @@ def _model_binding(environment: Mapping[str, str], role: str) -> ModelBinding:
 
 def load_configuration(environment: Mapping[str, str]) -> DeploymentConfiguration:
     """Load and validate deployment configuration without retaining secrets."""
-    try:
-        embedding_dimension = int(
-            _required(environment, "OPTIMA_REDIS_EMBEDDING_DIMENSION")
-        )
-    except ValueError as error:
+    semantic_cache_enabled = _required_boolean(
+        environment, "OPTIMA_SEMANTIC_CACHE_ENABLED"
+    )
+    supplied_cache_settings = sorted(
+        name
+        for name in PREFLIGHT_CACHE_ONLY_SETTINGS
+        if environment.get(name, "").strip()
+    )
+    if not semantic_cache_enabled and supplied_cache_settings:
         raise PreflightError(
-            "OPTIMA_REDIS_EMBEDDING_DIMENSION must be an integer"
-        ) from error
-    if not 1 <= embedding_dimension <= 32768:
-        raise PreflightError(
-            "OPTIMA_REDIS_EMBEDDING_DIMENSION must be between 1 and 32768"
+            "Disabled semantic cache cannot configure cache-only deployment "
+            f"settings: {', '.join(supplied_cache_settings)}"
         )
+    embedding_dimension: int | None = None
+    if semantic_cache_enabled:
+        try:
+            embedding_dimension = int(
+                _required(environment, "OPTIMA_REDIS_EMBEDDING_DIMENSION")
+            )
+        except ValueError as error:
+            raise PreflightError(
+                "OPTIMA_REDIS_EMBEDDING_DIMENSION must be an integer"
+            ) from error
+        if not 1 <= embedding_dimension <= 32768:
+            raise PreflightError(
+                "OPTIMA_REDIS_EMBEDDING_DIMENSION must be between 1 and 32768"
+            )
     try:
         reviewed_on = date.fromisoformat(
             _required(environment, "OPTIMA_COST_REVIEWED_ON")
@@ -415,16 +467,26 @@ def load_configuration(environment: Mapping[str, str]) -> DeploymentConfiguratio
             "OPTIMA_PRICING_JUDGE_CACHED_INPUT_RATE_PER_MILLION_TOKENS",
             required=False,
         ),
-        embedding_model=_required(environment, "OPTIMA_PRICING_EMBEDDING_MODEL"),
-        embedding_model_version=_required(
-            environment, "OPTIMA_PRICING_EMBEDDING_MODEL_VERSION"
+        embedding_model=(
+            _required(environment, "OPTIMA_PRICING_EMBEDDING_MODEL")
+            if semantic_cache_enabled
+            else None
         ),
-        embedding_input=cast(
-            Decimal,
-            _decimal(
-                environment,
-                "OPTIMA_PRICING_EMBEDDING_INPUT_RATE_PER_MILLION_TOKENS",
-            ),
+        embedding_model_version=(
+            _required(environment, "OPTIMA_PRICING_EMBEDDING_MODEL_VERSION")
+            if semantic_cache_enabled
+            else None
+        ),
+        embedding_input=(
+            cast(
+                Decimal,
+                _decimal(
+                    environment,
+                    "OPTIMA_PRICING_EMBEDDING_INPUT_RATE_PER_MILLION_TOKENS",
+                ),
+            )
+            if semantic_cache_enabled
+            else None
         ),
     )
     fixed_cost = cast(
@@ -449,10 +511,15 @@ def load_configuration(environment: Mapping[str, str]) -> DeploymentConfiguratio
         ui_auth_secret_present=bool(
             _required(environment, "OPTIMA_UI_AUTH_CLIENT_SECRET")
         ),
+        semantic_cache_enabled=semantic_cache_enabled,
         embedding_dimension=embedding_dimension,
         models=tuple(
             _model_binding(environment, role)
-            for role in ("SMALL", "STRONG", "JUDGE", "EMBEDDING")
+            for role in (
+                ("SMALL", "STRONG", "JUDGE", "EMBEDDING")
+                if semantic_cache_enabled
+                else ("SMALL", "STRONG", "JUDGE")
+            )
         ),
         pricing=pricing,
         expected_fixed_monthly_cost_inr=fixed_cost,
@@ -493,9 +560,7 @@ def validate_configuration(
     if len({binding.deployment for binding in configuration.models}) != len(
         configuration.models
     ):
-        raise PreflightError(
-            "SMALL, STRONG, JUDGE, and embedding deployments must be distinct"
-        )
+        raise PreflightError("Active model-role deployments must be distinct")
     pricing_bindings = {
         "SMALL": (
             configuration.pricing.small_model,
@@ -509,11 +574,22 @@ def validate_configuration(
             configuration.pricing.judge_model,
             configuration.pricing.judge_model_version,
         ),
-        "EMBEDDING": (
+    }
+    if configuration.semantic_cache_enabled:
+        if (
+            configuration.embedding_dimension is None
+            or configuration.pricing.embedding_model is None
+            or configuration.pricing.embedding_model_version is None
+            or configuration.pricing.embedding_input is None
+        ):
+            raise PreflightError(
+                "Enabled semantic cache requires complete embedding configuration "
+                "and pricing"
+            )
+        pricing_bindings["EMBEDDING"] = (
             configuration.pricing.embedding_model,
             configuration.pricing.embedding_model_version,
-        ),
-    }
+        )
     for binding in configuration.models:
         if pricing_bindings[binding.role] != (binding.model, binding.version):
             raise PreflightError(
@@ -589,11 +665,6 @@ def pricing_binding_sha256(pricing: PricingConfiguration) -> str:
     document = {
         "catalog_version": pricing.catalog_version,
         "currency": pricing.currency,
-        "embedding": {
-            "input": str(pricing.embedding_input),
-            "model": pricing.embedding_model,
-            "model_version": pricing.embedding_model_version,
-        },
         "judge": {
             "cached_input": (
                 str(pricing.judge_cached_input)
@@ -629,6 +700,16 @@ def pricing_binding_sha256(pricing: PricingConfiguration) -> str:
             "output": str(pricing.strong_output),
         },
     }
+    if (
+        pricing.embedding_input is not None
+        and pricing.embedding_model is not None
+        and pricing.embedding_model_version is not None
+    ):
+        document["embedding"] = {
+            "input": str(pricing.embedding_input),
+            "model": pricing.embedding_model,
+            "model_version": pricing.embedding_model_version,
+        }
     serialized = json.dumps(
         document,
         ensure_ascii=True,
@@ -662,9 +743,13 @@ def _check_account(configuration: DeploymentConfiguration, azure: AzureQuery) ->
         raise PreflightError("Azure subscription is not enabled")
 
 
-def _check_providers(azure: AzureQuery) -> dict[str, Any]:
+def _check_providers(
+    azure: AzureQuery, *, semantic_cache_enabled: bool
+) -> dict[str, Any] | None:
     cache_provider: dict[str, Any] | None = None
     for namespace in REQUIRED_PROVIDERS:
+        if namespace == "Microsoft.Cache" and not semantic_cache_enabled:
+            continue
         provider = azure.json("provider", "show", "--namespace", namespace)
         if not isinstance(provider, dict):
             if namespace == "Microsoft.Cache":
@@ -696,7 +781,7 @@ def _check_providers(azure: AzureQuery) -> dict[str, Any]:
             )
         if namespace == "Microsoft.Cache":
             cache_provider = provider
-    if cache_provider is None:
+    if semantic_cache_enabled and cache_provider is None:
         raise RedisPreflightError(
             RedisPreflightErrorCode.PROVIDER_METADATA_MALFORMED,
             "Microsoft.Cache provider metadata is unavailable",
@@ -1541,6 +1626,7 @@ def _check_iac_representation(repository_root: Path) -> None:
             "modules/container-apps.bicep",
             "deployRuntimeAccess",
             "deployContainerApps",
+            "semanticCacheEnabled",
         ),
         "infra/modules/container-apps.bicep": (
             "Microsoft.App/managedEnvironments@",
@@ -1592,7 +1678,7 @@ def _check_resource_group(
         configuration.location
     ):
         raise PreflightError("OPTIMA resource group is not in eastus2")
-    if not require_foundation:
+    if not require_foundation and configuration.semantic_cache_enabled:
         return []
     resources = azure.json(
         "resource", "list", "--resource-group", configuration.resource_group
@@ -1604,7 +1690,19 @@ def _check_resource_group(
     for resource in typed_resources:
         resource_type = str(resource.get("type", "")).casefold()
         counts[resource_type] = counts.get(resource_type, 0) + 1
-    for resource_type, minimum in REQUIRED_FOUNDATION_RESOURCE_TYPES.items():
+    if (
+        not configuration.semantic_cache_enabled
+        and counts.get(REDIS_FOUNDATION_RESOURCE_TYPE, 0) != 0
+    ):
+        raise PreflightError(
+            "Disabled semantic cache requires Azure Managed Redis to be absent"
+        )
+    required_resource_types = dict(REQUIRED_FOUNDATION_RESOURCE_TYPES)
+    if configuration.semantic_cache_enabled:
+        required_resource_types[REDIS_FOUNDATION_RESOURCE_TYPE] = 1
+    if not require_foundation:
+        return typed_resources
+    for resource_type, minimum in required_resource_types.items():
         if counts.get(resource_type, 0) < minimum:
             raise PreflightError(
                 f"Required foundation resource type {resource_type} is missing"
@@ -1726,12 +1824,12 @@ def _check_runtime_access(
 ) -> None:
     registry = _one_resource(resources, "Microsoft.ContainerRegistry/registries")
     cosmos = _one_resource(resources, "Microsoft.DocumentDB/databaseAccounts")
-    redis = _one_resource(resources, "Microsoft.Cache/redisEnterprise")
-    for resource, label in (
-        (registry, "registry"),
-        (cosmos, "Cosmos"),
-        (redis, "Redis"),
-    ):
+    identified_resources = [(registry, "registry"), (cosmos, "Cosmos")]
+    redis: dict[str, Any] | None = None
+    if configuration.semantic_cache_enabled:
+        redis = _one_resource(resources, "Microsoft.Cache/redisEnterprise")
+        identified_resources.append((redis, "Redis"))
+    for resource, label in identified_resources:
         if not isinstance(resource.get("id"), str) or not resource["id"]:
             raise PreflightError(f"{label} resource ID is unavailable")
     principals: dict[str, str] = {}
@@ -1797,29 +1895,32 @@ def _check_runtime_access(
         raise PreflightError(
             "OPTIMA API identity lacks container-scoped Cosmos data contribution"
         )
-    redis_assignments = azure.json(
-        "rest",
-        "--method",
-        "get",
-        "--url",
-        (
-            f"{redis['id']}/databases/default/accessPolicyAssignments"
-            "?api-version=2025-07-01"
-        ),
-    )
-    redis_values = (
-        redis_assignments.get("value") if isinstance(redis_assignments, dict) else None
-    )
-    if not isinstance(redis_values, list) or not any(
-        isinstance(assignment, dict)
-        and assignment.get("properties", {}).get("accessPolicyName") == "default"
-        and assignment.get("properties", {}).get("user", {}).get("objectId")
-        == principals["api"]
-        for assignment in redis_values
-    ):
-        raise PreflightError(
-            "OPTIMA API identity lacks the reviewed Redis default access policy"
+    if redis is not None:
+        redis_assignments = azure.json(
+            "rest",
+            "--method",
+            "get",
+            "--url",
+            (
+                f"{redis['id']}/databases/default/accessPolicyAssignments"
+                "?api-version=2025-07-01"
+            ),
         )
+        redis_values = (
+            redis_assignments.get("value")
+            if isinstance(redis_assignments, dict)
+            else None
+        )
+        if not isinstance(redis_values, list) or not any(
+            isinstance(assignment, dict)
+            and assignment.get("properties", {}).get("accessPolicyName") == "default"
+            and assignment.get("properties", {}).get("user", {}).get("objectId")
+            == principals["api"]
+            for assignment in redis_values
+        ):
+            raise PreflightError(
+                "OPTIMA API identity lacks the reviewed Redis default access policy"
+            )
 
 
 def _validated_digest(value: str, component: str) -> str:
@@ -1866,9 +1967,16 @@ def run_preflight(
         raise PreflightError(f"Unsupported preflight phase {phase}")
     _check_iac_representation(repository_root)
     _check_account(configuration, azure)
-    cache_provider = _check_providers(azure)
+    cache_provider = _check_providers(
+        azure,
+        semantic_cache_enabled=configuration.semantic_cache_enabled,
+    )
     _check_oidc_federation(configuration, azure)
-    redis_evidence = _check_redis_availability(configuration, azure, cache_provider)
+    redis_evidence: dict[str, Any] | None = None
+    if configuration.semantic_cache_enabled:
+        if cache_provider is None:
+            raise AssertionError("enabled semantic cache requires provider evidence")
+        redis_evidence = _check_redis_availability(configuration, azure, cache_provider)
     model_evidence = _check_model_deployments(configuration, azure)
     require_foundation = phase in {"publish", "artifacts", "rollout"}
     resources = _check_resource_group(
@@ -1910,12 +2018,22 @@ def run_preflight(
             "account",
             "providers",
             "github_oidc_federation",
-            "redis_provider_registration",
-            "redis_regional_resource_type",
-            "redis_exact_sku_advertisement",
-            "redis_applicable_restrictions",
-            "redis_quota_exposure",
-            "redis_allocation_not_provable",
+            *(
+                (
+                    "redis_provider_registration",
+                    "redis_regional_resource_type",
+                    "redis_exact_sku_advertisement",
+                    "redis_applicable_restrictions",
+                    "redis_quota_exposure",
+                    "redis_allocation_not_provable",
+                )
+                if configuration.semantic_cache_enabled
+                else (
+                    "semantic_cache_explicitly_disabled",
+                    "redis_resource_absent",
+                    "embedding_configuration_absent",
+                )
+            ),
             "model_deployments",
             "iac_representation",
             *(
@@ -1944,6 +2062,20 @@ def run_preflight(
         "models": model_evidence,
         "phase": phase,
         "redis": redis_evidence,
+        "semantic_cache": {
+            "embedding_configuration": (
+                "REQUIRED" if configuration.semantic_cache_enabled else "NOT_CONFIGURED"
+            ),
+            "enabled": configuration.semantic_cache_enabled,
+            "redis_resource": (
+                "REQUIRED"
+                if configuration.semantic_cache_enabled
+                else "NOT_PROVISIONED"
+            ),
+            "status": (
+                "ENABLED" if configuration.semantic_cache_enabled else "DISABLED"
+            ),
+        },
         "resource_group": configuration.resource_group,
         "subscription_id": _redact_identifier(configuration.subscription_id),
         "tenant_id": _redact_identifier(configuration.tenant_id),

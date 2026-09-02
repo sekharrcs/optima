@@ -22,6 +22,9 @@ param deployApplications bool
 @description('Expose UI ingress only after the deployed authentication child resource is verified.')
 param exposePublicUi bool
 
+@description('Configure the API semantic-cache runtime integration.')
+param semanticCacheEnabled bool
+
 @description('Container Apps managed environment name.')
 param containerAppsEnvironmentName string
 
@@ -75,19 +78,19 @@ param cosmosDatabaseName string
 param cosmosContainerName string
 
 @description('Azure Managed Redis hostname.')
-param redisHost string
+param redisHost string?
 
 @description('Pre-provisioned RediSearch index name.')
-param redisIndexName string
+param redisIndexName string?
 
 @description('Embedding vector dimension shared by Foundry and RediSearch.')
-param redisEmbeddingDimension int
+param redisEmbeddingDimension int?
 
 @description('Provider-reported embedding model identity.')
-param redisEmbeddingModel string
+param redisEmbeddingModel string?
 
 @description('Foundry embedding deployment used by the semantic cache.')
-param redisEmbeddingDeployment string
+param redisEmbeddingDeployment string?
 
 @description('Foundry or APIM Azure OpenAI v1 API root.')
 param foundryBaseUrl string
@@ -157,24 +160,127 @@ param pricingStrongOutputRatePerMillionTokens string
 param pricingStrongCachedInputRatePerMillionTokens string?
 
 @description('Reviewed JUDGE input price per million tokens in LLM_JUDGE mode.')
-param pricingJudgeInputRatePerMillionTokens string
+param pricingJudgeInputRatePerMillionTokens string?
 
 @description('Reviewed JUDGE output price per million tokens in LLM_JUDGE mode.')
-param pricingJudgeOutputRatePerMillionTokens string
+param pricingJudgeOutputRatePerMillionTokens string?
 
 @description('Reviewed JUDGE cached-input price per million tokens when the selected model has a distinct rate.')
 param pricingJudgeCachedInputRatePerMillionTokens string?
 
 @description('Reviewed embedding input price per million tokens.')
-param pricingEmbeddingInputRatePerMillionTokens string
+param pricingEmbeddingInputRatePerMillionTokens string?
 
 @description('Common resource tags.')
 param tags object
 
-var judgeConfigurationIsDeployable = !empty(judgeDeployment) && !empty(judgeModel) && judgeDeployment != 'replace-judge-deployment' && judgeModel != 'replace-judge-model'
-var validatedEvaluatorMode = !deployApplications || productionEvaluatorMode != 'LLM_JUDGE' || judgeConfigurationIsDeployable
-  ? productionEvaluatorMode
-  : fail('LLM_JUDGE Container Apps deployment requires deployable judge identities.')
+var judgeConfigurationIsComplete = !empty(trim(judgeDeployment ?? '')) && !startsWith(
+  toLower(judgeDeployment ?? ''),
+  'replace-'
+) && !empty(trim(judgeModel ?? '')) && !startsWith(toLower(judgeModel ?? ''), 'replace-') && !empty(trim(pricingJudgeInputRatePerMillionTokens ?? '')) && !startsWith(
+  toLower(pricingJudgeInputRatePerMillionTokens ?? ''),
+  'replace-'
+) && !empty(trim(pricingJudgeOutputRatePerMillionTokens ?? '')) && !startsWith(
+  toLower(pricingJudgeOutputRatePerMillionTokens ?? ''),
+  'replace-'
+)
+var judgeConfigurationIsAbsent = judgeDeployment == null && judgeModel == null && pricingJudgeInputRatePerMillionTokens == null && pricingJudgeOutputRatePerMillionTokens == null && pricingJudgeCachedInputRatePerMillionTokens == null
+var validatedEvaluatorMode = productionEvaluatorMode == 'LLM_JUDGE'
+  ? judgeConfigurationIsComplete
+      ? productionEvaluatorMode
+      : fail('LLM_JUDGE Container Apps deployment requires deployable judge identity and pricing values.')
+  : judgeConfigurationIsAbsent
+      ? productionEvaluatorMode
+      : fail('EXACT_REFERENCE Container Apps deployment rejects inactive JUDGE identity and pricing values.')
+var judgeEnvironment = validatedEvaluatorMode == 'LLM_JUDGE'
+  ? concat(
+      [
+        {
+          name: 'OPTIMA_JUDGE_DEPLOYMENT'
+          value: judgeDeployment!
+        }
+        {
+          name: 'OPTIMA_JUDGE_MODEL'
+          value: judgeModel!
+        }
+        {
+          name: 'OPTIMA_JUDGE_TIMEOUT_SECONDS'
+          value: string(judgeTimeoutSeconds)
+        }
+        {
+          name: 'OPTIMA_PRICING_JUDGE_INPUT_RATE_PER_MILLION_TOKENS'
+          value: pricingJudgeInputRatePerMillionTokens!
+        }
+        {
+          name: 'OPTIMA_PRICING_JUDGE_OUTPUT_RATE_PER_MILLION_TOKENS'
+          value: pricingJudgeOutputRatePerMillionTokens!
+        }
+      ],
+      !empty(pricingJudgeCachedInputRatePerMillionTokens)
+        ? [
+            {
+              name: 'OPTIMA_PRICING_JUDGE_CACHED_INPUT_RATE_PER_MILLION_TOKENS'
+              value: pricingJudgeCachedInputRatePerMillionTokens!
+            }
+          ]
+        : []
+    )
+  : []
+var semanticCacheConfigurationIsComplete = !empty(trim(redisHost ?? '')) && !empty(trim(redisIndexName ?? '')) && !empty(trim(redisEmbeddingDeployment ?? '')) && !startsWith(
+  toLower(redisEmbeddingDeployment ?? ''),
+  'replace-'
+) && !empty(trim(redisEmbeddingModel ?? '')) && !startsWith(toLower(redisEmbeddingModel ?? ''), 'replace-') && (redisEmbeddingDimension ?? 0) >= 1 && (redisEmbeddingDimension ?? 0) <= 32768 && !empty(trim(pricingEmbeddingInputRatePerMillionTokens ?? '')) && !startsWith(
+  toLower(pricingEmbeddingInputRatePerMillionTokens ?? ''),
+  'replace-'
+)
+var semanticCacheConfigurationIsAbsent = redisHost == null && redisIndexName == null && redisEmbeddingDeployment == null && redisEmbeddingModel == null && redisEmbeddingDimension == null && pricingEmbeddingInputRatePerMillionTokens == null
+var validatedSemanticCacheEnabled = semanticCacheEnabled
+  ? semanticCacheConfigurationIsComplete
+      ? true
+      : fail('Enabled semantic cache requires Redis, embedding, and reviewed embedding-pricing values.')
+  : semanticCacheConfigurationIsAbsent
+      ? false
+      : fail('Disabled semantic cache rejects Redis, embedding, and embedding-pricing values.')
+var semanticCacheEnvironment = validatedSemanticCacheEnabled
+  ? [
+      {
+        name: 'OPTIMA_REDIS_HOST'
+        value: redisHost!
+      }
+      {
+        name: 'OPTIMA_REDIS_INDEX_NAME'
+        value: redisIndexName!
+      }
+      {
+        name: 'OPTIMA_REDIS_EMBEDDING_DIMENSION'
+        value: string(redisEmbeddingDimension!)
+      }
+      {
+        name: 'OPTIMA_REDIS_EMBEDDING_MODEL'
+        value: redisEmbeddingModel!
+      }
+      {
+        name: 'OPTIMA_REDIS_EMBEDDING_DEPLOYMENT'
+        value: redisEmbeddingDeployment!
+      }
+      {
+        name: 'OPTIMA_REDIS_AUTH_MODE'
+        value: 'MANAGED_IDENTITY'
+      }
+      {
+        name: 'OPTIMA_REDIS_OBJECT_ID'
+        value: apiIdentityPrincipalId
+      }
+      {
+        name: 'OPTIMA_REDIS_MANAGED_IDENTITY_CLIENT_ID'
+        value: apiIdentityClientId
+      }
+      {
+        name: 'OPTIMA_PRICING_EMBEDDING_INPUT_RATE_PER_MILLION_TOKENS'
+        value: pricingEmbeddingInputRatePerMillionTokens!
+      }
+    ]
+  : []
 var optionalPricingEnvironment = concat(
   !empty(pricingSmallCachedInputRatePerMillionTokens)
     ? [
@@ -189,14 +295,6 @@ var optionalPricingEnvironment = concat(
         {
           name: 'OPTIMA_PRICING_STRONG_CACHED_INPUT_RATE_PER_MILLION_TOKENS'
           value: pricingStrongCachedInputRatePerMillionTokens!
-        }
-      ]
-    : [],
-  !empty(pricingJudgeCachedInputRatePerMillionTokens)
-    ? [
-        {
-          name: 'OPTIMA_PRICING_JUDGE_CACHED_INPUT_RATE_PER_MILLION_TOKENS'
-          value: pricingJudgeCachedInputRatePerMillionTokens!
         }
       ]
     : []
@@ -281,6 +379,10 @@ resource api 'Microsoft.App/containerApps@2025-07-01' = if (deployApplications) 
                 value: validatedEvaluatorMode == 'EXACT_REFERENCE' ? 'true' : 'false'
               }
               {
+                name: 'OPTIMA_SEMANTIC_CACHE_ENABLED'
+                value: validatedSemanticCacheEnabled ? 'true' : 'false'
+              }
+              {
                 name: 'OPTIMA_EXECUTION_CONCURRENCY_LIMIT'
                 value: '4'
               }
@@ -307,18 +409,6 @@ resource api 'Microsoft.App/containerApps@2025-07-01' = if (deployApplications) 
               {
                 name: 'OPTIMA_FOUNDRY_STRONG_MODEL'
                 value: foundryStrongModel
-              }
-              {
-                name: 'OPTIMA_JUDGE_DEPLOYMENT'
-                value: validatedEvaluatorMode == 'LLM_JUDGE' ? judgeDeployment! : 'not-applicable'
-              }
-              {
-                name: 'OPTIMA_JUDGE_MODEL'
-                value: validatedEvaluatorMode == 'LLM_JUDGE' ? judgeModel! : 'not-applicable'
-              }
-              {
-                name: 'OPTIMA_JUDGE_TIMEOUT_SECONDS'
-                value: string(judgeTimeoutSeconds)
               }
               {
                 name: 'OPTIMA_FOUNDRY_AUTH_MODE'
@@ -355,38 +445,6 @@ resource api 'Microsoft.App/containerApps@2025-07-01' = if (deployApplications) 
               {
                 name: 'OPTIMA_COSMOS_TIMEOUT_SECONDS'
                 value: '10'
-              }
-              {
-                name: 'OPTIMA_REDIS_HOST'
-                value: redisHost
-              }
-              {
-                name: 'OPTIMA_REDIS_INDEX_NAME'
-                value: redisIndexName
-              }
-              {
-                name: 'OPTIMA_REDIS_EMBEDDING_DIMENSION'
-                value: string(redisEmbeddingDimension)
-              }
-              {
-                name: 'OPTIMA_REDIS_EMBEDDING_MODEL'
-                value: redisEmbeddingModel
-              }
-              {
-                name: 'OPTIMA_REDIS_EMBEDDING_DEPLOYMENT'
-                value: redisEmbeddingDeployment
-              }
-              {
-                name: 'OPTIMA_REDIS_AUTH_MODE'
-                value: 'MANAGED_IDENTITY'
-              }
-              {
-                name: 'OPTIMA_REDIS_OBJECT_ID'
-                value: apiIdentityPrincipalId
-              }
-              {
-                name: 'OPTIMA_REDIS_MANAGED_IDENTITY_CLIENT_ID'
-                value: apiIdentityClientId
               }
               {
                 name: 'OPTIMA_APPLICATION_INSIGHTS_ENABLED'
@@ -452,19 +510,9 @@ resource api 'Microsoft.App/containerApps@2025-07-01' = if (deployApplications) 
                 name: 'OPTIMA_PRICING_STRONG_OUTPUT_RATE_PER_MILLION_TOKENS'
                 value: pricingStrongOutputRatePerMillionTokens
               }
-              {
-                name: 'OPTIMA_PRICING_JUDGE_INPUT_RATE_PER_MILLION_TOKENS'
-                value: pricingJudgeInputRatePerMillionTokens
-              }
-              {
-                name: 'OPTIMA_PRICING_JUDGE_OUTPUT_RATE_PER_MILLION_TOKENS'
-                value: pricingJudgeOutputRatePerMillionTokens
-              }
-              {
-                name: 'OPTIMA_PRICING_EMBEDDING_INPUT_RATE_PER_MILLION_TOKENS'
-                value: pricingEmbeddingInputRatePerMillionTokens
-              }
             ],
+            judgeEnvironment,
+            semanticCacheEnvironment,
             optionalPricingEnvironment
           )
           probes: [
@@ -741,6 +789,10 @@ resource deploymentSmokeJob 'Microsoft.App/jobs@2025-07-01' = if (deployApplicat
               name: 'OPTIMA_API_TIMEOUT_SECONDS'
               value: '315'
             }
+            {
+              name: 'OPTIMA_SEMANTIC_CACHE_ENABLED'
+              value: validatedSemanticCacheEnabled ? 'true' : 'false'
+            }
           ]
           resources: {
             cpu: json('0.5')
@@ -760,3 +812,4 @@ output apiUrl string = deployApplications ? 'https://${api!.properties.configura
 output uiResourceId string = deployApplications ? ui!.id : ''
 output uiRevisionName string = deployApplications ? ui!.properties.latestRevisionName : ''
 output uiUrl string = deployApplications ? 'https://${ui!.properties.configuration.ingress.fqdn}' : ''
+output semanticCacheEnabled bool = validatedSemanticCacheEnabled

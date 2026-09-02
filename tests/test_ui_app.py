@@ -228,6 +228,30 @@ _render_execute_result(HistoryEntry(result=result))
     assert any("Semantic Cache: Succeeded" in item.value for item in app.success)
 
 
+def test_execute_result_renders_cache_disabled_as_not_attempted() -> None:
+    """Show explicit disabled activity instead of presenting zero as lookup work."""
+    app = AppTest.from_string(
+        """
+from test_ui_presentation import execute_cache_disabled_result
+from ui.app import _render_execute_result
+from ui.history import HistoryEntry
+
+_render_execute_result(HistoryEntry(result=execute_cache_disabled_result()))
+"""
+    ).run()
+
+    metrics = {metric.label: metric.value for metric in app.metric}
+    information = [element.value for element in app.info]
+
+    assert not app.exception
+    assert metrics["Cache outcome"] == "Disabled Bypassed"
+    assert metrics["Cache lookup latency"] == "Not attempted"
+    assert (
+        "Semantic cache lookup and embedding request were not attempted because "
+        "semantic cache was disabled."
+    ) in information
+
+
 def test_run_history_detail_shows_generation_and_judge_call_counts() -> None:
     """Expose both model-call categories before the detailed usage table."""
     app = AppTest.from_string(

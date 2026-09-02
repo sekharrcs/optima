@@ -191,11 +191,8 @@ def _build_price_catalog(settings: AppSettings) -> PriceCatalog:
             entries=(),
         )
     foundry = settings.foundry_provider_configuration()
-    redis = settings.redis_semantic_cache_configuration()
-    if foundry is None or redis is None:
-        raise AssertionError(
-            "validated production settings require Foundry and Redis for pricing"
-        )
+    if foundry is None:
+        raise AssertionError("validated production settings require Foundry pricing")
     entries = [
         PriceCatalogEntry(
             provider=FOUNDRY_PROVIDER_NAME,
@@ -219,15 +216,25 @@ def _build_price_catalog(settings: AppSettings) -> PriceCatalog:
                 inputs.strong.cached_input_rate_per_million_tokens
             ),
         ),
-        PriceCatalogEntry(
-            provider=FOUNDRY_PROVIDER_NAME,
-            deployment=redis.embedding_deployment,
-            input_rate_per_million_tokens=(
-                inputs.embedding_input_rate_per_million_tokens
-            ),
-            output_rate_per_million_tokens=Decimal("0"),
-        ),
     ]
+    embedding_deployment: str | None = None
+    if inputs.embedding_input_rate_per_million_tokens is not None:
+        redis = settings.redis_semantic_cache_configuration()
+        if redis is None:
+            raise AssertionError(
+                "validated embedding pricing requires Redis configuration"
+            )
+        embedding_deployment = redis.embedding_deployment
+        entries.append(
+            PriceCatalogEntry(
+                provider=FOUNDRY_PROVIDER_NAME,
+                deployment=embedding_deployment,
+                input_rate_per_million_tokens=(
+                    inputs.embedding_input_rate_per_million_tokens
+                ),
+                output_rate_per_million_tokens=Decimal("0"),
+            )
+        )
     judge_deployment: str | None = None
     if inputs.judge is not None:
         judge = settings.judge_provider_configuration()
@@ -254,7 +261,7 @@ def _build_price_catalog(settings: AppSettings) -> PriceCatalog:
     _reject_shared_role_deployments(
         small=foundry.small_deployment,
         strong=foundry.strong_deployment,
-        embedding=redis.embedding_deployment,
+        embedding=embedding_deployment,
         judge=judge_deployment,
     )
     return PriceCatalog(
@@ -268,7 +275,7 @@ def _reject_shared_role_deployments(
     *,
     small: str,
     strong: str,
-    embedding: str,
+    embedding: str | None,
     judge: str | None,
 ) -> None:
     """Fail closed with the exact colliding roles when deployments are shared.
@@ -280,8 +287,9 @@ def _reject_shared_role_deployments(
     role_deployments = [
         ("SMALL", small),
         ("STRONG", strong),
-        ("embedding", embedding),
     ]
+    if embedding is not None:
+        role_deployments.append(("embedding", embedding))
     if judge is not None:
         role_deployments.append(("JUDGE", judge))
     seen: dict[str, str] = {}
@@ -312,18 +320,21 @@ async def build_production_runtime(
         if settings.production_evaluator_mode is ProductionEvaluatorMode.LLM_JUDGE:
             judge_resources = builders.judge(settings)
             closers.append(judge_resources.aclose)
-        embedding = builders.embedding(settings)
-        closers.append(embedding.aclose)
-        redis = builders.redis(settings, embedding.provider)
-        closers.append(redis.aclose)
-        redis_configuration = settings.redis_semantic_cache_configuration()
-        if redis_configuration is None:
-            raise AssertionError("validated production settings require Redis")
-        await builders.bootstrap_index(
-            redis.client,
-            index_name=redis_configuration.index_name,
-            embedding_profile=redis_configuration.embedding_profile(),
-        )
+        semantic_cache: SemanticCache | None = None
+        if settings.semantic_cache_enabled:
+            embedding = builders.embedding(settings)
+            closers.append(embedding.aclose)
+            redis = builders.redis(settings, embedding.provider)
+            closers.append(redis.aclose)
+            redis_configuration = settings.redis_semantic_cache_configuration()
+            if redis_configuration is None:
+                raise AssertionError("validated production settings require Redis")
+            await builders.bootstrap_index(
+                redis.client,
+                index_name=redis_configuration.index_name,
+                embedding_profile=redis_configuration.embedding_profile(),
+            )
+            semantic_cache = redis.cache
         cosmos = builders.cosmos(settings)
         closers.append(cosmos.aclose)
 
@@ -353,7 +364,7 @@ async def build_production_runtime(
             evaluator=evaluator,
             cost_calculator=CostCalculator(_build_price_catalog(settings)),
             run_history_store=cosmos.store,
-            semantic_cache=redis.cache,
+            semantic_cache=semantic_cache,
             context_reducer=DeterministicExtractiveReducer(token_counter),
             token_counter=token_counter,
             context_reducer_safety_policy=DeterministicExtractiveSafetyPolicy(),
