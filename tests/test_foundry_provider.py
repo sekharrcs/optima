@@ -702,6 +702,85 @@ def test_generator_composition_derives_pinned_azure_response_identity(
 
 
 @pytest.mark.parametrize(
+    ("role", "deployment", "model", "version", "returned_model"),
+    [
+        (
+            ModelRole.SMALL,
+            "optima-small-gpt5-nano",
+            "gpt-5-nano",
+            "2025-08-07",
+            "gpt-5-nano",
+        ),
+        (
+            ModelRole.SMALL,
+            "optima-small-gpt5-nano",
+            "gpt-5-nano",
+            "2025-08-07",
+            "gpt-5-nano-2025-08-06",
+        ),
+        (
+            ModelRole.STRONG,
+            "optima-strong-gpt52",
+            "gpt-5.2",
+            "2025-12-11",
+            "gpt-5.2",
+        ),
+        (
+            ModelRole.STRONG,
+            "optima-strong-gpt52",
+            "gpt-5.2",
+            "2025-12-11",
+            "gpt-5.2-2025-12-10",
+        ),
+    ],
+    ids=[
+        "small-missing-version",
+        "small-wrong-version",
+        "strong-missing-version",
+        "strong-wrong-version",
+    ],
+)
+def test_generator_composition_rejects_correct_family_with_wrong_version(
+    role: ModelRole,
+    deployment: str,
+    model: str,
+    version: str,
+    returned_model: str,
+) -> None:
+    """Fail closed when the family matches but the reviewed version does not."""
+    requests: list[httpx.Request] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=successful_response(model=returned_model))
+
+    updates = {
+        f"foundry_{role.value.lower()}_deployment": deployment,
+        f"foundry_{role.value.lower()}_model": model,
+        f"foundry_{role.value.lower()}_model_version": version,
+    }
+    pair = build_foundry_provider_pair(
+        foundry_settings(
+            FoundryAuthMode.API_KEY,
+            foundry_api_key="fake-key",
+            **updates,
+        ),
+        transport=httpx.MockTransport(handle),
+    )
+    provider = pair.small_provider if role is ModelRole.SMALL else pair.strong_provider
+
+    async def execute() -> None:
+        with pytest.raises(FoundryProviderError) as captured:
+            await provider.generate(provider_request(role))
+        assert captured.value.code == "INVALID_RESPONSE"
+        await pair.aclose()
+
+    asyncio.run(execute())
+
+    assert json.loads(requests[0].content)["model"] == deployment
+
+
+@pytest.mark.parametrize(
     ("auth_mode", "settings_updates", "expected_client_id"),
     [
         (
@@ -845,6 +924,38 @@ def test_judge_composition_rejects_unverified_response_model(
             lambda request: httpx.Response(
                 200,
                 json=successful_response(model=reported_model),
+            )
+        ),
+    )
+
+    with pytest.raises(FoundryProviderError) as captured:
+        asyncio.run(resources.provider.generate(provider_request(ModelRole.JUDGE)))
+
+    asyncio.run(resources.aclose())
+    assert captured.value.code == "INVALID_RESPONSE"
+
+
+@pytest.mark.parametrize(
+    "returned_model",
+    ["gpt-4o", "gpt-4o-2024-11-19"],
+    ids=["missing-version", "wrong-version"],
+)
+def test_judge_composition_rejects_response_with_wrong_version(
+    returned_model: str,
+) -> None:
+    """Fail closed when the judge family matches but the reviewed version does not."""
+    resources = build_foundry_judge_provider(
+        foundry_settings(
+            FoundryAuthMode.API_KEY,
+            foundry_api_key="fake-key",
+            judge_deployment="optima-judge-gpt4o",
+            judge_model="gpt-4o",
+            judge_model_version="2024-11-20",
+        ),
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                json=successful_response(model=returned_model),
             )
         ),
     )
