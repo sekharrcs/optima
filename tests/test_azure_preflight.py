@@ -569,6 +569,27 @@ def test_load_configuration_accepts_explicit_disabled_cache_profile() -> None:
     assert configuration.pricing.embedding_input is None
 
 
+def test_model_versions_remain_separate_from_pricing_binding_contract() -> None:
+    """Keep deployment and pricing identities explicit without changing the digest."""
+    environment = valid_environment()
+    configuration = load_configuration(environment)
+
+    assert {
+        binding.role: (binding.model, binding.version)
+        for binding in configuration.models
+    } == {
+        "SMALL": ("gpt-4.1-mini", "2025-04-14"),
+        "STRONG": ("gpt-4.1", "2025-04-14"),
+        "JUDGE": ("gpt-4.1-nano", "2025-04-14"),
+        "EMBEDDING": ("text-embedding-3-small", "1"),
+    }
+    assert (
+        pricing_binding_sha256(configuration.pricing)
+        == environment["OPTIMA_PRICING_BINDING_SHA256"]
+        == "904c36f6deaf8ea867be97dbdd9fa57f54135d868c8bb8291586fc7c767284cd"
+    )
+
+
 def test_load_configuration_requires_explicit_cache_decision() -> None:
     """Reject an omitted cache mode instead of inferring it from cache settings."""
     environment = valid_environment()

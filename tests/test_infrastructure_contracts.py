@@ -116,16 +116,50 @@ def test_container_apps_map_production_runtime_environment_contract() -> None:
     assert "name: 'OPTIMA_REQUIRE_REFERENCE_OUTPUT'" in module
     assert "name: 'OPTIMA_JUDGE_DEPLOYMENT'" in module
     assert "name: 'OPTIMA_JUDGE_MODEL'" in module
+    assert "name: 'OPTIMA_JUDGE_MODEL_VERSION'" in module
     assert "name: 'OPTIMA_JUDGE_TIMEOUT_SECONDS'" in module
     assert "validatedEvaluatorMode == 'EXACT_REFERENCE' ? 'true' : 'false'" in module
     assert "name: 'OPTIMA_FOUNDRY_MANAGED_IDENTITY_CLIENT_ID'" in module
     assert "name: 'OPTIMA_FOUNDRY_SMALL_MODEL'" in module
+    assert "name: 'OPTIMA_FOUNDRY_SMALL_MODEL_VERSION'" in module
     assert "name: 'OPTIMA_FOUNDRY_STRONG_MODEL'" in module
+    assert "name: 'OPTIMA_FOUNDRY_STRONG_MODEL_VERSION'" in module
     assert "name: 'OPTIMA_COSMOS_MANAGED_IDENTITY_CLIENT_ID'" in module
     assert "name: 'OPTIMA_REDIS_MANAGED_IDENTITY_CLIENT_ID'" in module
     assert "name: 'OPTIMA_API_BASE_URL'" in module
     assert "name: 'OPTIMA_API_TIMEOUT_SECONDS'" in module
     assert "name: 'OPTIMA_UI_PRODUCTION_MODE'" in module
+
+
+def test_reviewed_model_versions_propagate_to_api_runtime() -> None:
+    """Carry each reviewed role version through Bicep without renaming it."""
+    main = read("infra/main.bicep")
+    resources = read("infra/resource-group.bicep")
+    module = read("infra/modules/container-apps.bicep")
+    expected = {
+        "foundrySmallModelVersion": "OPTIMA_FOUNDRY_SMALL_MODEL_VERSION",
+        "foundryStrongModelVersion": "OPTIMA_FOUNDRY_STRONG_MODEL_VERSION",
+        "judgeModelVersion": "OPTIMA_JUDGE_MODEL_VERSION",
+    }
+
+    for parameter, environment_name in expected.items():
+        assert f"param {parameter} string" in main
+        assert f"{parameter}: {parameter}" in main
+        assert f"param {parameter} string" in resources
+        assert f"{parameter}: {parameter}" in resources
+        assert f"param {parameter} string" in module
+        assert re.search(
+            rf"name: '{environment_name}'\s+value: {parameter}",
+            module,
+        )
+
+    for relative_path in (
+        "infra/environments/hackathon.bicepparam",
+        "infra/environments/hackathon.runtime.bicepparam",
+    ):
+        parameters = read(relative_path)
+        for parameter in expected:
+            assert f"param {parameter} = 'replace-" in parameters
 
 
 def test_semantic_cache_bicep_source_is_explicit_and_conditionally_composed() -> None:
@@ -309,6 +343,7 @@ def test_hackathon_parameters_select_reference_free_judge_without_deployment() -
         assert "param productionEvaluatorMode = 'LLM_JUDGE'" in content
         assert "param judgeDeployment = 'replace-judge-deployment'" in content
         assert "param judgeModel = 'replace-judge-model'" in content
+        assert "param judgeModelVersion = 'replace-judge-model-version'" in content
         assert "param judgeTimeoutSeconds = 30" in content
         assert "param deployContainerApps = false" in content
 
@@ -321,6 +356,7 @@ def test_container_apps_reject_checked_in_judge_placeholders() -> None:
     assert "judgeConfigurationIsAbsent" in module
     assert "toLower(judgeDeployment ?? '')" in module
     assert "toLower(judgeModel ?? '')" in module
+    assert "toLower(judgeModelVersion ?? '')" in module
     assert "requires deployable judge identity and pricing values" in module
     assert "EXACT_REFERENCE Container Apps deployment rejects inactive JUDGE" in module
     assert "var judgeEnvironment = validatedEvaluatorMode == 'LLM_JUDGE'" in module

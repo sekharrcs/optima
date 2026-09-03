@@ -101,11 +101,17 @@ param foundrySmallDeployment string
 @description('Provider model identity expected from the OPTIMA SMALL deployment.')
 param foundrySmallModel string
 
+@description('Reviewed model version expected from the OPTIMA SMALL deployment.')
+param foundrySmallModelVersion string
+
 @description('Foundry deployment mapped to the OPTIMA STRONG role.')
 param foundryStrongDeployment string
 
 @description('Provider model identity expected from the OPTIMA STRONG deployment.')
 param foundryStrongModel string
+
+@description('Reviewed model version expected from the OPTIMA STRONG deployment.')
+param foundryStrongModelVersion string
 
 @description('Production quality evaluator mode.')
 @allowed([
@@ -119,6 +125,9 @@ param judgeDeployment string?
 
 @description('Provider model identity expected for the OPTIMA JUDGE role in LLM_JUDGE mode.')
 param judgeModel string?
+
+@description('Reviewed model version expected for the OPTIMA JUDGE role in LLM_JUDGE mode.')
+param judgeModelVersion string?
 
 @description('Timeout in seconds for one JUDGE model request.')
 @minValue(1)
@@ -177,14 +186,17 @@ param tags object
 var judgeConfigurationIsComplete = !empty(trim(judgeDeployment ?? '')) && !startsWith(
   toLower(judgeDeployment ?? ''),
   'replace-'
-) && !empty(trim(judgeModel ?? '')) && !startsWith(toLower(judgeModel ?? ''), 'replace-') && !empty(trim(pricingJudgeInputRatePerMillionTokens ?? '')) && !startsWith(
+) && !empty(trim(judgeModel ?? '')) && !startsWith(toLower(judgeModel ?? ''), 'replace-') && !empty(trim(judgeModelVersion ?? '')) && !startsWith(
+  toLower(judgeModelVersion ?? ''),
+  'replace-'
+) && !empty(trim(pricingJudgeInputRatePerMillionTokens ?? '')) && !startsWith(
   toLower(pricingJudgeInputRatePerMillionTokens ?? ''),
   'replace-'
 ) && !empty(trim(pricingJudgeOutputRatePerMillionTokens ?? '')) && !startsWith(
   toLower(pricingJudgeOutputRatePerMillionTokens ?? ''),
   'replace-'
 )
-var judgeConfigurationIsAbsent = judgeDeployment == null && judgeModel == null && pricingJudgeInputRatePerMillionTokens == null && pricingJudgeOutputRatePerMillionTokens == null && pricingJudgeCachedInputRatePerMillionTokens == null
+var judgeConfigurationIsAbsent = judgeDeployment == null && judgeModel == null && judgeModelVersion == null && pricingJudgeInputRatePerMillionTokens == null && pricingJudgeOutputRatePerMillionTokens == null && pricingJudgeCachedInputRatePerMillionTokens == null
 var validatedEvaluatorMode = productionEvaluatorMode == 'LLM_JUDGE'
   ? judgeConfigurationIsComplete
       ? productionEvaluatorMode
@@ -202,6 +214,10 @@ var judgeEnvironment = validatedEvaluatorMode == 'LLM_JUDGE'
         {
           name: 'OPTIMA_JUDGE_MODEL'
           value: judgeModel!
+        }
+        {
+          name: 'OPTIMA_JUDGE_MODEL_VERSION'
+          value: judgeModelVersion!
         }
         {
           name: 'OPTIMA_JUDGE_TIMEOUT_SECONDS'
@@ -403,12 +419,20 @@ resource api 'Microsoft.App/containerApps@2025-07-01' = if (deployApplications) 
                 value: foundrySmallModel
               }
               {
+                name: 'OPTIMA_FOUNDRY_SMALL_MODEL_VERSION'
+                value: foundrySmallModelVersion
+              }
+              {
                 name: 'OPTIMA_FOUNDRY_STRONG_DEPLOYMENT'
                 value: foundryStrongDeployment
               }
               {
                 name: 'OPTIMA_FOUNDRY_STRONG_MODEL'
                 value: foundryStrongModel
+              }
+              {
+                name: 'OPTIMA_FOUNDRY_STRONG_MODEL_VERSION'
+                value: foundryStrongModelVersion
               }
               {
                 name: 'OPTIMA_FOUNDRY_AUTH_MODE'

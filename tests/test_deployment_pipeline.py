@@ -112,6 +112,22 @@ def test_cache_mode_is_configuration_controlled_and_propagated() -> None:
     )
 
 
+def test_reviewed_model_versions_reach_both_bicep_deployment_phases() -> None:
+    """Pass each protected role version through foundation and rollout unchanged."""
+    content = workflow()
+    expected = {
+        "foundrySmallModelVersion": "OPTIMA_FOUNDRY_SMALL_MODEL_VERSION",
+        "foundryStrongModelVersion": "OPTIMA_FOUNDRY_STRONG_MODEL_VERSION",
+        "judgeModelVersion": "OPTIMA_JUDGE_MODEL_VERSION",
+    }
+
+    for parameter, variable in expected.items():
+        assert f'{variable}: "${{{{ vars.{variable} }}}}"' in content
+        assert content.count(f'"{parameter}=${variable}"') == 2
+
+    assert "EXPECTED_RESPONSE_MODEL" not in content
+
+
 def test_cache_mode_is_not_hardcoded_to_a_literal_boolean() -> None:
     """Reject any workflow-owned cache mode that would need a code edit to change."""
     content = workflow()

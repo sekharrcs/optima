@@ -82,7 +82,7 @@ def successful_response(**updates: object) -> dict[str, object]:
     """Build one Azure OpenAI chat-completion response."""
     response: dict[str, object] = {
         "id": "chatcmpl-provider-1",
-        "model": "generator-response-model",
+        "model": "generator-response-model-v1",
         "choices": [{"message": {"role": "assistant", "content": "Result"}}],
         "usage": {
             "prompt_tokens": 17,
@@ -575,8 +575,10 @@ def foundry_settings(
         "foundry_base_url": "https://gateway.example/openai/v1",
         "foundry_small_deployment": "small-deployment",
         "foundry_small_model": "generator-response-model",
+        "foundry_small_model_version": "v1",
         "foundry_strong_deployment": "strong-deployment",
         "foundry_strong_model": "generator-response-model",
+        "foundry_strong_model_version": "v1",
         "foundry_auth_mode": auth_mode,
     }
     values.update(updates)
@@ -640,6 +642,63 @@ def test_generator_composition_rejects_unexpected_response_model() -> None:
         await pair.aclose()
 
     asyncio.run(execute())
+
+
+@pytest.mark.parametrize(
+    ("role", "deployment", "model", "version", "returned_model"),
+    [
+        (
+            ModelRole.SMALL,
+            "optima-small-gpt5-nano",
+            "gpt-5-nano",
+            "2025-08-07",
+            "gpt-5-nano-2025-08-07",
+        ),
+        (
+            ModelRole.STRONG,
+            "optima-strong-gpt52",
+            "gpt-5.2",
+            "2025-12-11",
+            "gpt-5.2-2025-12-11",
+        ),
+    ],
+)
+def test_generator_composition_derives_pinned_azure_response_identity(
+    role: ModelRole,
+    deployment: str,
+    model: str,
+    version: str,
+    returned_model: str,
+) -> None:
+    """Use deployment names for routing and model versions for response identity."""
+    requests: list[httpx.Request] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=successful_response(model=returned_model))
+
+    updates = {
+        f"foundry_{role.value.lower()}_deployment": deployment,
+        f"foundry_{role.value.lower()}_model": model,
+        f"foundry_{role.value.lower()}_model_version": version,
+    }
+    pair = build_foundry_provider_pair(
+        foundry_settings(
+            FoundryAuthMode.API_KEY,
+            foundry_api_key="fake-key",
+            **updates,
+        ),
+        transport=httpx.MockTransport(handle),
+    )
+    provider = pair.small_provider if role is ModelRole.SMALL else pair.strong_provider
+
+    async def execute() -> None:
+        await provider.generate(provider_request(role))
+        await pair.aclose()
+
+    asyncio.run(execute())
+
+    assert json.loads(requests[0].content)["model"] == deployment
 
 
 @pytest.mark.parametrize(
@@ -738,15 +797,16 @@ def test_judge_composition_uses_explicit_role_deployment_and_timeout() -> None:
         requests.append(request)
         return httpx.Response(
             200,
-            json=successful_response(model="judge-model-v1"),
+            json=successful_response(model="gpt-4o-2024-11-20"),
         )
 
     resources = build_foundry_judge_provider(
         foundry_settings(
             FoundryAuthMode.API_KEY,
             foundry_api_key="fake-key",
-            judge_deployment="judge-deployment",
-            judge_model="judge-model-v1",
+            judge_deployment="optima-judge-gpt4o",
+            judge_model="gpt-4o",
+            judge_model_version="2024-11-20",
             judge_timeout_seconds=7.5,
         ),
         transport=httpx.MockTransport(handle),
@@ -759,9 +819,9 @@ def test_judge_composition_uses_explicit_role_deployment_and_timeout() -> None:
     asyncio.run(execute())
 
     assert resources.provider.model_role is ModelRole.JUDGE
-    assert resources.provider.deployment_name == "judge-deployment"
+    assert resources.provider.deployment_name == "optima-judge-gpt4o"
     assert resources.http_client.timeout.read == 7.5
-    assert json.loads(requests[0].content)["model"] == "judge-deployment"
+    assert json.loads(requests[0].content)["model"] == "optima-judge-gpt4o"
 
 
 @pytest.mark.parametrize(
@@ -779,6 +839,7 @@ def test_judge_composition_rejects_unverified_response_model(
             foundry_api_key="fake-key",
             judge_deployment="judge-deployment",
             judge_model="judge-model-v1",
+            judge_model_version="2025-04-14",
         ),
         transport=httpx.MockTransport(
             lambda request: httpx.Response(

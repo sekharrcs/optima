@@ -61,11 +61,17 @@ param foundrySmallDeployment string
 @description('Provider model identity expected from the OPTIMA SMALL deployment.')
 param foundrySmallModel string
 
+@description('Reviewed model version expected from the OPTIMA SMALL deployment.')
+param foundrySmallModelVersion string
+
 @description('Foundry deployment mapped to the OPTIMA STRONG role.')
 param foundryStrongDeployment string
 
 @description('Provider model identity expected from the OPTIMA STRONG deployment.')
 param foundryStrongModel string
+
+@description('Reviewed model version expected from the OPTIMA STRONG deployment.')
+param foundryStrongModelVersion string
 
 @description('Production quality evaluator mode.')
 @allowed([
@@ -79,6 +85,9 @@ param judgeDeployment string?
 
 @description('Provider model identity expected for the OPTIMA JUDGE role in LLM_JUDGE mode.')
 param judgeModel string?
+
+@description('Reviewed model version expected for the OPTIMA JUDGE role in LLM_JUDGE mode.')
+param judgeModelVersion string?
 
 @description('Timeout in seconds for one JUDGE model request.')
 @minValue(1)
@@ -293,11 +302,14 @@ module resources 'resource-group.bicep' = {
     foundryBaseUrl: foundryBaseUrl
     foundrySmallDeployment: foundrySmallDeployment
     foundrySmallModel: foundrySmallModel
+    foundrySmallModelVersion: foundrySmallModelVersion
     foundryStrongDeployment: foundryStrongDeployment
     foundryStrongModel: foundryStrongModel
+    foundryStrongModelVersion: foundryStrongModelVersion
     foundryTokenScope: foundryTokenScope
     judgeDeployment: judgeDeployment
     judgeModel: judgeModel
+    judgeModelVersion: judgeModelVersion
     judgeTimeoutSeconds: judgeTimeoutSeconds
     location: location
     pricingCatalogVersion: pricingCatalogVersion

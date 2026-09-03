@@ -55,8 +55,10 @@ def production_settings(**updates: object) -> AppSettings:
         "foundry_base_url": "https://optima.openai.azure.com/openai/v1",
         "foundry_small_deployment": "small",
         "foundry_small_model": "small-model",
+        "foundry_small_model_version": "small-version",
         "foundry_strong_deployment": "strong",
         "foundry_strong_model": "strong-model",
+        "foundry_strong_model_version": "strong-version",
         "foundry_auth_mode": FoundryAuthMode.MANAGED_IDENTITY,
         "foundry_token_scope": "https://cognitiveservices.azure.com/.default",
         "foundry_managed_identity_client_id": "api-client-id",
@@ -316,6 +318,7 @@ def llm_judge_settings(**updates: object) -> AppSettings:
         "production_require_reference_output": False,
         "judge_deployment": "judge",
         "judge_model": "judge-model-v1",
+        "judge_model_version": "2025-04-14",
     }
     values.update(updates)
     return production_settings(**values)
