@@ -144,7 +144,9 @@ def build_foundry_provider_pair(
             model_role=ModelRole.SMALL,
             authentication=authentication,
             client=client,
-            expected_response_model=configuration.small_model,
+            expected_response_model=(
+                f"{configuration.small_model}-{configuration.small_model_version}"
+            ),
             clock=monotonic_clock,
         ),
         strong_provider=FoundryModelProvider(
@@ -153,7 +155,9 @@ def build_foundry_provider_pair(
             model_role=ModelRole.STRONG,
             authentication=authentication,
             client=client,
-            expected_response_model=configuration.strong_model,
+            expected_response_model=(
+                f"{configuration.strong_model}-{configuration.strong_model_version}"
+            ),
             clock=monotonic_clock,
         ),
         http_client=client,
@@ -206,7 +210,7 @@ def build_foundry_judge_provider(
             model_role=ModelRole.JUDGE,
             authentication=authentication,
             client=client,
-            expected_response_model=judge.model,
+            expected_response_model=f"{judge.model}-{judge.model_version}",
             clock=monotonic_clock,
         ),
         http_client=client,

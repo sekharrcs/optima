@@ -330,6 +330,15 @@ deployments. The JUDGE role has its own deployment, model identity, timeout, HTT
 client, usage records, pricing entry, and application-lifetime close boundary. It
 is never inferred from the SMALL or STRONG deployment.
 
+Azure production composition also receives the separately reviewed model
+version for each active role. For the three pinned deployments, live canaries
+proved that Azure reports `${model}-${version}` in the response. The composition
+root derives that exact expected identity and supplies it to the generic
+provider. The provider performs strict literal equality and contains no Azure
+naming convention, normalization, or compatibility fallback. Any future
+model/version binding requires its own canary before this production derivation
+is accepted.
+
 ### Evaluator
 
 Produces measured evidence against the Quality Contract. It does not choose the

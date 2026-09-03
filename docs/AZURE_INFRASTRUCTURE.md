@@ -249,9 +249,14 @@ The UI receives no Foundry, Cosmos, Redis, or Application Insights setting.
 | `OPTIMA_EXECUTION_TIMEOUT_SECONDS`                  | Literal `300`                                  | No     | Not applicable                 | IaC                |
 | `OPTIMA_FOUNDRY_BASE_URL`                           | Reviewed Foundry/APIM parameter                | No     | Not applicable                 | AI/gateway slice   |
 | `OPTIMA_FOUNDRY_SMALL_DEPLOYMENT`                   | Reviewed model deployment parameter            | No     | Not applicable                 | AI/model slice     |
+| `OPTIMA_FOUNDRY_SMALL_MODEL`                        | Reviewed SMALL model identity                  | No     | Not applicable                 | AI/model slice     |
+| `OPTIMA_FOUNDRY_SMALL_MODEL_VERSION`                | Reviewed SMALL model version                   | No     | Not applicable                 | AI/model slice     |
 | `OPTIMA_FOUNDRY_STRONG_DEPLOYMENT`                  | Reviewed model deployment parameter            | No     | Not applicable                 | AI/model slice     |
+| `OPTIMA_FOUNDRY_STRONG_MODEL`                       | Reviewed STRONG model identity                 | No     | Not applicable                 | AI/model slice     |
+| `OPTIMA_FOUNDRY_STRONG_MODEL_VERSION`               | Reviewed STRONG model version                  | No     | Not applicable                 | AI/model slice     |
 | `OPTIMA_JUDGE_DEPLOYMENT`                           | Reviewed judge deployment parameter            | No     | Not applicable                 | AI/model slice     |
 | `OPTIMA_JUDGE_MODEL`                                | Reviewed judge model identity                  | No     | Not applicable                 | AI/model slice     |
+| `OPTIMA_JUDGE_MODEL_VERSION`                        | Reviewed judge model version                   | No     | Not applicable                 | AI/model slice     |
 | `OPTIMA_JUDGE_TIMEOUT_SECONDS`                      | Bounded judge timeout parameter                | No     | Not applicable                 | AI/model slice     |
 | `OPTIMA_FOUNDRY_AUTH_MODE`                          | Literal `MANAGED_IDENTITY`                     | No     | Selected mode                  | IaC                |
 | `OPTIMA_FOUNDRY_TOKEN_SCOPE`                        | Reviewed direct Foundry or APIM token scope    | No     | Token audience                 | AI/gateway slice   |
@@ -281,6 +286,12 @@ to preserve the Slice 10D isolation and cost contract. Existing module flags,
 quality thresholds, planner thresholds, Redis timeouts, Redis connection bounds,
 Cosmos retry limits, and history list limits retain their typed application
 defaults unless benchmark calibration supplies an explicit override.
+
+For the pinned production deployments, Azure returned response identities in
+the exact `${model}-${version}` form. Container Apps passes each model and
+version separately. Production composition derives the expected response value,
+while the provider retains one literal fail-closed equality check. A future
+model/version binding must pass a response-identity canary before rollout.
 
 No account key, Redis access key, Foundry API key, password, subscription
 credential, or tenant credential is present in a parameter file or template

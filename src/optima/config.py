@@ -47,6 +47,10 @@ NonNegativeRate = Annotated[
     Field(ge=Decimal("0"), allow_inf_nan=False),
 ]
 NonEmptyString = Annotated[str, Field(strict=True, min_length=1)]
+NonBlankModelVersion = Annotated[
+    str,
+    Field(strict=True, min_length=1, pattern=r"^\S+$"),
+]
 TelemetryResourceName = Annotated[
     str,
     Field(
@@ -84,6 +88,7 @@ _PRODUCTION_JUDGE_ONLY_FIELDS = frozenset(
     {
         "judge_deployment",
         "judge_model",
+        "judge_model_version",
         "judge_timeout_seconds",
         "pricing_judge_cached_input_rate_per_million_tokens",
         "pricing_judge_input_rate_per_million_tokens",
@@ -153,6 +158,7 @@ class JudgeProviderConfiguration(ImmutableModel):
 
     deployment: NonEmptyString
     model: NonEmptyString
+    model_version: NonBlankModelVersion
     timeout_seconds: BoundedTimeoutSeconds = 30.0
 
 
@@ -287,8 +293,10 @@ class FoundryProviderConfiguration(ImmutableModel):
     base_url: NonEmptyString
     small_deployment: NonEmptyString
     small_model: NonEmptyString
+    small_model_version: NonBlankModelVersion
     strong_deployment: NonEmptyString
     strong_model: NonEmptyString
+    strong_model_version: NonBlankModelVersion
     auth_mode: FoundryAuthMode
     api_key: SecretStr | None = None
     token_scope: NonEmptyString | None = None
@@ -517,8 +525,10 @@ class AppSettings(BaseSettings):
     foundry_base_url: str | None = None
     foundry_small_deployment: str | None = None
     foundry_small_model: str | None = None
+    foundry_small_model_version: str | None = None
     foundry_strong_deployment: str | None = None
     foundry_strong_model: str | None = None
+    foundry_strong_model_version: str | None = None
     foundry_auth_mode: FoundryAuthMode | None = None
     foundry_api_key: SecretStr | None = None
     foundry_token_scope: str | None = None
@@ -526,6 +536,7 @@ class AppSettings(BaseSettings):
     foundry_timeout_seconds: PositiveSeconds = 30.0
     judge_deployment: str | None = None
     judge_model: str | None = None
+    judge_model_version: str | None = None
     judge_timeout_seconds: BoundedTimeoutSeconds = 30.0
     cosmos_endpoint: str | None = None
     cosmos_database_name: str | None = None
@@ -615,8 +626,10 @@ class AppSettings(BaseSettings):
             self.foundry_base_url,
             self.foundry_small_deployment,
             self.foundry_small_model,
+            self.foundry_small_model_version,
             self.foundry_strong_deployment,
             self.foundry_strong_model,
+            self.foundry_strong_model_version,
             self.foundry_auth_mode,
             self.foundry_api_key,
             self.foundry_token_scope,
@@ -628,20 +641,24 @@ class AppSettings(BaseSettings):
             self.foundry_base_url is None
             or self.foundry_small_deployment is None
             or self.foundry_small_model is None
+            or self.foundry_small_model_version is None
             or self.foundry_strong_deployment is None
             or self.foundry_strong_model is None
+            or self.foundry_strong_model_version is None
             or self.foundry_auth_mode is None
         ):
             raise ValueError(
                 "Foundry composition requires base URL, SMALL and STRONG deployment "
-                "and model identities, and auth mode"
+                "and model/version identities, and auth mode"
             )
         return FoundryProviderConfiguration(
             base_url=self.foundry_base_url,
             small_deployment=self.foundry_small_deployment,
             small_model=self.foundry_small_model,
+            small_model_version=self.foundry_small_model_version,
             strong_deployment=self.foundry_strong_deployment,
             strong_model=self.foundry_strong_model,
+            strong_model_version=self.foundry_strong_model_version,
             auth_mode=self.foundry_auth_mode,
             api_key=self.foundry_api_key,
             token_scope=self.foundry_token_scope,
@@ -651,13 +668,24 @@ class AppSettings(BaseSettings):
 
     def judge_provider_configuration(self) -> JudgeProviderConfiguration | None:
         """Build the explicit JUDGE role settings when they are configured."""
-        if self.judge_deployment is None and self.judge_model is None:
+        if (
+            self.judge_deployment is None
+            and self.judge_model is None
+            and self.judge_model_version is None
+        ):
             return None
-        if self.judge_deployment is None or self.judge_model is None:
-            raise ValueError("LLM judge composition requires both deployment and model")
+        if (
+            self.judge_deployment is None
+            or self.judge_model is None
+            or self.judge_model_version is None
+        ):
+            raise ValueError(
+                "LLM judge composition requires deployment and model/version identity"
+            )
         return JudgeProviderConfiguration(
             deployment=self.judge_deployment,
             model=self.judge_model,
+            model_version=self.judge_model_version,
             timeout_seconds=self.judge_timeout_seconds,
         )
 

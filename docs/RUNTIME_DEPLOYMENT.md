@@ -235,6 +235,7 @@ Evaluator configuration is explicit:
   requirement
 * `OPTIMA_JUDGE_DEPLOYMENT` identifies the JUDGE deployment in `LLM_JUDGE` mode
 * `OPTIMA_JUDGE_MODEL` records the reviewed provider model identity
+* `OPTIMA_JUDGE_MODEL_VERSION` records the reviewed provider model version
 * `OPTIMA_JUDGE_TIMEOUT_SECONDS` sets a bounded JUDGE request timeout, default 30
 
 Required external Foundry values are:
@@ -242,13 +243,22 @@ Required external Foundry values are:
 * HTTPS Azure OpenAI v1 root ending in `/openai/v1`
 * SMALL chat-completions deployment name
 * SMALL provider-reported model identity
+* SMALL provider-reported model version
 * STRONG chat-completions deployment name
 * STRONG provider-reported model identity
-* JUDGE chat-completions deployment and provider model identity
+* STRONG provider-reported model version
+* JUDGE chat-completions deployment, provider model identity, and model version
 * Embedding deployment name and provider-reported model identity when cache is enabled
 * Exact embedding vector dimension when cache is enabled
 * Token scope, normally `https://cognitiveservices.azure.com/.default`
 * Cognitive Services OpenAI User for the API identity on the exact Foundry resource
+
+The pinned Azure deployments returned response identities in the exact
+`${model}-${version}` form during live canaries. Production composition derives
+that expected value from the separate reviewed fields and supplies it to the
+generic provider, which retains strict literal equality. This is a fail-closed
+contract for the reviewed bindings, not a universal Azure naming rule. Run a
+new response-identity canary before changing any production model or version.
 
 Production Managed Identity mode requires the API user-assigned client ID for
 Foundry and Cosmos. Enabled cache mode additionally requires it for Redis, plus

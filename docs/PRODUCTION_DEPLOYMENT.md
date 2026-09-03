@@ -282,6 +282,19 @@ Do not derive a deployment name from a model name. Do not create a missing
 deployment until the owner has reviewed regional availability, quota, and
 estimated variable usage cost.
 
+Live canaries for the pinned hackathon deployments returned
+`gpt-5-nano-2025-08-07`, `gpt-5.2-2025-12-11`, and
+`gpt-4o-2024-11-20`. Production therefore keeps deployment, model, and version
+as separate reviewed values, sends the deployment name for request routing, and
+derives the exact expected response identity as `${model}-${version}`. The
+provider compares that derived value by strict equality without normalization,
+prefix matching, or fallback identities.
+
+This contract records observed behavior for the pinned deployments. It does not
+claim that every current or future Azure model uses the same response naming
+convention. Any model or version change requires a bounded canary that confirms
+the returned response identity before production use.
+
 Capture a public HTTPS pricing source without credentials or a query string,
 catalog snapshot/version, currency, and exact
 per-million-token rates for the same model and version. Cached-input rates are

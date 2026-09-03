@@ -57,8 +57,10 @@ def isolate_settings_sources(
         "OPTIMA_FOUNDRY_BASE_URL",
         "OPTIMA_FOUNDRY_SMALL_DEPLOYMENT",
         "OPTIMA_FOUNDRY_SMALL_MODEL",
+        "OPTIMA_FOUNDRY_SMALL_MODEL_VERSION",
         "OPTIMA_FOUNDRY_STRONG_DEPLOYMENT",
         "OPTIMA_FOUNDRY_STRONG_MODEL",
+        "OPTIMA_FOUNDRY_STRONG_MODEL_VERSION",
         "OPTIMA_FOUNDRY_AUTH_MODE",
         "OPTIMA_FOUNDRY_API_KEY",
         "OPTIMA_FOUNDRY_TOKEN_SCOPE",
@@ -66,6 +68,7 @@ def isolate_settings_sources(
         "OPTIMA_FOUNDRY_TIMEOUT_SECONDS",
         "OPTIMA_JUDGE_DEPLOYMENT",
         "OPTIMA_JUDGE_MODEL",
+        "OPTIMA_JUDGE_MODEL_VERSION",
         "OPTIMA_JUDGE_TIMEOUT_SECONDS",
         "OPTIMA_COSMOS_ENDPOINT",
         "OPTIMA_COSMOS_DATABASE_NAME",
@@ -201,8 +204,10 @@ def test_settings_accept_explicit_injection() -> None:
         "foundry_base_url": None,
         "foundry_small_deployment": None,
         "foundry_small_model": None,
+        "foundry_small_model_version": None,
         "foundry_strong_deployment": None,
         "foundry_strong_model": None,
+        "foundry_strong_model_version": None,
         "foundry_auth_mode": None,
         "foundry_api_key": None,
         "foundry_token_scope": None,
@@ -210,6 +215,7 @@ def test_settings_accept_explicit_injection() -> None:
         "foundry_timeout_seconds": 30.0,
         "judge_deployment": None,
         "judge_model": None,
+        "judge_model_version": None,
         "judge_timeout_seconds": 30.0,
         "cosmos_endpoint": None,
         "cosmos_database_name": None,
@@ -262,8 +268,10 @@ def production_settings(**updates: object) -> AppSettings:
         "foundry_base_url": "https://optima.openai.azure.com/openai/v1",
         "foundry_small_deployment": "small",
         "foundry_small_model": "small-model",
+        "foundry_small_model_version": "small-version",
         "foundry_strong_deployment": "strong",
         "foundry_strong_model": "strong-model",
+        "foundry_strong_model_version": "strong-version",
         "foundry_auth_mode": FoundryAuthMode.MANAGED_IDENTITY,
         "foundry_token_scope": "https://cognitiveservices.azure.com/.default",
         "foundry_managed_identity_client_id": "api-client-id",
@@ -320,6 +328,7 @@ def test_production_runtime_accepts_disabled_cache_without_cache_only_settings()
     [
         "judge_deployment",
         "judge_model",
+        "judge_model_version",
         "judge_timeout_seconds",
         "pricing_judge_cached_input_rate_per_million_tokens",
         "pricing_judge_input_rate_per_million_tokens",
@@ -389,6 +398,7 @@ def test_production_runtime_accepts_reference_free_llm_judge_configuration() -> 
         production_require_reference_output=False,
         judge_deployment="judge-deployment",
         judge_model="judge-model-v1",
+        judge_model_version="2025-04-14",
         judge_timeout_seconds=12.5,
     )
 
@@ -397,6 +407,7 @@ def test_production_runtime_accepts_reference_free_llm_judge_configuration() -> 
     assert judge is not None
     assert judge.deployment == "judge-deployment"
     assert judge.model == "judge-model-v1"
+    assert judge.model_version == "2025-04-14"
     assert judge.timeout_seconds == 12.5
 
 
@@ -431,6 +442,7 @@ def test_production_runtime_rejects_unsupported_evaluator_configuration(
                 "production_require_reference_output": True,
                 "judge_deployment": "judge-deployment",
                 "judge_model": "judge-model-v1",
+                "judge_model_version": "2025-04-14",
             },
             "must not require reference output",
         ),
@@ -447,7 +459,7 @@ def test_production_runtime_rejects_unsupported_evaluator_configuration(
                 "production_require_reference_output": False,
                 "judge_deployment": "judge-deployment",
             },
-            "requires both deployment and model",
+            "requires deployment and model/version identity",
         ),
     ],
     ids=["reference-gate", "missing-judge", "partial-judge"],
@@ -469,8 +481,10 @@ def test_production_runtime_rejects_invalid_llm_judge_configuration(
                 "foundry_base_url": None,
                 "foundry_small_deployment": None,
                 "foundry_small_model": None,
+                "foundry_small_model_version": None,
                 "foundry_strong_deployment": None,
                 "foundry_strong_model": None,
+                "foundry_strong_model_version": None,
                 "foundry_auth_mode": None,
                 "foundry_token_scope": None,
                 "foundry_managed_identity_client_id": None,
@@ -583,6 +597,7 @@ def test_llm_judge_pricing_builds_separate_role_rates() -> None:
         production_require_reference_output=False,
         judge_deployment="judge-deployment",
         judge_model="judge-model-v1",
+        judge_model_version="2025-04-14",
         pricing_catalog_version="foundry-apim-2026-01-01",
         pricing_small_input_rate_per_million_tokens=Decimal("0.15"),
         pricing_small_output_rate_per_million_tokens=Decimal("0.60"),
@@ -610,6 +625,7 @@ def test_llm_judge_rejects_catalog_without_judge_rates() -> None:
             production_require_reference_output=False,
             judge_deployment="judge-deployment",
             judge_model="judge-model-v1",
+            judge_model_version="2025-04-14",
             pricing_catalog_version="foundry-apim-2026-01-01",
             pricing_small_input_rate_per_million_tokens=Decimal("0.15"),
             pricing_small_output_rate_per_million_tokens=Decimal("0.60"),
@@ -665,6 +681,7 @@ def test_cache_disabled_pricing_requires_only_active_model_and_judge_roles() -> 
         production_cost_measurement_required=True,
         judge_deployment="judge-deployment",
         judge_model="judge-model-v1",
+        judge_model_version="2025-04-14",
         pricing_catalog_version="foundry-apim-2026-01-01",
         pricing_small_input_rate_per_million_tokens=Decimal("0.15"),
         pricing_small_output_rate_per_million_tokens=Decimal("0.60"),
@@ -1110,8 +1127,10 @@ def test_settings_build_explicit_foundry_authentication_modes(
         "foundry_base_url": "https://gateway.example/openai/v1",
         "foundry_small_deployment": "small-deployment",
         "foundry_small_model": "small-model",
+        "foundry_small_model_version": "small-version",
         "foundry_strong_deployment": "strong-deployment",
         "foundry_strong_model": "strong-model",
+        "foundry_strong_model_version": "strong-version",
         "foundry_auth_mode": auth_mode,
     }
     values.update(auth_values)
@@ -1123,9 +1142,50 @@ def test_settings_build_explicit_foundry_authentication_modes(
     assert configuration.auth_mode is auth_mode
     assert configuration.small_deployment == "small-deployment"
     assert configuration.small_model == "small-model"
+    assert configuration.small_model_version == "small-version"
     assert configuration.strong_deployment == "strong-deployment"
     assert configuration.strong_model == "strong-model"
+    assert configuration.strong_model_version == "strong-version"
     assert isinstance(configuration.api_key, SecretStr) or configuration.api_key is None
+
+
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value", "message"),
+    [
+        ("foundry_small_model_version", None, "Foundry composition requires"),
+        ("foundry_small_model_version", "", "String should have at least 1 character"),
+        ("foundry_small_model_version", "   ", "String should match pattern"),
+        ("foundry_small_model_version", " 2025-08-07", "String should match pattern"),
+        ("foundry_small_model_version", "2025-08-07 ", "String should match pattern"),
+        ("foundry_strong_model_version", None, "Foundry composition requires"),
+        ("foundry_strong_model_version", "", "String should have at least 1 character"),
+        ("foundry_strong_model_version", "   ", "String should match pattern"),
+        ("foundry_strong_model_version", " 2025-12-11", "String should match pattern"),
+        ("foundry_strong_model_version", "2025-12-11 ", "String should match pattern"),
+        ("judge_model_version", None, "LLM judge composition requires"),
+        ("judge_model_version", "", "String should have at least 1 character"),
+        ("judge_model_version", "   ", "String should match pattern"),
+        ("judge_model_version", " 2024-11-20", "String should match pattern"),
+        ("judge_model_version", "2024-11-20 ", "String should match pattern"),
+    ],
+)
+def test_production_model_versions_must_be_present_and_nonblank(
+    field_name: str,
+    invalid_value: object,
+    message: str,
+) -> None:
+    """Reject missing or blank reviewed versions before provider construction."""
+    values: dict[str, object] = {
+        "production_evaluator_mode": ProductionEvaluatorMode.LLM_JUDGE,
+        "production_require_reference_output": False,
+        "judge_deployment": "judge-deployment",
+        "judge_model": "judge-model",
+        "judge_model_version": "judge-version",
+    }
+    values[field_name] = invalid_value
+
+    with pytest.raises(ValidationError, match=message):
+        production_settings(**values)
 
 
 def test_settings_read_foundry_api_key_without_exposing_it(
@@ -1138,8 +1198,10 @@ def test_settings_read_foundry_api_key_without_exposing_it(
     )
     monkeypatch.setenv("OPTIMA_FOUNDRY_SMALL_DEPLOYMENT", "small-deployment")
     monkeypatch.setenv("OPTIMA_FOUNDRY_SMALL_MODEL", "small-model")
+    monkeypatch.setenv("OPTIMA_FOUNDRY_SMALL_MODEL_VERSION", "small-version")
     monkeypatch.setenv("OPTIMA_FOUNDRY_STRONG_DEPLOYMENT", "strong-deployment")
     monkeypatch.setenv("OPTIMA_FOUNDRY_STRONG_MODEL", "strong-model")
+    monkeypatch.setenv("OPTIMA_FOUNDRY_STRONG_MODEL_VERSION", "strong-version")
     monkeypatch.setenv("OPTIMA_FOUNDRY_AUTH_MODE", "API_KEY")
     monkeypatch.setenv("OPTIMA_FOUNDRY_API_KEY", "configured-secret")
 
