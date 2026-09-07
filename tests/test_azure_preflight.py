@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import json
 from dataclasses import replace
 from datetime import date, timedelta
 from decimal import Decimal
@@ -13,6 +15,7 @@ import pytest
 from scripts.azure_preflight import (
     ACR_PUSH_ROLE_ID,
     CONTRIBUTOR_ROLE_ID,
+    MICROSOFT_GRAPH_HOST,
     OPENAI_USER_ROLE_ID,
     PREFLIGHT_CACHE_ONLY_SETTINGS,
     READER_ROLE_ID,
@@ -36,6 +39,11 @@ ROOT = Path(__file__).resolve().parents[1]
 SUBSCRIPTION_ID = "11111111-2222-3333-4444-555555555555"
 TENANT_ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 CLIENT_ID = "12345678-abcd-4321-abcd-123456789abc"
+DEPLOYMENT_PRINCIPAL_ID = "22222222-3333-4444-5555-666666666666"
+FOUNDATION_PLAN_CLIENT_ID = "87654321-dcba-1234-dcba-cba987654321"
+FOUNDATION_PLAN_PRINCIPAL_ID = "77777777-6666-5555-4444-333333333333"
+FOUNDATION_PLAN_ROLE_DEFINITION_ID = "99999999-8888-7777-6666-555555555555"
+TRANSITIVE_GROUP_ID = "88888888-7777-6666-5555-444444444444"
 UI_AUTH_CLIENT_ID = "ui-auth-client-id"
 UI_AUTH_CLIENT_SECRET_ENV = "".join(("OPTIMA_UI_AUTH_", "CLIENT_SECRET"))
 OPENAI_RESOURCE_ID = (
@@ -51,6 +59,112 @@ REDIS_USAGE_URL = (
     "Microsoft.Cache/locations/eastus2/usages"
     f"?api-version={REDIS_API_VERSION}"
 )
+
+
+def role_definition_resource_id(role_id: str) -> str:
+    """Return one canonical subscription role-definition ARM ID."""
+    return (
+        f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+        f"Microsoft.Authorization/roleDefinitions/{role_id}"
+    )
+
+
+def synthetic_access_token(
+    *,
+    tenant_id: str,
+    client_id: str,
+    principal_id: str,
+    client_claim_name: str = "appid",
+    extra_claims: dict[str, Any] | None = None,
+) -> str:
+    """Build a non-secret JWT-shaped value for local claim parsing tests."""
+
+    def encode(document: dict[str, Any]) -> str:
+        payload = json.dumps(document, separators=(",", ":")).encode("utf-8")
+        return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+    claims: dict[str, Any] = {
+        client_claim_name: client_id,
+        "oid": principal_id,
+        "tid": tenant_id,
+    }
+    claims.update(extra_claims or {})
+    return f"{encode({'alg': 'RS256', 'typ': 'JWT'})}.{encode(claims)}.signature"
+
+
+def effective_assignment(
+    role_id: str,
+    scope: str,
+    *,
+    principal_id: str,
+    principal_type: str = "ServicePrincipal",
+) -> dict[str, str]:
+    """Return one canonical effective Azure RBAC assignment."""
+    return {
+        "principalId": principal_id,
+        "principalType": principal_type,
+        "roleDefinitionId": role_definition_resource_id(role_id),
+        "scope": scope,
+    }
+
+
+def apply_effective_assignments() -> list[dict[str, str]]:
+    """Return the exact post-bootstrap apply role set."""
+    subscription_scope = f"/subscriptions/{SUBSCRIPTION_ID}"
+    return [
+        effective_assignment(
+            READER_ROLE_ID,
+            subscription_scope,
+            principal_id=DEPLOYMENT_PRINCIPAL_ID,
+        ),
+        effective_assignment(
+            CONTRIBUTOR_ROLE_ID,
+            f"{subscription_scope}/resourceGroups/rg-optima-hackathon",
+            principal_id=DEPLOYMENT_PRINCIPAL_ID,
+        ),
+    ]
+
+
+def plan_effective_assignments() -> list[dict[str, str]]:
+    """Return the exact read-only foundation plan role set."""
+    subscription_scope = f"/subscriptions/{SUBSCRIPTION_ID}"
+    return [
+        effective_assignment(
+            READER_ROLE_ID,
+            subscription_scope,
+            principal_id=FOUNDATION_PLAN_PRINCIPAL_ID,
+        ),
+        effective_assignment(
+            FOUNDATION_PLAN_ROLE_DEFINITION_ID,
+            f"{subscription_scope}/resourceGroups/rg-optima-hackathon",
+            principal_id=FOUNDATION_PLAN_PRINCIPAL_ID,
+        ),
+    ]
+
+
+def foundation_plan_role_definition(
+    *,
+    actions: list[str] | None = None,
+    assignable_scopes: list[str] | None = None,
+) -> dict[str, Any]:
+    """Return the exact non-mutating custom role definition for planning."""
+    return {
+        "assignableScopes": assignable_scopes
+        if assignable_scopes is not None
+        else [f"/subscriptions/{SUBSCRIPTION_ID}"],
+        "id": role_definition_resource_id(FOUNDATION_PLAN_ROLE_DEFINITION_ID),
+        "permissions": [
+            {
+                "actions": actions
+                if actions is not None
+                else ["Microsoft.Resources/deployments/whatIf/action"],
+                "dataActions": [],
+                "notActions": [],
+                "notDataActions": [],
+            }
+        ],
+        "roleType": "CustomRole",
+    }
 
 
 def redis_provider_metadata(*, quota_advertised: bool = False) -> dict[str, Any]:
@@ -237,6 +351,41 @@ def foundation_environment() -> dict[str, str]:
     }
 
 
+def foundation_plan_environment() -> dict[str, str]:
+    """Return the minimal foundation contract with a distinct plan identity."""
+    environment = foundation_environment()
+    environment.update(
+        {
+            "AZURE_FOUNDATION_PLAN_CLIENT_ID": FOUNDATION_PLAN_CLIENT_ID,
+            "AZURE_FOUNDATION_PLAN_IDENTITY_RESOURCE_ID": (
+                f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg-identity/"
+                "providers/Microsoft.ManagedIdentity/userAssignedIdentities/"
+                "id-optima-foundation-plan"
+            ),
+            "AZURE_FOUNDATION_PLAN_ROLE_DEFINITION_ID": (
+                FOUNDATION_PLAN_ROLE_DEFINITION_ID
+            ),
+        }
+    )
+    return environment
+
+
+def foundation_apply_environment() -> dict[str, str]:
+    """Return the minimal separated apply contract with both identities."""
+    environment = foundation_environment()
+    environment.update(
+        {
+            "AZURE_FOUNDATION_PLAN_CLIENT_ID": FOUNDATION_PLAN_CLIENT_ID,
+            "AZURE_FOUNDATION_PLAN_IDENTITY_RESOURCE_ID": (
+                f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg-identity/"
+                "providers/Microsoft.ManagedIdentity/userAssignedIdentities/"
+                "id-optima-foundation-plan"
+            ),
+        }
+    )
+    return environment
+
+
 class FakeAzure:
     """Return deterministic Azure resource evidence for preflight tests."""
 
@@ -256,6 +405,23 @@ class FakeAzure:
         self.forbidden_deployment_role = forbidden_deployment_role
         self.lingering_subscription_contributor = lingering_subscription_contributor
         self.lingering_redis = lingering_redis
+        self.deployment_principal_id = (
+            FOUNDATION_PLAN_PRINCIPAL_ID
+            if configuration.foundation_plan_role_definition_id is not None
+            else DEPLOYMENT_PRINCIPAL_ID
+        )
+        self.session_client_id = configuration.deployment_client_id
+        self.session_principal_id = self.deployment_principal_id
+        self.session_tenant_id = configuration.tenant_id
+        self.account_user_type = "servicePrincipal"
+        self.returned_identity_id = configuration.deployment_identity_resource_id
+        self.returned_identity_client_id = configuration.deployment_client_id
+        self.effective_assignments: list[dict[str, Any]] | None = None
+        self.access_token: str | None = None
+        self.role_definition_response: Any = None
+        self.transitive_group_ids: list[str] = []
+        self.transitive_group_response: Any = None
+        self.group_role_assignments: dict[str, list[dict[str, Any]]] = {}
         self.calls: list[tuple[str, ...]] = []
 
     def json(self, *arguments: str, allow_missing: bool = False) -> Any:
@@ -267,6 +433,20 @@ class FakeAzure:
                 "id": self.configuration.subscription_id,
                 "state": "Enabled",
                 "tenantId": self.configuration.tenant_id,
+                "user": {
+                    "name": self.session_client_id,
+                    "type": self.account_user_type,
+                },
+            }
+        if arguments[:2] == ("account", "get-access-token"):
+            return {
+                "accessToken": self.access_token
+                or synthetic_access_token(
+                    tenant_id=self.session_tenant_id,
+                    client_id=self.session_client_id,
+                    principal_id=self.session_principal_id,
+                ),
+                "tokenType": "Bearer",
             }
         if arguments[:2] == ("provider", "show"):
             assert arguments[-1] in REQUIRED_PROVIDERS
@@ -275,10 +455,11 @@ class FakeAzure:
             return {"registrationState": "Registered"}
         if arguments[:2] == ("identity", "show"):
             identity_name = arguments[arguments.index("--name") + 1]
-            if identity_name == "id-optima-deploy":
+            if identity_name in {"id-optima-deploy", "id-optima-foundation-plan"}:
                 return {
-                    "clientId": self.configuration.deployment_client_id,
-                    "principalId": "deployment-principal-id",
+                    "clientId": self.returned_identity_client_id,
+                    "id": self.returned_identity_id,
+                    "principalId": self.deployment_principal_id,
                 }
             if identity_name == "id-optima-api-hackathon":
                 return {"principalId": "api-principal-id"}
@@ -292,6 +473,14 @@ class FakeAzure:
                     "subject": "repo:sekharrcs/optima:environment:hackathon",
                 }
             ]
+        if arguments[:3] == ("role", "definition", "list"):
+            if self.role_definition_response is not None:
+                return self.role_definition_response
+            role_id = self.configuration.foundation_plan_role_definition_id
+            assert role_id is not None
+            definition = foundation_plan_role_definition()
+            definition["id"] = role_definition_resource_id(role_id)
+            return [definition]
         if arguments[:3] == ("ad", "app", "show"):
             return {
                 "signInAudience": "AzureADMyOrg",
@@ -300,7 +489,18 @@ class FakeAzure:
         if arguments[:3] == ("ad", "sp", "show"):
             return {"appRoleAssignmentRequired": True}
         if arguments[:3] == ("rest", "--method", "get"):
-            url = arguments[-1]
+            url = arguments[arguments.index("--url") + 1]
+            if url.startswith(f"https://{MICROSOFT_GRAPH_HOST}/v1.0/"):
+                if self.transitive_group_response is not None:
+                    return self.transitive_group_response
+                values = [
+                    {"@odata.type": "#microsoft.graph.group", "id": group_id}
+                    for group_id in self.transitive_group_ids
+                ]
+                return {
+                    "@odata.count": len(values),
+                    "value": values,
+                }
             if "/skus?" in url:
                 assert url == REDIS_SKU_URL
                 return {"value": [redis_sku_item()]}
@@ -435,54 +635,133 @@ class FakeAzure:
             ):
                 return [
                     {
-                        "roleDefinitionId": (f"/providers/roles/{OPENAI_USER_ROLE_ID}"),
+                        "roleDefinitionId": role_definition_resource_id(
+                            OPENAI_USER_ROLE_ID
+                        ),
                         "scope": OPENAI_RESOURCE_ID,
                     }
                 ]
-            if "--scope" not in arguments:
-                assignments = [
-                    {
-                        "roleDefinitionId": (f"/providers/roles/{CONTRIBUTOR_ROLE_ID}"),
-                        "scope": (
-                            f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/"
-                            "rg-optima-hackathon"
-                            if self.foundation_exists
-                            else f"/subscriptions/{SUBSCRIPTION_ID}"
-                        ),
-                    }
+            assignee = (
+                arguments[arguments.index("--assignee-object-id") + 1]
+                if "--assignee-object-id" in arguments
+                else None
+            )
+            if assignee in self.group_role_assignments:
+                assignments = self.group_role_assignments[assignee]
+                if "--scope" not in arguments:
+                    return [
+                        assignment
+                        for assignment in assignments
+                        if assignment["scope"]
+                        .casefold()
+                        .startswith(f"/subscriptions/{SUBSCRIPTION_ID}".casefold())
+                    ]
+                return assignments
+            subscription_scope = f"/subscriptions/{SUBSCRIPTION_ID}"
+            if (
+                "--scope" in arguments
+                and arguments[arguments.index("--scope") + 1] == subscription_scope
+                and "--include-inherited" in arguments
+            ):
+                source = self.effective_assignments
+                if source is None:
+                    role_id = (
+                        READER_ROLE_ID
+                        if self.foundation_exists
+                        or self.configuration.foundation_plan_role_definition_id
+                        is not None
+                        else CONTRIBUTOR_ROLE_ID
+                    )
+                    source = [
+                        effective_assignment(
+                            role_id,
+                            subscription_scope,
+                            principal_id=self.deployment_principal_id,
+                        )
+                    ]
+                return [
+                    assignment
+                    for assignment in source
+                    if assignment["scope"].casefold() == subscription_scope.casefold()
+                    or assignment["scope"]
+                    .casefold()
+                    .startswith("/providers/microsoft.management/managementgroups/")
                 ]
+            if "--scope" not in arguments:
+                if self.effective_assignments is not None:
+                    return self.effective_assignments
+                resource_group_scope = (
+                    f"{subscription_scope}/resourceGroups/rg-optima-hackathon"
+                )
+                if self.configuration.foundation_plan_role_definition_id is not None:
+                    assignments = [
+                        effective_assignment(
+                            READER_ROLE_ID,
+                            subscription_scope,
+                            principal_id=self.deployment_principal_id,
+                        ),
+                        effective_assignment(
+                            self.configuration.foundation_plan_role_definition_id,
+                            resource_group_scope,
+                            principal_id=self.deployment_principal_id,
+                        ),
+                    ]
+                elif self.foundation_exists:
+                    assignments = [
+                        effective_assignment(
+                            READER_ROLE_ID,
+                            subscription_scope,
+                            principal_id=self.deployment_principal_id,
+                        ),
+                        effective_assignment(
+                            CONTRIBUTOR_ROLE_ID,
+                            resource_group_scope,
+                            principal_id=self.deployment_principal_id,
+                        ),
+                    ]
+                    if self.configuration.registry_name is not None and self.acr_push:
+                        assignments.append(
+                            effective_assignment(
+                                ACR_PUSH_ROLE_ID,
+                                (
+                                    f"{resource_group_scope}/providers/"
+                                    "Microsoft.ContainerRegistry/registries/"
+                                    f"{self.configuration.registry_name}"
+                                ),
+                                principal_id=self.deployment_principal_id,
+                            )
+                        )
+                else:
+                    assignments = [
+                        effective_assignment(
+                            CONTRIBUTOR_ROLE_ID,
+                            subscription_scope,
+                            principal_id=self.deployment_principal_id,
+                        )
+                    ]
                 if self.forbidden_deployment_role:
                     assignments.append(
-                        {
-                            "roleDefinitionId": (
-                                "/providers/roles/8e3af657-a8ff-443c-a75c-2fe8c4bcb635"
-                            ),
-                            "scope": f"/subscriptions/{SUBSCRIPTION_ID}",
-                        }
-                    )
-                if self.foundation_exists:
-                    assignments.append(
-                        {
-                            "roleDefinitionId": f"/providers/roles/{READER_ROLE_ID}",
-                            "scope": f"/subscriptions/{SUBSCRIPTION_ID}",
-                        }
+                        effective_assignment(
+                            "8e3af657-a8ff-443c-a75c-2fe8c4bcb635",
+                            subscription_scope,
+                            principal_id=self.deployment_principal_id,
+                        )
                     )
                 if self.foundation_exists and self.lingering_subscription_contributor:
                     assignments.append(
-                        {
-                            "roleDefinitionId": (
-                                f"/providers/roles/{CONTRIBUTOR_ROLE_ID}"
-                            ),
-                            "scope": f"/subscriptions/{SUBSCRIPTION_ID}",
-                        }
+                        effective_assignment(
+                            CONTRIBUTOR_ROLE_ID,
+                            subscription_scope,
+                            principal_id=self.deployment_principal_id,
+                        )
                     )
                 return assignments
             if "--assignee-object-id" not in arguments:
                 return [
                     {
                         "principalId": principal_id,
-                        "roleDefinitionId": (
-                            "/providers/roles/7f951dda-4ed3-4680-a7ca-43fe172d538d"
+                        "roleDefinitionId": role_definition_resource_id(
+                            "7f951dda-4ed3-4680-a7ca-43fe172d538d"
                         ),
                     }
                     for principal_id in ("api-principal-id", "ui-principal-id")
@@ -490,7 +769,9 @@ class FakeAzure:
             return (
                 [
                     {
-                        "roleDefinitionId": f"/providers/roles/{ACR_PUSH_ROLE_ID}",
+                        "roleDefinitionId": role_definition_resource_id(
+                            ACR_PUSH_ROLE_ID
+                        ),
                         "scope": arguments[arguments.index("--scope") + 1],
                     }
                 ]
@@ -1453,8 +1734,16 @@ def test_redis_provider_requires_target_region_and_stable_api() -> None:
     assert_redis_failure(
         version_azure, RedisPreflightErrorCode.API_VERSION_NOT_ADVERTISED
     )
-    assert not any(call[:1] == ("rest",) for call in region_azure.calls)
-    assert not any(call[:1] == ("rest",) for call in version_azure.calls)
+    assert not any(
+        call[:3] == ("rest", "--method", "get")
+        and "management.azure.com" in call[call.index("--url") + 1]
+        for call in region_azure.calls
+    )
+    assert not any(
+        call[:3] == ("rest", "--method", "get")
+        and "management.azure.com" in call[call.index("--url") + 1]
+        for call in version_azure.calls
+    )
 
 
 @pytest.mark.parametrize(
@@ -1518,7 +1807,10 @@ def test_redis_failure_does_not_query_region_sku_service_or_version_fallbacks() 
     assert_redis_failure(azure, RedisPreflightErrorCode.REQUESTED_SKU_REGION_ABSENT)
 
     rest_urls = [
-        call[-1] for call in azure.calls if call[:3] == ("rest", "--method", "get")
+        call[call.index("--url") + 1]
+        for call in azure.calls
+        if call[:3] == ("rest", "--method", "get")
+        and "management.azure.com" in call[call.index("--url") + 1]
     ]
     assert rest_urls == [REDIS_SKU_URL]
     assert all("2024-11-01" not in url for url in rest_urls)
@@ -1756,8 +2048,8 @@ def test_redis_multiple_quota_meters_fail_closed() -> None:
     assert_redis_failure(azure, RedisPreflightErrorCode.QUOTA_RESPONSE_MALFORMED)
 
 
-def test_foundation_plan_loads_without_deferred_runtime_inputs() -> None:
-    """Load a foundation plan from only the inputs foundation resources need."""
+def test_foundation_apply_loads_without_deferred_runtime_inputs() -> None:
+    """Load foundation apply from only the inputs foundation resources need."""
     configuration = load_configuration(foundation_environment(), phase="foundation")
 
     assert configuration.pricing is None
@@ -1771,31 +2063,134 @@ def test_foundation_plan_loads_without_deferred_runtime_inputs() -> None:
     assert configuration.semantic_cache_enabled is False
 
 
+def test_foundation_plan_selects_distinct_read_only_identity() -> None:
+    """Keep planning credentials separate from the foundation apply identity."""
+    configuration = load_configuration(
+        foundation_plan_environment(), phase="foundation-plan"
+    )
+
+    assert configuration.deployment_client_id == FOUNDATION_PLAN_CLIENT_ID
+    assert configuration.deployment_identity_resource_id.endswith(
+        "/id-optima-foundation-plan"
+    )
+    assert (
+        configuration.foundation_plan_role_definition_id
+        == FOUNDATION_PLAN_ROLE_DEFINITION_ID
+    )
+
+
+@pytest.mark.parametrize("shared_value", ["client", "resource"])
+def test_foundation_plan_rejects_apply_identity_alias(shared_value: str) -> None:
+    """Require separate client and managed-identity resource identities."""
+    environment = foundation_plan_environment()
+    if shared_value == "client":
+        environment["AZURE_CLIENT_ID"] = FOUNDATION_PLAN_CLIENT_ID
+        message = "client IDs must be distinct"
+    else:
+        environment["AZURE_DEPLOYMENT_IDENTITY_RESOURCE_ID"] = environment[
+            "AZURE_FOUNDATION_PLAN_IDENTITY_RESOURCE_ID"
+        ]
+        message = "identity resource IDs must be distinct"
+
+    with pytest.raises(PreflightError, match=message):
+        load_configuration(environment, phase="foundation-plan")
+
+
+def test_cache_enabled_foundation_plan_is_rejected() -> None:
+    """Keep Redis provisioning unreachable from the read-only plan identity."""
+    environment = foundation_plan_environment()
+    environment["OPTIMA_SEMANTIC_CACHE_ENABLED"] = "true"
+
+    with pytest.raises(PreflightError, match="foundation-plan does not support"):
+        load_configuration(environment, phase="foundation-plan")
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["not-a-guid", "99999999-8888-7777-6666-55555555555z"],
+)
+def test_foundation_plan_requires_stable_custom_role_guid(value: str) -> None:
+    """Reject mutable display names and malformed plan role identities."""
+    environment = foundation_plan_environment()
+    environment["AZURE_FOUNDATION_PLAN_ROLE_DEFINITION_ID"] = value
+
+    with pytest.raises(PreflightError, match="canonical GUID"):
+        load_configuration(environment, phase="foundation-plan")
+
+
+def test_cache_enabled_foundation_loads_complete_runtime_configuration() -> None:
+    """Validate the complete cache runtime contract before Redis can be created."""
+    configuration = load_configuration(valid_environment(), phase="foundation")
+
+    assert configuration.registry_name == "acroptima123456789"
+    assert configuration.pricing is not None
+    assert {binding.role for binding in configuration.models} == {
+        "SMALL",
+        "STRONG",
+        "JUDGE",
+        "EMBEDDING",
+    }
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "message"),
+    [
+        (
+            "OPTIMA_PRICING_CATALOG_VERSION",
+            None,
+            "OPTIMA_PRICING_CATALOG_VERSION is missing",
+        ),
+        (
+            "OPTIMA_PRICING_EMBEDDING_MODEL",
+            "different-embedding-model",
+            "EMBEDDING pricing model/version",
+        ),
+    ],
+)
+def test_cache_enabled_foundation_rejects_incomplete_runtime_configuration(
+    name: str,
+    value: str | None,
+    message: str,
+) -> None:
+    """Reject missing or mismatched runtime evidence before Redis provisioning."""
+    environment = valid_environment()
+    if value is None:
+        environment.pop(name)
+    else:
+        environment[name] = value
+
+    with pytest.raises(PreflightError, match=message):
+        load_configuration(environment, phase="foundation")
+
+
 def test_foundation_apply_uses_the_same_phase_aware_input_contract() -> None:
-    """Give foundation apply the identical minimal foundation input contract."""
-    environment = foundation_environment()
+    """Keep plan and apply on the same minimal disabled-cache foundation inputs."""
+    plan = load_configuration(foundation_plan_environment(), phase="foundation-plan")
+    apply = load_configuration(foundation_environment(), phase="foundation")
 
-    plan = load_configuration(environment, phase="foundation")
-    apply = load_configuration(environment, phase="foundation")
-
-    assert plan == apply
+    assert plan.deployment_client_id != apply.deployment_client_id
+    assert plan.models == apply.models == ()
+    assert plan.pricing is apply.pricing is None
+    assert plan.semantic_cache_enabled is apply.semantic_cache_enabled is False
     assert apply.pricing is None
     assert apply.ui_auth_secret_present is False
 
 
 def test_foundation_plan_preflight_is_read_only_and_skips_runtime_checks() -> None:
     """Verify the foundation plan omits UI, ACR, model, and runtime checks."""
-    configuration = load_configuration(foundation_environment(), phase="foundation")
+    configuration = load_configuration(
+        foundation_plan_environment(), phase="foundation-plan"
+    )
     azure = FakeAzure(configuration, foundation_exists=True)
 
     evidence = run_preflight(
         configuration,
         azure,
-        phase="foundation",
+        phase="foundation-plan",
         repository_root=ROOT,
     )
 
-    assert evidence["phase"] == "foundation"
+    assert evidence["phase"] == "foundation-plan"
     assert "model_deployments" not in evidence["checks"]
     assert "ui_entra_authentication" not in evidence["checks"]
     assert "acr_push" not in evidence["checks"]
@@ -1808,8 +2203,8 @@ def test_foundation_plan_preflight_is_read_only_and_skips_runtime_checks() -> No
     assert not any(call[:2] == ("acr", "show") for call in azure.calls)
 
 
-def test_foundation_plan_verifies_least_privilege_scopes() -> None:
-    """Reject a lingering subscription Contributor during foundation planning."""
+def test_foundation_apply_verifies_least_privilege_scopes() -> None:
+    """Reject a lingering subscription Contributor during foundation apply."""
     configuration = load_configuration(foundation_environment(), phase="foundation")
     azure = FakeAzure(
         configuration,
@@ -1826,8 +2221,8 @@ def test_foundation_plan_verifies_least_privilege_scopes() -> None:
         )
 
 
-def test_foundation_plan_rejects_forbidden_owner_role() -> None:
-    """Reject an Owner or RBAC-administration role on the deployment identity."""
+def test_foundation_apply_rejects_forbidden_owner_role() -> None:
+    """Reject an Owner or RBAC role on the foundation apply identity."""
     configuration = load_configuration(foundation_environment(), phase="foundation")
     azure = FakeAzure(
         configuration,
@@ -1846,11 +2241,617 @@ def test_foundation_plan_rejects_forbidden_owner_role() -> None:
 
 def test_foundation_plan_still_requires_cost_governance() -> None:
     """Keep foundation resources gated on their genuinely required inputs."""
-    environment = foundation_environment()
+    environment = foundation_plan_environment()
     environment.pop("OPTIMA_EXPECTED_FIXED_MONTHLY_COST_INR")
 
     with pytest.raises(PreflightError, match="OPTIMA_EXPECTED_FIXED_MONTHLY_COST_INR"):
-        load_configuration(environment, phase="foundation")
+        load_configuration(environment, phase="foundation-plan")
+
+
+@pytest.mark.parametrize(
+    ("phase", "environment_factory"),
+    [
+        ("foundation-plan", foundation_plan_environment),
+        ("foundation-apply", foundation_apply_environment),
+        ("foundation", foundation_environment),
+        ("publish", disabled_environment),
+    ],
+)
+def test_valid_plan_apply_publish_identity_matrices(
+    phase: str,
+    environment_factory: Any,
+) -> None:
+    """Accept only the reviewed effective role set for each deployment phase."""
+    configuration = load_configuration(environment_factory(), phase=phase)
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.access_token = synthetic_access_token(
+        tenant_id=configuration.tenant_id,
+        client_id=configuration.deployment_client_id,
+        principal_id=azure.deployment_principal_id,
+    )
+
+    evidence = run_preflight(
+        configuration,
+        azure,
+        phase=phase,
+        repository_root=ROOT,
+    )
+
+    assert evidence["phase"] == phase
+    assert azure.access_token not in json.dumps(evidence)
+    assert (
+        "account",
+        "get-access-token",
+        "--resource-type",
+        "arm",
+        "--subscription",
+        SUBSCRIPTION_ID,
+    ) in azure.calls
+    assert any(
+        call[:6]
+        == (
+            "role",
+            "assignment",
+            "list",
+            "--assignee-object-id",
+            azure.deployment_principal_id,
+            "--all",
+        )
+        and call[6:]
+        == (
+            "--fill-principal-name",
+            "false",
+        )
+        for call in azure.calls
+    )
+    assert any(
+        call[:6]
+        == (
+            "role",
+            "assignment",
+            "list",
+            "--assignee-object-id",
+            azure.deployment_principal_id,
+            "--scope",
+        )
+        and call[6:]
+        == (
+            f"/subscriptions/{SUBSCRIPTION_ID}",
+            "--include-inherited",
+            "--fill-principal-name",
+            "false",
+        )
+        for call in azure.calls
+    )
+    assert any(
+        call[:3] == ("rest", "--method", "get")
+        and call[call.index("--url") + 1].startswith(
+            f"https://{MICROSOFT_GRAPH_HOST}/v1.0/servicePrincipals/"
+            f"{azure.deployment_principal_id}/transitiveMemberOf/"
+        )
+        and "$count=true" in call[call.index("--url") + 1]
+        and "ConsistencyLevel=eventual" in call
+        and call[call.index("--resource") + 1] == "https://graph.microsoft.com/"
+        for call in azure.calls
+    )
+
+
+def test_foundation_bootstrap_retains_only_subscription_contributor() -> None:
+    """Preserve the temporary first-bootstrap apply contract while the RG is absent."""
+    configuration = load_configuration(foundation_environment(), phase="foundation")
+    azure = FakeAzure(configuration)
+
+    evidence = run_preflight(
+        configuration,
+        azure,
+        phase="foundation",
+        repository_root=ROOT,
+    )
+
+    assert evidence["phase"] == "foundation"
+
+
+def test_separated_foundation_apply_requires_existing_resource_group() -> None:
+    """Do not let the separated apply inherit production bootstrap permissions."""
+    configuration = load_configuration(
+        foundation_apply_environment(), phase="foundation-apply"
+    )
+    azure = FakeAzure(configuration)
+
+    with pytest.raises(PreflightError, match="requires the target resource group"):
+        run_preflight(
+            configuration,
+            azure,
+            phase="foundation-apply",
+            repository_root=ROOT,
+        )
+
+
+@pytest.mark.parametrize(
+    ("claim", "value", "message"),
+    [
+        ("tid", "bbbbbbbb-cccc-dddd-eeee-ffffffffffff", "token tenant"),
+        ("appid", "cccccccc-dddd-eeee-ffff-000000000000", "token client"),
+        ("oid", CLIENT_ID, "token object"),
+    ],
+)
+def test_authenticated_session_claims_must_match_configured_identity(
+    claim: str,
+    value: str,
+    message: str,
+) -> None:
+    """Bind tenant, client, and principal claims to the selected apply identity."""
+    configuration = load_configuration(foundation_environment(), phase="foundation")
+    azure = FakeAzure(configuration, foundation_exists=True)
+    claims = {
+        "appid": CLIENT_ID,
+        "oid": DEPLOYMENT_PRINCIPAL_ID,
+        "tid": TENANT_ID,
+    }
+    claims[claim] = value
+    azure.access_token = synthetic_access_token(
+        tenant_id=str(claims["tid"]),
+        client_id=str(claims["appid"]),
+        principal_id=str(claims["oid"]),
+    )
+
+    with pytest.raises(PreflightError, match=message):
+        run_preflight(
+            configuration,
+            azure,
+            phase="foundation",
+            repository_root=ROOT,
+        )
+
+
+def test_authenticated_session_accepts_azp_client_claim() -> None:
+    """Accept the documented azp claim when appid is absent."""
+    configuration = load_configuration(foundation_environment(), phase="foundation")
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.access_token = synthetic_access_token(
+        tenant_id=TENANT_ID,
+        client_id=CLIENT_ID,
+        principal_id=DEPLOYMENT_PRINCIPAL_ID,
+        client_claim_name="azp",
+    )
+
+    run_preflight(
+        configuration,
+        azure,
+        phase="foundation",
+        repository_root=ROOT,
+    )
+
+
+@pytest.mark.parametrize("token", ["not-a-jwt", "a.%%%%.c", "a.e30.c"])
+def test_authenticated_session_rejects_malformed_or_incomplete_token_claims(
+    token: str,
+) -> None:
+    """Fail closed when ARM token claims cannot be decoded and verified."""
+    configuration = load_configuration(foundation_environment(), phase="foundation")
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.access_token = token
+
+    with pytest.raises(PreflightError, match="token"):
+        run_preflight(
+            configuration,
+            azure,
+            phase="foundation",
+            repository_root=ROOT,
+        )
+
+
+@pytest.mark.parametrize("user_type", ["user", "managedIdentity", ""])
+def test_authenticated_account_requires_service_principal_type(
+    user_type: str,
+) -> None:
+    """Reject interactive or otherwise unbound Azure CLI sessions."""
+    configuration = load_configuration(foundation_environment(), phase="foundation")
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.account_user_type = user_type
+
+    with pytest.raises(PreflightError, match="service-principal"):
+        run_preflight(
+            configuration,
+            azure,
+            phase="foundation",
+            repository_root=ROOT,
+        )
+
+
+def test_identity_resource_id_subscription_must_match_configuration() -> None:
+    """Reject a syntactically valid identity from a different subscription."""
+    environment = foundation_environment()
+    environment["AZURE_DEPLOYMENT_IDENTITY_RESOURCE_ID"] = environment[
+        "AZURE_DEPLOYMENT_IDENTITY_RESOURCE_ID"
+    ].replace(SUBSCRIPTION_ID, "00000000-1111-2222-3333-444444444444")
+    configuration = load_configuration(environment, phase="foundation")
+    azure = FakeAzure(configuration, foundation_exists=True)
+
+    with pytest.raises(PreflightError, match="identity subscription"):
+        run_preflight(
+            configuration,
+            azure,
+            phase="foundation",
+            repository_root=ROOT,
+        )
+
+
+@pytest.mark.parametrize(
+    "invalid_identity_id",
+    [
+        (
+            f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg-identity/providers/"
+            "Microsoft.ManagedIdentity/systemAssignedIdentities/id-optima-deploy"
+        ),
+        (
+            f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg-identity/providers/"
+            "Microsoft.ManagedIdentity/userAssignedIdentities/id-optima-deploy/child"
+        ),
+        (
+            f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg%2fidentity/providers/"
+            "Microsoft.ManagedIdentity/userAssignedIdentities/id-optima-deploy"
+        ),
+    ],
+    ids=("wrong-resource-type", "extra-child", "encoded-separator"),
+)
+def test_identity_resource_id_requires_exact_user_assigned_identity_grammar(
+    invalid_identity_id: str,
+) -> None:
+    """Reject lookalike or noncanonical managed-identity resource IDs."""
+    environment = foundation_environment()
+    environment["AZURE_DEPLOYMENT_IDENTITY_RESOURCE_ID"] = invalid_identity_id
+    configuration = load_configuration(environment, phase="foundation")
+    azure = FakeAzure(configuration, foundation_exists=True)
+
+    with pytest.raises(
+        PreflightError,
+        match="user-assigned managed identity|malformed ARM path segment",
+    ):
+        run_preflight(
+            configuration,
+            azure,
+            phase="foundation",
+            repository_root=ROOT,
+        )
+
+
+def test_returned_identity_id_must_match_configured_resource_id() -> None:
+    """Reject lookup substitution to another identity with a matching client ID."""
+    configuration = load_configuration(foundation_environment(), phase="foundation")
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.returned_identity_id = configuration.deployment_identity_resource_id.replace(
+        "id-optima-deploy", "id-optima-other"
+    )
+
+    with pytest.raises(PreflightError, match="identity ID does not match"):
+        run_preflight(
+            configuration,
+            azure,
+            phase="foundation",
+            repository_root=ROOT,
+        )
+
+
+def test_returned_identity_client_id_must_not_be_principal_id() -> None:
+    """Keep application/client identity distinct from object/principal identity."""
+    configuration = load_configuration(foundation_environment(), phase="foundation")
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.returned_identity_client_id = DEPLOYMENT_PRINCIPAL_ID
+
+    with pytest.raises(PreflightError, match="does not match client ID"):
+        run_preflight(
+            configuration,
+            azure,
+            phase="foundation",
+            repository_root=ROOT,
+        )
+
+
+@pytest.mark.parametrize(
+    "role_id",
+    ["8e3af657-a8ff-443c-a75c-2fe8c4bcb635", CONTRIBUTOR_ROLE_ID],
+    ids=("owner", "contributor"),
+)
+def test_inherited_management_group_broad_roles_are_rejected(role_id: str) -> None:
+    """Reject effective mutation access inherited above the subscription."""
+    configuration = load_configuration(foundation_environment(), phase="foundation")
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.effective_assignments = [
+        *apply_effective_assignments(),
+        effective_assignment(
+            role_id,
+            "/providers/Microsoft.Management/managementGroups/tenant-root",
+            principal_id=DEPLOYMENT_PRINCIPAL_ID,
+        ),
+    ]
+
+    with pytest.raises(PreflightError, match="approved|Contributor|Owner"):
+        run_preflight(
+            configuration,
+            azure,
+            phase="foundation",
+            repository_root=ROOT,
+        )
+
+
+def test_group_derived_assignment_is_rejected() -> None:
+    """Reject a transitive group role absent from direct identity assignments."""
+    configuration = load_configuration(foundation_environment(), phase="foundation")
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.transitive_group_ids = [TRANSITIVE_GROUP_ID]
+    azure.group_role_assignments[TRANSITIVE_GROUP_ID] = [
+        effective_assignment(
+            "8e3af657-a8ff-443c-a75c-2fe8c4bcb635",
+            "/providers/Microsoft.Management/managementGroups/tenant-root",
+            principal_id=TRANSITIVE_GROUP_ID,
+            principal_type="Group",
+        ),
+    ]
+
+    with pytest.raises(PreflightError, match="group-derived Azure role"):
+        run_preflight(
+            configuration,
+            azure,
+            phase="foundation",
+            repository_root=ROOT,
+        )
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"value": []},
+        {"@odata.count": 1, "value": []},
+        {
+            "@odata.count": 1,
+            "@odata.nextLink": "https://graph.microsoft.com/v1.0/next",
+            "value": [{"id": TRANSITIVE_GROUP_ID}],
+        },
+        {
+            "@odata.count": 2,
+            "value": [
+                {"id": TRANSITIVE_GROUP_ID},
+                {"id": TRANSITIVE_GROUP_ID},
+            ],
+        },
+    ],
+    ids=("missing-count", "count-mismatch", "paginated", "duplicate-group"),
+)
+def test_transitive_group_evidence_fails_closed(response: Any) -> None:
+    """Reject incomplete or contradictory Microsoft Graph membership evidence."""
+    configuration = load_configuration(foundation_environment(), phase="foundation")
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.transitive_group_response = response
+
+    with pytest.raises(PreflightError, match="transitive membership"):
+        run_preflight(
+            configuration,
+            azure,
+            phase="foundation",
+            repository_root=ROOT,
+        )
+
+
+@pytest.mark.parametrize(
+    "spoofed_id",
+    [
+        f"/providers/roles/{READER_ROLE_ID}",
+        f"/providers/Microsoft.Authorization/roleDefinitions/{READER_ROLE_ID}-suffix",
+        (
+            f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+            f"Microsoft.Authorization/notRoleDefinitions/{READER_ROLE_ID}"
+        ),
+    ],
+)
+def test_malformed_or_spoofed_role_definition_ids_are_rejected(
+    spoofed_id: str,
+) -> None:
+    """Never infer a role from a suffix or an unapproved ARM resource type."""
+    configuration = load_configuration(foundation_environment(), phase="foundation")
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.effective_assignments = apply_effective_assignments()
+    azure.effective_assignments[0]["roleDefinitionId"] = spoofed_id
+
+    with pytest.raises(PreflightError, match="role definition"):
+        run_preflight(
+            configuration,
+            azure,
+            phase="foundation",
+            repository_root=ROOT,
+        )
+
+
+def test_duplicate_effective_assignments_are_rejected() -> None:
+    """Reject contradictory duplicate direct or inherited assignment evidence."""
+    configuration = load_configuration(foundation_environment(), phase="foundation")
+    azure = FakeAzure(configuration, foundation_exists=True)
+    assignments = apply_effective_assignments()
+    azure.effective_assignments = [*assignments, dict(assignments[0])]
+
+    with pytest.raises(PreflightError, match="duplicate role assignments"):
+        run_preflight(
+            configuration,
+            azure,
+            phase="foundation",
+            repository_root=ROOT,
+        )
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [
+        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg-optima-hackathon/",
+        (f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg-optima%2fhackathon"),
+        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups",
+    ],
+    ids=("trailing-slash", "encoded-separator", "missing-group-name"),
+)
+def test_malformed_effective_assignment_scopes_are_rejected(scope: str) -> None:
+    """Require every effective assignment scope to be a canonical ARM scope."""
+    configuration = load_configuration(foundation_environment(), phase="foundation")
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.effective_assignments = apply_effective_assignments()
+    azure.effective_assignments[1]["scope"] = scope
+
+    with pytest.raises(PreflightError, match="scope is malformed"):
+        run_preflight(
+            configuration,
+            azure,
+            phase="foundation",
+            repository_root=ROOT,
+        )
+
+
+def test_apply_rejects_any_custom_or_extra_effective_role() -> None:
+    """Prove apply cannot acquire role-assignment administration through custom RBAC."""
+    configuration = load_configuration(foundation_environment(), phase="foundation")
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.effective_assignments = [
+        *apply_effective_assignments(),
+        effective_assignment(
+            "dddddddd-eeee-ffff-0000-111111111111",
+            f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg-optima-hackathon",
+            principal_id=DEPLOYMENT_PRINCIPAL_ID,
+        ),
+    ]
+
+    with pytest.raises(PreflightError, match="exactly the approved effective roles"):
+        run_preflight(
+            configuration,
+            azure,
+            phase="foundation",
+            repository_root=ROOT,
+        )
+
+
+@pytest.mark.parametrize(
+    "actions",
+    [
+        ["Microsoft.Authorization/roleAssignments/write"],
+        ["Microsoft.Authorization/*"],
+        ["*"],
+        [
+            "Microsoft.Resources/deployments/whatIf/action",
+            "Microsoft.Authorization/roleAssignments/write",
+        ],
+    ],
+    ids=("exact-role-write", "authorization-wildcard", "global-wildcard", "extra"),
+)
+def test_foundation_plan_role_rejects_mutating_or_extra_actions(
+    actions: list[str],
+) -> None:
+    """Keep the plan identity structurally unable to mutate resources or RBAC."""
+    configuration = load_configuration(
+        foundation_plan_environment(), phase="foundation-plan"
+    )
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.role_definition_response = [foundation_plan_role_definition(actions=actions)]
+
+    with pytest.raises(PreflightError, match="allow only deployments what-if"):
+        run_preflight(
+            configuration,
+            azure,
+            phase="foundation-plan",
+            repository_root=ROOT,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "action"),
+    [
+        ("dataActions", "Microsoft.Storage/storageAccounts/blobServices/read"),
+        ("notDataActions", "Microsoft.Storage/*"),
+        ("notActions", "Microsoft.Authorization/roleAssignments/write"),
+    ],
+)
+def test_foundation_plan_role_rejects_nonempty_secondary_permissions(
+    field: str,
+    action: str,
+) -> None:
+    """Require a closed single-action control-plane permission contract."""
+    configuration = load_configuration(
+        foundation_plan_environment(), phase="foundation-plan"
+    )
+    azure = FakeAzure(configuration, foundation_exists=True)
+    definition = foundation_plan_role_definition()
+    definition["permissions"][0][field] = [action]
+    azure.role_definition_response = [definition]
+
+    with pytest.raises(PreflightError, match="allow only deployments what-if"):
+        run_preflight(
+            configuration,
+            azure,
+            phase="foundation-plan",
+            repository_root=ROOT,
+        )
+
+
+@pytest.mark.parametrize("response", [None, [], {}, [{"roleType": "CustomRole"}]])
+def test_foundation_plan_role_definition_fails_closed_when_unreadable_or_malformed(
+    response: Any,
+) -> None:
+    """Do not continue when the custom role definition cannot be proven."""
+    configuration = load_configuration(
+        foundation_plan_environment(), phase="foundation-plan"
+    )
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.role_definition_response = response if response is not None else [None]
+
+    with pytest.raises(PreflightError, match="role definition"):
+        run_preflight(
+            configuration,
+            azure,
+            phase="foundation-plan",
+            repository_root=ROOT,
+        )
+
+
+def test_foundation_plan_role_requires_usable_assignable_scope() -> None:
+    """Require the custom role to be assignable at the exact target hierarchy."""
+    configuration = load_configuration(
+        foundation_plan_environment(), phase="foundation-plan"
+    )
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.role_definition_response = [
+        foundation_plan_role_definition(
+            assignable_scopes=[
+                f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg-other"
+            ]
+        )
+    ]
+
+    with pytest.raises(PreflightError, match="not assignable"):
+        run_preflight(
+            configuration,
+            azure,
+            phase="foundation-plan",
+            repository_root=ROOT,
+        )
+
+
+def test_foundation_plan_rejects_any_extra_effective_assignment() -> None:
+    """Allow only subscription Reader and target-RG what-if access for planning."""
+    configuration = load_configuration(
+        foundation_plan_environment(), phase="foundation-plan"
+    )
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.effective_assignments = [
+        *plan_effective_assignments(),
+        effective_assignment(
+            CONTRIBUTOR_ROLE_ID,
+            f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg-optima-hackathon",
+            principal_id=FOUNDATION_PLAN_PRINCIPAL_ID,
+        ),
+    ]
+
+    with pytest.raises(PreflightError, match="Contributor only at the approved scope"):
+        run_preflight(
+            configuration,
+            azure,
+            phase="foundation-plan",
+            repository_root=ROOT,
+        )
 
 
 @pytest.mark.parametrize(
@@ -1873,6 +2874,30 @@ def test_enabled_phases_still_require_runtime_inputs(missing: str) -> None:
         load_configuration(environment, phase="rollout")
 
 
+@pytest.mark.parametrize("phase", ["publish", "artifacts", "rollout"])
+def test_runtime_phases_load_the_complete_runtime_contract(phase: str) -> None:
+    """Keep all non-foundation phases on the strict runtime contract."""
+    configuration = load_configuration(disabled_environment(), phase=phase)
+
+    assert configuration.registry_name == "acroptima123456789"
+    assert configuration.pricing is not None
+    assert {binding.role for binding in configuration.models} == {
+        "SMALL",
+        "STRONG",
+        "JUDGE",
+    }
+
+
+def test_default_configuration_phase_remains_strict_rollout() -> None:
+    """Preserve rollout as the strict default for every existing caller."""
+    environment = disabled_environment()
+
+    assert load_configuration(environment) == load_configuration(
+        environment,
+        phase="rollout",
+    )
+
+
 @pytest.mark.parametrize(
     "supplied",
     [
@@ -1885,10 +2910,10 @@ def test_enabled_phases_still_require_runtime_inputs(missing: str) -> None:
 )
 def test_foundation_plan_ignores_absent_runtime_inputs(supplied: str) -> None:
     """Never require a deferred runtime input during foundation planning."""
-    environment = foundation_environment()
+    environment = foundation_plan_environment()
     environment.pop(supplied, None)
 
-    configuration = load_configuration(environment, phase="foundation")
+    configuration = load_configuration(environment, phase="foundation-plan")
 
     assert configuration.pricing is None
 

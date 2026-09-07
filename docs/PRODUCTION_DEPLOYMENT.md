@@ -5,9 +5,10 @@ description: OIDC, Azure preflight, immutable image publication, Container Apps 
 
 ## Deployment architecture
 
-The manual `Deploy production` workflow is the only automated production
-publisher. It extends the existing Bicep architecture and does not create a
-second deployment path.
+The manual `Deploy production` workflow is the production publisher. The
+manual `Foundation plan and apply` workflow is a separate foundation-only
+operational path. Production does not consume foundation plan evidence, and a
+foundation apply is not a prerequisite for production.
 
 ```text
 Exact Git commit
@@ -25,11 +26,12 @@ Exact Git commit
   -> revision, health, UI-to-API, Entra, and telemetry verification
 ```
 
-The validation job has `contents: read` only. The deployment job receives
+Each workflow completes validation in an unprivileged job with `contents: read`,
+no GitHub environment, and no OIDC permission. An Azure-facing job receives
 `id-token: write` only after validation succeeds and runs inside the `hackathon`
-environment. Production deployments are serialized by the
-`optima-production` concurrency group and never run from a pull request or push
-trigger.
+environment. Foundation and production mutations share the non-canceling
+`optima-hackathon-azure-mutation` concurrency group. Neither workflow runs from
+a pull request or push trigger.
 
 The API and UI use separate Dockerfiles because their commands and ports differ.
 Both install the frozen production dependency closure from the approved
@@ -44,79 +46,145 @@ The `Foundation plan and apply` workflow
 (`.github/workflows/foundation.yml`) provisions only the Azure foundation for the
 approved profile `location=eastus2`, `deployContainerApps=false`,
 `exposePublicUi=false`, `deployRuntimeAccess=false`, and
-`semanticCacheEnabled=false`. It exists because the full `Deploy production`
-workflow requires the deployment confirmation, always builds images, and
-continues from the foundation what-if straight into publication and rollout. The
-foundation workflow adds a read-only planning operation and a distinct promotion
-operation so the foundation can be reviewed before any Azure mutation. Redis,
-embeddings, Container Apps, runtime role assignments, application images, Entra UI
-authentication, and inference canaries stay deferred to the later rollout stage in
-`Deploy production`.
+`semanticCacheEnabled=false`. Both operations use
+`infra/environments/hackathon.foundation.bicepparam`. They do not load UI or
+Entra configuration, image or ACR publication values, Azure OpenAI deployments,
+model pricing, Redis or embedding settings, runtime-access values, or a callback
+URI. The enabled application and runtime phases in `Deploy production` retain
+their complete fail-closed input contracts.
+
+The separated workflow requires `rg-optima-hackathon` to exist. It adds a
+read-only planning operation and a distinct promotion operation for an existing
+target group. Only `Deploy production` retains compatibility with initial
+subscription-scope resource-group bootstrap.
 
 The workflow dispatch input `operation` selects one of two mutually exclusive
-jobs. `foundation-plan` is the default and is read only. `foundation-apply` is the
-separate promotion. Each job authenticates through GitHub Actions OIDC inside the
-`hackathon` environment and holds only `contents: read` and `id-token: write`; the
-apply job additionally holds `actions: read` solely to download the approved plan
-evidence from the referenced plan run.
+Azure jobs. `foundation-plan` is the default and uses the dedicated read-only
+plan identity. `foundation-apply` uses the deployment identity and additionally
+holds `actions: read` to authenticate and download the approved plan artifact.
+The two managed-identity resource IDs and client IDs must be distinct; preflight
+rejects either form of aliasing. The preceding validation job cannot request a
+GitHub OIDC token.
 
 ### foundation-plan
 
 `foundation-plan` performs no Azure mutation, builds no image, deploys no
 Container App, and creates no role assignment. It:
 
-1. Verifies the expected tenant, subscription, client identity, and permitted
-   scopes through `scripts/azure_preflight.py --phase foundation`, which confirms
-   the deployment principal is not subscription Owner or Contributor and holds
-   only subscription Reader plus `rg-optima-hackathon` Contributor.
-2. Runs the application quality gates and validates every Bicep entry point.
-3. Runs exactly one authoritative `az deployment group what-if` against the
-   existing resource group with the approved foundation parameters.
-4. Classifies the structured what-if with
+1. Rechecks that the dispatch commit is the current `main` head.
+2. Authenticates the configured plan identity and verifies its session claims,
+   canonical identity resource ID, federation, exact effective role assignments,
+   and custom role definition.
+3. Runs exactly one structured `az deployment group what-if` against the existing
+   resource group with `--validation-level ProviderNoRbac`.
+4. Classifies the full structured result with
    `scripts/whatif_classification.py classify`, which fails closed on anything the
    foundation profile does not create.
-5. Uploads a sanitized, commit-scoped `foundation-plan-evidence` artifact that
-   records the commit SHA, the effective parameter fingerprint, and the approved
-   change set. The artifact never contains subscription identifiers, secrets, or
-   raw resource IDs.
+5. Uploads the sole sanitized artifact,
+   `foundation-plan-evidence-<commit>`, with 30-day retention and no compression.
 
 Because `foundation-plan` requires only the inputs the foundation resources need,
-it does not require a UI client secret, UI or Entra client identity, Azure OpenAI
-runtime binding, container registry name, image digest, embedding, Redis, or
-model pricing value. It still requires the foundation identity, scope, semantic
-cache decision (`false`), and the fixed monthly cost review.
+it requires only the plan identity and role variables, Azure target and OIDC
+values, the fixed monthly cost review, and the fixed disabled-cache decision. Its
+cost gate validates the review date and a finite, positive Decimal estimate within
+the infrastructure limit. It does not validate active models or model pricing.
 
-### Review the plan evidence
+### Review and promote the plan
 
-Download the `foundation-plan-evidence` artifact and confirm the classification is
-`APPROVED`, the commit SHA is the reviewed `main` commit, and the change set
-contains only the expected foundation resource types. The what-if classifier
-allows only expected `Create` operations and legitimate `NoChange` results inside
-`rg-optima-hackathon`. It fails closed on deletions, replacements, unexpected
-modifications, unsupported or unclassifiable changes, Azure OpenAI account or
-deployment changes, role assignments, Redis or embedding resources, Container Apps
-or application revisions, resources outside the approved group, any resource type
-the foundation contract does not declare, and any missing, truncated, or malformed
-structured evidence.
+Use this exact operator sequence:
+
+1. From the current `main` commit, dispatch `Foundation plan and apply` with
+   `operation=foundation-plan` and leave all apply-only inputs empty.
+2. After the workflow succeeds, download its only artifact,
+   `foundation-plan-evidence-<commit>`. Inspect the single
+   `foundation-plan-evidence.json` file and confirm the commit, `APPROVED`
+   classification, target, fingerprints, counts, and nine resource facts.
+3. Record the plan run ID, the dispatch actor, and the GitHub artifact metadata
+   digest in exact `sha256:<64-lowercase-hex>` form. Use GitHub's artifact digest,
+   not a new digest calculated from the downloaded JSON or archive.
+4. Within 24 hours and before another foundation workflow run supersedes the
+   plan, dispatch `operation=foundation-apply` from that same current `main`
+   commit. Set `confirm_commit_sha` to the full commit,
+   `confirm_foundation=APPLY-FOUNDATION`, `plan_run_id` to the recorded run ID,
+   `confirm_plan_actor` to the recorded actor, and
+   `confirm_plan_artifact_digest` to the recorded GitHub digest.
+
+The apply authenticates that the source run belongs to the expected repository
+and `.github/workflows/foundation.yml`, ran on `main` through
+`workflow_dispatch`, used the confirmed commit and consistent run attempt, and
+was dispatched and triggered by the confirmed actor. The source workflow and its
+single `Read-only foundation plan` job must be completed successfully, the run
+must be no more than 24 hours old, and the newest-first run history must contain
+the unchanged source immediately before the current apply with no intervening
+workflow run. The source must contain exactly one unexpired, bounded-size artifact
+with the expected name, run metadata, and GitHub `sha256:` digest. Only then does
+the apply download the exact authenticated artifact ID and require one regular,
+non-symlink evidence file and no other extracted entry.
+
+The plan artifact is retained for 30 days but can authorize promotion for only 24
+hours. It is visible to principals allowed to read repository Actions artifacts.
+It contains no secrets, raw subscription ID, or full resource IDs, but it remains
+deployment metadata and should not be redistributed.
+
+### Foundation evidence contract
+
+The closed, versioned evidence schema binds these canonical fingerprints:
+
+* The target fingerprint hashes the non-redacted subscription ID and exact
+  resource group before the artifact exposes only the resource group and digest
+* The deployment-source fingerprint hashes the template, parameter file, and all
+  recursively referenced Bicep module paths and bytes
+* The parameter fingerprint hashes the complete closed foundation parameter set,
+  including source paths, target profile, and all four disabled deployment flags
+* The resource-change fingerprint hashes every field of every accepted structured
+  change after full resource-ID canonicalization, with the change objects sorted
+  by canonical JSON so equivalent response ordering produces the same digest
+
+The human-readable projection must contain exactly these nine facts, in canonical
+role order. Every fact is either `Create` or `NoChange`.
+
+| Resource role           | Exact name or parent path                 | Resource type                                                   |
+|-------------------------|-------------------------------------------|-----------------------------------------------------------------|
+| API identity            | `id-optima-api-hackathon`                 | `Microsoft.ManagedIdentity/userAssignedIdentities`              |
+| Application Insights    | `appi-optima-hackathon`                   | `Microsoft.Insights/components`                                 |
+| Container registry      | `acroptima<13-character-suffix>`          | `Microsoft.ContainerRegistry/registries`                        |
+| Cosmos account          | `cosmos-optima-<same-suffix>`             | `Microsoft.DocumentDB/databaseAccounts`                         |
+| Cosmos container        | `<exact-account>/optima/runs`             | `Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers` |
+| Cosmos database         | `<exact-account>/optima`                  | `Microsoft.DocumentDB/databaseAccounts/sqlDatabases`            |
+| Log Analytics workspace | `law-optima-hackathon`                    | `Microsoft.OperationalInsights/workspaces`                      |
+| Managed environment     | `cae-optima-hackathon`                    | `Microsoft.App/managedEnvironments`                             |
+| UI identity             | `id-optima-ui-hackathon`                  | `Microsoft.ManagedIdentity/userAssignedIdentities`              |
+
+The exact Cosmos account is `cosmos-optima-<same-suffix>`. The shared
+13-character suffix and exact Cosmos parent chain are mandatory. The classifier
+rejects missing or duplicate resources, extra same-type resources, wrong parents,
+malformed IDs, non-success status, service errors, diagnostics, potential changes,
+deletions, modifications, unsupported changes, contradictory payloads, and unknown
+schema fields.
+
+Sanitizing the readable evidence does not weaken comparison. The target digest is
+computed from the original non-redacted scope, and the change digest is computed
+from complete canonical resource IDs and payloads before those values are omitted
+from the artifact. Apply recomputes those digests from its fresh unredacted result
+and compares the entire strict evidence document.
 
 ### foundation-apply
 
 `foundation-apply` is dispatched separately after the plan evidence is reviewed.
-It requires the confirmation value `APPLY-FOUNDATION`, the exact 40-character
-`main` commit SHA being promoted, and the `plan_run_id` of the approving
-`foundation-plan` run. It:
+It:
 
-1. Verifies the confirmation, that the promoted SHA equals the checked-out head,
-   and that the run targets `main`.
-2. Downloads the plan evidence from `plan_run_id` and confirms it targets this
-   commit and was classified `APPROVED`.
-3. Re-runs the application and Bicep validation and the foundation preflight.
-4. Runs a fresh authoritative what-if and reclassifies it with the same
-   fail-closed rules to close the time-of-check to time-of-use gap.
-5. Refuses promotion unless the fresh evidence matches the approved plan on commit
-   SHA, parameter fingerprint, and `APPROVED` classification.
-6. Executes only the foundation `az deployment group create`, then verifies the
-   deployment reached `Succeeded` and that a convergence what-if remains approved.
+1. Rechecks the confirmed commit against the checkout and current `main` head.
+2. Authenticates the source run and exact artifact before Azure login.
+3. Verifies that the apply identity has exactly subscription Reader and target
+   resource-group Contributor, with no inherited, group-derived, or extra role.
+4. Runs a fresh structured `ProviderNoRbac` what-if with the reviewed plan's run
+   provenance, exact source, and exact parameters, then rebuilds strict evidence.
+5. Compares the complete plan and apply evidence documents, including commit,
+   target, source, parameters, full change payload, counts, and resource facts.
+6. Immediately executes only the foundation `az deployment group create` after a
+   successful comparison.
+7. Reconciles the exact deployment, requires `Succeeded`, and runs a classified
+   convergence what-if.
 
 `foundation-apply` never builds or publishes an image, deploys a Container App,
 creates a runtime role assignment, configures Entra, provisions Redis or
@@ -126,10 +194,26 @@ convergence check.
 ### Azure fresh-what-if limitation
 
 Azure does not support applying a previously stored what-if result. The plan
-evidence is therefore an integrity record, not an executable plan. The promotion
-gate is the combination of the fresh matching what-if at apply time plus the
-commit SHA and parameter fingerprint carried in the approved plan evidence. The
-apply operation does not claim stronger plan immutability than Azure provides.
+evidence is therefore an integrity record, not an executable plan. Apply reruns a
+fresh structured what-if with reviewed plan provenance and compares its entire
+strict evidence before create.
+
+A residual race remains between the fresh what-if and Azure accepting the create.
+The shared non-canceling workflow concurrency group, running-foundation-deployment
+checks for any non-terminal provisioning state, repeated current-`main` checks
+(including one immediately before create), exact source and parameters, reviewed
+plan provenance, and immediate create minimize that interval. They do not
+eliminate it: a principal outside these workflows can still mutate Azure manually
+during the interval. The workflow does not claim stronger plan immutability than
+Azure provides.
+
+The independent production path performs the same orphan check at both resource
+group and subscription deployment scope before its first mutation. This covers
+an interrupted initial subscription bootstrap as well as a later group-scoped
+foundation apply. Resource-group existence must return literal `true` or `false`;
+authorization, transient, malformed, or unknown query failures stop the run. The
+production mutation step repeats both-scope orphan checks before selecting its
+group or subscription deployment branch.
 
 ### Failure and recovery
 
@@ -137,16 +221,24 @@ Any classifier failure, promotion mismatch, malformed or truncated what-if,
 absent plan evidence, or preflight rejection stops the run before Azure mutation.
 Correct the underlying prerequisite, re-run `foundation-plan` for the same commit,
 review the new evidence, and dispatch `foundation-apply` again with the new
-`plan_run_id`. Do not weaken the profile, the confirmation, or the classifier to
+provenance inputs. Do not weaken the profile, confirmation, or classifier to
 bypass a failed gate.
+
+Runner interruption does not prove that Azure stopped. An accepted deployment may
+continue after workflow failure, timeout, or manual cancellation. The always-run
+reconciliation step observes the exact deployment and requests cancellation while
+it is `Accepted` or `Running`, but Azure cancellation is not rollback and can
+leave created or modified resources. Reconcile Azure state first. Any interrupted
+or superseded plan/apply attempt invalidates the reviewed plan and requires a new
+`foundation-plan`; do not reuse its artifact.
 
 ### Next post-foundation stage
 
-After the foundation converges, the application rollout continues in the separate
-`Deploy production` workflow, which builds and publishes the immutable images,
-applies runtime access, configures Entra UI authentication, and deploys the
-digest-qualified Container Apps. The foundation workflow deliberately performs
-none of those steps.
+Application rollout uses the separate `Deploy production` path, which builds and
+publishes verified images, applies runtime access, configures Entra UI
+authentication, and deploys digest-qualified Container Apps. It does not consume
+foundation evidence and does not require a prior foundation apply. The paths share
+one mutation concurrency group but retain independent authorization and evidence.
 
 ## Selected East US 2 cache profile
 
@@ -182,11 +274,13 @@ Configure the `hackathon` environment before dispatching the workflow:
 * Configure the non-secret variables below at environment scope
 * Configure the single secret below at environment scope
 
-The workflow verifies required reviewers and a deployment branch policy, and it
-refuses any ref other than `refs/heads/main`. Its unprivileged job repeats the
-full application checks, Linux AMD64 builds, runtime smoke, rootfs inspection,
-SBOM generation, and final-image scanning for the exact main commit before Azure
-login.
+Required reviewers and deployment branch restrictions are operator-configured
+external prerequisites. The workflows do not query GitHub environment settings
+and do not claim to verify those controls. They do reject any ref other than
+`refs/heads/main` and recheck the current `main` commit where the operation
+requires it. The production unprivileged job repeats the full application checks,
+Linux AMD64 builds, runtime smoke, rootfs inspection, SBOM generation, and
+final-image scanning before Azure login.
 
 ### Non-secret variables
 
@@ -194,6 +288,9 @@ login.
 |----------|----------------------------|
 | `AZURE_CLIENT_ID` | Client ID of the dedicated OIDC deployment identity |
 | `AZURE_DEPLOYMENT_IDENTITY_RESOURCE_ID` | Full resource ID of that user-assigned identity |
+| `AZURE_FOUNDATION_PLAN_CLIENT_ID` | Client ID of the separate read-only foundation-plan identity |
+| `AZURE_FOUNDATION_PLAN_IDENTITY_RESOURCE_ID` | Full resource ID of the foundation-plan user-assigned identity |
+| `AZURE_FOUNDATION_PLAN_ROLE_DEFINITION_ID` | GUID of the custom role that allows only target-group deployment what-if |
 | `AZURE_TENANT_ID` | Reviewed tenant ID |
 | `AZURE_SUBSCRIPTION_ID` | Reviewed subscription ID |
 | `AZURE_RESOURCE_GROUP` | `rg-optima-hackathon` |
@@ -266,8 +363,8 @@ and the GitHub environment together.
 
 ## OIDC prerequisites
 
-The dedicated deployment user-assigned managed identity needs this federated
-credential:
+The separate foundation-plan and apply user-assigned managed identities each need
+this federated credential for the `hackathon` environment:
 
 | Property | Exact value |
 |----------|-------------|
@@ -275,26 +372,39 @@ credential:
 | Subject | `repo:sekharrcs/optima:environment:hackathon` |
 | Audience | `api://AzureADTokenExchange` |
 
-Use temporary Contributor on the subscription only when the initial deployment
-must create `rg-optima-hackathon`. After bootstrap, scope Contributor to that
-resource group, retain subscription Reader for provider, quota, and assignment
-inspection, and remove the subscription Contributor assignment before the next phase.
-Grant `AcrPush` directly on the exact OPTIMA registry. Preflight rejects Owner,
-User Access Administrator, RBAC Administrator, inherited `AcrPush`, and a
-subscription Contributor assignment after the resource group exists.
+The foundation-plan identity must have exactly subscription Reader plus one custom
+role assignment at `rg-optima-hackathon`. That custom role must contain one
+permission entry whose only action is
+`Microsoft.Resources/deployments/whatIf/action`, with empty `notActions`,
+`dataActions`, and `notDataActions`. Its assignable scopes must cover the target
+group. Preflight binds the authenticated client and object claims to the canonical
+configured identity and resolves direct and inherited assignments. It also calls
+Microsoft Graph `servicePrincipals/{id}/transitiveMemberOf` to enumerate the
+identity's transitive groups, then rejects any Azure role assigned to one of those
+groups. The advanced Graph query requires `ConsistencyLevel=eventual`,
+`$count=true`, and an exact count matching the returned values. Membership
+evidence that is malformed, paginated beyond the bounded 999 groups, duplicated,
+contradictory, or unavailable fails closed. Both identities therefore need the
+Microsoft Graph `Application.Read.All` application permission with admin consent.
+Preflight rejects any assignment outside the exact phase set.
 
-The deployment identity also needs Reader on its exact user-assigned identity
-and Reader on the exact external Azure OpenAI account so preflight can inspect
-federation, deployments, and role assignments. Grant the managed identity the
-Microsoft Graph `Application.Read.All` application role with admin consent so it
-can verify the existing UI application and service-principal assignment policy.
-These read grants do not permit model inference or application mutation outside
-the reviewed resource group.
+For `foundation-apply`, the apply identity must have exactly subscription Reader
+plus Contributor at `rg-optima-hackathon`, with no inherited, group-derived, or
+extra assignment. The separated workflow refuses to plan or apply when the group
+is absent. Only the independent `Deploy production` compatibility path permits
+exact subscription Contributor while creating the group; after the group exists,
+remove that assignment and use subscription Reader plus target-group Contributor.
+Later production publication and rollout phases enforce their own additional
+phase-specific access, including exact-registry `AcrPush` where required.
+
+`Application.Read.All` also lets the production deployment identity verify the
+existing UI application and service-principal assignment policy. The external
+Azure OpenAI owner grants Cognitive Services OpenAI User to
+`id-optima-api-hackathon` on the exact selected account.
 
 The reviewed access bootstrap principal additionally needs Role Based Access
 Control Administrator on the exact registry to create the two `AcrPull`
-assignments. The external Azure OpenAI owner grants Cognitive Services OpenAI
-User to `id-optima-api-hackathon` on the exact selected account.
+assignments. This bootstrap identity is not either workflow OIDC identity.
 
 ## First deployment procedure
 
@@ -314,9 +424,9 @@ contains the Container Apps environment default domain.
    redirect URI on the UI Entra application, require user assignment, and set
    `OPTIMA_UI_AUTH_REDIRECT_URI` to that exact value.
 6. Grant Cognitive Services OpenAI User to the API identity. Grant the publisher
-  `AcrPush`. Apply ACR and Cosmos runtime access with the separate reviewed
-  bootstrap principal; disabled mode creates no Redis assignment. The routine
-  workflow never requests RBAC administration.
+   `AcrPush`. Apply ACR and Cosmos runtime access with the separate reviewed
+   bootstrap principal; disabled mode creates no Redis assignment. The routine
+   workflow never requests RBAC administration.
 7. Set `OPTIMA_RUNTIME_ACCESS_BOOTSTRAPPED=true` only after the assignments are
    present. Remove temporary subscription or RBAC-administration permissions.
 8. Dispatch the workflow again for the same exact commit. It transfers the exact
@@ -329,7 +439,7 @@ contains the Container Apps environment default domain.
    behavior, and intended-user restriction.
 
 Do not enable `deployContainerApps` manually to bypass a failed gate. Correct the
-missing prerequisite and rerun the same immutable commit.
+missing prerequisite and rerun the same exact commit.
 
 ## Preflight procedure
 
@@ -338,6 +448,10 @@ Azure CLI queries and emits secret-free JSON evidence with redacted subscription
 and tenant IDs.
 
 ```bash
+python scripts/azure_preflight.py --phase foundation-plan \
+   --output foundation-plan-preflight.json
+python scripts/azure_preflight.py --phase foundation-apply \
+   --output foundation-apply-preflight.json
 python scripts/azure_preflight.py --phase foundation --output foundation-preflight.json
 python scripts/azure_preflight.py --phase publish --output publish-preflight.json
 python scripts/azure_preflight.py --phase artifacts \
@@ -348,18 +462,32 @@ python scripts/azure_preflight.py --phase rollout \
 
 The phases prove these progressively stronger conditions:
 
-* `foundation`: tenant, subscription, OIDC federation, Contributor scope,
-  providers, active Azure OpenAI deployments, active-role pricing provenance,
-  budget, checked-in IaC representation, explicit disabled mode, and absent
-  Redis and embedding configuration. Cache-enabled mode additionally requires
-  the East US 2 Redis Enterprise resource type, exact Balanced B0 advertisement,
-  applicable restrictions, quota exposure, and allocation-unknown evidence
-* `publish`: foundation resources, exact UI callback and assignment policy,
-  `AcrPush`, and external Foundry access for the API identity
+* `foundation-plan`: dedicated read-only identity, providers, checked-in IaC,
+   semantically valid fixed-cost governance, explicit disabled cache, and absent
+   Redis and embedding configuration
+* `foundation`: apply identity, providers, checked-in IaC, and semantically valid
+   fixed-cost governance. The disabled-cache profile does not validate active
+   model deployments or model pricing. Cache-enabled production instead requires
+   the complete runtime composition, validates active models and the canonical
+   pricing binding, and checks the East US 2 Redis resource type, exact Balanced
+   B0 advertisement, applicable restrictions, quota exposure, and
+   allocation-unknown evidence before Redis mutation
+* `publish`: foundation resources, active model deployments and pricing binding,
+   exact UI callback and assignment policy, `AcrPush`, and external Foundry access
+   for the API identity
 * `artifacts`: separate API and UI registry manifest digests
 * `rollout`: artifacts plus API/UI `AcrPull`, container-scoped Cosmos data
   contribution, and Foundry inference access. Cache-enabled mode also requires
   the Redis `default` policy
+
+Application and runtime phases remain strict once enabled: they do not accept
+missing UI, Entra, registry, Foundry, model, pricing, image, runtime-access, or
+callback inputs because an earlier foundation-only phase omitted them. UI client
+and tenant IDs must be canonical GUIDs, and the confidential-client secret cannot
+be empty or whitespace. Decimal cost values must be finite and semantically valid,
+required rates must be positive, optional cached rates must be non-negative,
+model/version bindings must match live deployments, and the canonical pricing
+digest must match every reviewed source, currency, identity, and rate field.
 
 The following Redis quota and allocation behavior applies only to cache-enabled
 mode. Disabled mode does not query `Microsoft.Cache` and instead proves that the

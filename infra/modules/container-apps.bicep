@@ -197,13 +197,15 @@ var judgeConfigurationIsComplete = !empty(trim(judgeDeployment ?? '')) && !start
   'replace-'
 )
 var judgeConfigurationIsAbsent = judgeDeployment == null && judgeModel == null && judgeModelVersion == null && pricingJudgeInputRatePerMillionTokens == null && pricingJudgeOutputRatePerMillionTokens == null && pricingJudgeCachedInputRatePerMillionTokens == null
-var validatedEvaluatorMode = productionEvaluatorMode == 'LLM_JUDGE'
-  ? judgeConfigurationIsComplete
-      ? productionEvaluatorMode
-      : fail('LLM_JUDGE Container Apps deployment requires deployable judge identity and pricing values.')
-  : judgeConfigurationIsAbsent
-      ? productionEvaluatorMode
-      : fail('EXACT_REFERENCE Container Apps deployment rejects inactive JUDGE identity and pricing values.')
+var validatedEvaluatorMode = !deployApplications
+  ? productionEvaluatorMode
+  : productionEvaluatorMode == 'LLM_JUDGE'
+      ? judgeConfigurationIsComplete
+          ? productionEvaluatorMode
+          : fail('LLM_JUDGE Container Apps deployment requires deployable judge identity and pricing values.')
+      : judgeConfigurationIsAbsent
+          ? productionEvaluatorMode
+          : fail('EXACT_REFERENCE Container Apps deployment rejects inactive JUDGE identity and pricing values.')
 var judgeEnvironment = validatedEvaluatorMode == 'LLM_JUDGE'
   ? concat(
       [
@@ -324,7 +326,7 @@ var revisionSuffix = 'r-${take(deploymentCommitSha, 12)}-${take(deploymentWorkfl
 resource managedEnvironment 'Microsoft.App/managedEnvironments@2025-07-01' = {
   name: containerAppsEnvironmentName
   location: location
-  tags: deploymentTags
+  tags: tags
   properties: {
     appLogsConfiguration: {
       destination: 'none'

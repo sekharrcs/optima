@@ -33,6 +33,75 @@ def test_application_parameter_files_target_eastus2_with_deployment_disabled() -
             assert f"param {cache_parameter} =" not in content
 
 
+def test_foundation_parameter_file_contains_only_consumed_profile_values() -> None:
+    """Keep every deferred application and runtime input out of foundation plans."""
+    content = read("infra/environments/hackathon.foundation.bicepparam")
+    parameter_names = set(re.findall(r"^param (\w+) =", content, flags=re.MULTILINE))
+
+    assert "using '../resource-group.bicep'" in content
+    assert parameter_names == {
+        "deploymentCommitSha",
+        "deploymentWorkflowRunId",
+        "environmentName",
+        "location",
+        "semanticCacheEnabled",
+    }
+    assert "param semanticCacheEnabled = false" in content
+
+
+def test_resource_group_defaults_only_inactive_application_parameters() -> None:
+    """Allow foundation evaluation while retaining strict application deployment."""
+    resources = read("infra/resource-group.bicep")
+    main = read("infra/main.bicep")
+
+    for parameter in (
+        "apiImageDigest",
+        "foundryBaseUrl",
+        "foundrySmallDeployment",
+        "foundrySmallModel",
+        "foundrySmallModelVersion",
+        "foundryStrongDeployment",
+        "foundryStrongModel",
+        "foundryStrongModelVersion",
+        "pricingCatalogVersion",
+        "pricingCurrency",
+        "pricingSmallInputRatePerMillionTokens",
+        "pricingSmallOutputRatePerMillionTokens",
+        "pricingStrongInputRatePerMillionTokens",
+        "pricingStrongOutputRatePerMillionTokens",
+        "productionEvaluatorMode",
+        "uiAuthClientId",
+        "uiAuthTenantId",
+        "uiImageDigest",
+    ):
+        assert re.search(rf"param {parameter} [^\n]+ = ", resources)
+        assert not re.search(rf"param {parameter} [^\n]+ = ", main)
+
+    for parameter in (
+        "deploymentCommitSha",
+        "deploymentWorkflowRunId",
+        "semanticCacheEnabled",
+    ):
+        assert not re.search(rf"param {parameter} [^\n]+ = ", resources)
+
+    assert "!deployContainerApps || modelConfigurationIsDeployable" in resources
+    assert "!deployContainerApps || basePricingConfigurationIsDeployable" in resources
+    assert "!deployContainerApps" in resources
+    assert "? productionEvaluatorMode" in resources
+
+
+def test_managed_environment_uses_stable_foundation_tags() -> None:
+    """Keep workflow provenance on applications and jobs, not foundation resources."""
+    module = read("infra/modules/container-apps.bicep")
+    managed_environment = module[
+        module.index("resource managedEnvironment") : module.index("resource api ")
+    ]
+
+    assert "tags: tags" in managed_environment
+    assert "deploymentTags" not in managed_environment
+    assert module.count("tags: deploymentTags") == 3
+
+
 def test_container_apps_require_separate_immutable_image_digests() -> None:
     """Reference each runtime image by manifest digest rather than a mutable tag."""
     main = read("infra/main.bicep")
@@ -305,9 +374,13 @@ def test_container_app_deployment_rejects_placeholder_entra_identity() -> None:
     """Reject deployment with placeholder identities or a missing client secret."""
     resources = read("infra/resource-group.bicep")
 
+    assert "func isCanonicalGuid(value string) bool" in resources
+    assert "length(replace(value, '-', '')) == 32" in resources
+    assert "isCanonicalGuid(uiAuthClientId)" in resources
     assert "uiAuthClientId != placeholderIdentity" in resources
+    assert "isCanonicalGuid(uiAuthTenantId)" in resources
     assert "uiAuthTenantId != placeholderIdentity" in resources
-    assert "!empty(uiAuthClientSecret)" in resources
+    assert "!empty(trim(uiAuthClientSecret))" in resources
     assert "!deployContainerApps || uiAuthConfigurationIsDeployable" in resources
     assert (
         "requires a non-placeholder UI Entra client ID, tenant ID, and "

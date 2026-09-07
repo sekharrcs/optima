@@ -16,7 +16,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: optima-production
+  # Replaces the former group: optima-production to serialize target mutations.
+  group: optima-hackathon-azure-mutation
   cancel-in-progress: false
 
 env:
@@ -140,7 +141,7 @@ jobs:
             --entrypoint uvicorn optima-api:production-check \
             optima.api.app:app --host 0.0.0.0 --port 8000
           api_port="$(docker port optima-api-production-check 8000/tcp | awk -F: 'END {print $NF}')"
-          for attempt in $(seq 1 60); do
+          for _attempt in $(seq 1 60); do
             if curl --fail --silent --show-error --connect-timeout 2 --max-time 3 \
               "http://127.0.0.1:$api_port/api/v1/health" | grep -F '"status":"ok"'; then
               api_ready=true
@@ -155,7 +156,7 @@ jobs:
             --env OPTIMA_UI_PRODUCTION_MODE=true \
             optima-ui:production-check
           ui_port="$(docker port optima-ui-production-check 8501/tcp | awk -F: 'END {print $NF}')"
-          for attempt in $(seq 1 60); do
+          for _attempt in $(seq 1 60); do
             if curl --fail --silent --show-error --connect-timeout 2 --max-time 3 \
               "http://127.0.0.1:$ui_port/_stcore/health" | grep -F 'ok'; then
               ui_ready=true
@@ -374,6 +375,33 @@ jobs:
           python scripts/azure_preflight.py --phase foundation \
             --output "$RUNNER_TEMP/foundation-preflight.json"
 
+      - name: Reject interrupted foundation deployments before mutation
+        shell: bash
+        run: |
+          set -euo pipefail
+          active_filter="[?starts_with(name, 'optima-foundation-') && properties.provisioningState!='Succeeded' && properties.provisioningState!='Failed' && properties.provisioningState!='Canceled' && properties.provisioningState!='Deleted'].name"
+          subscription_active="$(az deployment sub list \
+            --query "$active_filter" --output tsv)"
+          group_active=""
+          group_exists="$(az group exists \
+            --name "$AZURE_RESOURCE_GROUP" --output tsv)"
+          case "$group_exists" in
+            true)
+              group_active="$(az deployment group list \
+                --resource-group "$AZURE_RESOURCE_GROUP" \
+                --query "$active_filter" --output tsv)"
+              ;;
+            false) ;;
+            *)
+              echo "Resource-group existence returned invalid evidence" >&2
+              exit 1
+              ;;
+          esac
+          if test -n "$subscription_active" || test -n "$group_active"; then
+            echo "An interrupted foundation deployment is still active" >&2
+            exit 1
+          fi
+
       - name: What-if and converge the Azure foundation
         shell: bash
         run: |
@@ -417,7 +445,28 @@ jobs:
               "pricingEmbeddingInputRatePerMillionTokens=$OPTIMA_PRICING_EMBEDDING_INPUT_RATE_PER_MILLION_TOKENS"
             )
           fi
-          if az group show --name "$AZURE_RESOURCE_GROUP" >/dev/null 2>&1; then
+          active_filter="[?starts_with(name, 'optima-foundation-') && properties.provisioningState!='Succeeded' && properties.provisioningState!='Failed' && properties.provisioningState!='Canceled' && properties.provisioningState!='Deleted'].name"
+          subscription_active="$(az deployment sub list \
+            --query "$active_filter" --output tsv)"
+          group_exists="$(az group exists \
+            --name "$AZURE_RESOURCE_GROUP" --output tsv)"
+          case "$group_exists" in
+            true)
+              group_active="$(az deployment group list \
+                --resource-group "$AZURE_RESOURCE_GROUP" \
+                --query "$active_filter" --output tsv)"
+              test -z "$subscription_active"
+              test -z "$group_active"
+              ;;
+            false)
+              test -z "$subscription_active"
+              ;;
+            *)
+              echo "Resource-group existence returned invalid evidence" >&2
+              exit 1
+              ;;
+          esac
+          if test "$group_exists" = "true"; then
             az deployment group what-if --name optima-foundation-what-if \
               --resource-group "$AZURE_RESOURCE_GROUP" \
               --template-file infra/resource-group.bicep \
@@ -670,7 +719,7 @@ jobs:
           smoke_execution="$(az containerapp job start --name "$smoke_job" \
             --resource-group "$AZURE_RESOURCE_GROUP" --query name --output tsv)"
           smoke_status=Running
-          for attempt in $(seq 1 66); do
+          for _attempt in $(seq 1 66); do
             smoke_status="$(az containerapp job execution list --name "$smoke_job" \
               --resource-group "$AZURE_RESOURCE_GROUP" \
               --query "[?name=='$smoke_execution'].properties.status | [0]" \
@@ -682,7 +731,7 @@ jobs:
           az extension add --name application-insights \
             --version "$APPLICATION_INSIGHTS_EXTENSION_VERSION" --only-show-errors
           telemetry_seen=false
-          for attempt in $(seq 1 12); do
+          for _attempt in $(seq 1 12); do
             count="$(az monitor app-insights query --app appi-optima-hackathon \
               --resource-group "$AZURE_RESOURCE_GROUP" \
               --analytics-query "requests | where timestamp > ago(20m) | where operation_Id == '$trace_id' | count" \
@@ -772,7 +821,7 @@ jobs:
             exit 0
           fi
           contained=false
-          for attempt in 1 2 3; do
+          for _attempt in 1 2 3; do
             if az containerapp ingress update --name ca-optima-ui-hackathon \
                 --resource-group "$AZURE_RESOURCE_GROUP" --type internal && \
               test "$(az containerapp show --name ca-optima-ui-hackathon \
@@ -813,7 +862,7 @@ jobs:
             app_name="${contract%%|*}"
             revision_name="${contract#*|}"
             healthy=false
-            for attempt in $(seq 1 60); do
+            for _attempt in $(seq 1 60); do
               state="$(az containerapp revision show --name "$app_name" \
                 --revision "$revision_name" \
                 --resource-group "$AZURE_RESOURCE_GROUP" \

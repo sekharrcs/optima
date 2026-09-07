@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import hashlib
 import json
 import os
@@ -20,7 +22,14 @@ from urllib.parse import parse_qs, urljoin, urlparse
 
 EXIT_SUCCESS = 0
 EXIT_FAILURE = 1
-PREFLIGHT_PHASES = ("foundation", "publish", "artifacts", "rollout")
+PREFLIGHT_PHASES = (
+    "foundation-plan",
+    "foundation-apply",
+    "foundation",
+    "publish",
+    "artifacts",
+    "rollout",
+)
 RUNTIME_COMPOSITION_PHASES = frozenset({"publish", "artifacts", "rollout"})
 EXPECTED_LOCATION = "eastus2"
 EXPECTED_ENVIRONMENT = "hackathon"
@@ -33,6 +42,8 @@ REDIS_SKU_NAME = "Balanced_B0"
 REDIS_SKU_TIER = "Balanced"
 REDIS_MAX_RESPONSE_PAGES = 32
 REDIS_ARM_HOST = "management.azure.com"
+MICROSOFT_GRAPH_HOST = "graph.microsoft.com"
+MAX_TRANSITIVE_GROUPS = 999
 ACR_PUSH_ROLE_ID = "8311e382-0749-4cb8-b61a-304f252e45ec"
 ACR_PULL_ROLE_ID = "7f951dda-4ed3-4680-a7ca-43fe172d538d"
 CONTRIBUTOR_ROLE_ID = "b24988ac-6180-42a0-ab88-20f7382dd24c"
@@ -203,13 +214,17 @@ class DeploymentConfiguration:
     """Non-secret production bindings plus proof that the UI secret exists.
 
     Runtime-composition bindings are absent when the effective phase does not
-    deploy or consume them; foundation planning never requires them.
+    deploy or consume them. Disabled-cache foundation planning omits them, while
+    cache-enabled foundation planning validates them before Redis provisioning.
     """
 
     tenant_id: str
     subscription_id: str
     deployment_client_id: str
     deployment_identity_resource_id: str
+    counterpart_client_id: str | None
+    counterpart_identity_resource_id: str | None
+    foundation_plan_role_definition_id: str | None
     resource_group: str
     location: str
     registry_name: str | None
@@ -228,6 +243,14 @@ class DeploymentConfiguration:
     github_repository: str
     github_environment: str
     oidc_request_available: bool
+
+
+@dataclass(frozen=True)
+class EffectiveRoleAssignment:
+    """One canonical effective Azure RBAC assignment."""
+
+    role_definition_id: str
+    scope: str
 
 
 class AzureCli:
@@ -317,6 +340,20 @@ def _required_boolean(environment: Mapping[str, str], name: str) -> bool:
     if value == "false":
         return False
     raise PreflightError(f"Deployment setting {name} must be exactly true or false")
+
+
+def _required_guid(environment: Mapping[str, str], name: str) -> str:
+    """Load one stable canonical GUID."""
+    value = _required(environment, name).casefold()
+    if (
+        re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            value,
+        )
+        is None
+    ):
+        raise PreflightError(f"Deployment setting {name} must be a canonical GUID")
+    return value
 
 
 def _decimal(
@@ -471,18 +508,22 @@ def load_configuration(
 ) -> DeploymentConfiguration:
     """Load configuration for one effective phase without retaining secrets.
 
-    ``phase`` selects which runtime-composition inputs are required. Foundation
-    planning needs only the inputs that create foundation resources; the UI,
-    image-publication, Azure OpenAI runtime, and pricing inputs are required only
-    once their phases run. The default keeps the strict rollout contract used by
-    existing callers unchanged.
+    ``phase`` selects which runtime-composition inputs are required. A
+    disabled-cache foundation needs only foundation inputs. Cache-enabled
+    foundation validates the complete runtime contract before Redis can be
+    provisioned. The default keeps the strict rollout contract used by existing
+    callers unchanged.
     """
     if phase not in PREFLIGHT_PHASES:
         raise PreflightError(f"Unsupported preflight phase {phase}")
-    runtime_composition = phase in RUNTIME_COMPOSITION_PHASES
     semantic_cache_enabled = _required_boolean(
         environment, "OPTIMA_SEMANTIC_CACHE_ENABLED"
     )
+    foundation_plan = phase == "foundation-plan"
+    separated_foundation_apply = phase == "foundation-apply"
+    if foundation_plan and semantic_cache_enabled:
+        raise PreflightError("foundation-plan does not support enabled semantic cache")
+    runtime_composition = phase in RUNTIME_COMPOSITION_PHASES or semantic_cache_enabled
     supplied_cache_settings = sorted(
         name
         for name in PREFLIGHT_CACHE_ONLY_SETTINGS
@@ -525,9 +566,50 @@ def load_configuration(
     configuration = DeploymentConfiguration(
         tenant_id=_required(environment, "AZURE_TENANT_ID"),
         subscription_id=_required(environment, "AZURE_SUBSCRIPTION_ID"),
-        deployment_client_id=_required(environment, "AZURE_CLIENT_ID"),
+        deployment_client_id=_required(
+            environment,
+            (
+                "AZURE_FOUNDATION_PLAN_CLIENT_ID"
+                if foundation_plan
+                else "AZURE_CLIENT_ID"
+            ),
+        ),
         deployment_identity_resource_id=_required(
-            environment, "AZURE_DEPLOYMENT_IDENTITY_RESOURCE_ID"
+            environment,
+            (
+                "AZURE_FOUNDATION_PLAN_IDENTITY_RESOURCE_ID"
+                if foundation_plan
+                else "AZURE_DEPLOYMENT_IDENTITY_RESOURCE_ID"
+            ),
+        ),
+        counterpart_client_id=(
+            _required(
+                environment,
+                (
+                    "AZURE_CLIENT_ID"
+                    if foundation_plan
+                    else "AZURE_FOUNDATION_PLAN_CLIENT_ID"
+                ),
+            )
+            if foundation_plan or separated_foundation_apply
+            else None
+        ),
+        counterpart_identity_resource_id=(
+            _required(
+                environment,
+                (
+                    "AZURE_DEPLOYMENT_IDENTITY_RESOURCE_ID"
+                    if foundation_plan
+                    else "AZURE_FOUNDATION_PLAN_IDENTITY_RESOURCE_ID"
+                ),
+            )
+            if foundation_plan or separated_foundation_apply
+            else None
+        ),
+        foundation_plan_role_definition_id=(
+            _required_guid(environment, "AZURE_FOUNDATION_PLAN_ROLE_DEFINITION_ID")
+            if foundation_plan
+            else None
         ),
         resource_group=_required(environment, "AZURE_RESOURCE_GROUP"),
         location=_required(environment, "AZURE_LOCATION"),
@@ -652,8 +734,8 @@ def validate_configuration(
     """Validate non-Azure deployment invariants and reviewed selections.
 
     Runtime-composition invariants apply only to the inputs the effective phase
-    supplied; foundation planning validates the foundation and governance inputs
-    and leaves absent runtime bindings unchecked rather than fabricated.
+    supplied. Disabled-cache foundation planning leaves absent runtime bindings
+    unchecked rather than fabricating them.
     """
     if configuration.location != EXPECTED_LOCATION:
         raise PreflightError(
@@ -667,6 +749,37 @@ def validate_configuration(
         raise PreflightError(f"OIDC environment must be {EXPECTED_ENVIRONMENT}")
     if not configuration.oidc_request_available:
         raise PreflightError("GitHub OIDC request variables are unavailable")
+    if (
+        configuration.counterpart_client_id is not None
+        or configuration.counterpart_identity_resource_id is not None
+    ):
+        if (
+            configuration.counterpart_client_id is None
+            or configuration.counterpart_identity_resource_id is None
+        ):
+            raise PreflightError("Foundation identity separation is incomplete")
+        if _canonical_guid(
+            configuration.deployment_client_id,
+            label="selected foundation client ID",
+        ) == _canonical_guid(
+            configuration.counterpart_client_id,
+            label="counterpart foundation client ID",
+        ):
+            raise PreflightError(
+                "Foundation plan and apply client IDs must be distinct"
+            )
+        _, _, selected_identity_id = _identity_parts(
+            configuration.deployment_identity_resource_id,
+            subscription_id=configuration.subscription_id,
+        )
+        _, _, counterpart_identity_id = _identity_parts(
+            configuration.counterpart_identity_resource_id,
+            subscription_id=configuration.subscription_id,
+        )
+        if selected_identity_id == counterpart_identity_id:
+            raise PreflightError(
+                "Foundation plan and apply identity resource IDs must be distinct"
+            )
     if (
         configuration.ui_auth_tenant_id is not None
         and configuration.ui_auth_tenant_id != configuration.tenant_id
@@ -792,18 +905,131 @@ def _normalized_location(value: str) -> str:
     return re.sub(r"[^a-z0-9]", "", value.casefold())
 
 
-def _check_account(configuration: DeploymentConfiguration, azure: AzureQuery) -> None:
+def _canonical_guid(value: object, *, label: str) -> str:
+    if not isinstance(value, str):
+        raise PreflightError(f"{label} is not a canonical GUID")
+    normalized = value.casefold()
+    if (
+        re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            normalized,
+        )
+        is None
+    ):
+        raise PreflightError(f"{label} is not a canonical GUID")
+    return normalized
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    document: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in document:
+            raise ValueError("duplicate JSON key")
+        document[key] = value
+    return document
+
+
+def _decode_access_token_claims(access_token: object) -> dict[str, Any]:
+    if not isinstance(access_token, str):
+        raise PreflightError("Azure ARM access token response is malformed")
+    segments = access_token.split(".")
+    if len(segments) != 3 or any(
+        not segment or re.fullmatch(r"[A-Za-z0-9_-]+", segment) is None
+        for segment in segments
+    ):
+        raise PreflightError("Azure ARM access token claims are malformed")
+    encoded_payload = segments[1] + ("=" * (-len(segments[1]) % 4))
+    try:
+        payload_bytes = base64.b64decode(
+            encoded_payload,
+            altchars=b"-_",
+            validate=True,
+        )
+        claims = json.loads(
+            payload_bytes.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_json_keys,
+        )
+    except (
+        binascii.Error,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        ValueError,
+    ) as error:
+        raise PreflightError("Azure ARM access token claims are malformed") from error
+    if not isinstance(claims, dict):
+        raise PreflightError("Azure ARM access token claims are malformed")
+    return claims
+
+
+def _check_account(configuration: DeploymentConfiguration, azure: AzureQuery) -> str:
     account = azure.json("account", "show")
     if not isinstance(account, dict):
         raise PreflightError("Azure account response is malformed")
-    if account.get("id") != configuration.subscription_id:
+    subscription_id = _canonical_guid(
+        configuration.subscription_id,
+        label="AZURE_SUBSCRIPTION_ID",
+    )
+    tenant_id = _canonical_guid(
+        configuration.tenant_id,
+        label="AZURE_TENANT_ID",
+    )
+    client_id = _canonical_guid(
+        configuration.deployment_client_id,
+        label="configured deployment client ID",
+    )
+    if _canonical_guid(account.get("id"), label="Azure CLI subscription ID") != (
+        subscription_id
+    ):
         raise PreflightError(
             "Azure CLI subscription does not match AZURE_SUBSCRIPTION_ID"
         )
-    if account.get("tenantId") != configuration.tenant_id:
+    if _canonical_guid(account.get("tenantId"), label="Azure CLI tenant ID") != (
+        tenant_id
+    ):
         raise PreflightError("Azure CLI tenant does not match AZURE_TENANT_ID")
     if account.get("state") != "Enabled":
         raise PreflightError("Azure subscription is not enabled")
+    user = account.get("user")
+    if (
+        not isinstance(user, dict)
+        or not isinstance(user.get("type"), str)
+        or user["type"].casefold() != "serviceprincipal"
+        or _canonical_guid(user.get("name"), label="Azure CLI client identity")
+        != client_id
+    ):
+        raise PreflightError(
+            "Azure CLI session is not the configured service-principal client"
+        )
+    token_document = azure.json(
+        "account",
+        "get-access-token",
+        "--resource-type",
+        "arm",
+        "--subscription",
+        configuration.subscription_id,
+    )
+    if not isinstance(token_document, dict) or token_document.get("tokenType") != (
+        "Bearer"
+    ):
+        raise PreflightError("Azure ARM access token response is malformed")
+    claims = _decode_access_token_claims(token_document.get("accessToken"))
+    claim_tenant = _canonical_guid(claims.get("tid"), label="ARM token tenant claim")
+    claim_principal = _canonical_guid(
+        claims.get("oid"),
+        label="ARM token object claim",
+    )
+    client_claims = [
+        _canonical_guid(claims[name], label=f"ARM token {name} claim")
+        for name in ("appid", "azp")
+        if name in claims
+    ]
+    if claim_tenant != tenant_id:
+        raise PreflightError("Azure ARM token tenant does not match AZURE_TENANT_ID")
+    if not client_claims or any(claim != client_id for claim in client_claims):
+        raise PreflightError(
+            "Azure ARM token client does not match the configured deployment client"
+        )
+    return claim_principal
 
 
 def _check_providers(
@@ -852,9 +1078,17 @@ def _check_providers(
     return cache_provider
 
 
-def _identity_parts(resource_id: str) -> tuple[str, str]:
+def _canonical_arm_segment(value: str, *, label: str) -> str:
+    if re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9._()-]{0,255}", value
+    ) is None or value.endswith("."):
+        raise PreflightError(f"{label} contains a malformed ARM path segment")
+    return value.casefold()
+
+
+def _identity_parts(resource_id: str, *, subscription_id: str) -> tuple[str, str, str]:
     match = re.fullmatch(
-        r"/subscriptions/[^/]+/resourceGroups/([^/]+)/providers/"
+        r"/subscriptions/([^/]+)/resourceGroups/([^/]+)/providers/"
         r"Microsoft\.ManagedIdentity/userAssignedIdentities/([^/]+)",
         resource_id,
         flags=re.IGNORECASE,
@@ -864,14 +1098,517 @@ def _identity_parts(resource_id: str) -> tuple[str, str]:
             "AZURE_DEPLOYMENT_IDENTITY_RESOURCE_ID is not a user-assigned "
             "managed identity resource ID"
         )
-    return match.group(1), match.group(2)
+    identity_subscription = _canonical_guid(
+        match.group(1),
+        label="deployment identity subscription",
+    )
+    configured_subscription = _canonical_guid(
+        subscription_id,
+        label="AZURE_SUBSCRIPTION_ID",
+    )
+    if identity_subscription != configured_subscription:
+        raise PreflightError(
+            "Deployment identity subscription does not match AZURE_SUBSCRIPTION_ID"
+        )
+    resource_group = _canonical_arm_segment(
+        match.group(2),
+        label="deployment identity resource group",
+    )
+    identity_name = _canonical_arm_segment(
+        match.group(3),
+        label="deployment identity name",
+    )
+    canonical_id = (
+        f"/subscriptions/{identity_subscription}/resourcegroups/{resource_group}/"
+        "providers/microsoft.managedidentity/userassignedidentities/"
+        f"{identity_name}"
+    )
+    return match.group(2), match.group(3), canonical_id
+
+
+def _canonical_arm_scope(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or not value.startswith("/")
+        or value.endswith("/")
+        or "%" in value
+        or "?" in value
+        or "#" in value
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        raise PreflightError("OIDC deployment role assignment scope is malformed")
+    segments = value.split("/")
+    if (
+        len(segments) >= 4
+        and segments[1].casefold() == "providers"
+        and segments[2].casefold() == "microsoft.management"
+    ):
+        if (
+            len(segments) != 5
+            or segments[1].casefold() != "providers"
+            or segments[3].casefold() != "managementgroups"
+        ):
+            raise PreflightError("OIDC deployment role assignment scope is malformed")
+        management_group = _canonical_arm_segment(
+            segments[4],
+            label="management group scope",
+        )
+        return f"/providers/microsoft.management/managementgroups/{management_group}"
+    if len(segments) < 3 or segments[1].casefold() != "subscriptions":
+        raise PreflightError("OIDC deployment role assignment scope is malformed")
+    subscription_id = _canonical_guid(
+        segments[2],
+        label="role assignment scope subscription",
+    )
+    canonical = f"/subscriptions/{subscription_id}"
+    if len(segments) == 3:
+        return canonical
+    if len(segments) < 5 or segments[3].casefold() != "resourcegroups":
+        raise PreflightError("OIDC deployment role assignment scope is malformed")
+    resource_group = _canonical_arm_segment(
+        segments[4],
+        label="role assignment resource group",
+    )
+    canonical += f"/resourcegroups/{resource_group}"
+    if len(segments) == 5:
+        return canonical
+    if (
+        len(segments) < 9
+        or segments[5].casefold() != "providers"
+        or (len(segments) - 7) % 2 != 0
+        or re.fullmatch(r"[A-Za-z][A-Za-z0-9.]+", segments[6]) is None
+    ):
+        raise PreflightError("OIDC deployment role assignment scope is malformed")
+    canonical += f"/providers/{segments[6].casefold()}"
+    for index in range(7, len(segments), 2):
+        resource_type = _canonical_arm_segment(
+            segments[index],
+            label="role assignment resource type",
+        )
+        resource_name = _canonical_arm_segment(
+            segments[index + 1],
+            label="role assignment resource name",
+        )
+        canonical += f"/{resource_type}/{resource_name}"
+    return canonical
+
+
+def _role_definition_guid(value: object, *, subscription_id: str) -> str:
+    if not isinstance(value, str):
+        raise PreflightError("OIDC deployment role definition ID is malformed")
+    patterns = (
+        (
+            r"/subscriptions/([^/]+)/providers/Microsoft\.Authorization/"
+            r"roleDefinitions/([^/]+)",
+            True,
+        ),
+        (
+            r"/providers/Microsoft\.Authorization/roleDefinitions/([^/]+)",
+            False,
+        ),
+        (
+            r"/providers/Microsoft\.Management/managementGroups/([^/]+)/providers/"
+            r"Microsoft\.Authorization/roleDefinitions/([^/]+)",
+            False,
+        ),
+    )
+    for pattern, has_subscription in patterns:
+        match = re.fullmatch(pattern, value, flags=re.IGNORECASE)
+        if match is None:
+            continue
+        role_id = match.group(2 if has_subscription else match.lastindex or 1)
+        if has_subscription and _canonical_guid(
+            match.group(1),
+            label="role definition subscription",
+        ) != _canonical_guid(subscription_id, label="AZURE_SUBSCRIPTION_ID"):
+            raise PreflightError(
+                "OIDC deployment role definition belongs to another subscription"
+            )
+        return _canonical_guid(role_id, label="OIDC deployment role definition ID")
+    raise PreflightError("OIDC deployment role definition ID is malformed")
+
+
+def _effective_role_assignments(
+    configuration: DeploymentConfiguration,
+    azure: AzureQuery,
+    *,
+    principal_id: str,
+) -> tuple[EffectiveRoleAssignment, ...]:
+    subscription_scope = f"/subscriptions/{configuration.subscription_id}"
+    query_arguments = (
+        (
+            "role",
+            "assignment",
+            "list",
+            "--assignee-object-id",
+            principal_id,
+            "--all",
+            "--fill-principal-name",
+            "false",
+        ),
+        (
+            "role",
+            "assignment",
+            "list",
+            "--assignee-object-id",
+            principal_id,
+            "--scope",
+            subscription_scope,
+            "--include-inherited",
+            "--fill-principal-name",
+            "false",
+        ),
+    )
+    parsed: list[EffectiveRoleAssignment] = []
+    seen: set[EffectiveRoleAssignment] = set()
+    for arguments in query_arguments:
+        assignments = azure.json(*arguments)
+        if not isinstance(assignments, list):
+            raise PreflightError(
+                "OIDC deployment role assignment response is malformed"
+            )
+        query_seen: set[EffectiveRoleAssignment] = set()
+        for assignment in assignments:
+            if not isinstance(assignment, dict):
+                raise PreflightError(
+                    "OIDC deployment role assignment response is malformed"
+                )
+            principal_type = assignment.get("principalType")
+            if isinstance(principal_type, str) and principal_type.casefold() == "group":
+                raise PreflightError(
+                    "OIDC deployment identity has a group-derived role"
+                )
+            if (
+                not isinstance(principal_type, str)
+                or principal_type.casefold() != "serviceprincipal"
+                or _canonical_guid(
+                    assignment.get("principalId"),
+                    label="role assignment principal ID",
+                )
+                != principal_id
+            ):
+                raise PreflightError(
+                    "OIDC deployment role assignment principal is malformed"
+                )
+            parsed_assignment = EffectiveRoleAssignment(
+                role_definition_id=_role_definition_guid(
+                    assignment.get("roleDefinitionId"),
+                    subscription_id=configuration.subscription_id,
+                ),
+                scope=_canonical_arm_scope(assignment.get("scope")),
+            )
+            if parsed_assignment in query_seen:
+                raise PreflightError(
+                    "OIDC deployment identity has duplicate role assignments"
+                )
+            query_seen.add(parsed_assignment)
+            if parsed_assignment not in seen:
+                seen.add(parsed_assignment)
+                parsed.append(parsed_assignment)
+    return tuple(parsed)
+
+
+def _transitive_group_ids(azure: AzureQuery, *, principal_id: str) -> tuple[str, ...]:
+    """Return bounded transitive Microsoft Entra group membership evidence."""
+    document = azure.json(
+        "rest",
+        "--method",
+        "get",
+        "--url",
+        (
+            f"https://{MICROSOFT_GRAPH_HOST}/v1.0/servicePrincipals/"
+            f"{principal_id}/transitiveMemberOf/microsoft.graph.group"
+            "?$select=id&$top=999&$count=true"
+        ),
+        "--headers",
+        "ConsistencyLevel=eventual",
+        "--resource",
+        "https://graph.microsoft.com/",
+    )
+    if not isinstance(document, dict) or set(document) - {
+        "@odata.count",
+        "@odata.context",
+        "@odata.nextLink",
+        "value",
+    }:
+        raise PreflightError("Microsoft Graph transitive membership is malformed")
+    if document.get("@odata.nextLink") not in (None, ""):
+        raise PreflightError("Microsoft Graph transitive membership exceeds the limit")
+    values = document.get("value")
+    count = document.get("@odata.count")
+    if (
+        not isinstance(values, list)
+        or len(values) > MAX_TRANSITIVE_GROUPS
+        or not isinstance(count, int)
+        or isinstance(count, bool)
+        or count != len(values)
+    ):
+        raise PreflightError("Microsoft Graph transitive membership is malformed")
+    group_ids: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if not isinstance(value, dict) or set(value) - {"@odata.type", "id"}:
+            raise PreflightError("Microsoft Graph transitive membership is malformed")
+        if value.get("@odata.type") not in (None, "#microsoft.graph.group"):
+            raise PreflightError("Microsoft Graph transitive membership is malformed")
+        group_id = _canonical_guid(
+            value.get("id"),
+            label="Microsoft Graph transitive group ID",
+        )
+        if group_id in seen:
+            raise PreflightError(
+                "Microsoft Graph transitive membership contains duplicate groups"
+            )
+        seen.add(group_id)
+        group_ids.append(group_id)
+    return tuple(sorted(group_ids))
+
+
+def _reject_transitive_group_roles(
+    configuration: DeploymentConfiguration,
+    azure: AzureQuery,
+    *,
+    principal_id: str,
+) -> None:
+    """Reject any Azure role inherited through a transitive Entra group."""
+    subscription_scope = f"/subscriptions/{configuration.subscription_id}"
+    for group_id in _transitive_group_ids(azure, principal_id=principal_id):
+        for arguments in (
+            (
+                "role",
+                "assignment",
+                "list",
+                "--assignee-object-id",
+                group_id,
+                "--all",
+                "--fill-principal-name",
+                "false",
+            ),
+            (
+                "role",
+                "assignment",
+                "list",
+                "--assignee-object-id",
+                group_id,
+                "--scope",
+                subscription_scope,
+                "--include-inherited",
+                "--fill-principal-name",
+                "false",
+            ),
+        ):
+            assignments = azure.json(*arguments)
+            if not isinstance(assignments, list):
+                raise PreflightError(
+                    "Transitive group role assignment response is malformed"
+                )
+            if assignments:
+                raise PreflightError(
+                    "OIDC deployment identity has a group-derived Azure role"
+                )
+
+
+def _closed_permission_list(permission: Mapping[str, Any], field: str) -> list[str]:
+    value = permission.get(field)
+    if not isinstance(value, list) or any(
+        not isinstance(action, str) or not action.strip() for action in value
+    ):
+        raise PreflightError(
+            "Foundation plan role definition permissions are malformed"
+        )
+    normalized = [action.strip().casefold() for action in value]
+    if len(normalized) != len(set(normalized)):
+        raise PreflightError(
+            "Foundation plan role definition permissions are malformed"
+        )
+    return normalized
+
+
+def _check_foundation_plan_role_definition(
+    configuration: DeploymentConfiguration,
+    azure: AzureQuery,
+    *,
+    subscription_scope: str,
+    resource_group_scope: str,
+) -> None:
+    role_id = configuration.foundation_plan_role_definition_id
+    if role_id is None:
+        raise PreflightError("Foundation plan role definition ID is unavailable")
+    definitions = azure.json(
+        "role",
+        "definition",
+        "list",
+        "--name",
+        role_id,
+        "--custom-role-only",
+        "true",
+    )
+    if (
+        not isinstance(definitions, list)
+        or len(definitions) != 1
+        or not isinstance(definitions[0], dict)
+    ):
+        raise PreflightError(
+            "Foundation plan role definition is unreadable or malformed"
+        )
+    definition = definitions[0]
+    if (
+        definition.get("roleType") != "CustomRole"
+        or _role_definition_guid(
+            definition.get("id"),
+            subscription_id=configuration.subscription_id,
+        )
+        != role_id
+    ):
+        raise PreflightError("Foundation plan role definition identity is malformed")
+    permissions = definition.get("permissions")
+    if (
+        not isinstance(permissions, list)
+        or len(permissions) != 1
+        or not isinstance(permissions[0], dict)
+    ):
+        raise PreflightError(
+            "Foundation plan role definition permissions are malformed"
+        )
+    permission = permissions[0]
+    if set(permission) != {"actions", "notActions", "dataActions", "notDataActions"}:
+        raise PreflightError(
+            "Foundation plan role definition permissions are malformed"
+        )
+    actions = _closed_permission_list(permission, "actions")
+    if actions != ["microsoft.resources/deployments/whatif/action"] or any(
+        _closed_permission_list(permission, field)
+        for field in ("notActions", "dataActions", "notDataActions")
+    ):
+        raise PreflightError(
+            "Foundation plan role must allow only deployments what-if action"
+        )
+    assignable_scopes = definition.get("assignableScopes")
+    if not isinstance(assignable_scopes, list) or any(
+        not isinstance(scope, str) for scope in assignable_scopes
+    ):
+        raise PreflightError("Foundation plan role assignable scopes are malformed")
+    canonical_scopes = [_canonical_arm_scope(scope) for scope in assignable_scopes]
+    if len(canonical_scopes) != len(set(canonical_scopes)) or not {
+        subscription_scope,
+        resource_group_scope,
+    }.intersection(canonical_scopes):
+        raise PreflightError(
+            "Foundation plan role is not assignable to the target resource group"
+        )
+
+
+def _check_deployment_role_allowlist(
+    configuration: DeploymentConfiguration,
+    azure: AzureQuery,
+    *,
+    phase: str,
+    principal_id: str,
+) -> None:
+    _reject_transitive_group_roles(
+        configuration,
+        azure,
+        principal_id=principal_id,
+    )
+    assignments = set(
+        _effective_role_assignments(
+            configuration,
+            azure,
+            principal_id=principal_id,
+        )
+    )
+    subscription_scope = _canonical_arm_scope(
+        f"/subscriptions/{configuration.subscription_id}"
+    )
+    resource_group_scope = _canonical_arm_scope(
+        f"/subscriptions/{configuration.subscription_id}/resourceGroups/"
+        f"{configuration.resource_group}"
+    )
+    if phase == "foundation-plan":
+        plan_role_id = configuration.foundation_plan_role_definition_id
+        if plan_role_id is None:
+            raise PreflightError("Foundation plan role definition ID is unavailable")
+        expected = {
+            EffectiveRoleAssignment(READER_ROLE_ID, subscription_scope),
+            EffectiveRoleAssignment(plan_role_id, resource_group_scope),
+        }
+    elif phase in {"foundation", "foundation-apply"}:
+        group = azure.json(
+            "group",
+            "show",
+            "--name",
+            configuration.resource_group,
+            allow_missing=True,
+        )
+        if group is None:
+            if phase == "foundation-apply":
+                raise PreflightError(
+                    "Separated foundation apply requires the target resource group"
+                )
+            expected = {
+                EffectiveRoleAssignment(CONTRIBUTOR_ROLE_ID, subscription_scope)
+            }
+        else:
+            expected = {
+                EffectiveRoleAssignment(READER_ROLE_ID, subscription_scope),
+                EffectiveRoleAssignment(CONTRIBUTOR_ROLE_ID, resource_group_scope),
+            }
+    else:
+        if configuration.registry_name is None:
+            raise PreflightError("Container registry name is unavailable")
+        registry_scope = _canonical_arm_scope(
+            f"{resource_group_scope}/providers/Microsoft.ContainerRegistry/"
+            f"registries/{configuration.registry_name}"
+        )
+        expected = {
+            EffectiveRoleAssignment(READER_ROLE_ID, subscription_scope),
+            EffectiveRoleAssignment(CONTRIBUTOR_ROLE_ID, resource_group_scope),
+            EffectiveRoleAssignment(ACR_PUSH_ROLE_ID, registry_scope),
+        }
+        if EffectiveRoleAssignment(ACR_PUSH_ROLE_ID, registry_scope) not in assignments:
+            raise PreflightError(
+                "OIDC deployment identity lacks AcrPush on the OPTIMA registry"
+            )
+    if assignments != expected:
+        if any(
+            assignment.role_definition_id in FORBIDDEN_DEPLOYMENT_ROLE_IDS
+            for assignment in assignments
+        ):
+            raise PreflightError(
+                "OIDC deployment identity has a forbidden Owner or RBAC "
+                "administration role"
+            )
+        if any(
+            assignment.role_definition_id == CONTRIBUTOR_ROLE_ID
+            and assignment not in expected
+            for assignment in assignments
+        ):
+            raise PreflightError(
+                "OIDC deployment identity must have Contributor only at the "
+                "approved scope"
+            )
+        raise PreflightError(
+            "OIDC deployment identity must have exactly the approved effective roles"
+        )
+    if phase == "foundation-plan":
+        _check_foundation_plan_role_definition(
+            configuration,
+            azure,
+            subscription_scope=subscription_scope,
+            resource_group_scope=resource_group_scope,
+        )
 
 
 def _check_oidc_federation(
-    configuration: DeploymentConfiguration, azure: AzureQuery
+    configuration: DeploymentConfiguration,
+    azure: AzureQuery,
+    *,
+    phase: str,
+    session_principal_id: str,
 ) -> None:
-    resource_group, identity_name = _identity_parts(
-        configuration.deployment_identity_resource_id
+    resource_group, identity_name, configured_identity_id = _identity_parts(
+        configuration.deployment_identity_resource_id,
+        subscription_id=configuration.subscription_id,
     )
     identity = azure.json(
         "identity",
@@ -881,12 +1618,33 @@ def _check_oidc_federation(
         "--name",
         identity_name,
     )
-    if (
-        not isinstance(identity, dict)
-        or identity.get("clientId") != configuration.deployment_client_id
-        or not identity.get("principalId")
+    if not isinstance(identity, dict):
+        raise PreflightError("OIDC deployment identity response is malformed")
+    _, _, returned_identity_id = _identity_parts(
+        identity.get("id", ""),
+        subscription_id=configuration.subscription_id,
+    )
+    identity_client_id = _canonical_guid(
+        identity.get("clientId"),
+        label="OIDC deployment identity client ID",
+    )
+    identity_principal_id = _canonical_guid(
+        identity.get("principalId"),
+        label="OIDC deployment identity principal ID",
+    )
+    if returned_identity_id != configured_identity_id:
+        raise PreflightError(
+            "Returned OIDC deployment identity ID does not match configured identity"
+        )
+    if identity_client_id != _canonical_guid(
+        configuration.deployment_client_id,
+        label="configured deployment client ID",
     ):
-        raise PreflightError("OIDC deployment identity does not match AZURE_CLIENT_ID")
+        raise PreflightError("OIDC deployment identity does not match client ID")
+    if identity_principal_id != session_principal_id:
+        raise PreflightError(
+            "Azure ARM token object does not match deployment identity principal"
+        )
     credentials = azure.json(
         "identity",
         "federated-credential",
@@ -910,90 +1668,12 @@ def _check_oidc_federation(
         raise PreflightError(
             "GitHub environment federated credential is missing or mismatched"
         )
-    assignments = azure.json(
-        "role",
-        "assignment",
-        "list",
-        "--assignee-object-id",
-        str(identity["principalId"]),
-        "--all",
+    _check_deployment_role_allowlist(
+        configuration,
+        azure,
+        phase=phase,
+        principal_id=identity_principal_id,
     )
-    group = azure.json(
-        "group",
-        "show",
-        "--name",
-        configuration.resource_group,
-        allow_missing=True,
-    )
-    subscription_scope = f"/subscriptions/{configuration.subscription_id}".casefold()
-    resource_group_scope = (
-        f"/subscriptions/{configuration.subscription_id}/resourceGroups/"
-        f"{configuration.resource_group}"
-    ).casefold()
-    if not isinstance(assignments, list):
-        raise PreflightError("OIDC deployment role assignment response is malformed")
-    contributor_scopes = {
-        str(assignment.get("scope", "")).casefold()
-        for assignment in assignments
-        if isinstance(assignment, dict)
-        and str(assignment.get("roleDefinitionId", ""))
-        .casefold()
-        .endswith(CONTRIBUTOR_ROLE_ID)
-    }
-    required_contributor_scope = (
-        subscription_scope if group is None else resource_group_scope
-    )
-    if contributor_scopes != {required_contributor_scope}:
-        raise PreflightError(
-            "OIDC deployment identity must have Contributor only at the approved scope"
-        )
-    if group is not None and not any(
-        isinstance(assignment, dict)
-        and str(assignment.get("roleDefinitionId", ""))
-        .casefold()
-        .endswith(READER_ROLE_ID)
-        and str(assignment.get("scope", "")).casefold() == subscription_scope
-        for assignment in assignments
-    ):
-        raise PreflightError(
-            "OIDC deployment identity requires subscription Reader after bootstrap"
-        )
-    registry_name = configuration.registry_name
-    acr_push_assignments = [
-        assignment
-        for assignment in assignments
-        if isinstance(assignment, dict)
-        and str(assignment.get("roleDefinitionId", ""))
-        .casefold()
-        .endswith(ACR_PUSH_ROLE_ID)
-    ]
-    if registry_name is None:
-        if acr_push_assignments:
-            raise PreflightError(
-                "Foundation deployment identity must not hold AcrPush before "
-                "image publication"
-            )
-    else:
-        registry_scope = (
-            f"{resource_group_scope}/providers/Microsoft.ContainerRegistry/"
-            f"registries/{registry_name}"
-        ).casefold()
-        if any(
-            str(assignment.get("scope", "")).casefold() != registry_scope
-            for assignment in acr_push_assignments
-        ):
-            raise PreflightError("AcrPush must not be inherited or broadly scoped")
-    if any(
-        isinstance(assignment, dict)
-        and any(
-            str(assignment.get("roleDefinitionId", "")).casefold().endswith(role_id)
-            for role_id in FORBIDDEN_DEPLOYMENT_ROLE_IDS
-        )
-        for assignment in assignments
-    ):
-        raise PreflightError(
-            "OIDC deployment identity has a forbidden Owner or RBAC administration role"
-        )
 
 
 def _check_ui_authentication(
@@ -1798,8 +2478,9 @@ def _check_acr_push(configuration: DeploymentConfiguration, azure: AzureQuery) -
         raise PreflightError(
             "Container registry name is required to verify AcrPush publication access"
         )
-    identity_resource_group, identity_name = _identity_parts(
-        configuration.deployment_identity_resource_id
+    identity_resource_group, identity_name, _ = _identity_parts(
+        configuration.deployment_identity_resource_id,
+        subscription_id=configuration.subscription_id,
     )
     identity = azure.json(
         "identity",
@@ -1838,14 +2519,22 @@ def _check_acr_push(configuration: DeploymentConfiguration, azure: AzureQuery) -
         registry_id,
         "--all",
     )
-    if not isinstance(assignments, list) or not any(
-        isinstance(assignment, dict)
-        and str(assignment.get("roleDefinitionId", ""))
-        .casefold()
-        .endswith(ACR_PUSH_ROLE_ID)
-        and str(assignment.get("scope", "")).casefold() == registry_id.casefold()
-        for assignment in assignments
-    ):
+    if not isinstance(assignments, list):
+        raise PreflightError("ACR role assignment response is malformed")
+    registry_scope = _canonical_arm_scope(registry_id)
+    has_acr_push = False
+    for assignment in assignments:
+        if not isinstance(assignment, dict):
+            raise PreflightError("ACR role assignment response is malformed")
+        has_acr_push = has_acr_push or (
+            _role_definition_guid(
+                assignment.get("roleDefinitionId"),
+                subscription_id=configuration.subscription_id,
+            )
+            == ACR_PUSH_ROLE_ID
+            and _canonical_arm_scope(assignment.get("scope")) == registry_scope
+        )
+    if not has_acr_push:
         raise PreflightError(
             "OIDC deployment identity lacks AcrPush on the OPTIMA registry"
         )
@@ -1879,14 +2568,22 @@ def _check_foundry_runtime_access(
         openai_resource_id,
         "--all",
     )
-    if not isinstance(assignments, list) or not any(
-        isinstance(assignment, dict)
-        and str(assignment.get("roleDefinitionId", ""))
-        .casefold()
-        .endswith(OPENAI_USER_ROLE_ID)
-        and str(assignment.get("scope", "")).casefold() == openai_resource_id.casefold()
-        for assignment in assignments
-    ):
+    if not isinstance(assignments, list):
+        raise PreflightError("Foundry role assignment response is malformed")
+    openai_scope = _canonical_arm_scope(openai_resource_id)
+    has_openai_user = False
+    for assignment in assignments:
+        if not isinstance(assignment, dict):
+            raise PreflightError("Foundry role assignment response is malformed")
+        has_openai_user = has_openai_user or (
+            _role_definition_guid(
+                assignment.get("roleDefinitionId"),
+                subscription_id=configuration.subscription_id,
+            )
+            == OPENAI_USER_ROLE_ID
+            and _canonical_arm_scope(assignment.get("scope")) == openai_scope
+        )
+    if not has_openai_user:
         raise PreflightError(
             "OPTIMA API identity lacks Cognitive Services OpenAI User on the "
             "selected account"
@@ -1949,14 +2646,19 @@ def _check_runtime_access(
     if not isinstance(registry_assignments, list):
         raise PreflightError("ACR role assignment response is malformed")
     for component, principal_id in principals.items():
-        if not any(
-            isinstance(assignment, dict)
-            and assignment.get("principalId") == principal_id
-            and str(assignment.get("roleDefinitionId", ""))
-            .casefold()
-            .endswith(ACR_PULL_ROLE_ID)
-            for assignment in registry_assignments
-        ):
+        has_acr_pull = False
+        for assignment in registry_assignments:
+            if not isinstance(assignment, dict):
+                raise PreflightError("ACR role assignment response is malformed")
+            has_acr_pull = has_acr_pull or (
+                assignment.get("principalId") == principal_id
+                and _role_definition_guid(
+                    assignment.get("roleDefinitionId"),
+                    subscription_id=configuration.subscription_id,
+                )
+                == ACR_PULL_ROLE_ID
+            )
+        if not has_acr_pull:
             raise PreflightError(
                 f"OPTIMA {component.upper()} identity lacks AcrPull on the registry"
             )
@@ -1973,12 +2675,14 @@ def _check_runtime_access(
         else None
     )
     expected_cosmos_scope = f"{cosmos['id']}/dbs/optima/colls/runs".casefold()
+    expected_cosmos_role = (
+        f"{cosmos['id']}/sqlRoleDefinitions/00000000-0000-0000-0000-000000000002"
+    ).casefold()
     if not isinstance(cosmos_values, list) or not any(
         isinstance(assignment, dict)
         and assignment.get("properties", {}).get("principalId") == principals["api"]
-        and str(assignment.get("properties", {}).get("roleDefinitionId", ""))
-        .casefold()
-        .endswith("/sqlroledefinitions/00000000-0000-0000-0000-000000000002")
+        and str(assignment.get("properties", {}).get("roleDefinitionId", "")).casefold()
+        == expected_cosmos_role
         and str(assignment.get("properties", {}).get("scope", "")).casefold()
         == expected_cosmos_scope
         for assignment in cosmos_values
@@ -2058,15 +2762,20 @@ def run_preflight(
     ui_digest: str | None = None,
 ) -> dict[str, Any]:
     """Run a read-only preflight phase and return secret-free evidence."""
-    if phase not in {"foundation", "publish", "artifacts", "rollout"}:
+    if phase not in PREFLIGHT_PHASES:
         raise PreflightError(f"Unsupported preflight phase {phase}")
     _check_iac_representation(repository_root)
-    _check_account(configuration, azure)
+    session_principal_id = _check_account(configuration, azure)
     cache_provider = _check_providers(
         azure,
         semantic_cache_enabled=configuration.semantic_cache_enabled,
     )
-    _check_oidc_federation(configuration, azure)
+    _check_oidc_federation(
+        configuration,
+        azure,
+        phase=phase,
+        session_principal_id=session_principal_id,
+    )
     redis_evidence: dict[str, Any] | None = None
     if configuration.semantic_cache_enabled:
         if cache_provider is None:
@@ -2188,7 +2897,7 @@ def create_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--phase",
-        choices=("foundation", "publish", "artifacts", "rollout"),
+        choices=PREFLIGHT_PHASES,
         required=True,
     )
     parser.add_argument("--repository-root", type=Path, default=Path.cwd())
