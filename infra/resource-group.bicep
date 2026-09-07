@@ -39,10 +39,10 @@ param deployRuntimeAccess bool = false
 param semanticCacheEnabled bool
 
 @description('Existing single-tenant Microsoft Entra application client ID for UI authentication.')
-param uiAuthClientId string
+param uiAuthClientId string = ''
 
 @description('Microsoft Entra tenant ID that may authenticate to the public UI.')
-param uiAuthTenantId string
+param uiAuthTenantId string = ''
 
 @secure()
 @description('Confidential-client secret of the existing UI Entra app registration. Supplied at preflight; never committed to source or parameter files.')
@@ -51,40 +51,40 @@ param uiAuthClientSecret string = ''
 @description('Immutable API image manifest digest produced by a later build slice.')
 @minLength(71)
 @maxLength(71)
-param apiImageDigest string
+param apiImageDigest string = 'sha256:0000000000000000000000000000000000000000000000000000000000000000'
 
 @description('Immutable UI image manifest digest produced by a later build slice.')
 @minLength(71)
 @maxLength(71)
-param uiImageDigest string
+param uiImageDigest string = 'sha256:0000000000000000000000000000000000000000000000000000000000000000'
 
 @description('Foundry or APIM Azure OpenAI v1 API root.')
-param foundryBaseUrl string
+param foundryBaseUrl string = ''
 
 @description('Foundry deployment mapped to the OPTIMA SMALL role.')
-param foundrySmallDeployment string
+param foundrySmallDeployment string = ''
 
 @description('Provider model identity expected from the OPTIMA SMALL deployment.')
-param foundrySmallModel string
+param foundrySmallModel string = ''
 
 @description('Reviewed model version expected from the OPTIMA SMALL deployment.')
-param foundrySmallModelVersion string
+param foundrySmallModelVersion string = ''
 
 @description('Foundry deployment mapped to the OPTIMA STRONG role.')
-param foundryStrongDeployment string
+param foundryStrongDeployment string = ''
 
 @description('Provider model identity expected from the OPTIMA STRONG deployment.')
-param foundryStrongModel string
+param foundryStrongModel string = ''
 
 @description('Reviewed model version expected from the OPTIMA STRONG deployment.')
-param foundryStrongModelVersion string
+param foundryStrongModelVersion string = ''
 
 @description('Production quality evaluator mode.')
 @allowed([
   'EXACT_REFERENCE'
   'LLM_JUDGE'
 ])
-param productionEvaluatorMode string
+param productionEvaluatorMode string = 'EXACT_REFERENCE'
 
 @description('Foundry deployment mapped to the OPTIMA JUDGE role in LLM_JUDGE mode.')
 param judgeDeployment string?
@@ -122,25 +122,25 @@ param redisEmbeddingDimension int?
 param applicationInsightsSamplingRatio string = '0.25'
 
 @description('Reviewed pricing catalog version that identifies the exact model-rate source.')
-param pricingCatalogVersion string
+param pricingCatalogVersion string = ''
 
 @description('Shared ISO 4217 currency used by every reviewed model rate.')
-param pricingCurrency string
+param pricingCurrency string = ''
 
 @description('Reviewed SMALL input price per million tokens.')
-param pricingSmallInputRatePerMillionTokens string
+param pricingSmallInputRatePerMillionTokens string = ''
 
 @description('Reviewed SMALL output price per million tokens.')
-param pricingSmallOutputRatePerMillionTokens string
+param pricingSmallOutputRatePerMillionTokens string = ''
 
 @description('Reviewed SMALL cached-input price per million tokens when the selected model has a distinct rate.')
 param pricingSmallCachedInputRatePerMillionTokens string?
 
 @description('Reviewed STRONG input price per million tokens.')
-param pricingStrongInputRatePerMillionTokens string
+param pricingStrongInputRatePerMillionTokens string = ''
 
 @description('Reviewed STRONG output price per million tokens.')
-param pricingStrongOutputRatePerMillionTokens string
+param pricingStrongOutputRatePerMillionTokens string = ''
 
 @description('Reviewed STRONG cached-input price per million tokens when the selected model has a distinct rate.')
 param pricingStrongCachedInputRatePerMillionTokens string?
@@ -156,6 +156,62 @@ param pricingJudgeCachedInputRatePerMillionTokens string?
 
 @description('Reviewed embedding input price per million tokens.')
 param pricingEmbeddingInputRatePerMillionTokens string?
+
+func containsOnlyHex(value string) bool =>
+  empty(replace(
+    replace(
+      replace(
+        replace(
+          replace(
+            replace(
+              replace(
+                replace(
+                  replace(
+                    replace(
+                      replace(
+                        replace(replace(replace(replace(replace(value, '0', ''), '1', ''), '2', ''), '3', ''), '4', ''),
+                        '5',
+                        ''
+                      ),
+                      '6',
+                      ''
+                    ),
+                    '7',
+                    ''
+                  ),
+                  '8',
+                  ''
+                ),
+                '9',
+                ''
+              ),
+              'a',
+              ''
+            ),
+            'b',
+            ''
+          ),
+          'c',
+          ''
+        ),
+        'd',
+        ''
+      ),
+      'e',
+      ''
+    ),
+    'f',
+    ''
+  ))
+
+func isCanonicalGuid(value string) bool =>
+  value == trim(value) && length(value) == 36
+    ? substring(value, 8, 1) == '-' && substring(value, 13, 1) == '-' && substring(value, 18, 1) == '-' && substring(
+        value,
+        23,
+        1
+      ) == '-' && length(replace(value, '-', '')) == 32 && containsOnlyHex(replace(toLower(value), '-', ''))
+    : false
 
 var placeholderImageDigest = 'sha256:0000000000000000000000000000000000000000000000000000000000000000'
 var apiDigestHex = substring(apiImageDigest, 7, 64)
@@ -265,13 +321,26 @@ var validatedUiImageDigest = !deployContainerApps || uiImageDigestIsDeployable
   ? uiImageDigest
   : fail('Container Apps deployment requires a non-placeholder UI sha256 digest.')
 var placeholderIdentity = '00000000-0000-0000-0000-000000000000'
-var uiAuthConfigurationIsDeployable = uiAuthClientId != placeholderIdentity && uiAuthTenantId != placeholderIdentity && !empty(uiAuthClientSecret)
+var uiAuthConfigurationIsDeployable = isCanonicalGuid(uiAuthClientId) && uiAuthClientId != placeholderIdentity && isCanonicalGuid(uiAuthTenantId) && uiAuthTenantId != placeholderIdentity && !empty(trim(uiAuthClientSecret))
 var validatedUiAuthClientId = !deployContainerApps || uiAuthConfigurationIsDeployable
   ? uiAuthClientId
   : fail('Container Apps deployment requires a non-placeholder UI Entra client ID, tenant ID, and confidential-client secret.')
 var validatedUiAuthTenantId = !deployContainerApps || uiAuthConfigurationIsDeployable
   ? uiAuthTenantId
   : fail('Container Apps deployment requires a non-placeholder UI Entra client ID, tenant ID, and confidential-client secret.')
+var modelConfigurationIsDeployable = !empty(trim(foundryBaseUrl)) && !contains(toLower(foundryBaseUrl), 'replace-') && !empty(trim(foundrySmallDeployment)) && !startsWith(
+  toLower(foundrySmallDeployment),
+  'replace-'
+) && !empty(trim(foundrySmallModel)) && !startsWith(toLower(foundrySmallModel), 'replace-') && !empty(trim(foundrySmallModelVersion)) && !startsWith(
+  toLower(foundrySmallModelVersion),
+  'replace-'
+) && !empty(trim(foundryStrongDeployment)) && !startsWith(toLower(foundryStrongDeployment), 'replace-') && !empty(trim(foundryStrongModel)) && !startsWith(
+  toLower(foundryStrongModel),
+  'replace-'
+) && !empty(trim(foundryStrongModelVersion)) && !startsWith(toLower(foundryStrongModelVersion), 'replace-')
+var validatedFoundryBaseUrl = !deployContainerApps || modelConfigurationIsDeployable
+  ? foundryBaseUrl
+  : fail('Container Apps deployment requires complete deployable SMALL and STRONG model configuration.')
 var basePricingConfigurationIsDeployable = !empty(pricingCatalogVersion) && !startsWith(
   pricingCatalogVersion,
   'replace-'
@@ -296,13 +365,15 @@ var judgeConfigurationIsComplete = !empty(trim(judgeDeployment ?? '')) && !start
   'replace-'
 )
 var judgeConfigurationIsAbsent = judgeDeployment == null && judgeModel == null && judgeModelVersion == null && pricingJudgeInputRatePerMillionTokens == null && pricingJudgeOutputRatePerMillionTokens == null && pricingJudgeCachedInputRatePerMillionTokens == null
-var validatedEvaluatorMode = productionEvaluatorMode == 'LLM_JUDGE'
-  ? judgeConfigurationIsComplete
-      ? productionEvaluatorMode
-      : fail('LLM_JUDGE requires deployable JUDGE identity and pricing values.')
-  : judgeConfigurationIsAbsent
-      ? productionEvaluatorMode
-      : fail('EXACT_REFERENCE rejects inactive JUDGE identity and pricing values.')
+var validatedEvaluatorMode = !deployContainerApps
+  ? productionEvaluatorMode
+  : productionEvaluatorMode == 'LLM_JUDGE'
+      ? judgeConfigurationIsComplete
+          ? productionEvaluatorMode
+          : fail('LLM_JUDGE requires deployable JUDGE identity and pricing values.')
+      : judgeConfigurationIsAbsent
+          ? productionEvaluatorMode
+          : fail('EXACT_REFERENCE rejects inactive JUDGE identity and pricing values.')
 var cacheConfigurationIsComplete = !empty(trim(redisEmbeddingDeployment ?? '')) && !startsWith(
   toLower(redisEmbeddingDeployment ?? ''),
   'replace-'
@@ -522,7 +593,7 @@ module containerApps 'modules/container-apps.bicep' = {
     deployApplications: deployContainerApps
     environmentName: environmentName
     exposePublicUi: validatedExposePublicUi
-    foundryBaseUrl: foundryBaseUrl
+    foundryBaseUrl: validatedFoundryBaseUrl
     foundrySmallDeployment: foundrySmallDeployment
     foundrySmallModel: foundrySmallModel
     foundrySmallModelVersion: foundrySmallModelVersion
