@@ -20,6 +20,8 @@ from urllib.parse import parse_qs, urljoin, urlparse
 
 EXIT_SUCCESS = 0
 EXIT_FAILURE = 1
+PREFLIGHT_PHASES = ("foundation", "publish", "artifacts", "rollout")
+RUNTIME_COMPOSITION_PHASES = frozenset({"publish", "artifacts", "rollout"})
 EXPECTED_LOCATION = "eastus2"
 EXPECTED_ENVIRONMENT = "hackathon"
 EXPECTED_REPOSITORY = "sekharrcs/optima"
@@ -198,7 +200,11 @@ class PricingConfiguration:
 
 @dataclass(frozen=True)
 class DeploymentConfiguration:
-    """Non-secret production bindings plus proof that the UI secret exists."""
+    """Non-secret production bindings plus proof that the UI secret exists.
+
+    Runtime-composition bindings are absent when the effective phase does not
+    deploy or consume them; foundation planning never requires them.
+    """
 
     tenant_id: str
     subscription_id: str
@@ -206,17 +212,17 @@ class DeploymentConfiguration:
     deployment_identity_resource_id: str
     resource_group: str
     location: str
-    registry_name: str
-    openai_resource_id: str
-    foundry_base_url: str
-    ui_auth_client_id: str
-    ui_auth_tenant_id: str
+    registry_name: str | None
+    openai_resource_id: str | None
+    foundry_base_url: str | None
+    ui_auth_client_id: str | None
+    ui_auth_tenant_id: str | None
     ui_auth_redirect_uri: str
     ui_auth_secret_present: bool
     semantic_cache_enabled: bool
     embedding_dimension: int | None
     models: tuple[ModelBinding, ...]
-    pricing: PricingConfiguration
+    pricing: PricingConfiguration | None
     expected_fixed_monthly_cost_inr: Decimal
     cost_reviewed_on: date
     github_repository: str
@@ -358,42 +364,11 @@ def _model_binding(environment: Mapping[str, str], role: str) -> ModelBinding:
     )
 
 
-def load_configuration(environment: Mapping[str, str]) -> DeploymentConfiguration:
-    """Load and validate deployment configuration without retaining secrets."""
-    semantic_cache_enabled = _required_boolean(
-        environment, "OPTIMA_SEMANTIC_CACHE_ENABLED"
-    )
-    supplied_cache_settings = sorted(
-        name
-        for name in PREFLIGHT_CACHE_ONLY_SETTINGS
-        if environment.get(name, "").strip()
-    )
-    if not semantic_cache_enabled and supplied_cache_settings:
-        raise PreflightError(
-            "Disabled semantic cache cannot configure cache-only deployment "
-            f"settings: {', '.join(supplied_cache_settings)}"
-        )
-    embedding_dimension: int | None = None
-    if semantic_cache_enabled:
-        try:
-            embedding_dimension = int(
-                _required(environment, "OPTIMA_REDIS_EMBEDDING_DIMENSION")
-            )
-        except ValueError as error:
-            raise PreflightError(
-                "OPTIMA_REDIS_EMBEDDING_DIMENSION must be an integer"
-            ) from error
-        if not 1 <= embedding_dimension <= 32768:
-            raise PreflightError(
-                "OPTIMA_REDIS_EMBEDDING_DIMENSION must be between 1 and 32768"
-            )
-    try:
-        reviewed_on = date.fromisoformat(
-            _required(environment, "OPTIMA_COST_REVIEWED_ON")
-        )
-    except ValueError as error:
-        raise PreflightError("OPTIMA_COST_REVIEWED_ON must use YYYY-MM-DD") from error
-    pricing = PricingConfiguration(
+def _load_pricing(
+    environment: Mapping[str, str], *, semantic_cache_enabled: bool
+) -> PricingConfiguration:
+    """Load the reviewed pricing catalog for a runtime-composition phase."""
+    return PricingConfiguration(
         catalog_version=_required(environment, "OPTIMA_PRICING_CATALOG_VERSION"),
         binding_sha256=_required(environment, "OPTIMA_PRICING_BINDING_SHA256"),
         source_url=_required(environment, "OPTIMA_PRICING_SOURCE_URL"),
@@ -489,6 +464,60 @@ def load_configuration(environment: Mapping[str, str]) -> DeploymentConfiguratio
             else None
         ),
     )
+
+
+def load_configuration(
+    environment: Mapping[str, str], *, phase: str = "rollout"
+) -> DeploymentConfiguration:
+    """Load configuration for one effective phase without retaining secrets.
+
+    ``phase`` selects which runtime-composition inputs are required. Foundation
+    planning needs only the inputs that create foundation resources; the UI,
+    image-publication, Azure OpenAI runtime, and pricing inputs are required only
+    once their phases run. The default keeps the strict rollout contract used by
+    existing callers unchanged.
+    """
+    if phase not in PREFLIGHT_PHASES:
+        raise PreflightError(f"Unsupported preflight phase {phase}")
+    runtime_composition = phase in RUNTIME_COMPOSITION_PHASES
+    semantic_cache_enabled = _required_boolean(
+        environment, "OPTIMA_SEMANTIC_CACHE_ENABLED"
+    )
+    supplied_cache_settings = sorted(
+        name
+        for name in PREFLIGHT_CACHE_ONLY_SETTINGS
+        if environment.get(name, "").strip()
+    )
+    if not semantic_cache_enabled and supplied_cache_settings:
+        raise PreflightError(
+            "Disabled semantic cache cannot configure cache-only deployment "
+            f"settings: {', '.join(supplied_cache_settings)}"
+        )
+    embedding_dimension: int | None = None
+    if semantic_cache_enabled:
+        try:
+            embedding_dimension = int(
+                _required(environment, "OPTIMA_REDIS_EMBEDDING_DIMENSION")
+            )
+        except ValueError as error:
+            raise PreflightError(
+                "OPTIMA_REDIS_EMBEDDING_DIMENSION must be an integer"
+            ) from error
+        if not 1 <= embedding_dimension <= 32768:
+            raise PreflightError(
+                "OPTIMA_REDIS_EMBEDDING_DIMENSION must be between 1 and 32768"
+            )
+    try:
+        reviewed_on = date.fromisoformat(
+            _required(environment, "OPTIMA_COST_REVIEWED_ON")
+        )
+    except ValueError as error:
+        raise PreflightError("OPTIMA_COST_REVIEWED_ON must use YYYY-MM-DD") from error
+    pricing = (
+        _load_pricing(environment, semantic_cache_enabled=semantic_cache_enabled)
+        if runtime_composition
+        else None
+    )
     fixed_cost = cast(
         Decimal,
         _decimal(environment, "OPTIMA_EXPECTED_FIXED_MONTHLY_COST_INR"),
@@ -502,24 +531,50 @@ def load_configuration(environment: Mapping[str, str]) -> DeploymentConfiguratio
         ),
         resource_group=_required(environment, "AZURE_RESOURCE_GROUP"),
         location=_required(environment, "AZURE_LOCATION"),
-        registry_name=_required(environment, "AZURE_CONTAINER_REGISTRY_NAME"),
-        openai_resource_id=_required(environment, "AZURE_OPENAI_RESOURCE_ID"),
-        foundry_base_url=_required(environment, "OPTIMA_FOUNDRY_BASE_URL"),
-        ui_auth_client_id=_required(environment, "OPTIMA_UI_AUTH_CLIENT_ID"),
-        ui_auth_tenant_id=_required(environment, "OPTIMA_UI_AUTH_TENANT_ID"),
+        registry_name=(
+            _required(environment, "AZURE_CONTAINER_REGISTRY_NAME")
+            if runtime_composition
+            else None
+        ),
+        openai_resource_id=(
+            _required(environment, "AZURE_OPENAI_RESOURCE_ID")
+            if runtime_composition
+            else None
+        ),
+        foundry_base_url=(
+            _required(environment, "OPTIMA_FOUNDRY_BASE_URL")
+            if runtime_composition
+            else None
+        ),
+        ui_auth_client_id=(
+            _required(environment, "OPTIMA_UI_AUTH_CLIENT_ID")
+            if runtime_composition
+            else None
+        ),
+        ui_auth_tenant_id=(
+            _required(environment, "OPTIMA_UI_AUTH_TENANT_ID")
+            if runtime_composition
+            else None
+        ),
         ui_auth_redirect_uri=environment.get("OPTIMA_UI_AUTH_REDIRECT_URI", "").strip(),
-        ui_auth_secret_present=bool(
-            _required(environment, "OPTIMA_UI_AUTH_CLIENT_SECRET")
+        ui_auth_secret_present=(
+            bool(_required(environment, "OPTIMA_UI_AUTH_CLIENT_SECRET"))
+            if runtime_composition
+            else False
         ),
         semantic_cache_enabled=semantic_cache_enabled,
         embedding_dimension=embedding_dimension,
-        models=tuple(
-            _model_binding(environment, role)
-            for role in (
-                ("SMALL", "STRONG", "JUDGE", "EMBEDDING")
-                if semantic_cache_enabled
-                else ("SMALL", "STRONG", "JUDGE")
+        models=(
+            tuple(
+                _model_binding(environment, role)
+                for role in (
+                    ("SMALL", "STRONG", "JUDGE", "EMBEDDING")
+                    if semantic_cache_enabled
+                    else ("SMALL", "STRONG", "JUDGE")
+                )
             )
+            if runtime_composition
+            else ()
         ),
         pricing=pricing,
         expected_fixed_monthly_cost_inr=fixed_cost,
@@ -535,12 +590,71 @@ def load_configuration(environment: Mapping[str, str]) -> DeploymentConfiguratio
     return configuration
 
 
+def _validate_pricing_bindings(
+    configuration: DeploymentConfiguration, pricing: PricingConfiguration
+) -> None:
+    """Validate reviewed pricing identity, provenance, and model agreement."""
+    pricing_bindings = {
+        "SMALL": (pricing.small_model, pricing.small_model_version),
+        "STRONG": (pricing.strong_model, pricing.strong_model_version),
+        "JUDGE": (pricing.judge_model, pricing.judge_model_version),
+    }
+    if configuration.semantic_cache_enabled:
+        if (
+            configuration.embedding_dimension is None
+            or pricing.embedding_model is None
+            or pricing.embedding_model_version is None
+            or pricing.embedding_input is None
+        ):
+            raise PreflightError(
+                "Enabled semantic cache requires complete embedding configuration "
+                "and pricing"
+            )
+        pricing_bindings["EMBEDDING"] = (
+            pricing.embedding_model,
+            pricing.embedding_model_version,
+        )
+    for binding in configuration.models:
+        if pricing_bindings[binding.role] != (binding.model, binding.version):
+            raise PreflightError(
+                f"{binding.role} pricing model/version does not match its live "
+                "deployment binding"
+            )
+    if not re.fullmatch(r"[A-Z]{3}", pricing.currency):
+        raise PreflightError("Pricing currency must be a three-letter uppercase code")
+    pricing_source = urlparse(pricing.source_url)
+    if (
+        pricing_source.scheme != "https"
+        or not pricing_source.hostname
+        or pricing_source.username
+        or pricing_source.password
+        or pricing_source.query
+        or pricing_source.fragment
+    ):
+        raise PreflightError("OPTIMA_PRICING_SOURCE_URL must be a public HTTPS URL")
+    expected_pricing_digest = pricing_binding_sha256(pricing)
+    if re.fullmatch(r"[0-9a-f]{64}", pricing.binding_sha256) is None:
+        raise PreflightError(
+            "OPTIMA_PRICING_BINDING_SHA256 must be 64 lowercase hexadecimal characters"
+        )
+    if pricing.binding_sha256 != expected_pricing_digest:
+        raise PreflightError(
+            "OPTIMA_PRICING_BINDING_SHA256 does not match the reviewed pricing "
+            f"binding; expected {expected_pricing_digest}"
+        )
+
+
 def validate_configuration(
     configuration: DeploymentConfiguration,
     *,
     today: date | None = None,
 ) -> None:
-    """Validate non-Azure deployment invariants and reviewed selections."""
+    """Validate non-Azure deployment invariants and reviewed selections.
+
+    Runtime-composition invariants apply only to the inputs the effective phase
+    supplied; foundation planning validates the foundation and governance inputs
+    and leaves absent runtime bindings unchecked rather than fabricated.
+    """
     if configuration.location != EXPECTED_LOCATION:
         raise PreflightError(
             f"Azure location must remain {EXPECTED_LOCATION}; no fallback is allowed"
@@ -553,7 +667,10 @@ def validate_configuration(
         raise PreflightError(f"OIDC environment must be {EXPECTED_ENVIRONMENT}")
     if not configuration.oidc_request_available:
         raise PreflightError("GitHub OIDC request variables are unavailable")
-    if configuration.ui_auth_tenant_id != configuration.tenant_id:
+    if (
+        configuration.ui_auth_tenant_id is not None
+        and configuration.ui_auth_tenant_id != configuration.tenant_id
+    ):
         raise PreflightError(
             "UI authentication tenant must match the deployment tenant"
         )
@@ -561,41 +678,6 @@ def validate_configuration(
         configuration.models
     ):
         raise PreflightError("Active model-role deployments must be distinct")
-    pricing_bindings = {
-        "SMALL": (
-            configuration.pricing.small_model,
-            configuration.pricing.small_model_version,
-        ),
-        "STRONG": (
-            configuration.pricing.strong_model,
-            configuration.pricing.strong_model_version,
-        ),
-        "JUDGE": (
-            configuration.pricing.judge_model,
-            configuration.pricing.judge_model_version,
-        ),
-    }
-    if configuration.semantic_cache_enabled:
-        if (
-            configuration.embedding_dimension is None
-            or configuration.pricing.embedding_model is None
-            or configuration.pricing.embedding_model_version is None
-            or configuration.pricing.embedding_input is None
-        ):
-            raise PreflightError(
-                "Enabled semantic cache requires complete embedding configuration "
-                "and pricing"
-            )
-        pricing_bindings["EMBEDDING"] = (
-            configuration.pricing.embedding_model,
-            configuration.pricing.embedding_model_version,
-        )
-    for binding in configuration.models:
-        if pricing_bindings[binding.role] != (binding.model, binding.version):
-            raise PreflightError(
-                f"{binding.role} pricing model/version does not match its live "
-                "deployment binding"
-            )
     if configuration.expected_fixed_monthly_cost_inr > MAX_FIXED_MONTHLY_COST_INR:
         raise PreflightError(
             "Reviewed fixed monthly infrastructure estimate exceeds the INR 5,000 "
@@ -608,42 +690,23 @@ def validate_configuration(
             f"Infrastructure cost review must be no more than "
             f"{MAX_COST_REVIEW_AGE_DAYS} days old"
         )
-    if not re.fullmatch(r"[A-Z]{3}", configuration.pricing.currency):
-        raise PreflightError("Pricing currency must be a three-letter uppercase code")
-    pricing_source = urlparse(configuration.pricing.source_url)
-    if (
-        pricing_source.scheme != "https"
-        or not pricing_source.hostname
-        or pricing_source.username
-        or pricing_source.password
-        or pricing_source.query
-        or pricing_source.fragment
-    ):
-        raise PreflightError("OPTIMA_PRICING_SOURCE_URL must be a public HTTPS URL")
-    expected_pricing_digest = pricing_binding_sha256(configuration.pricing)
-    if re.fullmatch(r"[0-9a-f]{64}", configuration.pricing.binding_sha256) is None:
-        raise PreflightError(
-            "OPTIMA_PRICING_BINDING_SHA256 must be 64 lowercase hexadecimal characters"
-        )
-    if configuration.pricing.binding_sha256 != expected_pricing_digest:
-        raise PreflightError(
-            "OPTIMA_PRICING_BINDING_SHA256 does not match the reviewed pricing "
-            f"binding; expected {expected_pricing_digest}"
-        )
-    parsed_url = urlparse(configuration.foundry_base_url)
-    if (
-        parsed_url.scheme != "https"
-        or not parsed_url.hostname
-        or parsed_url.username
-        or parsed_url.password
-        or parsed_url.path.rstrip("/") != "/openai/v1"
-        or parsed_url.params
-        or parsed_url.query
-        or parsed_url.fragment
-    ):
-        raise PreflightError(
-            "OPTIMA_FOUNDRY_BASE_URL must be an HTTPS /openai/v1 API root"
-        )
+    if configuration.pricing is not None:
+        _validate_pricing_bindings(configuration, configuration.pricing)
+    if configuration.foundry_base_url is not None:
+        parsed_url = urlparse(configuration.foundry_base_url)
+        if (
+            parsed_url.scheme != "https"
+            or not parsed_url.hostname
+            or parsed_url.username
+            or parsed_url.password
+            or parsed_url.path.rstrip("/") != "/openai/v1"
+            or parsed_url.params
+            or parsed_url.query
+            or parsed_url.fragment
+        ):
+            raise PreflightError(
+                "OPTIMA_FOUNDRY_BASE_URL must be an HTTPS /openai/v1 API root"
+            )
     if configuration.ui_auth_redirect_uri:
         redirect = urlparse(configuration.ui_auth_redirect_uri)
         if (
@@ -895,19 +958,31 @@ def _check_oidc_federation(
         raise PreflightError(
             "OIDC deployment identity requires subscription Reader after bootstrap"
         )
-    registry_scope = (
-        f"{resource_group_scope}/providers/Microsoft.ContainerRegistry/registries/"
-        f"{configuration.registry_name}"
-    ).casefold()
-    if any(
-        isinstance(assignment, dict)
+    registry_name = configuration.registry_name
+    acr_push_assignments = [
+        assignment
+        for assignment in assignments
+        if isinstance(assignment, dict)
         and str(assignment.get("roleDefinitionId", ""))
         .casefold()
         .endswith(ACR_PUSH_ROLE_ID)
-        and str(assignment.get("scope", "")).casefold() != registry_scope
-        for assignment in assignments
-    ):
-        raise PreflightError("AcrPush must not be inherited or broadly scoped")
+    ]
+    if registry_name is None:
+        if acr_push_assignments:
+            raise PreflightError(
+                "Foundation deployment identity must not hold AcrPush before "
+                "image publication"
+            )
+    else:
+        registry_scope = (
+            f"{resource_group_scope}/providers/Microsoft.ContainerRegistry/"
+            f"registries/{registry_name}"
+        ).casefold()
+        if any(
+            str(assignment.get("scope", "")).casefold() != registry_scope
+            for assignment in acr_push_assignments
+        ):
+            raise PreflightError("AcrPush must not be inherited or broadly scoped")
     if any(
         isinstance(assignment, dict)
         and any(
@@ -928,9 +1003,12 @@ def _check_ui_authentication(
         raise PreflightError(
             "OPTIMA_UI_AUTH_REDIRECT_URI is required after foundation provisioning"
         )
-    application = azure.json(
-        "ad", "app", "show", "--id", configuration.ui_auth_client_id
-    )
+    if configuration.ui_auth_client_id is None:
+        raise PreflightError(
+            "OPTIMA_UI_AUTH_CLIENT_ID is required to verify UI authentication"
+        )
+    ui_auth_client_id = configuration.ui_auth_client_id
+    application = azure.json("ad", "app", "show", "--id", ui_auth_client_id)
     if not isinstance(application, dict):
         raise PreflightError("UI Entra application response is malformed")
     if application.get("signInAudience") != "AzureADMyOrg":
@@ -941,9 +1019,7 @@ def _check_ui_authentication(
         raise PreflightError(
             "UI Entra application is missing the exact Container Apps callback URI"
         )
-    service_principal = azure.json(
-        "ad", "sp", "show", "--id", configuration.ui_auth_client_id
-    )
+    service_principal = azure.json("ad", "sp", "show", "--id", ui_auth_client_id)
     if not isinstance(service_principal, dict) or (
         service_principal.get("appRoleAssignmentRequired") is not True
     ):
@@ -1558,6 +1634,13 @@ def _openai_account_parts(resource_id: str) -> tuple[str, str]:
 def _check_model_deployments(
     configuration: DeploymentConfiguration, azure: AzureQuery
 ) -> dict[str, dict[str, str]]:
+    if (
+        configuration.openai_resource_id is None
+        or configuration.foundry_base_url is None
+    ):
+        raise PreflightError(
+            "Azure OpenAI runtime bindings are required to verify model deployments"
+        )
     resource_group, account_name = _openai_account_parts(
         configuration.openai_resource_id
     )
@@ -1711,6 +1794,10 @@ def _check_resource_group(
 
 
 def _check_acr_push(configuration: DeploymentConfiguration, azure: AzureQuery) -> None:
+    if configuration.registry_name is None:
+        raise PreflightError(
+            "Container registry name is required to verify AcrPush publication access"
+        )
     identity_resource_group, identity_name = _identity_parts(
         configuration.deployment_identity_resource_id
     )
@@ -1767,6 +1854,11 @@ def _check_acr_push(configuration: DeploymentConfiguration, azure: AzureQuery) -
 def _check_foundry_runtime_access(
     configuration: DeploymentConfiguration, azure: AzureQuery
 ) -> None:
+    if configuration.openai_resource_id is None:
+        raise PreflightError(
+            "Azure OpenAI resource ID is required to verify runtime access"
+        )
+    openai_resource_id = configuration.openai_resource_id
     identity = azure.json(
         "identity",
         "show",
@@ -1784,7 +1876,7 @@ def _check_foundry_runtime_access(
         "--assignee-object-id",
         str(identity["principalId"]),
         "--scope",
-        configuration.openai_resource_id,
+        openai_resource_id,
         "--all",
     )
     if not isinstance(assignments, list) or not any(
@@ -1792,8 +1884,7 @@ def _check_foundry_runtime_access(
         and str(assignment.get("roleDefinitionId", ""))
         .casefold()
         .endswith(OPENAI_USER_ROLE_ID)
-        and str(assignment.get("scope", "")).casefold()
-        == configuration.openai_resource_id.casefold()
+        and str(assignment.get("scope", "")).casefold() == openai_resource_id.casefold()
         for assignment in assignments
     ):
         raise PreflightError(
@@ -1938,6 +2029,10 @@ def _check_artifact(
     repository: str,
     digest: str,
 ) -> None:
+    if configuration.registry_name is None:
+        raise PreflightError(
+            "Container registry name is required to verify published artifacts"
+        )
     metadata = azure.json(
         "acr",
         "manifest",
@@ -1977,7 +2072,9 @@ def run_preflight(
         if cache_provider is None:
             raise AssertionError("enabled semantic cache requires provider evidence")
         redis_evidence = _check_redis_availability(configuration, azure, cache_provider)
-    model_evidence = _check_model_deployments(configuration, azure)
+    model_evidence: dict[str, dict[str, str]] = {}
+    if configuration.models:
+        model_evidence = _check_model_deployments(configuration, azure)
     require_foundation = phase in {"publish", "artifacts", "rollout"}
     resources = _check_resource_group(
         configuration,
@@ -2012,6 +2109,15 @@ def run_preflight(
             "api": validated_api_digest,
             "ui": validated_ui_digest,
         }
+    cost_evidence: dict[str, str] = {
+        "fixed_monthly_inr": str(configuration.expected_fixed_monthly_cost_inr),
+        "reviewed_on": configuration.cost_reviewed_on.isoformat(),
+    }
+    if configuration.pricing is not None:
+        cost_evidence["binding_sha256"] = configuration.pricing.binding_sha256
+        cost_evidence["catalog_version"] = configuration.pricing.catalog_version
+        cost_evidence["currency"] = configuration.pricing.currency
+        cost_evidence["source_url"] = configuration.pricing.source_url
     return {
         "artifacts": artifact_evidence,
         "checks": [
@@ -2034,7 +2140,7 @@ def run_preflight(
                     "embedding_configuration_absent",
                 )
             ),
-            "model_deployments",
+            *(("model_deployments",) if configuration.models else ()),
             "iac_representation",
             *(
                 (
@@ -2049,14 +2155,7 @@ def run_preflight(
             *(("runtime_access", "immutable_artifacts") if phase == "rollout" else ()),
             *(("immutable_artifacts",) if phase == "artifacts" else ()),
         ],
-        "cost": {
-            "binding_sha256": configuration.pricing.binding_sha256,
-            "catalog_version": configuration.pricing.catalog_version,
-            "currency": configuration.pricing.currency,
-            "fixed_monthly_inr": str(configuration.expected_fixed_monthly_cost_inr),
-            "reviewed_on": configuration.cost_reviewed_on.isoformat(),
-            "source_url": configuration.pricing.source_url,
-        },
+        "cost": cost_evidence,
         "environment": EXPECTED_ENVIRONMENT,
         "location": configuration.location,
         "models": model_evidence,
@@ -2103,7 +2202,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run preflight and write only redacted, non-secret evidence."""
     arguments = create_parser().parse_args(argv)
     try:
-        configuration = load_configuration(os.environ)
+        configuration = load_configuration(os.environ, phase=arguments.phase)
         evidence = run_preflight(
             configuration,
             AzureCli(),

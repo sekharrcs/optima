@@ -38,6 +38,116 @@ target `linux/amd64`. Native wheels such as `cryptography`, `pandas`, `Pillow`,
 and `pyarrow` are selected inside the AMD64 builder. An ARM workstation must not
 publish a native ARM build as an Azure runtime image.
 
+## Separated foundation plan and apply
+
+The `Foundation plan and apply` workflow
+(`.github/workflows/foundation.yml`) provisions only the Azure foundation for the
+approved profile `location=eastus2`, `deployContainerApps=false`,
+`exposePublicUi=false`, `deployRuntimeAccess=false`, and
+`semanticCacheEnabled=false`. It exists because the full `Deploy production`
+workflow requires the deployment confirmation, always builds images, and
+continues from the foundation what-if straight into publication and rollout. The
+foundation workflow adds a read-only planning operation and a distinct promotion
+operation so the foundation can be reviewed before any Azure mutation. Redis,
+embeddings, Container Apps, runtime role assignments, application images, Entra UI
+authentication, and inference canaries stay deferred to the later rollout stage in
+`Deploy production`.
+
+The workflow dispatch input `operation` selects one of two mutually exclusive
+jobs. `foundation-plan` is the default and is read only. `foundation-apply` is the
+separate promotion. Each job authenticates through GitHub Actions OIDC inside the
+`hackathon` environment and holds only `contents: read` and `id-token: write`; the
+apply job additionally holds `actions: read` solely to download the approved plan
+evidence from the referenced plan run.
+
+### foundation-plan
+
+`foundation-plan` performs no Azure mutation, builds no image, deploys no
+Container App, and creates no role assignment. It:
+
+1. Verifies the expected tenant, subscription, client identity, and permitted
+   scopes through `scripts/azure_preflight.py --phase foundation`, which confirms
+   the deployment principal is not subscription Owner or Contributor and holds
+   only subscription Reader plus `rg-optima-hackathon` Contributor.
+2. Runs the application quality gates and validates every Bicep entry point.
+3. Runs exactly one authoritative `az deployment group what-if` against the
+   existing resource group with the approved foundation parameters.
+4. Classifies the structured what-if with
+   `scripts/whatif_classification.py classify`, which fails closed on anything the
+   foundation profile does not create.
+5. Uploads a sanitized, commit-scoped `foundation-plan-evidence` artifact that
+   records the commit SHA, the effective parameter fingerprint, and the approved
+   change set. The artifact never contains subscription identifiers, secrets, or
+   raw resource IDs.
+
+Because `foundation-plan` requires only the inputs the foundation resources need,
+it does not require a UI client secret, UI or Entra client identity, Azure OpenAI
+runtime binding, container registry name, image digest, embedding, Redis, or
+model pricing value. It still requires the foundation identity, scope, semantic
+cache decision (`false`), and the fixed monthly cost review.
+
+### Review the plan evidence
+
+Download the `foundation-plan-evidence` artifact and confirm the classification is
+`APPROVED`, the commit SHA is the reviewed `main` commit, and the change set
+contains only the expected foundation resource types. The what-if classifier
+allows only expected `Create` operations and legitimate `NoChange` results inside
+`rg-optima-hackathon`. It fails closed on deletions, replacements, unexpected
+modifications, unsupported or unclassifiable changes, Azure OpenAI account or
+deployment changes, role assignments, Redis or embedding resources, Container Apps
+or application revisions, resources outside the approved group, any resource type
+the foundation contract does not declare, and any missing, truncated, or malformed
+structured evidence.
+
+### foundation-apply
+
+`foundation-apply` is dispatched separately after the plan evidence is reviewed.
+It requires the confirmation value `APPLY-FOUNDATION`, the exact 40-character
+`main` commit SHA being promoted, and the `plan_run_id` of the approving
+`foundation-plan` run. It:
+
+1. Verifies the confirmation, that the promoted SHA equals the checked-out head,
+   and that the run targets `main`.
+2. Downloads the plan evidence from `plan_run_id` and confirms it targets this
+   commit and was classified `APPROVED`.
+3. Re-runs the application and Bicep validation and the foundation preflight.
+4. Runs a fresh authoritative what-if and reclassifies it with the same
+   fail-closed rules to close the time-of-check to time-of-use gap.
+5. Refuses promotion unless the fresh evidence matches the approved plan on commit
+   SHA, parameter fingerprint, and `APPROVED` classification.
+6. Executes only the foundation `az deployment group create`, then verifies the
+   deployment reached `Succeeded` and that a convergence what-if remains approved.
+
+`foundation-apply` never builds or publishes an image, deploys a Container App,
+creates a runtime role assignment, configures Entra, provisions Redis or
+embeddings, or runs inference. It stops after the foundation deployment and
+convergence check.
+
+### Azure fresh-what-if limitation
+
+Azure does not support applying a previously stored what-if result. The plan
+evidence is therefore an integrity record, not an executable plan. The promotion
+gate is the combination of the fresh matching what-if at apply time plus the
+commit SHA and parameter fingerprint carried in the approved plan evidence. The
+apply operation does not claim stronger plan immutability than Azure provides.
+
+### Failure and recovery
+
+Any classifier failure, promotion mismatch, malformed or truncated what-if,
+absent plan evidence, or preflight rejection stops the run before Azure mutation.
+Correct the underlying prerequisite, re-run `foundation-plan` for the same commit,
+review the new evidence, and dispatch `foundation-apply` again with the new
+`plan_run_id`. Do not weaken the profile, the confirmation, or the classifier to
+bypass a failed gate.
+
+### Next post-foundation stage
+
+After the foundation converges, the application rollout continues in the separate
+`Deploy production` workflow, which builds and publishes the immutable images,
+applies runtime access, configures Entra UI authentication, and deploys the
+digest-qualified Container Apps. The foundation workflow deliberately performs
+none of those steps.
+
 ## Selected East US 2 cache profile
 
 The workflow reads one protected canonical production decision from the

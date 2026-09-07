@@ -1,0 +1,442 @@
+name: Foundation plan and apply
+
+# Safely separated foundation planning and application for the approved profile
+# location=eastus2, deployContainerApps=false, exposePublicUi=false,
+# deployRuntimeAccess=false, semanticCacheEnabled=false. This workflow never
+# builds or publishes an image, never deploys a Container App, never creates a
+# runtime role assignment, and never configures Entra, Redis, embeddings, or
+# inference canaries. Full application rollout stays in deploy-production.yml.
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Foundation operation to run
+        required: true
+        type: choice
+        default: foundation-plan
+        options:
+          - foundation-plan
+          - foundation-apply
+      confirm_commit_sha:
+        description: Full commit SHA promoted (foundation-apply only)
+        required: false
+        type: string
+      confirm_foundation:
+        description: Type APPLY-FOUNDATION to authorize foundation mutation
+        required: false
+        type: string
+      plan_run_id:
+        description: foundation-plan run ID whose evidence authorizes this apply
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: optima-foundation
+  cancel-in-progress: false
+
+env:
+  UV_NO_CACHE: "1"
+  BICEP_VERSION: "0.46.1"
+
+jobs:
+  foundation-plan:
+    name: Read-only foundation plan
+    if: ${{ inputs.operation == 'foundation-plan' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: hackathon
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AZURE_CLIENT_ID: "${{ vars.AZURE_CLIENT_ID }}"
+      AZURE_DEPLOYMENT_IDENTITY_RESOURCE_ID: "${{ vars.AZURE_DEPLOYMENT_IDENTITY_RESOURCE_ID }}"
+      AZURE_LOCATION: "${{ vars.AZURE_LOCATION }}"
+      AZURE_RESOURCE_GROUP: "${{ vars.AZURE_RESOURCE_GROUP }}"
+      AZURE_SUBSCRIPTION_ID: "${{ vars.AZURE_SUBSCRIPTION_ID }}"
+      AZURE_TENANT_ID: "${{ vars.AZURE_TENANT_ID }}"
+      OPTIMA_COST_REVIEWED_ON: "${{ vars.OPTIMA_COST_REVIEWED_ON }}"
+      OPTIMA_EXPECTED_FIXED_MONTHLY_COST_INR: "${{ vars.OPTIMA_EXPECTED_FIXED_MONTHLY_COST_INR }}"
+      OPTIMA_GITHUB_ENVIRONMENT: hackathon
+      OPTIMA_SEMANTIC_CACHE_ENABLED: "false"
+    steps:
+      # actions/checkout v7.0.1, resolved from the upstream tag with git ls-remote.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: "${{ github.sha }}"
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify protected foundation-plan context
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$OPTIMA_GITHUB_ENVIRONMENT" = "hackathon"
+          test "$OPTIMA_SEMANTIC_CACHE_ENABLED" = "false"
+
+      # astral-sh/setup-uv v10.0.1, resolved from the upstream tag with git ls-remote.
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
+        with:
+          version: "0.12.5"
+          enable-cache: false
+          python-version: "3.12"
+
+      - name: Run application quality gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv lock --check
+          uv sync --frozen --all-groups
+          uv run ruff format --check .
+          uv run ruff check .
+          uv run mypy src tests
+          uv run pytest
+
+      - name: Validate all Bicep entry points
+        shell: bash
+        run: |
+          set -euo pipefail
+          az bicep install --version "v$BICEP_VERSION"
+          test "$(az bicep version | sed -n 's/.*Bicep CLI version \([^ ]*\).*/\1/p')" = "$BICEP_VERSION"
+          for file in infra/main.bicep infra/resource-group.bicep infra/modules/*.bicep; do
+            az bicep build --file "$file" --stdout >/dev/null
+            diff --unified "$file" <(az bicep format --file "$file" --stdout)
+          done
+          for file in infra/environments/*.bicepparam; do
+            az bicep build-params --file "$file" --stdout >/dev/null
+            diff --unified "$file" <(az bicep format --file "$file" --stdout)
+          done
+
+      # Azure/login v2.3.0 peeled commit; the annotated tag object is not a commit.
+      - uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5
+        with:
+          client-id: "${{ vars.AZURE_CLIENT_ID }}"
+          tenant-id: "${{ vars.AZURE_TENANT_ID }}"
+          subscription-id: "${{ vars.AZURE_SUBSCRIPTION_ID }}"
+
+      - name: Verify identity, permitted scopes, and foundation readiness
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/azure_preflight.py --phase foundation \
+            --output "$RUNNER_TEMP/foundation-preflight.json"
+
+      - name: Write the effective foundation parameter set
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$AZURE_LOCATION" = "eastus2"
+          test "$AZURE_RESOURCE_GROUP" = "rg-optima-hackathon"
+          {
+            printf 'location=%s\n' "$AZURE_LOCATION"
+            printf 'environmentName=%s\n' "hackathon"
+            printf 'resourceGroup=%s\n' "$AZURE_RESOURCE_GROUP"
+            printf 'templateFile=%s\n' "infra/resource-group.bicep"
+            printf 'parameterFile=%s\n' "infra/environments/hackathon.runtime.bicepparam"
+            printf 'deployContainerApps=%s\n' "false"
+            printf 'exposePublicUi=%s\n' "false"
+            printf 'deployRuntimeAccess=%s\n' "false"
+            printf 'semanticCacheEnabled=%s\n' "false"
+          } > "$RUNNER_TEMP/foundation-parameters.txt"
+
+      - name: Run exactly one authoritative foundation what-if
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! az group show --name "$AZURE_RESOURCE_GROUP" >/dev/null 2>&1; then
+            echo "Approved resource group is absent; foundation plan requires it" >&2
+            exit 1
+          fi
+          az deployment group what-if --name optima-foundation-plan-whatif \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --template-file infra/resource-group.bicep \
+            --parameters infra/environments/hackathon.runtime.bicepparam \
+            --parameters \
+              "deploymentCommitSha=$GITHUB_SHA" \
+              "deploymentWorkflowRunId=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+              "deployContainerApps=false" \
+              "exposePublicUi=false" \
+              "deployRuntimeAccess=false" \
+              "semanticCacheEnabled=false" \
+            --no-pretty-print --only-show-errors \
+            > "$RUNNER_TEMP/foundation-whatif.json"
+
+      - name: Classify the foundation what-if and emit sanitized evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/whatif_classification.py classify \
+            --whatif "$RUNNER_TEMP/foundation-whatif.json" \
+            --subscription-id "$AZURE_SUBSCRIPTION_ID" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --commit-sha "$GITHUB_SHA" \
+            --parameters-file "$RUNNER_TEMP/foundation-parameters.txt" \
+            --output "$RUNNER_TEMP/foundation-plan-evidence.json"
+          rm -f "$RUNNER_TEMP/foundation-whatif.json"
+          {
+            printf '## OPTIMA foundation plan\n\n'
+            printf -- '- Operation: `foundation-plan` (read-only, no Azure mutation)\n'
+            printf -- '- Commit: `%s`\n' "$GITHUB_SHA"
+            printf -- '- Classification: `APPROVED`\n'
+            printf -- '- Review the sanitized plan evidence artifact before apply.\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # actions/upload-artifact v7.0.1, resolved from the upstream tag with git ls-remote.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: foundation-plan-evidence-${{ github.sha }}
+          path: ${{ runner.temp }}/foundation-plan-evidence.json
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+  foundation-apply:
+    name: Promoted foundation apply
+    if: ${{ inputs.operation == 'foundation-apply' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    environment: hackathon
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    env:
+      AZURE_CLIENT_ID: "${{ vars.AZURE_CLIENT_ID }}"
+      AZURE_DEPLOYMENT_IDENTITY_RESOURCE_ID: "${{ vars.AZURE_DEPLOYMENT_IDENTITY_RESOURCE_ID }}"
+      AZURE_LOCATION: "${{ vars.AZURE_LOCATION }}"
+      AZURE_RESOURCE_GROUP: "${{ vars.AZURE_RESOURCE_GROUP }}"
+      AZURE_SUBSCRIPTION_ID: "${{ vars.AZURE_SUBSCRIPTION_ID }}"
+      AZURE_TENANT_ID: "${{ vars.AZURE_TENANT_ID }}"
+      OPTIMA_COST_REVIEWED_ON: "${{ vars.OPTIMA_COST_REVIEWED_ON }}"
+      OPTIMA_EXPECTED_FIXED_MONTHLY_COST_INR: "${{ vars.OPTIMA_EXPECTED_FIXED_MONTHLY_COST_INR }}"
+      OPTIMA_GITHUB_ENVIRONMENT: hackathon
+      OPTIMA_SEMANTIC_CACHE_ENABLED: "false"
+    steps:
+      - name: Verify explicit foundation-apply authorization
+        shell: bash
+        env:
+          CONFIRMED_SHA: "${{ inputs.confirm_commit_sha }}"
+          CONFIRM_FOUNDATION: "${{ inputs.confirm_foundation }}"
+          PLAN_RUN_ID: "${{ inputs.plan_run_id }}"
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$CONFIRM_FOUNDATION" = "APPLY-FOUNDATION"
+          test "$CONFIRMED_SHA" = "$GITHUB_SHA"
+          test "${#CONFIRMED_SHA}" -eq 40
+          [[ "$PLAN_RUN_ID" =~ ^[0-9]+$ ]]
+
+      # actions/checkout v7.0.1, resolved from the upstream tag with git ls-remote.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: "${{ github.sha }}"
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify the promoted commit is the checked-out head
+        shell: bash
+        env:
+          CONFIRMED_SHA: "${{ inputs.confirm_commit_sha }}"
+        run: |
+          set -euo pipefail
+          test "$CONFIRMED_SHA" = "$(git rev-parse HEAD)"
+          if git config --local --get-regexp '^http\..*\.extraheader$'; then
+            echo "Checkout credentials remain configured" >&2
+            exit 1
+          fi
+
+      # actions/download-artifact v8.0.1, resolved from the upstream tag with git ls-remote.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: foundation-plan-evidence-${{ github.sha }}
+          run-id: "${{ inputs.plan_run_id }}"
+          github-token: "${{ github.token }}"
+          path: ${{ runner.temp }}/plan-evidence
+
+      - name: Verify the approved plan evidence targets this commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/plan-evidence/foundation-plan-evidence.json"
+          test -f "$evidence"
+          test "$(jq -r '.commit_sha' "$evidence")" = "$GITHUB_SHA"
+          test "$(jq -r '.classification' "$evidence")" = "APPROVED"
+
+      # astral-sh/setup-uv v10.0.1, resolved from the upstream tag with git ls-remote.
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
+        with:
+          version: "0.12.5"
+          enable-cache: false
+          python-version: "3.12"
+
+      - name: Run application quality gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv lock --check
+          uv sync --frozen --all-groups
+          uv run ruff format --check .
+          uv run ruff check .
+          uv run mypy src tests
+          uv run pytest
+
+      - name: Validate all Bicep entry points
+        shell: bash
+        run: |
+          set -euo pipefail
+          az bicep install --version "v$BICEP_VERSION"
+          test "$(az bicep version | sed -n 's/.*Bicep CLI version \([^ ]*\).*/\1/p')" = "$BICEP_VERSION"
+          for file in infra/main.bicep infra/resource-group.bicep infra/modules/*.bicep; do
+            az bicep build --file "$file" --stdout >/dev/null
+            diff --unified "$file" <(az bicep format --file "$file" --stdout)
+          done
+          for file in infra/environments/*.bicepparam; do
+            az bicep build-params --file "$file" --stdout >/dev/null
+            diff --unified "$file" <(az bicep format --file "$file" --stdout)
+          done
+
+      # Azure/login v2.3.0 peeled commit; the annotated tag object is not a commit.
+      - uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5
+        with:
+          client-id: "${{ vars.AZURE_CLIENT_ID }}"
+          tenant-id: "${{ vars.AZURE_TENANT_ID }}"
+          subscription-id: "${{ vars.AZURE_SUBSCRIPTION_ID }}"
+
+      - name: Verify identity, permitted scopes, and foundation readiness
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/azure_preflight.py --phase foundation \
+            --output "$RUNNER_TEMP/foundation-preflight.json"
+
+      - name: Write the effective foundation parameter set
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$AZURE_LOCATION" = "eastus2"
+          test "$AZURE_RESOURCE_GROUP" = "rg-optima-hackathon"
+          {
+            printf 'location=%s\n' "$AZURE_LOCATION"
+            printf 'environmentName=%s\n' "hackathon"
+            printf 'resourceGroup=%s\n' "$AZURE_RESOURCE_GROUP"
+            printf 'templateFile=%s\n' "infra/resource-group.bicep"
+            printf 'parameterFile=%s\n' "infra/environments/hackathon.runtime.bicepparam"
+            printf 'deployContainerApps=%s\n' "false"
+            printf 'exposePublicUi=%s\n' "false"
+            printf 'deployRuntimeAccess=%s\n' "false"
+            printf 'semanticCacheEnabled=%s\n' "false"
+          } > "$RUNNER_TEMP/foundation-parameters.txt"
+
+      - name: Run a fresh authoritative foundation what-if and reclassify
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! az group show --name "$AZURE_RESOURCE_GROUP" >/dev/null 2>&1; then
+            echo "Approved resource group is absent; foundation apply requires it" >&2
+            exit 1
+          fi
+          az deployment group what-if --name optima-foundation-apply-whatif \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --template-file infra/resource-group.bicep \
+            --parameters infra/environments/hackathon.runtime.bicepparam \
+            --parameters \
+              "deploymentCommitSha=$GITHUB_SHA" \
+              "deploymentWorkflowRunId=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+              "deployContainerApps=false" \
+              "exposePublicUi=false" \
+              "deployRuntimeAccess=false" \
+              "semanticCacheEnabled=false" \
+            --no-pretty-print --only-show-errors \
+            > "$RUNNER_TEMP/foundation-whatif.json"
+          python scripts/whatif_classification.py classify \
+            --whatif "$RUNNER_TEMP/foundation-whatif.json" \
+            --subscription-id "$AZURE_SUBSCRIPTION_ID" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --commit-sha "$GITHUB_SHA" \
+            --parameters-file "$RUNNER_TEMP/foundation-parameters.txt" \
+            --output "$RUNNER_TEMP/foundation-apply-evidence.json"
+          rm -f "$RUNNER_TEMP/foundation-whatif.json"
+
+      - name: Refuse promotion unless the fresh plan matches the approved plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/whatif_classification.py promote-check \
+            --plan "$RUNNER_TEMP/plan-evidence/foundation-plan-evidence.json" \
+            --apply "$RUNNER_TEMP/foundation-apply-evidence.json"
+
+      - name: Deploy only the Azure foundation
+        shell: bash
+        run: |
+          set -euo pipefail
+          az deployment group create \
+            --name "optima-foundation-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --template-file infra/resource-group.bicep \
+            --parameters infra/environments/hackathon.runtime.bicepparam \
+            --parameters \
+              "deploymentCommitSha=$GITHUB_SHA" \
+              "deploymentWorkflowRunId=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+              "deployContainerApps=false" \
+              "exposePublicUi=false" \
+              "deployRuntimeAccess=false" \
+              "semanticCacheEnabled=false" \
+            --only-show-errors >/dev/null
+
+      - name: Verify foundation convergence and stop
+        shell: bash
+        run: |
+          set -euo pipefail
+          state="$(az deployment group show \
+            --name "optima-foundation-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --query properties.provisioningState --output tsv)"
+          test "$state" = "Succeeded"
+          az deployment group what-if --name optima-foundation-converged-whatif \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --template-file infra/resource-group.bicep \
+            --parameters infra/environments/hackathon.runtime.bicepparam \
+            --parameters \
+              "deploymentCommitSha=$GITHUB_SHA" \
+              "deploymentWorkflowRunId=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+              "deployContainerApps=false" \
+              "exposePublicUi=false" \
+              "deployRuntimeAccess=false" \
+              "semanticCacheEnabled=false" \
+            --no-pretty-print --only-show-errors \
+            > "$RUNNER_TEMP/foundation-converged-whatif.json"
+          python scripts/whatif_classification.py classify \
+            --whatif "$RUNNER_TEMP/foundation-converged-whatif.json" \
+            --subscription-id "$AZURE_SUBSCRIPTION_ID" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --commit-sha "$GITHUB_SHA" \
+            --parameters-file "$RUNNER_TEMP/foundation-parameters.txt" \
+            --output "$RUNNER_TEMP/foundation-converged-evidence.json"
+          rm -f "$RUNNER_TEMP/foundation-converged-whatif.json"
+          {
+            printf '## OPTIMA foundation apply\n\n'
+            printf -- '- Operation: `foundation-apply` (foundation resources only)\n'
+            printf -- '- Commit: `%s`\n' "$GITHUB_SHA"
+            printf -- '- Provisioning state: `%s`\n' "$state"
+            printf -- '- No image build, ACR publication, Container App, runtime access,\n'
+            printf -- '  Entra configuration, Redis, embedding, or inference occurred.\n'
+            printf -- '- Next stage: the application rollout in deploy-production.yml.\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # actions/upload-artifact v7.0.1, resolved from the upstream tag with git ls-remote.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: foundation-apply-evidence-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/foundation-apply-evidence.json
+            ${{ runner.temp }}/foundation-converged-evidence.json
+            ${{ runner.temp }}/foundation-preflight.json
+          if-no-files-found: warn
+          retention-days: 30
+          compression-level: 0

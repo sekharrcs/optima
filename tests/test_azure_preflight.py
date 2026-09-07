@@ -211,6 +211,32 @@ def disabled_environment() -> dict[str, str]:
     return environment
 
 
+def foundation_environment() -> dict[str, str]:
+    """Return only the inputs a read-only foundation plan genuinely needs.
+
+    Deferred UI, image-publication, Azure OpenAI runtime, and pricing inputs are
+    absent, matching the currently configured hackathon environment variables.
+    """
+    return {
+        "ACTIONS_ID_TOKEN_REQUEST_TOKEN": "present",
+        "ACTIONS_ID_TOKEN_REQUEST_URL": "https://actions.invalid/oidc",
+        "AZURE_CLIENT_ID": CLIENT_ID,
+        "AZURE_DEPLOYMENT_IDENTITY_RESOURCE_ID": (
+            f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg-identity/providers/"
+            "Microsoft.ManagedIdentity/userAssignedIdentities/id-optima-deploy"
+        ),
+        "AZURE_LOCATION": "eastus2",
+        "AZURE_RESOURCE_GROUP": "rg-optima-hackathon",
+        "AZURE_SUBSCRIPTION_ID": SUBSCRIPTION_ID,
+        "AZURE_TENANT_ID": TENANT_ID,
+        "GITHUB_REPOSITORY": "sekharrcs/optima",
+        "OPTIMA_COST_REVIEWED_ON": date.today().isoformat(),
+        "OPTIMA_EXPECTED_FIXED_MONTHLY_COST_INR": "1600",
+        "OPTIMA_GITHUB_ENVIRONMENT": "hackathon",
+        "OPTIMA_SEMANTIC_CACHE_ENABLED": "false",
+    }
+
+
 class FakeAzure:
     """Return deterministic Azure resource evidence for preflight tests."""
 
@@ -564,6 +590,7 @@ def test_load_configuration_accepts_explicit_disabled_cache_profile() -> None:
         "STRONG",
         "JUDGE",
     }
+    assert configuration.pricing is not None
     assert configuration.pricing.embedding_model is None
     assert configuration.pricing.embedding_model_version is None
     assert configuration.pricing.embedding_input is None
@@ -583,6 +610,7 @@ def test_model_versions_remain_separate_from_pricing_binding_contract() -> None:
         "JUDGE": ("gpt-4.1-nano", "2025-04-14"),
         "EMBEDDING": ("text-embedding-3-small", "1"),
     }
+    assert configuration.pricing is not None
     assert (
         pricing_binding_sha256(configuration.pricing)
         == environment["OPTIMA_PRICING_BINDING_SHA256"]
@@ -1726,3 +1754,146 @@ def test_redis_multiple_quota_meters_fail_closed() -> None:
     )
 
     assert_redis_failure(azure, RedisPreflightErrorCode.QUOTA_RESPONSE_MALFORMED)
+
+
+def test_foundation_plan_loads_without_deferred_runtime_inputs() -> None:
+    """Load a foundation plan from only the inputs foundation resources need."""
+    configuration = load_configuration(foundation_environment(), phase="foundation")
+
+    assert configuration.pricing is None
+    assert configuration.models == ()
+    assert configuration.registry_name is None
+    assert configuration.openai_resource_id is None
+    assert configuration.foundry_base_url is None
+    assert configuration.ui_auth_client_id is None
+    assert configuration.ui_auth_tenant_id is None
+    assert configuration.ui_auth_secret_present is False
+    assert configuration.semantic_cache_enabled is False
+
+
+def test_foundation_apply_uses_the_same_phase_aware_input_contract() -> None:
+    """Give foundation apply the identical minimal foundation input contract."""
+    environment = foundation_environment()
+
+    plan = load_configuration(environment, phase="foundation")
+    apply = load_configuration(environment, phase="foundation")
+
+    assert plan == apply
+    assert apply.pricing is None
+    assert apply.ui_auth_secret_present is False
+
+
+def test_foundation_plan_preflight_is_read_only_and_skips_runtime_checks() -> None:
+    """Verify the foundation plan omits UI, ACR, model, and runtime checks."""
+    configuration = load_configuration(foundation_environment(), phase="foundation")
+    azure = FakeAzure(configuration, foundation_exists=True)
+
+    evidence = run_preflight(
+        configuration,
+        azure,
+        phase="foundation",
+        repository_root=ROOT,
+    )
+
+    assert evidence["phase"] == "foundation"
+    assert "model_deployments" not in evidence["checks"]
+    assert "ui_entra_authentication" not in evidence["checks"]
+    assert "acr_push" not in evidence["checks"]
+    assert "foundry_runtime_access" not in evidence["checks"]
+    assert "foundation_resources" not in evidence["checks"]
+    assert evidence["subscription_id"] != SUBSCRIPTION_ID
+    assert evidence["subscription_id"].startswith(SUBSCRIPTION_ID[:4])
+    assert not any(call[:1] == ("cognitiveservices",) for call in azure.calls)
+    assert not any(call[:3] == ("ad", "app", "show") for call in azure.calls)
+    assert not any(call[:2] == ("acr", "show") for call in azure.calls)
+
+
+def test_foundation_plan_verifies_least_privilege_scopes() -> None:
+    """Reject a lingering subscription Contributor during foundation planning."""
+    configuration = load_configuration(foundation_environment(), phase="foundation")
+    azure = FakeAzure(
+        configuration,
+        foundation_exists=True,
+        lingering_subscription_contributor=True,
+    )
+
+    with pytest.raises(PreflightError, match="Contributor only at the approved scope"):
+        run_preflight(
+            configuration,
+            azure,
+            phase="foundation",
+            repository_root=ROOT,
+        )
+
+
+def test_foundation_plan_rejects_forbidden_owner_role() -> None:
+    """Reject an Owner or RBAC-administration role on the deployment identity."""
+    configuration = load_configuration(foundation_environment(), phase="foundation")
+    azure = FakeAzure(
+        configuration,
+        foundation_exists=True,
+        forbidden_deployment_role=True,
+    )
+
+    with pytest.raises(PreflightError, match="forbidden Owner"):
+        run_preflight(
+            configuration,
+            azure,
+            phase="foundation",
+            repository_root=ROOT,
+        )
+
+
+def test_foundation_plan_still_requires_cost_governance() -> None:
+    """Keep foundation resources gated on their genuinely required inputs."""
+    environment = foundation_environment()
+    environment.pop("OPTIMA_EXPECTED_FIXED_MONTHLY_COST_INR")
+
+    with pytest.raises(PreflightError, match="OPTIMA_EXPECTED_FIXED_MONTHLY_COST_INR"):
+        load_configuration(environment, phase="foundation")
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [
+        "AZURE_CONTAINER_REGISTRY_NAME",
+        "AZURE_OPENAI_RESOURCE_ID",
+        "OPTIMA_FOUNDRY_BASE_URL",
+        "OPTIMA_UI_AUTH_CLIENT_ID",
+        UI_AUTH_CLIENT_SECRET_ENV,
+        "OPTIMA_PRICING_SMALL_INPUT_RATE_PER_MILLION_TOKENS",
+    ],
+)
+def test_enabled_phases_still_require_runtime_inputs(missing: str) -> None:
+    """Keep every runtime-composition input mandatory once its phase runs."""
+    environment = disabled_environment()
+    environment.pop(missing)
+
+    with pytest.raises(PreflightError):
+        load_configuration(environment, phase="rollout")
+
+
+@pytest.mark.parametrize(
+    "supplied",
+    [
+        "AZURE_CONTAINER_REGISTRY_NAME",
+        "AZURE_OPENAI_RESOURCE_ID",
+        "OPTIMA_FOUNDRY_BASE_URL",
+        "OPTIMA_UI_AUTH_CLIENT_ID",
+        "OPTIMA_PRICING_SMALL_INPUT_RATE_PER_MILLION_TOKENS",
+    ],
+)
+def test_foundation_plan_ignores_absent_runtime_inputs(supplied: str) -> None:
+    """Never require a deferred runtime input during foundation planning."""
+    environment = foundation_environment()
+    environment.pop(supplied, None)
+
+    configuration = load_configuration(environment, phase="foundation")
+
+    assert configuration.pricing is None
+
+
+def test_unsupported_preflight_phase_is_rejected() -> None:
+    """Reject an unknown preflight phase instead of inferring a contract."""
+    with pytest.raises(PreflightError, match="Unsupported preflight phase"):
+        load_configuration(foundation_environment(), phase="bootstrap")
