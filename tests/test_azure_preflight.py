@@ -28,7 +28,6 @@ from scripts.azure_preflight import (
     PricingConfiguration,
     RedisPreflightError,
     RedisPreflightErrorCode,
-    _check_oidc_federation,
     _classify_azure_query_failure,
     load_configuration,
     pricing_binding_sha256,
@@ -2269,6 +2268,11 @@ def test_legacy_subject_fails_before_role_checks_in_every_phase(
     configuration = load_configuration(environment, phase=phase)
     azure = FakeAzure(configuration, foundation_exists=True)
     original_json = azure.json
+    azure.access_token = synthetic_access_token(
+        tenant_id=configuration.tenant_id,
+        client_id=configuration.deployment_client_id,
+        principal_id=azure.deployment_principal_id,
+    )
 
     def legacy_json(*arguments: str, allow_missing: bool = False) -> Any:
         value = original_json(*arguments, allow_missing=allow_missing)
@@ -2278,11 +2282,11 @@ def test_legacy_subject_fails_before_role_checks_in_every_phase(
 
     monkeypatch.setattr(azure, "json", legacy_json)
     with pytest.raises(PreflightError, match="federated credential"):
-        _check_oidc_federation(
+        run_preflight(
             configuration,
             azure,
             phase=phase,
-            session_principal_id=azure.deployment_principal_id,
+            repository_root=ROOT,
         )
     assert not any(call[:2] == ("role", "assignment") for call in azure.calls)
 

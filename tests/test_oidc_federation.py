@@ -241,7 +241,9 @@ def test_readiness_rejects_changed_identity_binding(field: str) -> None:
     ],
 )
 def test_cli_errors_never_echo_output(
-    monkeypatch: pytest.MonkeyPatch, response: subprocess.CompletedProcess[str]
+    monkeypatch: pytest.MonkeyPatch,
+    response: subprocess.CompletedProcess[str],
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.setattr("scripts.oidc_federation.shutil.which", lambda name: name)
     monkeypatch.setattr(
@@ -250,9 +252,18 @@ def test_cli_errors_never_echo_output(
     with pytest.raises(FederationError) as caught:
         oidc_federation.CliMetadataQuery().json("gh", "api", "repos/sekharrcs/optima")
     assert "sensitive" not in str(caught.value)
+    captured = capsys.readouterr()
+    assert captured.out == captured.err == ""
+    assert oidc_federation.main([]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "FAILED" in captured.err
+    assert "sensitive" not in captured.err
 
 
-def test_cli_uses_bounded_non_shell_execution(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cli_uses_bounded_non_shell_execution(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
     def run(arguments: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         assert arguments == ["gh", "api", "repos/sekharrcs/optima"]
         assert kwargs == {
@@ -267,6 +278,13 @@ def test_cli_uses_bounded_non_shell_execution(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr("scripts.oidc_federation.subprocess.run", run)
     with pytest.raises(FederationError, match="unavailable"):
         oidc_federation.CliMetadataQuery().json("gh", "api", "repos/sekharrcs/optima")
+    captured = capsys.readouterr()
+    assert captured.out == captured.err == ""
+    assert oidc_federation.main([]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "unavailable" in captured.err
+    assert "sensitive" not in captured.err
 
 
 def test_main_exit_codes_and_no_authentication_claim(
