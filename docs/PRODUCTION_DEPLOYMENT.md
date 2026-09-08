@@ -369,8 +369,31 @@ this federated credential for the `hackathon` environment:
 | Property | Exact value |
 |----------|-------------|
 | Issuer | `https://token.actions.githubusercontent.com` |
-| Subject | `repo:sekharrcs/optima:environment:hackathon` |
+| Subject | `repo:sekharrcs@45002138/optima@1333906197:environment:hackathon` |
 | Audience | `api://AzureADTokenExchange` |
+
+Each identity must have exactly one `github-optima-hackathon` credential.
+Preflight enforces the credential's identity resource binding, exact issuer and
+subject, singleton audience, and absence of claims-matching expressions.
+It does not accept both name-only and ID-bearing subjects.
+
+Before any plan or deployment dispatch, run this read-only operator check from
+the reviewed checkout with Python 3.12+, authenticated `gh` and `az` sessions,
+GitHub repository Actions read access, and Azure identity/FIC read access:
+
+```bash
+python scripts/oidc_federation.py
+```
+
+Stop on a nonzero exit. This checks live GitHub repository/owner IDs and the
+effective default subject prefix against the pinned reviewed contract, then both
+Azure identities and their credential inventories. It does not request a GitHub
+OIDC assertion, mutate configuration, or dispatch a workflow. It is an operator
+prerequisite, not an automatically enforced GitHub dispatch gate. The normal
+workflow preflight runs after login and cannot diagnose failed login in advance.
+Metadata success does not prove live token exchange, environment approval, ARM
+session binding, or role/Graph preflight success. Review the
+[separate correction proposal](OIDC_FEDERATION_CORRECTION.md) before changing trust.
 
 The foundation-plan identity must have exactly subscription Reader plus one custom
 role assignment at `rg-optima-hackathon`. That custom role must contain one
@@ -646,6 +669,15 @@ an old commit and assume its registry digest will match.
 Verify issuer, subject, audience, client ID, tenant, subscription, protected
 environment name, and `id-token: write` on the deployment job. A repository or
 branch subject does not satisfy the required environment subject.
+
+Use the predispatch metadata check above. GitHub's generated default for this
+repository includes owner/repository IDs. Its observed `use_immutable_subject`
+value is `false` while `sub_claim_prefix` is ID-bearing; do not infer a name-only
+subject from that Boolean. A changed prefix, owner, repository ID, or custom
+template is a review blocker, not permission to add dual trust or a wildcard.
+Run 34228402819 failed before preflight because both Azure credentials retained
+the old name-only subject. Current official sources and exact before/after values
+are in the correction proposal; no change-activation history is inferred.
 
 ### ACR access
 

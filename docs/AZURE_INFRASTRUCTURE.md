@@ -335,21 +335,32 @@ command-level access because custom ACLs are incompatible with RediSearch.
 
 ## GitHub OIDC design
 
-The preferred deployment identity is one dedicated user-assigned managed
-identity, not a secret-bearing Entra application registration.
+Use separate dedicated user-assigned managed identities for foundation planning
+and deployment, not a secret-bearing Entra application registration.
 
 | Property           | Proposed value                                |
 |--------------------|-----------------------------------------------|
 | Repository         | `sekharrcs/optima`                            |
 | GitHub environment | `hackathon`                                   |
 | Issuer             | `https://token.actions.githubusercontent.com` |
-| Subject            | `repo:sekharrcs/optima:environment:hackathon` |
+| Subject            | `repo:sekharrcs@45002138/optima@1333906197:environment:hackathon` |
 | Audience           | `api://AzureADTokenExchange`                  |
 | Azure identity     | Dedicated deployment user-assigned identity   |
 | Authentication     | Workload identity federation / OIDC           |
 
-The later GitHub environment should hold subscription ID, tenant ID, and client
-ID as non-secret variables. OIDC creates no client secret.
+The GitHub environment holds subscription ID, tenant ID, and distinct plan and
+deployment client IDs as non-secret variables. OIDC creates no client secret.
+Each identity must have exactly one `github-optima-hackathon` credential with
+the exact issuer, subject, and singleton audience above. The common subject
+restricts both to `hackathon`; workflow policy and separate identity/RBAC bindings
+retain plan/deployment separation, not distinct job-specific subjects.
+
+Run `python scripts/oidc_federation.py` using existing authorized GitHub/Azure
+CLI sessions before dispatch. It checks current repository identity, effective
+GitHub prefix, and both complete Azure credential inventories without requesting
+an OIDC assertion. See the separate
+[federation correction proposal](OIDC_FEDERATION_CORRECTION.md) for evidence,
+exact pending trust changes, and live-authentication limitations.
 
 ### Deployment RBAC
 
