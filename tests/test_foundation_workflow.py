@@ -282,6 +282,7 @@ def test_validation_owns_main_head_quality_and_bicep_gates() -> None:
     validate = _job_commands("validate")
     plan = _job_commands("foundation-plan")
     apply = _job_commands("foundation-apply")
+    pytest_command = "uv run --no-sync python -m pytest"
 
     assert 'test "$GITHUB_REF" = "refs/heads/main"' in validate
     assert 'test "$GITHUB_SHA" = "$(git rev-parse HEAD)"' in validate
@@ -291,11 +292,15 @@ def test_validation_owns_main_head_quality_and_bicep_gates() -> None:
     assert "foundation-apply)" in validate
     assert "APPLY-FOUNDATION" in validate
     assert "uv lock --check" in validate
-    assert "uv run pytest" in validate
+    assert validate.index("uv sync --frozen --all-groups") < validate.index(
+        pytest_command
+    )
+    assert "uv run pytest" not in validate
+    assert "PYTHONPATH" not in validate
     assert "az bicep build" in validate
     assert "hackathon.foundation.bicepparam" in validate
-    assert "uv run pytest" not in plan
-    assert "uv run pytest" not in apply
+    assert pytest_command not in plan
+    assert pytest_command not in apply
     assert "az bicep build" not in plan
     assert "az bicep build" not in apply
 

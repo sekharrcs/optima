@@ -37,9 +37,15 @@ def test_production_deployment_is_manual_serialized_and_environment_gated() -> N
 def test_azure_oidc_permission_exists_only_after_validation() -> None:
     """Keep Azure identity unavailable to source validation and container builds."""
     content = workflow()
+    pytest_command = "uv run --no-sync python -m pytest"
 
     assert content.count("id-token: write") == 1
-    assert content.index("uv run pytest") < content.index("id-token: write")
+    assert content.index("uv sync --frozen --all-groups") < content.index(
+        pytest_command
+    )
+    assert content.index(pytest_command) < content.index("id-token: write")
+    assert "uv run pytest" not in content
+    assert "PYTHONPATH" not in content
     assert content.index("id-token: write") < content.index("azure/login@")
     assert content.index("azure/login@") < content.index("--phase foundation")
     assert "client-secret:" not in content
