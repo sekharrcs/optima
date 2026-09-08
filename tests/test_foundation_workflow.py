@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 from typing import Any
 
@@ -381,38 +382,125 @@ def _assert_block_cleanup(allocation_log: Path, scratch: Path) -> None:
     assert len(allocated) == 1, "Expected the block's one formatter directory"
     directory = Path(allocated[0])
     assert directory.parent.resolve() == scratch.resolve()
-    assert not directory.exists(), (
+    assert not (directory.exists() or directory.is_symlink()), (
         f"Block-owned formatter directory leaked: {directory}"
     )
 
 
+def _block_cleanup_commands(path: Path) -> str:
+    commands = _bicep_validation_commands(path)
+    start = commands.index('formatted_dir="$(mktemp -d)"')
+    end = commands.index("for file in", start)
+    return "set -euo pipefail\n" + commands[start:end]
+
+
 @pytest.mark.skipif(sys.platform != "linux", reason="requires Linux Bash and mktemp")
-@pytest.mark.parametrize("leak", [False, True])
+@pytest.mark.parametrize("path", [WORKFLOW, PRODUCTION_WORKFLOW])
+@pytest.mark.parametrize("cleanup", ["intact", "missing", "broken"])
 @pytest.mark.parametrize("fail", [False, True])
-def test_block_cleanup_tracks_ownership(tmp_path: Path, leak: bool, fail: bool) -> None:
+def test_block_cleanup_tracks_ownership(
+    tmp_path: Path, path: Path, cleanup: str, fail: bool
+) -> None:
     scratch = tmp_path / "scratch"
     scratch.mkdir()
     unrelated = scratch / "unrelated-tool-owned-file"
     unrelated.write_text("retained", encoding="utf-8")
     allocation_log = tmp_path / "allocations.txt"
-    commands = 'set -euo pipefail\nformatted_dir="$(mktemp -d)"\n'
-    if not leak:
-        commands += "trap 'rm -rf \"$formatted_dir\"' EXIT\n"
+    commands = _block_cleanup_commands(path)
+    if cleanup == "missing":
+        commands += "trap - EXIT\n"
+    elif cleanup == "broken":
+        commands += "trap ':' EXIT\n"
     commands += 'printf data > "$formatted_dir/result.bicep"\n'
-    commands += "exit 7\n" if fail else "exit 0\n"
+    commands += "false\n" if fail else "true\n"
     result = subprocess.run(
         ["bash", "-e", "-o", "pipefail", "-c", _record_block_allocations(commands)],
         env=os.environ
         | {"TMPDIR": str(scratch), "OPTIMA_ALLOCATION_LOG": str(allocation_log)},
         check=False,
     )
-    assert result.returncode == (7 if fail else 0)
+    assert result.returncode == (1 if fail else 0)
     assert unrelated.read_text(encoding="utf-8") == "retained"
-    if leak:
+    if cleanup != "intact":
         with pytest.raises(AssertionError, match="formatter directory leaked"):
             _assert_block_cleanup(allocation_log, scratch)
     else:
         _assert_block_cleanup(allocation_log, scratch)
+
+
+@LIVE_BICEP
+def test_live_bicep_telemetry_temp_ownership(tmp_path: Path) -> None:
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    allocation_log = tmp_path / "allocations.txt"
+    cli_python = Path(os.environ["UV_TOOL_DIR"]) / "azure-cli" / "bin" / "python"
+    script = textwrap.dedent(
+        """\
+        import datetime
+        import importlib.metadata
+        import inspect
+        import json
+        import os
+        import subprocess
+        import sys
+        from pathlib import Path
+        from unittest.mock import patch
+        from azure.cli.telemetry.components import records_collection
+        from azure.cli.telemetry.const import TELEMETRY_CACHE_DIR
+
+        assert importlib.metadata.version('azure-cli') == '2.89.1'
+        assert importlib.metadata.version('azure-cli-telemetry') == '1.1.0'
+        root = Path(sys.argv[1])
+        cache = root / TELEMETRY_CACHE_DIR
+        cache.mkdir(parents=True)
+        (cache / 'cache').write_text('2026-01-01T00:00:00,{}\\n')
+        collection = records_collection.RecordsCollection(
+            datetime.datetime.min, str(root))
+        original = records_collection.tempfile.mkdtemp
+        evidence = {}
+
+        def observe_allocation():
+            directory = Path(original())
+            assert directory.is_dir()
+            assert inspect.stack()[1].function == 'snapshot_and_read'
+            subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', sys.argv[2]],
+                           check=True)
+            log = Path(os.environ['OPTIMA_ALLOCATION_LOG'])
+            allocated = log.read_text().splitlines()
+            assert len(allocated) == 1
+            assert not Path(allocated[0]).exists()
+            assert directory.is_dir()
+            entries = sorted(item.name for item in directory.parent.iterdir())
+            evidence.update(creator='RecordsCollection.snapshot_and_read',
+                            tool_directory=str(directory), block_directory=allocated[0],
+                            shared_entries=entries)
+            return str(directory)
+
+        with patch.object(records_collection.tempfile, 'mkdtemp', observe_allocation):
+            collection.snapshot_and_read()
+        assert not Path(evidence['tool_directory']).exists()
+        print(json.dumps(evidence))
+        """
+    )
+    result = subprocess.run(
+        [
+            str(cli_python),
+            "-c",
+            script,
+            str(tmp_path / "telemetry"),
+            _record_block_allocations(_block_cleanup_commands(WORKFLOW)),
+        ],
+        env=os.environ
+        | {"TMPDIR": str(scratch), "OPTIMA_ALLOCATION_LOG": str(allocation_log)},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    evidence = json.loads(result.stdout)
+    assert set(evidence["shared_entries"]) - {".bicep"}
+    assert evidence["tool_directory"] != evidence["block_directory"]
+    _assert_block_cleanup(allocation_log, scratch)
+    print(f"Real telemetry allocation rejects old inventory assertion: {result.stdout}")
 
 
 @LIVE_BICEP
@@ -500,32 +588,10 @@ def test_live_bicep_workflow_validation(path: Path, tmp_path: Path) -> None:
         if source.is_file()
     }
     allocation_log = tmp_path / "allocations.txt"
-    probe = tmp_path / "probe"
-    probe.mkdir()
-    audit_log = tmp_path / "temporary-files.jsonl"
-    (probe / "sitecustomize.py").write_text(
-        "import json, os, sys, traceback\n"
-        "def record(event, arguments):\n"
-        "    if event not in ('tempfile.mkstemp', 'tempfile.mkdtemp',\n"
-        "                     'os.remove', 'os.rmdir'):\n"
-        "        return\n"
-        "    path = os.fsdecode(arguments[0])\n"
-        "    if not path.startswith(os.environ['TMPDIR'] + os.sep):\n"
-        "        return\n"
-        "    stack = [f'{frame.filename}:{frame.lineno}:{frame.name}'\n"
-        "             for frame in traceback.extract_stack()[:-1]]\n"
-        "    value = dict(event=event, path=path, pid=os.getpid(), stack=stack)\n"
-        "    with open(os.environ['OPTIMA_TEMP_AUDIT'], 'a') as output:\n"
-        "        output.write(json.dumps(value) + '\\n')\n"
-        "sys.addaudithook(record)\n",
-        encoding="utf-8",
-    )
     environment = os.environ | {
         "BICEP_VERSION": "0.46.1",
         "TMPDIR": str(scratch),
         "OPTIMA_ALLOCATION_LOG": str(allocation_log),
-        "OPTIMA_TEMP_AUDIT": str(audit_log),
-        "PYTHONPATH": str(probe),
     }
     subprocess.run(
         [
@@ -542,11 +608,6 @@ def test_live_bicep_workflow_validation(path: Path, tmp_path: Path) -> None:
     )
     assert all(source.read_bytes() == content for source, content in before.items())
     _assert_block_cleanup(allocation_log, scratch)
-    print(f"Block allocation: {allocation_log.read_text(encoding='utf-8').strip()}")
-    if audit_log.exists():
-        print(audit_log.read_text(encoding="utf-8"))
-    print(f"Shared TMPDIR entries: {sorted(entry.name for entry in scratch.iterdir())}")
-    assert {entry.name for entry in scratch.iterdir()} <= {".bicep"}
     print(f"Exact {path.name} Bicep validation block: PASS")
 
 
