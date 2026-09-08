@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import json
+import os
 import re
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "foundation.yml"
@@ -303,6 +310,194 @@ def test_validation_owns_main_head_quality_and_bicep_gates() -> None:
     assert pytest_command not in apply
     assert "az bicep build" not in plan
     assert "az bicep build" not in apply
+
+
+def _bicep_validation_commands(path: Path) -> str:
+    steps = _load_workflow(path)["jobs"]["validate"]["steps"]
+    commands = [
+        str(step["run"])
+        for step in steps
+        if "az bicep install" in str(step.get("run", ""))
+    ]
+    assert len(commands) == 1
+    return commands[0]
+
+
+@pytest.mark.parametrize("path", [WORKFLOW, PRODUCTION_WORKFLOW])
+def test_bicep_formatting_compares_files_without_weakening_diff(path: Path) -> None:
+    commands = _bicep_validation_commands(path)
+
+    assert commands.startswith("set -euo pipefail\n")
+    assert 'formatted_dir="$(mktemp -d)"' in commands
+    assert "trap 'rm -rf \"$formatted_dir\"' EXIT" in commands
+    comparison = (
+        'az bicep format --file "$file" '
+        '--outfile "$formatted_dir/$(basename "$file")"\n'
+        '  diff --unified "$file" "$formatted_dir/$(basename "$file")"'
+    )
+    assert commands.count(comparison) == 2
+    assert "<(az bicep format" not in commands
+    assert "||" not in commands
+    assert "set +e" not in commands
+    assert "ignore" not in commands
+    assert commands.count("diff ") == 2
+    assert 'az bicep build --file "$file" --stdout >/dev/null' in commands
+    assert 'az bicep build-params --file "$file" --stdout >/dev/null' in commands
+    assert _load_workflow(path)["env"]["BICEP_VERSION"] == "0.46.1"
+
+
+def test_bicep_validation_covers_all_templates_and_parameters() -> None:
+    patterns = (
+        "infra/main.bicep",
+        "infra/resource-group.bicep",
+        "infra/modules/*.bicep",
+        "infra/environments/*.bicepparam",
+    )
+    covered = {path for pattern in patterns for path in ROOT.glob(pattern)}
+    discovered = set((ROOT / "infra").rglob("*.bicep")) | set(
+        (ROOT / "infra").rglob("*.bicepparam")
+    )
+    assert covered == discovered
+    for workflow in (WORKFLOW, PRODUCTION_WORKFLOW):
+        commands = _bicep_validation_commands(workflow)
+        assert all(pattern in commands for pattern in patterns)
+
+
+LIVE_BICEP = pytest.mark.skipif(
+    sys.platform != "linux" or os.environ.get("OPTIMA_TEST_BICEP_TOOLCHAIN") != "1",
+    reason="requires opt-in Linux Bicep toolchain; no Azure login or paid calls",
+)
+
+
+@LIVE_BICEP
+def test_live_bicep_formatter_byte_provenance(tmp_path: Path) -> None:
+    direct_bicep = Path(os.environ["AZURE_CONFIG_DIR"]) / "bin" / "bicep"
+    version = subprocess.run(
+        [str(direct_bicep), "--version"], capture_output=True, check=True
+    ).stdout
+    assert version.startswith(b"Bicep CLI version 0.46.1 ")
+    azure_version = subprocess.run(
+        ["az", "version"], capture_output=True, check=True
+    ).stdout
+    assert json.loads(azure_version)["azure-cli"] == "2.89.1"
+    print(azure_version.decode("utf-8"))
+    files = sorted((ROOT / "infra").rglob("*.bicep")) + sorted(
+        (ROOT / "infra").rglob("*.bicepparam")
+    )
+    for source in files:
+        committed = subprocess.run(
+            ["git", "show", f"HEAD:{source.relative_to(ROOT).as_posix()}"],
+            cwd=ROOT,
+            capture_output=True,
+            check=True,
+        ).stdout
+        direct = subprocess.run(
+            [str(direct_bicep), "format", str(source), "--stdout"],
+            capture_output=True,
+            check=True,
+        ).stdout
+        wrapped = subprocess.run(
+            ["az", "bicep", "format", "--file", str(source), "--stdout"],
+            capture_output=True,
+            check=True,
+        ).stdout
+        output = tmp_path / source.name
+        subprocess.run(
+            ["az", "bicep", "format", "--file", str(source), "--outfile", str(output)],
+            check=True,
+        )
+        assert committed == source.read_bytes() == direct == output.read_bytes()
+        assert wrapped == direct + b"\n"
+        legacy = subprocess.run(
+            [
+                "bash",
+                "-e",
+                "-o",
+                "pipefail",
+                "-c",
+                'diff --unified "$1" <(az bicep format --file "$1" --stdout)',
+                "bicep-format-repro",
+                str(source),
+            ],
+            capture_output=True,
+            check=False,
+        )
+        assert legacy.returncode == 1
+        print(
+            json.dumps(
+                {
+                    "file": source.relative_to(ROOT).as_posix(),
+                    "source_bytes": len(committed),
+                    "direct_bytes": len(direct),
+                    "wrapper_bytes": len(wrapped),
+                    "source_direct_outfile_sha256": hashlib.sha256(
+                        committed
+                    ).hexdigest(),
+                    "wrapper_sha256": hashlib.sha256(wrapped).hexdigest(),
+                    "legacy_diff_exit": legacy.returncode,
+                    "file_comparison": "PASS",
+                },
+                sort_keys=True,
+            )
+        )
+
+
+@LIVE_BICEP
+@pytest.mark.parametrize("path", [WORKFLOW, PRODUCTION_WORKFLOW])
+def test_live_bicep_workflow_validation(path: Path, tmp_path: Path) -> None:
+    shutil.copytree(ROOT / "infra", tmp_path / "infra")
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    before = {
+        source: source.read_bytes()
+        for source in (tmp_path / "infra").rglob("*")
+        if source.is_file()
+    }
+    environment = os.environ | {"BICEP_VERSION": "0.46.1", "TMPDIR": str(scratch)}
+    subprocess.run(
+        ["bash", "-e", "-o", "pipefail", "-c", _bicep_validation_commands(path)],
+        cwd=tmp_path,
+        env=environment,
+        check=True,
+    )
+    assert all(source.read_bytes() == content for source, content in before.items())
+    assert {entry.name for entry in scratch.iterdir()} <= {".bicep"}
+    print(f"Exact {path.name} Bicep validation block: PASS")
+
+
+@LIVE_BICEP
+@pytest.mark.parametrize("suffix", [".bicep", ".bicepparam"])
+@pytest.mark.parametrize(
+    "drift", ["indentation", "extra_blank_line", "missing_final_lf"]
+)
+def test_live_bicep_formatting_rejects_drift(
+    tmp_path: Path, suffix: str, drift: str
+) -> None:
+    content = (
+        "param name string = 'example'\n"
+        if suffix == ".bicep"
+        else "using none\n\nparam name = 'example'\n"
+    )
+    if drift == "indentation":
+        content = content.replace("param name", "param  name")
+    elif drift == "extra_blank_line":
+        content += "\n"
+    else:
+        content = content[:-1]
+    source = tmp_path / f"source{suffix}"
+    output = tmp_path / f"formatted{suffix}"
+    source.write_bytes(content.encode("utf-8"))
+    subprocess.run(
+        ["az", "bicep", "format", "--file", str(source), "--outfile", str(output)],
+        check=True,
+    )
+    difference = subprocess.run(
+        ["diff", "--unified", str(source), str(output)],
+        capture_output=True,
+        check=False,
+    )
+    assert difference.returncode == 1
+    assert source.read_bytes() == content.encode("utf-8")
 
 
 def test_each_oidc_job_reverifies_current_main_after_environment_gating() -> None:
