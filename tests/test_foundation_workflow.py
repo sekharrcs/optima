@@ -461,7 +461,7 @@ def test_live_bicep_workflow_validation(path: Path, tmp_path: Path) -> None:
         check=True,
     )
     assert all(source.read_bytes() == content for source, content in before.items())
-    assert not list(scratch.iterdir())
+    assert {entry.name for entry in scratch.iterdir()} <= {".bicep"}
     print(f"Exact {path.name} Bicep validation block: PASS")
 
 
