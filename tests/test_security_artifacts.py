@@ -1295,7 +1295,7 @@ def test_pr_security_workflow_all_shell_blocks_pass_bash_syntax() -> None:
     assert bash is not None, "bash is required to validate workflow shell syntax"
 
     blocks = _literal_run_blocks(_pr_security_workflow())
-    assert len(blocks) == 24
+    assert len(blocks) == 25
     for index, block in enumerate(blocks):
         result = subprocess.run(
             [bash, "-n"],

@@ -89,13 +89,17 @@ jobs:
           set -euo pipefail
           az bicep install --version "v$BICEP_VERSION"
           test "$(az bicep version | sed -n 's/.*Bicep CLI version \([^ ]*\).*/\1/p')" = "$BICEP_VERSION"
+          formatted_dir="$(mktemp -d)"
+          trap 'rm -rf "$formatted_dir"' EXIT
           for file in infra/main.bicep infra/resource-group.bicep infra/modules/*.bicep; do
             az bicep build --file "$file" --stdout >/dev/null
-            diff --unified "$file" <(az bicep format --file "$file" --stdout)
+            az bicep format --file "$file" --outfile "$formatted_dir/$(basename "$file")"
+            diff --unified "$file" "$formatted_dir/$(basename "$file")"
           done
           for file in infra/environments/*.bicepparam; do
             az bicep build-params --file "$file" --stdout >/dev/null
-            diff --unified "$file" <(az bicep format --file "$file" --stdout)
+            az bicep format --file "$file" --outfile "$formatted_dir/$(basename "$file")"
+            diff --unified "$file" "$formatted_dir/$(basename "$file")"
           done
 
       - name: Scan the Slice 11C diff for secrets
