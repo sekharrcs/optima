@@ -468,9 +468,16 @@ class FakeAzure:
         if arguments[:3] == ("identity", "federated-credential", "list"):
             return [
                 {
+                    "id": (
+                        f"{self.configuration.deployment_identity_resource_id}/"
+                        "federatedIdentityCredentials/github-optima-hackathon"
+                    ),
+                    "name": "github-optima-hackathon",
                     "audiences": ["api://AzureADTokenExchange"],
                     "issuer": "https://token.actions.githubusercontent.com",
-                    "subject": "repo:sekharrcs/optima:environment:hackathon",
+                    "subject": (
+                        "repo:sekharrcs@45002138/optima@1333906197:environment:hackathon"
+                    ),
                 }
             ]
         if arguments[:3] == ("role", "definition", "list"):
@@ -2237,6 +2244,51 @@ def test_foundation_apply_rejects_forbidden_owner_role() -> None:
             phase="foundation",
             repository_root=ROOT,
         )
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [
+        "foundation-plan",
+        "foundation-apply",
+        "foundation",
+        "publish",
+        "artifacts",
+        "rollout",
+    ],
+)
+def test_legacy_subject_fails_before_role_checks_in_every_phase(
+    phase: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    environment_factory = {
+        "foundation-plan": foundation_plan_environment,
+        "foundation-apply": foundation_apply_environment,
+    }.get(phase, disabled_environment)
+    environment = environment_factory()
+    configuration = load_configuration(environment, phase=phase)
+    azure = FakeAzure(configuration, foundation_exists=True)
+    original_json = azure.json
+    azure.access_token = synthetic_access_token(
+        tenant_id=configuration.tenant_id,
+        client_id=configuration.deployment_client_id,
+        principal_id=azure.deployment_principal_id,
+    )
+
+    def legacy_json(*arguments: str, allow_missing: bool = False) -> Any:
+        value = original_json(*arguments, allow_missing=allow_missing)
+        if arguments[:3] == ("identity", "federated-credential", "list"):
+            value[0]["subject"] = "repo:sekharrcs/optima:environment:hackathon"
+        return value
+
+    monkeypatch.setattr(azure, "json", legacy_json)
+    with pytest.raises(PreflightError, match="federated credential"):
+        run_preflight(
+            configuration,
+            azure,
+            phase=phase,
+            repository_root=ROOT,
+        )
+    assert not any(call[:2] == ("role", "assignment") for call in azure.calls)
 
 
 def test_foundation_plan_still_requires_cost_governance() -> None:

@@ -17,8 +17,13 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 from urllib.parse import parse_qs, urljoin, urlparse
+
+if TYPE_CHECKING or __package__:
+    from scripts import oidc_federation
+else:
+    import oidc_federation
 
 EXIT_SUCCESS = 0
 EXIT_FAILURE = 1
@@ -1654,20 +1659,15 @@ def _check_oidc_federation(
         "--identity-name",
         identity_name,
     )
-    expected_subject = (
-        f"repo:{configuration.github_repository}:environment:"
-        f"{configuration.github_environment}"
-    )
-    if not isinstance(credentials, list) or not any(
-        isinstance(credential, dict)
-        and credential.get("issuer") == "https://token.actions.githubusercontent.com"
-        and credential.get("subject") == expected_subject
-        and "api://AzureADTokenExchange" in credential.get("audiences", [])
-        for credential in credentials
-    ):
+    try:
+        oidc_federation.validate_federated_credentials(
+            credentials,
+            identity_resource_id=configuration.deployment_identity_resource_id,
+        )
+    except oidc_federation.FederationError as error:
         raise PreflightError(
             "GitHub environment federated credential is missing or mismatched"
-        )
+        ) from error
     _check_deployment_role_allowlist(
         configuration,
         azure,
