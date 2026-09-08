@@ -369,6 +369,52 @@ LIVE_BICEP = pytest.mark.skipif(
 )
 
 
+def _record_block_allocations(commands: str) -> str:
+    return (
+        'mktemp() { command mktemp "$@" | tee -a "$OPTIMA_ALLOCATION_LOG"; }\n'
+        + commands
+    )
+
+
+def _assert_block_cleanup(allocation_log: Path, scratch: Path) -> None:
+    allocated = allocation_log.read_text(encoding="utf-8").splitlines()
+    assert len(allocated) == 1, "Expected the block's one formatter directory"
+    directory = Path(allocated[0])
+    assert directory.parent.resolve() == scratch.resolve()
+    assert not directory.exists(), (
+        f"Block-owned formatter directory leaked: {directory}"
+    )
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux Bash and mktemp")
+@pytest.mark.parametrize("leak", [False, True])
+@pytest.mark.parametrize("fail", [False, True])
+def test_block_cleanup_tracks_ownership(tmp_path: Path, leak: bool, fail: bool) -> None:
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    unrelated = scratch / "unrelated-tool-owned-file"
+    unrelated.write_text("retained", encoding="utf-8")
+    allocation_log = tmp_path / "allocations.txt"
+    commands = 'set -euo pipefail\nformatted_dir="$(mktemp -d)"\n'
+    if not leak:
+        commands += "trap 'rm -rf \"$formatted_dir\"' EXIT\n"
+    commands += 'printf data > "$formatted_dir/result.bicep"\n'
+    commands += "exit 7\n" if fail else "exit 0\n"
+    result = subprocess.run(
+        ["bash", "-e", "-o", "pipefail", "-c", _record_block_allocations(commands)],
+        env=os.environ
+        | {"TMPDIR": str(scratch), "OPTIMA_ALLOCATION_LOG": str(allocation_log)},
+        check=False,
+    )
+    assert result.returncode == (7 if fail else 0)
+    assert unrelated.read_text(encoding="utf-8") == "retained"
+    if leak:
+        with pytest.raises(AssertionError, match="formatter directory leaked"):
+            _assert_block_cleanup(allocation_log, scratch)
+    else:
+        _assert_block_cleanup(allocation_log, scratch)
+
+
 @LIVE_BICEP
 def test_live_bicep_formatter_byte_provenance(tmp_path: Path) -> None:
     direct_bicep = Path(os.environ["AZURE_CONFIG_DIR"]) / "bin" / "bicep"
@@ -453,14 +499,53 @@ def test_live_bicep_workflow_validation(path: Path, tmp_path: Path) -> None:
         for source in (tmp_path / "infra").rglob("*")
         if source.is_file()
     }
-    environment = os.environ | {"BICEP_VERSION": "0.46.1", "TMPDIR": str(scratch)}
+    allocation_log = tmp_path / "allocations.txt"
+    probe = tmp_path / "probe"
+    probe.mkdir()
+    audit_log = tmp_path / "temporary-files.jsonl"
+    (probe / "sitecustomize.py").write_text(
+        "import json, os, sys, traceback\n"
+        "def record(event, arguments):\n"
+        "    if event not in ('tempfile.mkstemp', 'tempfile.mkdtemp',\n"
+        "                     'os.remove', 'os.rmdir'):\n"
+        "        return\n"
+        "    path = os.fsdecode(arguments[0])\n"
+        "    if not path.startswith(os.environ['TMPDIR'] + os.sep):\n"
+        "        return\n"
+        "    stack = [f'{frame.filename}:{frame.lineno}:{frame.name}'\n"
+        "             for frame in traceback.extract_stack()[:-1]]\n"
+        "    value = dict(event=event, path=path, pid=os.getpid(), stack=stack)\n"
+        "    with open(os.environ['OPTIMA_TEMP_AUDIT'], 'a') as output:\n"
+        "        output.write(json.dumps(value) + '\\n')\n"
+        "sys.addaudithook(record)\n",
+        encoding="utf-8",
+    )
+    environment = os.environ | {
+        "BICEP_VERSION": "0.46.1",
+        "TMPDIR": str(scratch),
+        "OPTIMA_ALLOCATION_LOG": str(allocation_log),
+        "OPTIMA_TEMP_AUDIT": str(audit_log),
+        "PYTHONPATH": str(probe),
+    }
     subprocess.run(
-        ["bash", "-e", "-o", "pipefail", "-c", _bicep_validation_commands(path)],
+        [
+            "bash",
+            "-e",
+            "-o",
+            "pipefail",
+            "-c",
+            _record_block_allocations(_bicep_validation_commands(path)),
+        ],
         cwd=tmp_path,
         env=environment,
         check=True,
     )
     assert all(source.read_bytes() == content for source, content in before.items())
+    _assert_block_cleanup(allocation_log, scratch)
+    print(f"Block allocation: {allocation_log.read_text(encoding='utf-8').strip()}")
+    if audit_log.exists():
+        print(audit_log.read_text(encoding="utf-8"))
+    print(f"Shared TMPDIR entries: {sorted(entry.name for entry in scratch.iterdir())}")
     assert {entry.name for entry in scratch.iterdir()} <= {".bicep"}
     print(f"Exact {path.name} Bicep validation block: PASS")
 
