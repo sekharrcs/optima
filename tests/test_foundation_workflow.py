@@ -379,6 +379,7 @@ def test_live_bicep_formatter_byte_provenance(tmp_path: Path) -> None:
     azure_version = subprocess.run(
         ["az", "version"], capture_output=True, check=True
     ).stdout
+    assert json.loads(azure_version)["azure-cli"] == "2.89.1"
     print(azure_version.decode("utf-8"))
     files = sorted((ROOT / "infra").rglob("*.bicep")) + sorted(
         (ROOT / "infra").rglob("*.bicepparam")
@@ -406,7 +407,7 @@ def test_live_bicep_formatter_byte_provenance(tmp_path: Path) -> None:
             check=True,
         )
         assert committed == source.read_bytes() == direct == output.read_bytes()
-        assert wrapped in (direct, direct + b"\n")
+        assert wrapped == direct + b"\n"
         legacy = subprocess.run(
             [
                 "bash",
@@ -421,7 +422,7 @@ def test_live_bicep_formatter_byte_provenance(tmp_path: Path) -> None:
             capture_output=True,
             check=False,
         )
-        assert legacy.returncode == (0 if committed == wrapped else 1)
+        assert legacy.returncode == 1
         print(
             json.dumps(
                 {

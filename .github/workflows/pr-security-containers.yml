@@ -170,6 +170,10 @@ jobs:
           OPTIMA_TEST_BICEP_TOOLCHAIN: "1"
         run: |
           set -euo pipefail
+          export UV_TOOL_DIR="$RUNNER_TEMP/bicep-validation-tools/environments"
+          export UV_TOOL_BIN_DIR="$RUNNER_TEMP/bicep-validation-tools/bin"
+          uv tool install --python 3.12 azure-cli==2.89.1
+          export PATH="$UV_TOOL_BIN_DIR:$PATH"
           az version
           az bicep install --version "v$BICEP_VERSION"
           uv run --no-sync python -m pytest tests/test_foundation_workflow.py -k live_bicep -v -s
