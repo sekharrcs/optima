@@ -228,6 +228,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          umask 077
+          trap '
+            status=$?
+            if test "$status" -ne 0; then
+              rm -f -- "$RUNNER_TEMP/foundation-whatif.json"
+            fi
+            rm -f -- "$RUNNER_TEMP/foundation-whatif.stderr"
+            exit "$status"
+          ' EXIT
           if ! az group show --name "$AZURE_RESOURCE_GROUP" >/dev/null 2>&1; then
             echo "Approved resource group is absent; foundation plan requires it" >&2
             exit 1
@@ -250,13 +259,16 @@ jobs:
             --validation-level ProviderNoRbac \
             --result-format FullResourcePayloads \
             --no-pretty-print --only-show-errors \
-            > "$RUNNER_TEMP/foundation-whatif.json"
+            > "$RUNNER_TEMP/foundation-whatif.json" \
+            2> "$RUNNER_TEMP/foundation-whatif.stderr"
 
       - name: Classify the foundation what-if and emit sanitized evidence
         id: classify
         shell: bash
         run: |
           set -euo pipefail
+          umask 077
+          trap 'rm -f -- "$RUNNER_TEMP/foundation-whatif.json" "$RUNNER_TEMP/foundation-whatif.stderr"' EXIT
           python scripts/whatif_classification.py classify \
             --whatif "$RUNNER_TEMP/foundation-whatif.json" \
             --subscription-id "$AZURE_SUBSCRIPTION_ID" \
@@ -265,7 +277,6 @@ jobs:
             --parameters-file "$RUNNER_TEMP/foundation-parameters.txt" \
             --failure-diagnostics "$RUNNER_TEMP/foundation-classification-failure.json" \
             --output "$RUNNER_TEMP/foundation-plan-evidence.json"
-          rm -f "$RUNNER_TEMP/foundation-whatif.json"
           {
             printf '## OPTIMA foundation plan\n\n'
             printf -- '- Operation: `foundation-plan` (read-only, no Azure mutation)\n'
@@ -273,6 +284,14 @@ jobs:
             printf -- '- Classification: `APPROVED`\n'
             printf -- '- Review the sanitized plan evidence artifact before apply.\n'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Clean up private foundation what-if capture
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f -- "$RUNNER_TEMP/foundation-whatif.json" \
+            "$RUNNER_TEMP/foundation-whatif.stderr"
 
       # actions/upload-artifact v7.0.1, resolved from the upstream tag with git ls-remote.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
