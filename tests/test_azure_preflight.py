@@ -151,7 +151,7 @@ def foundation_plan_role_definition(
     return {
         "assignableScopes": assignable_scopes
         if assignable_scopes is not None
-        else [f"/subscriptions/{SUBSCRIPTION_ID}"],
+        else [f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg-optima-hackathon"],
         "id": role_definition_resource_id(FOUNDATION_PLAN_ROLE_DEFINITION_ID),
         "permissions": [
             {
@@ -2778,8 +2778,152 @@ def test_apply_rejects_any_custom_or_extra_effective_role() -> None:
 
 
 @pytest.mark.parametrize(
+    "metadata",
+    [
+        {},
+        {"condition": None, "conditionVersion": None},
+        {"condition": None},
+        {"conditionVersion": None},
+    ],
+    ids=("original", "observed-cli", "condition-only", "version-only"),
+)
+def test_foundation_plan_role_accepts_optional_null_condition_metadata(
+    metadata: dict[str, Any],
+) -> None:
+    """Accept CLI null metadata without removing fields from its response."""
+    configuration = load_configuration(
+        foundation_plan_environment(), phase="foundation-plan"
+    )
+    azure = FakeAzure(configuration, foundation_exists=True)
+    definition = foundation_plan_role_definition()
+    definition["permissions"][0].update(metadata)
+    azure.role_definition_response = [definition]
+    original = json.dumps(definition, sort_keys=True)
+
+    run_preflight(configuration, azure, phase="foundation-plan", repository_root=ROOT)
+
+    assert json.dumps(definition, sort_keys=True) == original
+
+
+@pytest.mark.parametrize("field", ["condition", "conditionVersion"])
+@pytest.mark.parametrize("value", ["", "2.0", "@Resource[foo]", False, 0, [], {}])
+def test_foundation_plan_role_rejects_nonnull_condition_metadata(
+    field: str, value: Any
+) -> None:
+    """Reject even falsey non-null conditions and version values."""
+    configuration = load_configuration(
+        foundation_plan_environment(), phase="foundation-plan"
+    )
+    azure = FakeAzure(configuration, foundation_exists=True)
+    definition = foundation_plan_role_definition()
+    definition["permissions"][0].update({"condition": None, "conditionVersion": None})
+    definition["permissions"][0][field] = value
+    azure.role_definition_response = [definition]
+
+    with pytest.raises(PreflightError, match="permissions are malformed"):
+        run_preflight(
+            configuration, azure, phase="foundation-plan", repository_root=ROOT
+        )
+
+
+@pytest.mark.parametrize("with_metadata", [False, True])
+@pytest.mark.parametrize(
+    "field", ["actions", "notActions", "dataActions", "notDataActions"]
+)
+@pytest.mark.parametrize(
+    "value", [None, "read", {}, [None], [1], [""], [" "], ["*", "*"]]
+)
+def test_foundation_plan_role_rejects_malformed_permission_lists(
+    with_metadata: bool, field: str, value: Any
+) -> None:
+    """Retain strict list, element and duplicate checks in both response shapes."""
+    configuration = load_configuration(
+        foundation_plan_environment(), phase="foundation-plan"
+    )
+    azure = FakeAzure(configuration, foundation_exists=True)
+    definition = foundation_plan_role_definition()
+    if with_metadata:
+        definition["permissions"][0].update(
+            {"condition": None, "conditionVersion": None}
+        )
+    definition["permissions"][0][field] = value
+    azure.role_definition_response = [definition]
+
+    with pytest.raises(PreflightError, match="permissions are malformed"):
+        run_preflight(
+            configuration, azure, phase="foundation-plan", repository_root=ROOT
+        )
+
+
+@pytest.mark.parametrize("with_metadata", [False, True])
+@pytest.mark.parametrize(
+    "field", ["actions", "notActions", "dataActions", "notDataActions"]
+)
+def test_foundation_plan_role_requires_all_original_permission_fields(
+    with_metadata: bool, field: str
+) -> None:
+    """Optional metadata cannot replace any required permission list."""
+    configuration = load_configuration(
+        foundation_plan_environment(), phase="foundation-plan"
+    )
+    azure = FakeAzure(configuration, foundation_exists=True)
+    definition = foundation_plan_role_definition()
+    if with_metadata:
+        definition["permissions"][0].update(
+            {"condition": None, "conditionVersion": None}
+        )
+    del definition["permissions"][0][field]
+    azure.role_definition_response = [definition]
+
+    with pytest.raises(PreflightError, match="permissions are malformed"):
+        run_preflight(
+            configuration, azure, phase="foundation-plan", repository_root=ROOT
+        )
+
+
+@pytest.mark.parametrize("field", ["unknown", "Condition", "conditions"])
+def test_foundation_plan_role_rejects_unknown_permission_fields(field: str) -> None:
+    """Do not strip arbitrary null fields or silently normalize key names."""
+    configuration = load_configuration(
+        foundation_plan_environment(), phase="foundation-plan"
+    )
+    azure = FakeAzure(configuration, foundation_exists=True)
+    definition = foundation_plan_role_definition()
+    definition["permissions"][0].update(
+        {"condition": None, "conditionVersion": None, field: None}
+    )
+    azure.role_definition_response = [definition]
+
+    with pytest.raises(PreflightError, match="permissions are malformed"):
+        run_preflight(
+            configuration, azure, phase="foundation-plan", repository_root=ROOT
+        )
+
+
+@pytest.mark.parametrize("permissions", [None, {}, [], [None], [{}, {}]])
+def test_foundation_plan_role_rejects_malformed_permission_blocks(
+    permissions: Any,
+) -> None:
+    """Require exactly one structured permission block."""
+    configuration = load_configuration(
+        foundation_plan_environment(), phase="foundation-plan"
+    )
+    azure = FakeAzure(configuration, foundation_exists=True)
+    definition = foundation_plan_role_definition()
+    definition["permissions"] = permissions
+    azure.role_definition_response = [definition]
+
+    with pytest.raises(PreflightError, match="permissions are malformed"):
+        run_preflight(
+            configuration, azure, phase="foundation-plan", repository_root=ROOT
+        )
+
+
+@pytest.mark.parametrize("with_metadata", [False, True])
+@pytest.mark.parametrize(
     "actions",
     [
+        [],
         ["Microsoft.Authorization/roleAssignments/write"],
         ["Microsoft.Authorization/*"],
         ["*"],
@@ -2788,9 +2932,16 @@ def test_apply_rejects_any_custom_or_extra_effective_role() -> None:
             "Microsoft.Authorization/roleAssignments/write",
         ],
     ],
-    ids=("exact-role-write", "authorization-wildcard", "global-wildcard", "extra"),
+    ids=(
+        "empty",
+        "exact-role-write",
+        "authorization-wildcard",
+        "global-wildcard",
+        "extra",
+    ),
 )
 def test_foundation_plan_role_rejects_mutating_or_extra_actions(
+    with_metadata: bool,
     actions: list[str],
 ) -> None:
     """Keep the plan identity structurally unable to mutate resources or RBAC."""
@@ -2798,7 +2949,12 @@ def test_foundation_plan_role_rejects_mutating_or_extra_actions(
         foundation_plan_environment(), phase="foundation-plan"
     )
     azure = FakeAzure(configuration, foundation_exists=True)
-    azure.role_definition_response = [foundation_plan_role_definition(actions=actions)]
+    definition = foundation_plan_role_definition(actions=actions)
+    if with_metadata:
+        definition["permissions"][0].update(
+            {"condition": None, "conditionVersion": None}
+        )
+    azure.role_definition_response = [definition]
 
     with pytest.raises(PreflightError, match="allow only deployments what-if"):
         run_preflight(
@@ -2809,6 +2965,7 @@ def test_foundation_plan_role_rejects_mutating_or_extra_actions(
         )
 
 
+@pytest.mark.parametrize("with_metadata", [False, True])
 @pytest.mark.parametrize(
     ("field", "action"),
     [
@@ -2818,6 +2975,7 @@ def test_foundation_plan_role_rejects_mutating_or_extra_actions(
     ],
 )
 def test_foundation_plan_role_rejects_nonempty_secondary_permissions(
+    with_metadata: bool,
     field: str,
     action: str,
 ) -> None:
@@ -2828,6 +2986,10 @@ def test_foundation_plan_role_rejects_nonempty_secondary_permissions(
     azure = FakeAzure(configuration, foundation_exists=True)
     definition = foundation_plan_role_definition()
     definition["permissions"][0][field] = [action]
+    if with_metadata:
+        definition["permissions"][0].update(
+            {"condition": None, "conditionVersion": None}
+        )
     azure.role_definition_response = [definition]
 
     with pytest.raises(PreflightError, match="allow only deployments what-if"):
@@ -2859,19 +3021,49 @@ def test_foundation_plan_role_definition_fails_closed_when_unreadable_or_malform
         )
 
 
-def test_foundation_plan_role_requires_usable_assignable_scope() -> None:
-    """Require the custom role to be assignable at the exact target hierarchy."""
+@pytest.mark.parametrize("with_metadata", [False, True])
+@pytest.mark.parametrize(
+    "scopes",
+    [
+        [],
+        [f"/subscriptions/{SUBSCRIPTION_ID}"],
+        [f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg-other"],
+        [
+            f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg-optima-hackathon",
+            f"/subscriptions/{SUBSCRIPTION_ID}",
+        ],
+        [
+            f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg-optima-hackathon",
+            f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg-other",
+        ],
+        [
+            f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg-optima-hackathon",
+            f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg-optima-hackathon",
+        ],
+    ],
+    ids=(
+        "empty",
+        "subscription",
+        "other-group",
+        "expanded",
+        "extra-group",
+        "duplicate",
+    ),
+)
+def test_foundation_plan_role_requires_usable_assignable_scope(
+    with_metadata: bool, scopes: list[str]
+) -> None:
+    """Require only the reviewed target group, not a containing or extra scope."""
     configuration = load_configuration(
         foundation_plan_environment(), phase="foundation-plan"
     )
     azure = FakeAzure(configuration, foundation_exists=True)
-    azure.role_definition_response = [
-        foundation_plan_role_definition(
-            assignable_scopes=[
-                f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg-other"
-            ]
+    definition = foundation_plan_role_definition(assignable_scopes=scopes)
+    if with_metadata:
+        definition["permissions"][0].update(
+            {"condition": None, "conditionVersion": None}
         )
-    ]
+    azure.role_definition_response = [definition]
 
     with pytest.raises(PreflightError, match="not assignable"):
         run_preflight(

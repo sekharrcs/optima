@@ -1476,7 +1476,15 @@ def _check_foundation_plan_role_definition(
             "Foundation plan role definition permissions are malformed"
         )
     permission = permissions[0]
-    if set(permission) != {"actions", "notActions", "dataActions", "notDataActions"}:
+    required_fields = {"actions", "notActions", "dataActions", "notDataActions"}
+    optional_null_fields = {"condition", "conditionVersion"}
+    permission_fields = set(permission)
+    if (
+        not required_fields
+        <= permission_fields
+        <= required_fields | optional_null_fields
+        or any(permission.get(field) is not None for field in optional_null_fields)
+    ):
         raise PreflightError(
             "Foundation plan role definition permissions are malformed"
         )
@@ -1494,12 +1502,9 @@ def _check_foundation_plan_role_definition(
     ):
         raise PreflightError("Foundation plan role assignable scopes are malformed")
     canonical_scopes = [_canonical_arm_scope(scope) for scope in assignable_scopes]
-    if len(canonical_scopes) != len(set(canonical_scopes)) or not {
-        subscription_scope,
-        resource_group_scope,
-    }.intersection(canonical_scopes):
+    if canonical_scopes != [resource_group_scope]:
         raise PreflightError(
-            "Foundation plan role is not assignable to the target resource group"
+            "Foundation plan role is not assignable only to the target resource group"
         )
 
 
