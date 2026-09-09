@@ -721,6 +721,41 @@ def test_plan_uploads_only_sanitized_classifier_evidence() -> None:
     assert upload["with"]["if-no-files-found"] == "error"
 
 
+def test_failure_diagnostics_are_separate_and_failure_only() -> None:
+    steps = _steps("foundation-plan")
+    classify = next(step for step in steps if step.get("id") == "classify")
+    uploads = [
+        step
+        for step in steps
+        if str(step.get("uses", "")).startswith("actions/upload-artifact@")
+    ]
+    assert len(uploads) == 2
+    evidence, diagnostics = uploads
+    assert "if" not in evidence
+    assert "continue-on-error" not in classify
+    assert classify["run"].startswith("set -euo pipefail\n")
+    assert (
+        '--failure-diagnostics "$RUNNER_TEMP/foundation-classification-failure.json"'
+        in classify["run"]
+    )
+    assert (
+        diagnostics["if"] == "${{ failure() && steps.classify.outcome == 'failure' }}"
+    )
+    assert diagnostics["with"] == {
+        "name": (
+            "foundation-classification-failure-"
+            "${{ github.run_id }}-${{ github.run_attempt }}"
+        ),
+        "path": "${{ runner.temp }}/foundation-classification-failure.json",
+        "if-no-files-found": "error",
+        "retention-days": "7",
+        "compression-level": "0",
+    }
+    assert evidence["with"]["path"] != diagnostics["with"]["path"]
+    assert "foundation-whatif.json" not in diagnostics["with"]["path"]
+    assert "--failure-diagnostics" not in _job_commands("foundation-apply")
+
+
 def test_apply_authenticates_provenance_before_exact_artifact_download() -> None:
     steps = _steps("foundation-apply")
     commands = _job_commands("foundation-apply")

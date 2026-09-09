@@ -178,6 +178,19 @@ def test_valid_promotion_returns_only_bound_artifact_outputs() -> None:
     assert outputs.source_run_attempt == 1
 
 
+@pytest.mark.parametrize("conclusion", ["failure", "success"])
+def test_diagnostic_artifact_never_qualifies_for_promotion(conclusion: str) -> None:
+    """Reject diagnostics even with forged successful source-run metadata."""
+    documents = _documents()
+    documents["source_run"]["conclusion"] = conclusion
+    documents["source_jobs"]["jobs"][1]["conclusion"] = conclusion
+    documents["source_artifacts"]["artifacts"][0]["name"] = (
+        f"foundation-classification-failure-{PLAN_RUN_ID}-1"
+    )
+    with pytest.raises(PromotionValidationError):
+        _validate(documents)
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [

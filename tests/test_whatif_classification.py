@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import copy
 import json
+import subprocess
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from scripts import whatif_classification
 from scripts.whatif_classification import (
     EVIDENCE_SCHEMA_VERSION,
     WhatIfClassificationCode,
@@ -467,6 +469,45 @@ def test_empty_reviewed_official_fields_are_accepted() -> None:
     assert len(_classification(document).allowed_changes) == 9
 
 
+@pytest.mark.parametrize("potential_changes", [None, []])
+@pytest.mark.parametrize("diagnostics", [None, []])
+def test_cli_nullable_optional_arrays_are_accepted_without_mutation(
+    potential_changes: Any, diagnostics: Any
+) -> None:
+    """Accept the CLI 2.89.1 SDK-model null output, not a captured Azure fixture."""
+    document = _foundation_creates()
+    document.update(potentialChanges=potential_changes, diagnostics=diagnostics)
+    original = copy.deepcopy(document)
+
+    assert _classification(document) == _classification(_foundation_creates())
+    assert document == original
+
+
+@pytest.mark.parametrize("field", ["potentialChanges", "diagnostics"])
+@pytest.mark.parametrize("value", [{}, "", "unsafe", False, True, 0, 1, 0.5])
+def test_optional_arrays_reject_every_nonnull_nonlist_value(
+    field: str, value: Any
+) -> None:
+    """Do not normalize falsey values into reviewed empty arrays."""
+    document = _foundation_creates()
+    document[field] = value
+    _assert_code(document, WhatIfClassificationCode.MALFORMED_DOCUMENT)
+
+
+@pytest.mark.parametrize("changes", [None, [], {}])
+def test_null_optional_arrays_do_not_allow_incomplete_changes(changes: Any) -> None:
+    """The required resource graph is not a nullable optional signal."""
+    _assert_code(
+        {
+            "status": "Succeeded",
+            "changes": changes,
+            "potentialChanges": None,
+            "diagnostics": None,
+        },
+        WhatIfClassificationCode.NO_STRUCTURED_CHANGES,
+    )
+
+
 def test_unknown_top_level_field_fails_closed() -> None:
     """Reject a future schema field until its security meaning is reviewed."""
     document = _foundation_creates()
@@ -915,6 +956,294 @@ def test_cli_classify_fails_closed_on_malformed_json(tmp_path: Path) -> None:
     )
 
     assert exit_code == 1
+
+
+@pytest.mark.parametrize(
+    ("payload", "parsed", "value_type", "count", "code"),
+    [
+        (
+            '{"status":"Succeeded","potentialChanges":false}',
+            True,
+            "boolean",
+            None,
+            WhatIfClassificationCode.MALFORMED_DOCUMENT,
+        ),
+        (
+            '{"status":"Succeeded","potentialChanges":[{"token":"secret-sentinel"}]}',
+            True,
+            "array",
+            1,
+            WhatIfClassificationCode.POTENTIAL_CHANGES,
+        ),
+        (
+            '{"status":"Succeeded","potentialChanges":null,"changes":[]}',
+            True,
+            "null",
+            None,
+            WhatIfClassificationCode.NO_STRUCTURED_CHANGES,
+        ),
+        (
+            '{"status":"Succeeded","secret-sentinel":{"token":"secret-sentinel"}}',
+            True,
+            "absent",
+            None,
+            WhatIfClassificationCode.MALFORMED_DOCUMENT,
+        ),
+        (
+            '{"status":"secret-sentinel",',
+            False,
+            "unavailable",
+            None,
+            WhatIfClassificationCode.MALFORMED_DOCUMENT,
+        ),
+        (
+            '{"status":1,"status":"secret-sentinel"}',
+            False,
+            "unavailable",
+            None,
+            WhatIfClassificationCode.MALFORMED_DOCUMENT,
+        ),
+        ("null", True, "absent", None, WhatIfClassificationCode.MALFORMED_DOCUMENT),
+    ],
+)
+def test_cli_failure_diagnostics_are_sanitized_and_not_promotable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    payload: str,
+    parsed: bool,
+    value_type: str,
+    count: int | None,
+    code: WhatIfClassificationCode,
+) -> None:
+    """Retain shape evidence, never raw input, and remove stale approved output."""
+    monkeypatch.setattr(
+        whatif_classification,
+        "_toolchain_versions",
+        lambda: {
+            "python": "3.12.10",
+            "azure_cli": "2.89.1",
+            "bicep": "0.46.1",
+        },
+    )
+    whatif = tmp_path / "whatif.json"
+    whatif.write_text(payload, encoding="utf-8")
+    output = tmp_path / "evidence.json"
+    output.write_text(json.dumps(_evidence()), encoding="utf-8")
+    diagnostics = tmp_path / "failure.json"
+    exit_code = main(
+        [
+            "classify",
+            "--whatif",
+            str(whatif),
+            "--subscription-id",
+            SUBSCRIPTION_ID,
+            "--resource-group",
+            RESOURCE_GROUP,
+            "--commit-sha",
+            COMMIT_SHA,
+            "--parameters-file",
+            str(_write_parameters(tmp_path)),
+            "--output",
+            str(output),
+            "--failure-diagnostics",
+            str(diagnostics),
+        ]
+    )
+    assert exit_code == 1
+    assert not output.exists()
+    serialized = diagnostics.read_text(encoding="utf-8")
+    report = json.loads(serialized)
+    assert (
+        report["schema_version"]
+        == whatif_classification.FAILURE_DIAGNOSTICS_SCHEMA_VERSION
+    )
+    assert report["classification"] == "FAILED"
+    assert report["promotable"] is False
+    assert report["classifier_error"] == code.value
+    assert report["document"]["parsed"] is parsed
+    assert report["fields"]["potentialChanges"]["json_type"] == value_type
+    assert report["fields"]["potentialChanges"]["array_count"] == count
+    for sensitive in (
+        "secret-sentinel",
+        SUBSCRIPTION_ID,
+        RESOURCE_GROUP,
+        COMMIT_SHA,
+        str(tmp_path),
+        "resourceId",
+        "fingerprint",
+    ):
+        assert sensitive not in serialized
+    with pytest.raises(WhatIfClassificationError):
+        compare_promotion_evidence(report, report)
+
+
+def test_success_does_not_emit_failure_diagnostics(tmp_path: Path) -> None:
+    """A successful plan has only its approved evidence, never stale diagnostics."""
+    whatif = tmp_path / "whatif.json"
+    whatif.write_text(json.dumps(_foundation_creates()), encoding="utf-8")
+    diagnostics = tmp_path / "failure.json"
+    diagnostics.write_text("stale", encoding="utf-8")
+    assert (
+        main(
+            [
+                "classify",
+                "--whatif",
+                str(whatif),
+                "--subscription-id",
+                SUBSCRIPTION_ID,
+                "--resource-group",
+                RESOURCE_GROUP,
+                "--commit-sha",
+                COMMIT_SHA,
+                "--parameters-file",
+                str(_write_parameters(tmp_path)),
+                "--failure-diagnostics",
+                str(diagnostics),
+            ]
+        )
+        == 0
+    )
+    assert not diagnostics.exists()
+
+
+@pytest.mark.parametrize("input_kind", ["missing", "invalid_utf8"])
+def test_unreadable_input_still_emits_nonpromotable_diagnostics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    input_kind: str,
+) -> None:
+    monkeypatch.setattr(whatif_classification, "_toolchain_versions", lambda: {})
+    whatif = tmp_path / "secret-sentinel.json"
+    if input_kind == "invalid_utf8":
+        whatif.write_bytes(b"\xffsecret-sentinel")
+    diagnostics = tmp_path / "failure.json"
+    assert (
+        main(
+            [
+                "classify",
+                "--whatif",
+                str(whatif),
+                "--subscription-id",
+                SUBSCRIPTION_ID,
+                "--resource-group",
+                RESOURCE_GROUP,
+                "--commit-sha",
+                COMMIT_SHA,
+                "--parameters-file",
+                str(_write_parameters(tmp_path)),
+                "--failure-diagnostics",
+                str(diagnostics),
+            ]
+        )
+        == 1
+    )
+    serialized = diagnostics.read_text(encoding="utf-8")
+    report = json.loads(serialized)
+    assert report["document"]["parsed"] is False
+    assert all(field["present"] is None for field in report["fields"].values())
+    assert "secret-sentinel" not in serialized
+
+
+@pytest.mark.parametrize("alias", ["input", "evidence"])
+def test_diagnostics_cannot_overwrite_inputs_or_promotion_output(
+    tmp_path: Path,
+    alias: str,
+) -> None:
+    whatif = tmp_path / "whatif.json"
+    payload = json.dumps(_foundation_creates())
+    whatif.write_text(payload, encoding="utf-8")
+    output = tmp_path / "evidence.json"
+    diagnostics = whatif if alias == "input" else output
+    assert (
+        main(
+            [
+                "classify",
+                "--whatif",
+                str(whatif),
+                "--subscription-id",
+                SUBSCRIPTION_ID,
+                "--resource-group",
+                RESOURCE_GROUP,
+                "--commit-sha",
+                COMMIT_SHA,
+                "--parameters-file",
+                str(_write_parameters(tmp_path)),
+                "--output",
+                str(output),
+                "--failure-diagnostics",
+                str(diagnostics),
+            ]
+        )
+        == 1
+    )
+    assert whatif.read_text(encoding="utf-8") == payload
+    assert not output.exists()
+
+
+def test_missing_version_tools_are_explicitly_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("scripts.whatif_classification.shutil.which", lambda name: None)
+    monkeypatch.delenv("ImageVersion", raising=False)
+    versions = whatif_classification._toolchain_versions()
+    assert versions["python"] is not None
+    assert all(
+        versions[key] is None
+        for key in (
+            "azure_cli",
+            "azure_cli_core",
+            "bicep",
+            "runner_image",
+        )
+    )
+
+
+def test_diagnostic_versions_never_include_arbitrary_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tool metadata uses a closed projection with no raw stdout or stderr."""
+    monkeypatch.setattr("scripts.whatif_classification.shutil.which", lambda name: "az")
+    monkeypatch.setenv("ImageVersion", "token-secret")
+    monkeypatch.setattr(
+        whatif_classification,
+        "_version_output",
+        lambda command: (
+            json.dumps(
+                {
+                    "azure-cli": "2.89.1",
+                    "azure-cli-core": "token-secret",
+                    "extensions": {"secret": "token-secret"},
+                }
+            )
+            if "bicep" not in command
+            else "Bicep CLI version 0.46.1 (545b338e2c)\n"
+        ),
+    )
+    versions = whatif_classification._toolchain_versions()
+    assert versions["azure_cli"] == "2.89.1"
+    assert versions["bicep"] == "0.46.1"
+    assert versions["azure_cli_core"] is None
+    assert versions["runner_image"] is None
+    assert "secret" not in json.dumps(versions)
+
+
+def test_version_probe_does_not_check_updates_or_forward_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        assert command == ["az", "bicep", "version"]
+        assert kwargs["env"]["AZURE_BICEP_CHECK_VERSION"] == "false"
+        assert kwargs["timeout"] == 15
+        assert kwargs["capture_output"] is True
+        return subprocess.CompletedProcess(
+            command, 1, "secret-sentinel", "token-sentinel"
+        )
+
+    monkeypatch.setattr("scripts.whatif_classification.subprocess.run", run)
+    assert whatif_classification._version_output(["az", "bicep", "version"]) == ""
+    captured = capsys.readouterr()
+    assert captured.out == captured.err == ""
 
 
 @pytest.mark.parametrize(
