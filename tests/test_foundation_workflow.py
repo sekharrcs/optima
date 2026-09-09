@@ -729,8 +729,8 @@ def test_failure_diagnostics_are_separate_and_failure_only() -> None:
         for step in steps
         if str(step.get("uses", "")).startswith("actions/upload-artifact@")
     ]
-    assert len(uploads) == 2
-    evidence, diagnostics = uploads
+    assert len(uploads) == 3
+    evidence, diagnostics, ciphertext = uploads
     assert "if" not in evidence
     assert "continue-on-error" not in classify
     assert classify["run"].startswith("set -euo pipefail\n")
@@ -754,6 +754,462 @@ def test_failure_diagnostics_are_separate_and_failure_only() -> None:
     assert evidence["with"]["path"] != diagnostics["with"]["path"]
     assert "foundation-whatif.json" not in diagnostics["with"]["path"]
     assert "--failure-diagnostics" not in _job_commands("foundation-apply")
+    assert ciphertext["if"] == (
+        "${{ failure() && steps.whatif.outputs.sealed == 'true' }}"
+    )
+    assert ciphertext["with"] == {
+        "name": (
+            "foundation-private-diagnostic-"
+            "${{ github.run_id }}-${{ github.run_attempt }}"
+        ),
+        "path": "${{ runner.temp }}/foundation-private-capture.cms",
+        "if-no-files-found": "error",
+        "retention-days": "1",
+        "compression-level": "0",
+    }
+    assert "continue-on-error" not in ciphertext
+    assert "foundation_diagnostic_capture" not in _job_commands("foundation-apply")
+
+
+def test_recipient_preparation_precedes_login_and_uses_only_public_variables() -> None:
+    steps = _steps("foundation-plan")
+    preparation = _capture_step(
+        "Validate owner-only diagnostic encryption before Azure login"
+    )
+    login = next(
+        step for step in steps if str(step.get("uses", "")).startswith("azure/login@")
+    )
+    assert steps.index(preparation) < steps.index(login)
+    assert preparation["id"] == "recipient"
+    assert preparation["run"].startswith("set -euo pipefail\numask 077\n")
+    assert (
+        "python scripts/foundation_diagnostic_capture.py prepare "
+        '--directory "$RUNNER_TEMP"'
+    ) in preparation["run"]
+    assert (
+        'mktemp -d "$RUNNER_TEMP/foundation-private.XXXXXXXXXX"' in preparation["run"]
+    )
+    for name in (
+        "OPTIMA_DIAGNOSTIC_CERTIFICATE_BASE64",
+        "OPTIMA_DIAGNOSTIC_CERTIFICATE_SHA256",
+    ):
+        assert _job("foundation-plan")["env"][name] == "${{ vars." + name + " }}"
+        assert name not in _job("foundation-apply")["env"]
+    assert _job("foundation-plan")["permissions"] == {
+        "contents": "read",
+        "id-token": "write",
+    }
+
+
+@pytest.fixture
+def capture_bash() -> str:
+    if sys.platform == "win32":
+        git = shutil.which("git")
+        candidate = Path(git).parent.parent / "bin" / "bash.exe" if git else None
+        if candidate is not None and candidate.is_file():
+            return str(candidate)
+        pytest.skip("requires existing Git Bash; never launch WSL")
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.skip("requires Bash")
+    return bash
+
+
+def _capture_step(name: str) -> dict[str, Any]:
+    return next(step for step in _steps("foundation-plan") if step.get("name") == name)
+
+
+def _run_capture_block(
+    bash: str, commands: str, tmp_path: Path, environment: dict[str, str]
+) -> subprocess.CompletedProcess[bytes]:
+    fake_commands = textwrap.dedent(
+        """\
+        az() {
+                    printf '%s\n' "$*" >> "$CAPTURE_AZ_CALLS"
+          case "$*" in
+            'group show '*) return 0 ;;
+            'deployment group list '*) return 0 ;;
+            'deployment group what-if '*)
+              printf '%s\n' "$@" >> "$CAPTURE_AZ_ARGUMENTS"
+              umask > "$CAPTURE_UMASK"
+              printf '%s' "$RAW_STDOUT_SENTINEL"
+              printf '%s' "$RAW_STDERR_SENTINEL" >&2
+              return "$WHATIF_EXIT"
+              ;;
+            *) return 99 ;;
+          esac
+        }
+        python() {
+                    if test "$1" = scripts/foundation_diagnostic_capture.py; then
+                        if test "$2" = prepare; then return "${PREPARE_EXIT:-0}"; fi
+                        test "$2" = seal || return 91
+                        test "$4" = "$RUNNER_TEMP" || return 92
+                        test "$6" = "$WHATIF_EXIT" || return 93
+                        raw_stdout="$(< "$RUNNER_TEMP/foundation-whatif.json")"
+                        raw_stderr="$(< "$RUNNER_TEMP/foundation-whatif.stderr")"
+                        test "$raw_stdout" = "$RAW_STDOUT_SENTINEL" || return 94
+                        test "$raw_stderr" = "$RAW_STDERR_SENTINEL" || return 95
+                        if test "${SEAL_EXIT:-0}" -ne 0; then return "$SEAL_EXIT"; fi
+                        printf 'SYNTHETIC_CIPHERTEXT' \
+                            > "$RUNNER_TEMP/foundation-private-capture.cms"
+                        return 0
+                    fi
+          test "$1" = scripts/whatif_classification.py
+          test "$2" = classify
+          printf '%s\n' "$@" > "$CAPTURE_CLASSIFIER_ARGUMENTS"
+          test "$(< "$RUNNER_TEMP/foundation-whatif.json")" = "$RAW_STDOUT_SENTINEL"
+          test ! -e "$RUNNER_TEMP/foundation-whatif.stderr"
+          umask > "$CAPTURE_CLASSIFIER_UMASK"
+          case "$CLASSIFIER_MODE" in
+            success)
+              printf '{"classification":"APPROVED"}\n' \
+                > "$RUNNER_TEMP/foundation-plan-evidence.json"
+              ;;
+            failure)
+              printf '{"classification":"FAILED","promotable":false}\n' \
+                > "$RUNNER_TEMP/foundation-classification-failure.json"
+              ;;
+            write_failure) return 73 ;;
+            unavailable) return 127 ;;
+            *) return 99 ;;
+          esac
+          return "$CLASSIFIER_EXIT"
+        }
+        """
+    )
+    return subprocess.run(
+        [bash, "--noprofile", "--norc", "-e", "-o", "pipefail"],
+        input=(fake_commands + commands).encode("utf-8"),
+        cwd=tmp_path,
+        env=os.environ | environment,
+        capture_output=True,
+        check=False,
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "whatif_exit",
+        "classifier_mode",
+        "classifier_exit",
+        "seal_exit",
+        "ciphertext_collision",
+    ),
+    [
+        (0, "success", 0, 0, False),
+        (0, "failure", 1, 0, False),
+        (0, "write_failure", 73, 0, False),
+        (0, "unavailable", 127, 0, False),
+        (7, "success", 0, 0, False),
+        (23, "success", 0, 0, False),
+        (130, "success", 0, 0, False),
+        (143, "success", 0, 0, False),
+        (0, "success", 0, 1, False),
+        (23, "success", 0, 1, False),
+        pytest.param(0, "success", 0, 0, True, id="ciphertext-collision"),
+    ],
+)
+def test_plan_capture_blocks_contain_raw_streams_and_preserve_status(
+    tmp_path: Path,
+    capture_bash: str,
+    whatif_exit: int,
+    classifier_mode: str,
+    classifier_exit: int,
+    seal_exit: int,
+    ciphertext_collision: bool,
+) -> None:
+    scratch = tmp_path / "runner temp"
+    scratch.mkdir()
+    environment = {
+        "RUNNER_TEMP": scratch.as_posix(),
+        "GITHUB_STEP_SUMMARY": (tmp_path / "summary").as_posix(),
+        "GITHUB_OUTPUT": (tmp_path / "outputs").as_posix(),
+        "GITHUB_SHA": "a" * 40,
+        "GITHUB_RUN_ID": "123",
+        "GITHUB_RUN_ATTEMPT": "2",
+        "AZURE_RESOURCE_GROUP": "rg-optima-hackathon",
+        "AZURE_SUBSCRIPTION_ID": "00000000-0000-0000-0000-000000000000",
+        "RAW_STDOUT_SENTINEL": "PRIVATE_STDOUT_SENTINEL\nraw-resource-secret",
+        "RAW_STDERR_SENTINEL": "PRIVATE_STDERR_SENTINEL\nraw-provider-secret",
+        "CAPTURE_AZ_CALLS": (tmp_path / "az-calls").as_posix(),
+        "CAPTURE_AZ_ARGUMENTS": (tmp_path / "az-arguments").as_posix(),
+        "CAPTURE_CLASSIFIER_ARGUMENTS": (tmp_path / "classifier-arguments").as_posix(),
+        "CAPTURE_UMASK": (tmp_path / "whatif-umask").as_posix(),
+        "CAPTURE_CLASSIFIER_UMASK": (tmp_path / "classifier-umask").as_posix(),
+        "WHATIF_EXIT": str(whatif_exit),
+        "SEAL_EXIT": str(seal_exit),
+        "CLASSIFIER_MODE": classifier_mode,
+        "CLASSIFIER_EXIT": str(classifier_exit),
+    }
+    ciphertext = scratch / "foundation-private-capture.cms"
+    if ciphertext_collision:
+        ciphertext.write_text(environment["RAW_STDOUT_SENTINEL"], encoding="utf-8")
+    capture = _capture_step("Run exactly one authoritative foundation what-if")
+    result = _run_capture_block(capture_bash, capture["run"], tmp_path, environment)
+    if ciphertext_collision:
+        assert result.returncode == 1
+        assert result.stdout == result.stderr == b""
+        assert not (tmp_path / "az-calls").exists()
+        assert not (tmp_path / "az-arguments").exists()
+        assert not (tmp_path / "classifier-arguments").exists()
+        assert not (tmp_path / "outputs").exists()
+        assert not (tmp_path / "summary").exists()
+        assert list(scratch.iterdir()) == [ciphertext]
+        assert (
+            ciphertext.read_text(encoding="utf-8") == environment["RAW_STDOUT_SENTINEL"]
+        )
+        upload = _capture_step(
+            "Retain owner-encrypted diagnostics for a failed plan only"
+        )
+        assert upload["if"] == (
+            "${{ failure() && steps.whatif.outputs.sealed == 'true' }}"
+        )
+        return
+    assert result.returncode == (whatif_exit or seal_exit)
+    assert result.stdout == result.stderr == b""
+    assert (tmp_path / "az-arguments").read_text(encoding="utf-8").splitlines() == [
+        "deployment",
+        "group",
+        "what-if",
+        "--name",
+        "optima-foundation-promotion-whatif",
+        "--resource-group",
+        "rg-optima-hackathon",
+        "--template-file",
+        "infra/resource-group.bicep",
+        "--parameters",
+        "infra/environments/hackathon.foundation.bicepparam",
+        "--parameters",
+        f"deploymentCommitSha={'a' * 40}",
+        "deploymentWorkflowRunId=123-2",
+        "--validation-level",
+        "ProviderNoRbac",
+        "--result-format",
+        "FullResourcePayloads",
+        "--no-pretty-print",
+        "--only-show-errors",
+    ]
+    assert (tmp_path / "whatif-umask").read_text().strip() == "0077"
+    raw = scratch / "foundation-whatif.json"
+    assert not (scratch / "foundation-whatif.stderr").exists()
+    expected_files: set[str] = set()
+    if whatif_exit == 0 and seal_exit == 0:
+        assert raw.read_text(encoding="utf-8") == environment["RAW_STDOUT_SENTINEL"]
+        if sys.platform != "win32":
+            assert raw.stat().st_mode & 0o777 == 0o600
+        classify = _capture_step(
+            "Classify the foundation what-if and emit sanitized evidence"
+        )
+        result = _run_capture_block(
+            capture_bash, classify["run"], tmp_path, environment
+        )
+        assert result.returncode == classifier_exit
+        assert result.stdout == result.stderr == b""
+        assert (tmp_path / "classifier-umask").read_text().strip() == "0077"
+        arguments = (tmp_path / "classifier-arguments").read_text().splitlines()
+        assert arguments[arguments.index("--whatif") + 1] == raw.as_posix()
+        if classifier_mode == "success":
+            expected_files = {"foundation-plan-evidence.json"}
+            assert "APPROVED" in (tmp_path / "summary").read_text()
+        elif classifier_mode == "failure":
+            expected_files = {"foundation-classification-failure.json"}
+            assert json.loads(
+                (scratch / "foundation-classification-failure.json").read_text()
+            ) == {"classification": "FAILED", "promotable": False}
+    assert not raw.exists()
+    if seal_exit == 0:
+        expected_files.add("foundation-private-capture.cms")
+        assert (tmp_path / "outputs").read_text().strip() == "sealed=true"
+    else:
+        assert not (tmp_path / "outputs").exists()
+    assert {entry.name for entry in scratch.iterdir()} == expected_files
+    if whatif_exit or classifier_exit or seal_exit:
+        assert not (tmp_path / "summary").exists()
+        assert not (scratch / "foundation-plan-evidence.json").exists()
+    for artifact in scratch.iterdir():
+        content = artifact.read_text(encoding="utf-8")
+        assert "PRIVATE_STDOUT_SENTINEL" not in content
+        assert "PRIVATE_STDERR_SENTINEL" not in content
+    cleanup = _capture_step("Clean up owner-encrypted diagnostic ciphertext")
+    assert cleanup["if"] == "${{ always() }}"
+    result = _run_capture_block(capture_bash, cleanup["run"], tmp_path, environment)
+    assert result.returncode == 0
+    assert not (scratch / "foundation-private-capture.cms").exists()
+
+
+@pytest.mark.parametrize("prepare_exit", [0, 1])
+def test_recipient_prepare_trap_and_cleanup_own_only_allocated_scratch(
+    tmp_path: Path, capture_bash: str, prepare_exit: int
+) -> None:
+    runner_temp = tmp_path / "runner temp"
+    runner_temp.mkdir()
+    unrelated = runner_temp / "foundation-private.unrelated"
+    unrelated.mkdir()
+    retained = unrelated / "retained.txt"
+    retained.write_text("unrelated", encoding="utf-8")
+    outputs = tmp_path / "outputs"
+    environment = {
+        "RUNNER_TEMP": runner_temp.as_posix(),
+        "GITHUB_OUTPUT": outputs.as_posix(),
+        "PREPARE_EXIT": str(prepare_exit),
+    }
+    prepare = _capture_step(
+        "Validate owner-only diagnostic encryption before Azure login"
+    )
+    result = _run_capture_block(capture_bash, prepare["run"], tmp_path, environment)
+    assert result.returncode == prepare_exit
+    assert result.stdout == result.stderr == b""
+    output_lines = outputs.read_text(encoding="utf-8").splitlines()
+    assert len(output_lines) == 1
+    key, separator, value = output_lines[0].partition("=")
+    assert (key, separator) == ("scratch", "=")
+    owned = Path(value)
+    assert owned.parent == runner_temp
+    assert re.fullmatch(r"foundation-private\.[A-Za-z0-9]{10}", owned.name)
+    assert owned != unrelated
+    if prepare_exit:
+        assert not owned.exists()
+    else:
+        assert owned.is_dir()
+        if sys.platform == "linux":
+            assert owned.stat().st_mode & 0o777 == 0o700
+        (owned / "plaintext.tar").write_text("synthetic plaintext", encoding="utf-8")
+    assert retained.read_text(encoding="utf-8") == "unrelated"
+    cleanup = _capture_step("Clean up private foundation what-if capture")
+    assert cleanup["if"] == "${{ always() }}"
+    result = _run_capture_block(
+        capture_bash,
+        cleanup["run"],
+        tmp_path,
+        environment | {"CAPTURE_SCRATCH": owned.as_posix()},
+    )
+    assert result.returncode == 0
+    assert result.stdout == result.stderr == b""
+    assert not owned.exists()
+    assert list(runner_temp.iterdir()) == [unrelated]
+    assert list(unrelated.iterdir()) == [retained]
+    assert retained.read_text(encoding="utf-8") == "unrelated"
+
+
+@pytest.mark.parametrize(
+    ("invalid_field", "expected_exit"),
+    [
+        ("none", 0),
+        ("command", 91),
+        ("directory", 92),
+        ("status", 93),
+        ("stdout", 94),
+        ("stderr", 95),
+    ],
+)
+def test_fake_seal_assertions_fail_even_in_if_context(
+    tmp_path: Path, capture_bash: str, invalid_field: str, expected_exit: int
+) -> None:
+    environment = {
+        "RUNNER_TEMP": tmp_path.as_posix(),
+        "WHATIF_EXIT": "23",
+        "SEAL_EXIT": "0",
+        "RAW_STDOUT_SENTINEL": "PRIVATE_STDOUT_SENTINEL",
+        "RAW_STDERR_SENTINEL": "PRIVATE_STDERR_SENTINEL",
+        "SEAL_COMMAND": "invalid" if invalid_field == "command" else "seal",
+        "SEAL_DIRECTORY": "invalid"
+        if invalid_field == "directory"
+        else tmp_path.as_posix(),
+        "SEAL_STATUS": "0" if invalid_field == "status" else "23",
+    }
+    for stream, filename in (
+        ("stdout", "foundation-whatif.json"),
+        ("stderr", "foundation-whatif.stderr"),
+    ):
+        content = (
+            "invalid"
+            if invalid_field == stream
+            else environment[f"RAW_{stream.upper()}_SENTINEL"]
+        )
+        (tmp_path / filename).write_text(content, encoding="utf-8")
+    result = _run_capture_block(
+        capture_bash,
+        "set -euo pipefail\n"
+        'if python scripts/foundation_diagnostic_capture.py "$SEAL_COMMAND" '
+        '--directory "$SEAL_DIRECTORY" --whatif-exit-code "$SEAL_STATUS"; then\n'
+        "  exit 0\n"
+        "else\n"
+        '  exit "$?"\n'
+        "fi\n",
+        tmp_path,
+        environment,
+    )
+    assert result.returncode == expected_exit
+    assert result.stdout == result.stderr == b""
+    ciphertext = tmp_path / "foundation-private-capture.cms"
+    if expected_exit:
+        assert not ciphertext.exists()
+    else:
+        assert ciphertext.read_text(encoding="utf-8") == "SYNTHETIC_CIPHERTEXT"
+
+
+def test_plan_capture_cleanup_rejects_unrelated_scratch_path(
+    tmp_path: Path, capture_bash: str
+) -> None:
+    unrelated = tmp_path / "unrelated"
+    unrelated.mkdir()
+    retained = unrelated / "retained.txt"
+    retained.write_text("unrelated", encoding="utf-8")
+    cleanup = _capture_step("Clean up private foundation what-if capture")
+    result = _run_capture_block(
+        capture_bash,
+        cleanup["run"],
+        tmp_path,
+        {"RUNNER_TEMP": tmp_path.as_posix(), "CAPTURE_SCRATCH": unrelated.as_posix()},
+    )
+    assert result.returncode == 1
+    assert result.stdout == b""
+    assert result.stderr == b"Private capture cleanup path rejected\n"
+    assert list(tmp_path.iterdir()) == [unrelated]
+    assert list(unrelated.iterdir()) == [retained]
+    assert retained.read_text(encoding="utf-8") == "unrelated"
+
+
+@pytest.mark.parametrize(
+    "interruption", ["before_capture", "partial_capture", "between_steps"]
+)
+def test_plan_capture_cancellation_cleanup_owns_only_exact_raw_paths(
+    tmp_path: Path, capture_bash: str, interruption: str
+) -> None:
+    cleanup = _capture_step("Clean up private foundation what-if capture")
+    assert cleanup["if"] == "${{ always() }}"
+    assert cleanup["env"] == {
+        "CAPTURE_SCRATCH": "${{ steps.recipient.outputs.scratch }}"
+    }
+    assert cleanup["run"].startswith(
+        "set -euo pipefail\n"
+        'rm -f -- "$RUNNER_TEMP/foundation-whatif.json" \\\n'
+        '  "$RUNNER_TEMP/foundation-whatif.stderr"'
+    )
+    owned = tmp_path / "foundation-private.owned"
+    owned.mkdir()
+    (owned / "plaintext.tar").write_text("private temporary bundle")
+    retained = {
+        "foundation-classification-failure.json",
+        "foundation-whatif.json.unrelated",
+        "foundation-whatif.stderr.unrelated",
+    }
+    for filename in retained:
+        (tmp_path / filename).write_text("retained", encoding="utf-8")
+    if interruption != "before_capture":
+        (tmp_path / "foundation-whatif.json").write_text("private stdout")
+    if interruption == "partial_capture":
+        (tmp_path / "foundation-whatif.stderr").write_text("private stderr")
+    result = _run_capture_block(
+        capture_bash,
+        cleanup["run"],
+        tmp_path,
+        {"RUNNER_TEMP": tmp_path.as_posix(), "CAPTURE_SCRATCH": owned.as_posix()},
+    )
+    assert result.returncode == 0
+    assert result.stdout == result.stderr == b""
+    assert {entry.name for entry in tmp_path.iterdir()} == retained
+    assert all((tmp_path / filename).read_text() == "retained" for filename in retained)
 
 
 def test_apply_authenticates_provenance_before_exact_artifact_download() -> None:

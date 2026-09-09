@@ -170,6 +170,8 @@ jobs:
       OPTIMA_EXPECTED_FIXED_MONTHLY_COST_INR: "${{ vars.OPTIMA_EXPECTED_FIXED_MONTHLY_COST_INR }}"
       OPTIMA_GITHUB_ENVIRONMENT: hackathon
       OPTIMA_SEMANTIC_CACHE_ENABLED: "false"
+      OPTIMA_DIAGNOSTIC_CERTIFICATE_BASE64: "${{ vars.OPTIMA_DIAGNOSTIC_CERTIFICATE_BASE64 }}"
+      OPTIMA_DIAGNOSTIC_CERTIFICATE_SHA256: "${{ vars.OPTIMA_DIAGNOSTIC_CERTIFICATE_SHA256 }}"
     steps:
       # actions/checkout v7.0.1, resolved from the upstream tag with git ls-remote.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -191,6 +193,18 @@ jobs:
             echo "Checkout credentials remain configured" >&2
             exit 1
           fi
+
+      - name: Validate owner-only diagnostic encryption before Azure login
+        id: recipient
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          OPTIMA_DIAGNOSTIC_SCRATCH_DIRECTORY="$(mktemp -d "$RUNNER_TEMP/foundation-private.XXXXXXXXXX")"
+          export OPTIMA_DIAGNOSTIC_SCRATCH_DIRECTORY
+          trap 'status=$?; if test "$status" -ne 0; then rm -rf -- "$OPTIMA_DIAGNOSTIC_SCRATCH_DIRECTORY"; fi; exit "$status"' EXIT
+          printf 'scratch=%s\n' "$OPTIMA_DIAGNOSTIC_SCRATCH_DIRECTORY" >> "$GITHUB_OUTPUT"
+          python scripts/foundation_diagnostic_capture.py prepare --directory "$RUNNER_TEMP"
 
       # Azure/login v2.3.0 peeled commit; the annotated tag object is not a commit.
       - uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5
@@ -225,9 +239,35 @@ jobs:
           } > "$RUNNER_TEMP/foundation-parameters.txt"
 
       - name: Run exactly one authoritative foundation what-if
+        id: whatif
         shell: bash
+        env:
+          OPTIMA_DIAGNOSTIC_SCRATCH_DIRECTORY: "${{ steps.recipient.outputs.scratch }}"
         run: |
           set -euo pipefail
+          umask 077
+          capture_started=false
+          trap '
+            status=$?
+            trap - EXIT
+            if "$capture_started"; then
+              if python scripts/foundation_diagnostic_capture.py seal \
+                --directory "$RUNNER_TEMP" --whatif-exit-code "$status"; then
+                printf "sealed=true\n" >> "$GITHUB_OUTPUT" || status=1
+              else
+                if test "$status" -eq 0; then status=1; fi
+              fi
+            fi
+            if test "$status" -ne 0; then
+              rm -f -- "$RUNNER_TEMP/foundation-whatif.json" || status=1
+            fi
+            rm -f -- "$RUNNER_TEMP/foundation-whatif.stderr" || status=1
+            exit "$status"
+          ' EXIT
+          for capture_file in foundation-whatif.json foundation-whatif.stderr foundation-private-capture.cms; do
+            test ! -e "$RUNNER_TEMP/$capture_file"
+            test ! -L "$RUNNER_TEMP/$capture_file"
+          done
           if ! az group show --name "$AZURE_RESOURCE_GROUP" >/dev/null 2>&1; then
             echo "Approved resource group is absent; foundation plan requires it" >&2
             exit 1
@@ -240,6 +280,7 @@ jobs:
             echo "A foundation deployment is already running" >&2
             exit 1
           fi
+          capture_started=true
           az deployment group what-if --name optima-foundation-promotion-whatif \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --template-file infra/resource-group.bicep \
@@ -250,13 +291,16 @@ jobs:
             --validation-level ProviderNoRbac \
             --result-format FullResourcePayloads \
             --no-pretty-print --only-show-errors \
-            > "$RUNNER_TEMP/foundation-whatif.json"
+            > "$RUNNER_TEMP/foundation-whatif.json" \
+            2> "$RUNNER_TEMP/foundation-whatif.stderr"
 
       - name: Classify the foundation what-if and emit sanitized evidence
         id: classify
         shell: bash
         run: |
           set -euo pipefail
+          umask 077
+          trap 'rm -f -- "$RUNNER_TEMP/foundation-whatif.json" "$RUNNER_TEMP/foundation-whatif.stderr"' EXIT
           python scripts/whatif_classification.py classify \
             --whatif "$RUNNER_TEMP/foundation-whatif.json" \
             --subscription-id "$AZURE_SUBSCRIPTION_ID" \
@@ -265,7 +309,6 @@ jobs:
             --parameters-file "$RUNNER_TEMP/foundation-parameters.txt" \
             --failure-diagnostics "$RUNNER_TEMP/foundation-classification-failure.json" \
             --output "$RUNNER_TEMP/foundation-plan-evidence.json"
-          rm -f "$RUNNER_TEMP/foundation-whatif.json"
           {
             printf '## OPTIMA foundation plan\n\n'
             printf -- '- Operation: `foundation-plan` (read-only, no Azure mutation)\n'
@@ -273,6 +316,21 @@ jobs:
             printf -- '- Classification: `APPROVED`\n'
             printf -- '- Review the sanitized plan evidence artifact before apply.\n'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Clean up private foundation what-if capture
+        if: ${{ always() }}
+        shell: bash
+        env:
+          CAPTURE_SCRATCH: "${{ steps.recipient.outputs.scratch }}"
+        run: |
+          set -euo pipefail
+          rm -f -- "$RUNNER_TEMP/foundation-whatif.json" \
+            "$RUNNER_TEMP/foundation-whatif.stderr"
+          case "$CAPTURE_SCRATCH" in
+            "$RUNNER_TEMP"/foundation-private.*) rm -rf -- "$CAPTURE_SCRATCH" ;;
+            "") ;;
+            *) echo "Private capture cleanup path rejected" >&2; exit 1 ;;
+          esac
 
       # actions/upload-artifact v7.0.1, resolved from the upstream tag with git ls-remote.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -292,6 +350,23 @@ jobs:
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
+
+      - name: Retain owner-encrypted diagnostics for a failed plan only
+        if: ${{ failure() && steps.whatif.outputs.sealed == 'true' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: foundation-private-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/foundation-private-capture.cms
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+      - name: Clean up owner-encrypted diagnostic ciphertext
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f -- "$RUNNER_TEMP/foundation-private-capture.cms"
 
   foundation-apply:
     name: Promoted foundation apply

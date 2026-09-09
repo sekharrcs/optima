@@ -1077,6 +1077,332 @@ def test_cli_failure_diagnostics_are_sanitized_and_not_promotable(
         compare_promotion_evidence(report, report)
 
 
+def _reviewed_diagnostic(level: str = "Warning") -> dict[str, Any]:
+    """Construct the published message form with synthetic private values."""
+    target = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/{RESOURCE_GROUP}"
+        "/providers/Microsoft.Resources/deployments/private-deployment"
+    )
+    return {
+        "code": "NestedDeploymentShortCircuited",
+        "level": level,
+        "target": target,
+        "message": (
+            f"The nested deployment '{target}' at line '1' and column '1020' "
+            "could not be expanded because it uses outer-mode evaluation and its "
+            "template contains expressions that could not be evaluated. "
+            "Please see https://aka.ms/WhatIfEvalStopped for more guidance."
+        ),
+        "additionalInfo": [{"type": "secret-sentinel", "info": {"key": target}}],
+    }
+
+
+@pytest.mark.parametrize("level", ["Info", "Warning", "Error"])
+def test_reviewed_diagnostic_details_survive_without_sensitive_values(
+    monkeypatch: pytest.MonkeyPatch, level: str
+) -> None:
+    monkeypatch.setattr(whatif_classification, "_toolchain_versions", lambda: {})
+    diagnostic = _reviewed_diagnostic(level)
+    document = {**_foundation_creates(), "diagnostics": [diagnostic]}
+    with pytest.raises(WhatIfClassificationError) as error:
+        classify_foundation_whatif(
+            document, subscription_id=SUBSCRIPTION_ID, resource_group=RESOURCE_GROUP
+        )
+    assert error.value.code == WhatIfClassificationCode.DIAGNOSTICS
+    report = whatif_classification._failure_diagnostics(
+        document, loaded=True, code=error.value.code
+    )
+    details = report["diagnostic_details"]
+    assert details["omitted_count"] == 0
+    entry = details["entries"][0]
+    assert entry["code"] == "NestedDeploymentShortCircuited"
+    assert entry["code_state"] == "recognized"
+    assert entry["level"] == level
+    assert entry["level_state"] == "recognized"
+    assert entry["message_state"] == "recognized"
+    assert entry["message_form"] == "nested-deployment-outer-evaluation-v1"
+    assert "outer-mode evaluation" in entry["message_summary"]
+    assert "[REDACTED]" in entry["message_summary"]
+    serialized = json.dumps(report)
+    for sensitive in (
+        SUBSCRIPTION_ID,
+        RESOURCE_GROUP,
+        "private-deployment",
+        "1020",
+        "secret-sentinel",
+    ):
+        assert sensitive not in serialized
+    assert report["promotable"] is False
+    with pytest.raises(WhatIfClassificationError):
+        compare_promotion_evidence(report, report)
+
+
+@pytest.mark.parametrize(
+    "field", ["code", "level", "message", "target", "additionalInfo"]
+)
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        True,
+        123,
+        {"token": "secret-sentinel", "nested": [{"resourceId": FOUNDATION_IDS[0]}]},
+        ["secret-sentinel", SUBSCRIPTION_ID],
+        "FutureCodeContainingSecretSentinel",
+        SUBSCRIPTION_ID,
+        FOUNDATION_IDS[0],
+        "https://private.invalid/path?sig=secret-sentinel&token=secret-sentinel",
+        "AccountKey=secret-sentinel;Password=secret-sentinel",
+        "C:\\private\\secret-sentinel.json",
+        "secret-sentinel\n::notice::secret-sentinel",
+        "\u202esecret-sentinel",
+        "secret-sentinel" * 4096,
+    ],
+    ids=[
+        "null",
+        "boolean",
+        "number",
+        "nested-object",
+        "nested-array",
+        "unknown-code",
+        "guid",
+        "resource-path",
+        "credential-url",
+        "connection-values",
+        "local-path",
+        "log-injection",
+        "unicode",
+        "oversized",
+    ],
+)
+def test_diagnostic_projection_never_forwards_unapproved_values(
+    monkeypatch: pytest.MonkeyPatch, field: str, value: Any
+) -> None:
+    monkeypatch.setattr(whatif_classification, "_toolchain_versions", lambda: {})
+    diagnostic = _reviewed_diagnostic()
+    diagnostic[field] = value
+    diagnostic["secret-sentinel"] = {"nested": value}
+    document = {**_foundation_creates(), "diagnostics": [diagnostic]}
+    with pytest.raises(WhatIfClassificationError) as error:
+        classify_foundation_whatif(
+            document, subscription_id=SUBSCRIPTION_ID, resource_group=RESOURCE_GROUP
+        )
+    assert error.value.code == WhatIfClassificationCode.DIAGNOSTICS
+    report = whatif_classification._failure_diagnostics(
+        document, loaded=True, code=error.value.code
+    )
+    entry = report["diagnostic_details"]["entries"][0]
+    assert entry["unknown_field_count"] == 1
+    if field in {"code", "level", "message"}:
+        expected_state = (
+            "null"
+            if value is None
+            else ("withheld" if isinstance(value, str) else "invalid")
+        )
+        assert entry[f"{field}_state"] == expected_state
+        if field in {"code", "level"}:
+            assert entry[field] is None
+    assert set(entry) == {
+        "index",
+        "json_type",
+        "code",
+        "code_state",
+        "level",
+        "level_state",
+        "message_state",
+        "message_form",
+        "message_summary",
+        "unknown_field_count",
+    }
+    approved_strings = {
+        "object",
+        "recognized",
+        "missing",
+        "null",
+        "invalid",
+        "withheld",
+        "NestedDeploymentShortCircuited",
+        "Warning",
+        "nested-deployment-outer-evaluation-v1",
+        whatif_classification._NESTED_DIAGNOSTIC_SUMMARY,
+    }
+    assert all(
+        projected in approved_strings
+        for projected in entry.values()
+        if isinstance(projected, str)
+    )
+    if field != "additionalInfo":
+        assert entry["message_summary"] is None
+    for secret in (
+        SUBSCRIPTION_ID,
+        "secret-sentinel",
+        "FutureCodeContainingSecretSentinel",
+        "private.invalid",
+        "private-deployment",
+    ):
+        assert secret not in json.dumps(report)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "prefix",
+        "suffix",
+        "url",
+        "line",
+        "target",
+        "control",
+        "oversized",
+        "unknown_code",
+        "unknown_level",
+    ],
+)
+def test_message_reconstruction_requires_the_complete_reviewed_form(
+    monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    monkeypatch.setattr(whatif_classification, "_toolchain_versions", lambda: {})
+    diagnostic = _reviewed_diagnostic()
+    if mutation == "prefix":
+        diagnostic["message"] = "secret-sentinel " + diagnostic["message"]
+    elif mutation == "suffix":
+        diagnostic["message"] += " secret-sentinel"
+    elif mutation == "url":
+        diagnostic["message"] = diagnostic["message"].replace(
+            "https://aka.ms/WhatIfEvalStopped",
+            "https://private.invalid/?sig=secret-sentinel",
+        )
+    elif mutation == "line":
+        diagnostic["message"] = diagnostic["message"].replace(
+            "line '1'", "line '12345678901'"
+        )
+    elif mutation == "target":
+        diagnostic["target"] += "-different"
+    elif mutation == "control":
+        diagnostic["message"] += "\n"
+    elif mutation == "oversized":
+        diagnostic["message"] = "x" * 4097
+    elif mutation == "unknown_code":
+        diagnostic["code"] = "FutureCodeContainingSecretSentinel"
+    else:
+        diagnostic["level"] = "warning"
+    report = whatif_classification._failure_diagnostics(
+        {"diagnostics": [diagnostic]},
+        loaded=True,
+        code=WhatIfClassificationCode.DIAGNOSTICS,
+    )
+    entry = report["diagnostic_details"]["entries"][0]
+    assert entry["message_state"] == "withheld"
+    assert entry["message_form"] is None
+    assert entry["message_summary"] is None
+
+
+@pytest.mark.parametrize("value", [None, False, 1, "secret-sentinel", [], {}])
+def test_malformed_diagnostic_entries_are_bounded_fatal_evidence(
+    monkeypatch: pytest.MonkeyPatch, value: Any
+) -> None:
+    monkeypatch.setattr(whatif_classification, "_toolchain_versions", lambda: {})
+    document = {**_foundation_creates(), "diagnostics": [value] * 40}
+    with pytest.raises(WhatIfClassificationError) as error:
+        classify_foundation_whatif(
+            document, subscription_id=SUBSCRIPTION_ID, resource_group=RESOURCE_GROUP
+        )
+    assert error.value.code == WhatIfClassificationCode.DIAGNOSTICS
+    report = whatif_classification._failure_diagnostics(
+        document, loaded=True, code=error.value.code
+    )
+    assert report["fields"]["diagnostics"]["array_count"] == 40
+    details = report["diagnostic_details"]
+    assert len(details["entries"]) == 32
+    assert details["omitted_count"] == 8
+    assert [entry["index"] for entry in details["entries"]] == list(range(32))
+    assert all(entry["code_state"] == "missing" for entry in details["entries"])
+    assert "secret-sentinel" not in json.dumps(report)
+
+
+@pytest.mark.parametrize("field", ["code", "level", "message"])
+def test_missing_diagnostic_fields_remain_explicit(
+    monkeypatch: pytest.MonkeyPatch, field: str
+) -> None:
+    monkeypatch.setattr(whatif_classification, "_toolchain_versions", lambda: {})
+    diagnostic = _reviewed_diagnostic()
+    del diagnostic[field]
+    diagnostic["severity"] = "Warning"
+    report = whatif_classification._failure_diagnostics(
+        {"diagnostics": [diagnostic]},
+        loaded=True,
+        code=WhatIfClassificationCode.DIAGNOSTICS,
+    )
+    entry = report["diagnostic_details"]["entries"][0]
+    assert entry[f"{field}_state"] == "missing"
+    assert entry["unknown_field_count"] == 1
+    assert entry["message_summary"] is None
+
+
+def test_cli_diagnostic_capture_never_logs_or_promotes_private_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(whatif_classification, "_toolchain_versions", lambda: {})
+    whatif = tmp_path / "whatif.json"
+    whatif.write_text(
+        json.dumps(
+            {
+                **_foundation_creates(),
+                "diagnostics": [
+                    _reviewed_diagnostic(),
+                    {"code": "secret-sentinel", "message": "password=secret-sentinel"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    output = tmp_path / "evidence.json"
+    output.write_text(json.dumps(_evidence()), encoding="utf-8")
+    diagnostics = tmp_path / "failure.json"
+    assert (
+        main(
+            [
+                "classify",
+                "--whatif",
+                str(whatif),
+                "--subscription-id",
+                SUBSCRIPTION_ID,
+                "--resource-group",
+                RESOURCE_GROUP,
+                "--commit-sha",
+                COMMIT_SHA,
+                "--parameters-file",
+                str(_write_parameters(tmp_path)),
+                "--output",
+                str(output),
+                "--failure-diagnostics",
+                str(diagnostics),
+            ]
+        )
+        == 1
+    )
+    assert not output.exists()
+    captured = capsys.readouterr()
+    assert "WHATIF_DIAGNOSTICS" in captured.err
+    serialized = diagnostics.read_text(encoding="utf-8")
+    report = json.loads(serialized)
+    assert report["schema_version"] == "optima-foundation-whatif-failure-v2"
+    assert report["diagnostic_details"]["entries"][0]["message_state"] == "recognized"
+    for secret in (
+        SUBSCRIPTION_ID,
+        RESOURCE_GROUP,
+        "private-deployment",
+        "secret-sentinel",
+    ):
+        assert secret not in serialized + captured.out + captured.err
+    for version in (
+        "optima-foundation-whatif-failure-v1",
+        "optima-foundation-whatif-failure-v2",
+    ):
+        report["schema_version"] = version
+        with pytest.raises(WhatIfClassificationError):
+            compare_promotion_evidence(report, report)
+
+
 def test_success_does_not_emit_failure_diagnostics(tmp_path: Path) -> None:
     """A successful plan has only its approved evidence, never stale diagnostics."""
     whatif = tmp_path / "whatif.json"

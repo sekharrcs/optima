@@ -30,7 +30,7 @@ EXIT_SUCCESS = 0
 EXIT_FAILURE = 1
 
 EVIDENCE_SCHEMA_VERSION = "optima-foundation-whatif-evidence-v1"
-FAILURE_DIAGNOSTICS_SCHEMA_VERSION = "optima-foundation-whatif-failure-v1"
+FAILURE_DIAGNOSTICS_SCHEMA_VERSION = "optima-foundation-whatif-failure-v2"
 SCOPE_FINGERPRINT_VERSION = "optima-foundation-scope-v1"
 SOURCE_FINGERPRINT_VERSION = "optima-foundation-deployment-source-v1"
 PARAMETER_FINGERPRINT_VERSION = "optima-foundation-parameters-v1"
@@ -97,6 +97,28 @@ _RESOURCE_ROLE_TYPES = {
     "ui_identity": "microsoft.managedidentity/userassignedidentities",
 }
 EXPECTED_FOUNDATION_RESOURCE_TYPES = frozenset(_RESOURCE_ROLE_TYPES.values())
+
+_DIAGNOSTIC_CODES = ("NestedDeploymentShortCircuited",)
+_DIAGNOSTIC_LEVELS = ("Info", "Warning", "Error")
+_DIAGNOSTIC_FIELDS = frozenset({"code", "level", "message", "target", "additionalInfo"})
+_MAX_DIAGNOSTIC_ENTRIES = 32
+_MAX_DIAGNOSTIC_MESSAGE_LENGTH = 4096
+_NESTED_DIAGNOSTIC_MESSAGE = re.compile(
+    r"The nested deployment '(?P<target>/subscriptions/"
+    r"[0-9a-fA-F-]{36}(?:/resourceGroups/[A-Za-z0-9_.()-]{1,90})?"
+    r"/providers/Microsoft\.Resources/deployments/[A-Za-z0-9_.()-]{1,64})' "
+    r"at line '[0-9]{1,10}' and column '[0-9]{1,10}' "
+    r"could not be expanded because it uses outer-mode evaluation and its "
+    r"template contains expressions that could not be evaluated\. "
+    r"Please see https://aka\.ms/WhatIfEvalStopped for more guidance\."
+)
+_NESTED_DIAGNOSTIC_SUMMARY = (
+    "The nested deployment '[REDACTED]' at line '[REDACTED]' and column "
+    "'[REDACTED]' could not be expanded because it uses outer-mode evaluation "
+    "and its template contains expressions that could not be evaluated. "
+    "This is a reconstructed explanation; analysis is incomplete "
+    "and review is required."
+)
 
 
 class WhatIfClassificationCode(StrEnum):
@@ -1301,10 +1323,85 @@ def _toolchain_versions() -> dict[str, str | None]:
     return versions
 
 
+def _approved_diagnostic_value(
+    diagnostic: Mapping[str, Any], field: str, approved: tuple[str, ...]
+) -> tuple[str | None, str]:
+    """Select a reviewed literal, never an arbitrary identifier-shaped string."""
+    if field not in diagnostic:
+        return None, "missing"
+    value = diagnostic[field]
+    if value is None:
+        return None, "null"
+    if not isinstance(value, str):
+        return None, "invalid"
+    for literal in approved:
+        if value == literal:
+            return literal, "recognized"
+    return None, "withheld"
+
+
+def _diagnostic_entry(value: Any, index: int) -> dict[str, Any]:
+    """Project constants only; never guess how to redact unknown prose."""
+    diagnostic = value if isinstance(value, dict) else {}
+    code, code_state = _approved_diagnostic_value(diagnostic, "code", _DIAGNOSTIC_CODES)
+    level, level_state = _approved_diagnostic_value(
+        diagnostic, "level", _DIAGNOSTIC_LEVELS
+    )
+    message = diagnostic.get("message")
+    message_state = "missing"
+    if "message" in diagnostic:
+        message_state = (
+            "null"
+            if message is None
+            else ("withheld" if isinstance(message, str) else "invalid")
+        )
+    message_form = None
+    message_summary = None
+    if (
+        code is not None
+        and level is not None
+        and isinstance(message, str)
+        and len(message) <= _MAX_DIAGNOSTIC_MESSAGE_LENGTH
+    ):
+        match = _NESTED_DIAGNOSTIC_MESSAGE.fullmatch(message)
+        if match is not None and diagnostic.get("target") == match["target"]:
+            message_state = "recognized"
+            message_form = "nested-deployment-outer-evaluation-v1"
+            message_summary = _NESTED_DIAGNOSTIC_SUMMARY
+    return {
+        "index": index,
+        "json_type": _json_type(value),
+        "code": code,
+        "code_state": code_state,
+        "level": level,
+        "level_state": level_state,
+        "message_state": message_state,
+        "message_form": message_form,
+        "message_summary": message_summary,
+        "unknown_field_count": len(set(diagnostic) - _DIAGNOSTIC_FIELDS)
+        if isinstance(value, dict)
+        else None,
+    }
+
+
+def _diagnostic_details(document: Any) -> dict[str, Any]:
+    """Bound supplementary failure evidence without changing classification."""
+    values = document.get("diagnostics") if isinstance(document, dict) else None
+    if not isinstance(values, list):
+        return {"entries": [], "omitted_count": None}
+    return {
+        "entries": [
+            _diagnostic_entry(value, index)
+            for index, value in enumerate(values[:_MAX_DIAGNOSTIC_ENTRIES])
+        ],
+        "omitted_count": max(0, len(values) - _MAX_DIAGNOSTIC_ENTRIES),
+    }
+
+
 def _failure_diagnostics(
     document: Any, *, loaded: bool, code: WhatIfClassificationCode
 ) -> dict[str, Any]:
-    """Project only field shapes and safe counts into nonpromotable diagnostics."""
+    """Project field shapes and reviewed literals into nonpromotable diagnostics."""
     fields: dict[str, Any] = {}
     for field in sorted(_TOP_LEVEL_FIELDS):
         present = field in document if isinstance(document, dict) else False
@@ -1329,6 +1426,9 @@ def _failure_diagnostics(
             else None,
         },
         "fields": fields,
+        "diagnostic_details": _diagnostic_details(document)
+        if loaded
+        else {"entries": [], "omitted_count": None},
         "toolchain": _toolchain_versions(),
     }
 
