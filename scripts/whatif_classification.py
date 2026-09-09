@@ -12,7 +12,11 @@ import argparse
 import hashlib
 import json
 import math
+import os
+import platform
 import re
+import shutil
+import subprocess
 import sys
 import unicodedata
 from collections.abc import Mapping, Sequence
@@ -26,6 +30,7 @@ EXIT_SUCCESS = 0
 EXIT_FAILURE = 1
 
 EVIDENCE_SCHEMA_VERSION = "optima-foundation-whatif-evidence-v1"
+FAILURE_DIAGNOSTICS_SCHEMA_VERSION = "optima-foundation-whatif-failure-v1"
 SCOPE_FINGERPRINT_VERSION = "optima-foundation-scope-v1"
 SOURCE_FINGERPRINT_VERSION = "optima-foundation-deployment-source-v1"
 PARAMETER_FINGERPRINT_VERSION = "optima-foundation-parameters-v1"
@@ -571,6 +576,8 @@ def classify_foundation_whatif(
     ):
         if field in document:
             value = document[field]
+            if value is None:
+                continue
             if not isinstance(value, list):
                 _raise_malformed(f"What-if output has an invalid {field} field")
             if value:
@@ -1223,9 +1230,155 @@ def _read_parameter_file(path: Path) -> dict[str, str]:
     return _parse_parameter_lines(text)
 
 
+def _json_type(value: Any) -> str:
+    """Describe a JSON value without exposing its contents."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float, Decimal)):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    return "unknown"
+
+
+def _safe_version(value: Any) -> str | None:
+    """Retain only bounded numeric tool versions, never arbitrary tool output."""
+    if isinstance(value, str) and re.fullmatch(
+        r"[0-9]{1,10}(?:\.[0-9]{1,10}){1,3}(?:(?:a|b|rc)[0-9]{1,4})?", value
+    ):
+        return value
+    return None
+
+
+def _version_output(command: list[str]) -> str:
+    """Read a local version without installation or forwarding tool errors."""
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+            env={**os.environ, "AZURE_BICEP_CHECK_VERSION": "false"},
+        )
+    except (OSError, UnicodeError, subprocess.TimeoutExpired):
+        return ""
+    return result.stdout if result.returncode == 0 else ""
+
+
+def _toolchain_versions() -> dict[str, str | None]:
+    """Capture allowlisted versions only; missing tools remain unavailable."""
+    versions = {
+        "python": _safe_version(platform.python_version()),
+        "azure_cli": None,
+        "azure_cli_core": None,
+        "bicep": None,
+        "runner_image": _safe_version(os.environ.get("ImageVersion")),
+    }
+    azure = shutil.which("az")
+    if azure:
+        try:
+            payload = json.loads(
+                _version_output([azure, "version", "--output", "json"])
+            )
+        except (ValueError, RecursionError):
+            payload = None
+        if isinstance(payload, dict):
+            versions["azure_cli"] = _safe_version(payload.get("azure-cli"))
+            versions["azure_cli_core"] = _safe_version(payload.get("azure-cli-core"))
+        match = re.fullmatch(
+            r"Bicep CLI version ([0-9.]+) \([0-9a-f]+\)\s*",
+            _version_output([azure, "bicep", "version"]),
+        )
+        if match:
+            versions["bicep"] = _safe_version(match[1])
+    return versions
+
+
+def _failure_diagnostics(
+    document: Any, *, loaded: bool, code: WhatIfClassificationCode
+) -> dict[str, Any]:
+    """Project only field shapes and safe counts into nonpromotable diagnostics."""
+    fields: dict[str, Any] = {}
+    for field in sorted(_TOP_LEVEL_FIELDS):
+        present = field in document if isinstance(document, dict) else False
+        value = document[field] if present else None
+        fields[field] = {
+            "present": present if loaded else None,
+            "json_type": _json_type(value)
+            if present
+            else ("absent" if loaded else "unavailable"),
+            "array_count": len(value) if isinstance(value, list) else None,
+        }
+    return {
+        "schema_version": FAILURE_DIAGNOSTICS_SCHEMA_VERSION,
+        "classification": "FAILED",
+        "promotable": False,
+        "classifier_error": code.value,
+        "document": {
+            "parsed": loaded,
+            "json_type": _json_type(document) if loaded else "unavailable",
+            "unknown_field_count": len(set(document) - _TOP_LEVEL_FIELDS)
+            if isinstance(document, dict)
+            else None,
+        },
+        "fields": fields,
+        "toolchain": _toolchain_versions(),
+    }
+
+
 def _run_classify(arguments: argparse.Namespace) -> None:
+    """Keep failed diagnostics separate from approved plan evidence."""
+    paths = [arguments.whatif, arguments.parameters_file]
+    paths.extend(
+        path
+        for path in (arguments.output, arguments.failure_diagnostics)
+        if path is not None
+    )
+    if len({path.resolve() for path in paths}) != len(paths):
+        _raise_malformed("Classification input and output paths must be distinct")
+    document: Any = None
+    loaded = False
+    try:
+        for path in (arguments.output, arguments.failure_diagnostics):
+            if path is not None:
+                path.unlink(missing_ok=True)
+        document = _load_json(
+            arguments.whatif, WhatIfClassificationCode.MALFORMED_DOCUMENT
+        )
+        loaded = True
+        _classify_document(arguments, document)
+    except (WhatIfClassificationError, OSError, UnicodeError, RecursionError) as error:
+        code = (
+            error.code
+            if isinstance(error, WhatIfClassificationError)
+            else (WhatIfClassificationCode.MALFORMED_DOCUMENT)
+        )
+        if arguments.failure_diagnostics is not None:
+            try:
+                report = _failure_diagnostics(document, loaded=loaded, code=code)
+                arguments.failure_diagnostics.parent.mkdir(parents=True, exist_ok=True)
+                arguments.failure_diagnostics.write_text(
+                    json.dumps(report, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+            except (OSError, ValueError, UnicodeError, RecursionError):
+                print("Cannot write sanitized failure diagnostics", file=sys.stderr)
+        if isinstance(error, WhatIfClassificationError):
+            raise
+        raise WhatIfClassificationError(
+            code, "Cannot process classification input or output"
+        ) from error
+
+
+def _classify_document(arguments: argparse.Namespace, document: Any) -> None:
     """Classify a what-if result and write sanitized plan evidence."""
-    document = _load_json(arguments.whatif, WhatIfClassificationCode.MALFORMED_DOCUMENT)
     parameters = _read_parameter_file(arguments.parameters_file)
     _validate_foundation_parameters(parameters, resource_group=arguments.resource_group)
     source_fingerprint, source_file_count = deployment_source_fingerprint(
@@ -1280,6 +1433,11 @@ def create_parser() -> argparse.ArgumentParser:
         help="Deterministic root containing the template and parameter source files.",
     )
     classify.add_argument("--output", type=Path)
+    classify.add_argument(
+        "--failure-diagnostics",
+        type=Path,
+        help="Write nonpromotable field-shape diagnostics on classification failure.",
+    )
     classify.set_defaults(handler=_run_classify)
 
     promote = subparsers.add_parser(

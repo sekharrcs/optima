@@ -253,6 +253,7 @@ jobs:
             > "$RUNNER_TEMP/foundation-whatif.json"
 
       - name: Classify the foundation what-if and emit sanitized evidence
+        id: classify
         shell: bash
         run: |
           set -euo pipefail
@@ -262,6 +263,7 @@ jobs:
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --commit-sha "$GITHUB_SHA" \
             --parameters-file "$RUNNER_TEMP/foundation-parameters.txt" \
+            --failure-diagnostics "$RUNNER_TEMP/foundation-classification-failure.json" \
             --output "$RUNNER_TEMP/foundation-plan-evidence.json"
           rm -f "$RUNNER_TEMP/foundation-whatif.json"
           {
@@ -279,6 +281,16 @@ jobs:
           path: ${{ runner.temp }}/foundation-plan-evidence.json
           if-no-files-found: error
           retention-days: 30
+          compression-level: 0
+
+      - name: Retain nonpromotable classification failure diagnostics
+        if: ${{ failure() && steps.classify.outcome == 'failure' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: foundation-classification-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/foundation-classification-failure.json
+          if-no-files-found: error
+          retention-days: 7
           compression-level: 0
 
   foundation-apply:
