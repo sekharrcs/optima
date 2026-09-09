@@ -1193,6 +1193,15 @@ def test_diagnostic_projection_never_forwards_unapproved_values(
     )
     entry = report["diagnostic_details"]["entries"][0]
     assert entry["unknown_field_count"] == 1
+    if field in {"code", "level", "message"}:
+        expected_state = (
+            "null"
+            if value is None
+            else ("withheld" if isinstance(value, str) else "invalid")
+        )
+        assert entry[f"{field}_state"] == expected_state
+        if field in {"code", "level"}:
+            assert entry[field] is None
     assert set(entry) == {
         "index",
         "json_type",
