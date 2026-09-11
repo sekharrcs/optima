@@ -146,6 +146,13 @@ jobs:
             diff --unified "$file" "$formatted_dir/$(basename "$file")"
           done
 
+      - name: Validate compiled foundation dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          OPTIMA_BICEP_COMMAND="${AZURE_CONFIG_DIR:-$HOME/.azure}/bin/bicep" \
+            uv run --no-sync python -m pytest tests/test_foundation_dependencies.py -v
+
   foundation-plan:
     name: Read-only foundation plan
     if: ${{ inputs.operation == 'foundation-plan' }}

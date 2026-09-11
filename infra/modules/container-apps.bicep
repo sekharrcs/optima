@@ -38,25 +38,25 @@ param uiContainerAppName string
 param smokeJobName string
 
 @description('Immutable API image reference.')
-param apiImage string
+param apiImage string?
 
 @description('Immutable UI image reference.')
-param uiImage string
+param uiImage string?
 
 @description('Azure Container Registry login server.')
-param registryLoginServer string
+param registryLoginServer string?
 
 @description('API user-assigned managed identity resource ID.')
-param apiIdentityResourceId string
+param apiIdentityResourceId string?
 
 @description('API user-assigned managed identity client ID.')
-param apiIdentityClientId string
+param apiIdentityClientId string?
 
 @description('API user-assigned managed identity object ID.')
-param apiIdentityPrincipalId string
+param apiIdentityPrincipalId string?
 
 @description('UI user-assigned managed identity resource ID.')
-param uiIdentityResourceId string
+param uiIdentityResourceId string?
 
 @description('Existing single-tenant Microsoft Entra application client ID for UI authentication.')
 param uiAuthClientId string
@@ -69,13 +69,13 @@ param uiAuthTenantId string
 param uiAuthClientSecret string
 
 @description('Cosmos DB HTTPS account endpoint.')
-param cosmosEndpoint string
+param cosmosEndpoint string?
 
 @description('Cosmos DB database name.')
-param cosmosDatabaseName string
+param cosmosDatabaseName string?
 
 @description('Cosmos DB run-history container name.')
-param cosmosContainerName string
+param cosmosContainerName string?
 
 @description('Azure Managed Redis hostname.')
 param redisHost string?
@@ -139,7 +139,7 @@ param foundryTokenScope string
 
 @secure()
 @description('Application Insights connection string stored as a Container App secret.')
-param applicationInsightsConnectionString string
+param applicationInsightsConnectionString string?
 
 @description('Root trace sampling ratio for Application Insights.')
 param applicationInsightsSamplingRatio string
@@ -182,6 +182,13 @@ param pricingEmbeddingInputRatePerMillionTokens string?
 
 @description('Common resource tags.')
 param tags object
+
+var runtimeInputsAreComplete = !empty(trim(apiImage ?? '')) && !empty(trim(uiImage ?? '')) && !empty(trim(registryLoginServer ?? '')) && !empty(trim(apiIdentityResourceId ?? '')) && !empty(trim(apiIdentityClientId ?? '')) && !empty(trim(uiIdentityResourceId ?? '')) && !empty(trim(cosmosEndpoint ?? '')) && !empty(trim(cosmosDatabaseName ?? '')) && !empty(trim(cosmosContainerName ?? '')) && !empty(trim(applicationInsightsConnectionString ?? '')) && (!semanticCacheEnabled || !empty(trim(apiIdentityPrincipalId ?? '')))
+var validatedDeployApplications = deployApplications
+  ? runtimeInputsAreComplete
+      ? true
+      : fail('Enabled applications require complete identity, image, registry, Cosmos, and telemetry inputs.')
+  : false
 
 var judgeConfigurationIsComplete = !empty(trim(judgeDeployment ?? '')) && !startsWith(
   toLower(judgeDeployment ?? ''),
@@ -253,13 +260,13 @@ var semanticCacheConfigurationIsComplete = !empty(trim(redisHost ?? '')) && !emp
 )
 var semanticCacheConfigurationIsAbsent = redisHost == null && redisIndexName == null && redisEmbeddingDeployment == null && redisEmbeddingModel == null && redisEmbeddingDimension == null && pricingEmbeddingInputRatePerMillionTokens == null
 var validatedSemanticCacheEnabled = semanticCacheEnabled
-  ? semanticCacheConfigurationIsComplete
+  ? !deployApplications || semanticCacheConfigurationIsComplete
       ? true
       : fail('Enabled semantic cache requires Redis, embedding, and reviewed embedding-pricing values.')
   : semanticCacheConfigurationIsAbsent
       ? false
       : fail('Disabled semantic cache rejects Redis, embedding, and embedding-pricing values.')
-var semanticCacheEnvironment = validatedSemanticCacheEnabled
+var semanticCacheEnvironment = deployApplications && validatedSemanticCacheEnabled
   ? [
       {
         name: 'OPTIMA_REDIS_HOST'
@@ -287,11 +294,11 @@ var semanticCacheEnvironment = validatedSemanticCacheEnabled
       }
       {
         name: 'OPTIMA_REDIS_OBJECT_ID'
-        value: apiIdentityPrincipalId
+        value: apiIdentityPrincipalId!
       }
       {
         name: 'OPTIMA_REDIS_MANAGED_IDENTITY_CLIENT_ID'
-        value: apiIdentityClientId
+        value: apiIdentityClientId!
       }
       {
         name: 'OPTIMA_PRICING_EMBEDDING_INPUT_RATE_PER_MILLION_TOKENS'
@@ -336,15 +343,13 @@ resource managedEnvironment 'Microsoft.App/managedEnvironments@2025-07-01' = {
   }
 }
 
-resource api 'Microsoft.App/containerApps@2025-07-01' = if (deployApplications) {
+resource api 'Microsoft.App/containerApps@2025-07-01' = if (validatedDeployApplications) {
   name: apiContainerAppName
   location: location
   tags: deploymentTags
   identity: {
     type: 'UserAssigned'
-    userAssignedIdentities: {
-      '${apiIdentityResourceId}': {}
-    }
+    userAssignedIdentities: deployApplications ? { '${apiIdentityResourceId!}': {} } : {}
   }
   properties: {
     environmentId: managedEnvironment.id
@@ -366,13 +371,13 @@ resource api 'Microsoft.App/containerApps@2025-07-01' = if (deployApplications) 
       secrets: [
         {
           name: 'application-insights-connection-string'
-          value: applicationInsightsConnectionString
+          value: applicationInsightsConnectionString!
         }
       ]
       registries: [
         {
-          identity: apiIdentityResourceId
-          server: registryLoginServer
+          identity: apiIdentityResourceId!
+          server: registryLoginServer!
         }
       ]
     }
@@ -381,7 +386,7 @@ resource api 'Microsoft.App/containerApps@2025-07-01' = if (deployApplications) 
       containers: [
         {
           name: 'api'
-          image: apiImage
+          image: apiImage!
           env: concat(
             [
               {
@@ -446,19 +451,19 @@ resource api 'Microsoft.App/containerApps@2025-07-01' = if (deployApplications) 
               }
               {
                 name: 'OPTIMA_FOUNDRY_MANAGED_IDENTITY_CLIENT_ID'
-                value: apiIdentityClientId
+                value: apiIdentityClientId!
               }
               {
                 name: 'OPTIMA_COSMOS_ENDPOINT'
-                value: cosmosEndpoint
+                value: cosmosEndpoint!
               }
               {
                 name: 'OPTIMA_COSMOS_DATABASE_NAME'
-                value: cosmosDatabaseName
+                value: cosmosDatabaseName!
               }
               {
                 name: 'OPTIMA_COSMOS_CONTAINER_NAME'
-                value: cosmosContainerName
+                value: cosmosContainerName!
               }
               {
                 name: 'OPTIMA_COSMOS_AUTH_MODE'
@@ -466,7 +471,7 @@ resource api 'Microsoft.App/containerApps@2025-07-01' = if (deployApplications) 
               }
               {
                 name: 'OPTIMA_COSMOS_MANAGED_IDENTITY_CLIENT_ID'
-                value: apiIdentityClientId
+                value: apiIdentityClientId!
               }
               {
                 name: 'OPTIMA_COSMOS_TIMEOUT_SECONDS'
@@ -594,15 +599,13 @@ resource api 'Microsoft.App/containerApps@2025-07-01' = if (deployApplications) 
   }
 }
 
-resource ui 'Microsoft.App/containerApps@2025-07-01' = if (deployApplications) {
+resource ui 'Microsoft.App/containerApps@2025-07-01' = if (validatedDeployApplications) {
   name: uiContainerAppName
   location: location
   tags: deploymentTags
   identity: {
     type: 'UserAssigned'
-    userAssignedIdentities: {
-      '${uiIdentityResourceId}': {}
-    }
+    userAssignedIdentities: deployApplications ? { '${uiIdentityResourceId!}': {} } : {}
   }
   properties: {
     environmentId: managedEnvironment.id
@@ -629,8 +632,8 @@ resource ui 'Microsoft.App/containerApps@2025-07-01' = if (deployApplications) {
       ]
       registries: [
         {
-          identity: uiIdentityResourceId
-          server: registryLoginServer
+          identity: uiIdentityResourceId!
+          server: registryLoginServer!
         }
       ]
     }
@@ -639,7 +642,7 @@ resource ui 'Microsoft.App/containerApps@2025-07-01' = if (deployApplications) {
       containers: [
         {
           name: 'ui'
-          image: uiImage
+          image: uiImage!
           env: [
             {
               name: 'OPTIMA_DEPLOYMENT_ENVIRONMENT'
@@ -711,7 +714,7 @@ resource ui 'Microsoft.App/containerApps@2025-07-01' = if (deployApplications) {
   }
 }
 
-resource uiAuthentication 'Microsoft.App/containerApps/authConfigs@2025-07-01' = if (deployApplications) {
+resource uiAuthentication 'Microsoft.App/containerApps/authConfigs@2025-07-01' = if (validatedDeployApplications) {
   parent: ui
   name: 'current'
   properties: {
@@ -763,15 +766,13 @@ resource uiAuthentication 'Microsoft.App/containerApps/authConfigs@2025-07-01' =
 // inside the environment. `az containerapp exec` cannot target a shell-less
 // container. Success is proven by the job execution exit status, not stdout,
 // because the environment ships no container console logs.
-resource deploymentSmokeJob 'Microsoft.App/jobs@2025-07-01' = if (deployApplications) {
+resource deploymentSmokeJob 'Microsoft.App/jobs@2025-07-01' = if (validatedDeployApplications) {
   name: smokeJobName
   location: location
   tags: deploymentTags
   identity: {
     type: 'UserAssigned'
-    userAssignedIdentities: {
-      '${uiIdentityResourceId}': {}
-    }
+    userAssignedIdentities: deployApplications ? { '${uiIdentityResourceId!}': {} } : {}
   }
   properties: {
     environmentId: managedEnvironment.id
@@ -785,8 +786,8 @@ resource deploymentSmokeJob 'Microsoft.App/jobs@2025-07-01' = if (deployApplicat
       }
       registries: [
         {
-          identity: uiIdentityResourceId
-          server: registryLoginServer
+          identity: uiIdentityResourceId!
+          server: registryLoginServer!
         }
       ]
     }
@@ -794,7 +795,7 @@ resource deploymentSmokeJob 'Microsoft.App/jobs@2025-07-01' = if (deployApplicat
       containers: [
         {
           name: 'smoke'
-          image: uiImage
+          image: uiImage!
           command: [
             'python'
           ]

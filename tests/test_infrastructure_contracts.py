@@ -140,7 +140,7 @@ def test_pre_exposure_smoke_runs_as_a_distroless_safe_job() -> None:
     resources = read("infra/resource-group.bicep")
 
     assert "resource deploymentSmokeJob 'Microsoft.App/jobs@" in module
-    assert "= if (deployApplications) {" in module
+    assert "= if (validatedDeployApplications) {" in module
     assert "triggerType: 'Manual'" in module
     assert "replicaRetryLimit: 0" in module
     assert "image: uiImage" in module
@@ -250,7 +250,10 @@ def test_semantic_cache_bicep_source_is_explicit_and_conditionally_composed() ->
         "redisName: validatedSemanticCacheEnabled ? resourceNames.redis : null"
         in resources
     )
-    assert "semanticCacheEnvironment = validatedSemanticCacheEnabled" in apps
+    assert (
+        "semanticCacheEnvironment = deployApplications && validatedSemanticCacheEnabled"
+        in apps
+    )
     assert "semanticCacheEnvironment," in apps
     for output_name, output_type in (
         ("redisName", "string?"),
@@ -447,11 +450,11 @@ def test_container_apps_environment_precedes_gated_applications() -> None:
     assert "resource managedEnvironment 'Microsoft.App/managedEnvironments@" in module
     assert (
         "resource api 'Microsoft.App/containerApps@2025-07-01' = if "
-        "(deployApplications)" in module
+        "(validatedDeployApplications)" in module
     )
     assert (
         "resource ui 'Microsoft.App/containerApps@2025-07-01' = if "
-        "(deployApplications)" in module
+        "(validatedDeployApplications)" in module
     )
     assert "output environmentDefaultDomain string" in module
     assert "Public UI exposure requires Container Apps deployment" in resources
@@ -484,7 +487,10 @@ def test_container_apps_require_active_role_production_pricing() -> None:
     assert "requires complete reviewed pricing" in resources
     assert "!empty(pricingCatalogVersion)" in resources
     assert "!empty(trim(pricingEmbeddingInputRatePerMillionTokens ?? ''))" in resources
-    assert "semanticCacheEnvironment = validatedSemanticCacheEnabled" in module
+    assert (
+        "semanticCacheEnvironment = deployApplications && validatedSemanticCacheEnabled"
+        in module
+    )
     assert "name: 'OPTIMA_PRICING_EMBEDDING_INPUT_RATE_PER_MILLION_TOKENS'" in module
     assert "!empty(deploymentWorkflowRunId)" in resources
     assert "deploymentCommitInvalidCharacters" in resources

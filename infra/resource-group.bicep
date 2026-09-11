@@ -578,16 +578,18 @@ module containerApps 'modules/container-apps.bicep' = {
   name: 'optima-container-apps'
   params: {
     apiContainerAppName: resourceNames.apiContainerApp
-    apiIdentityClientId: identities.outputs.apiClientId
-    apiIdentityPrincipalId: identities.outputs.apiPrincipalId
-    apiIdentityResourceId: identities.outputs.apiResourceId
-    apiImage: '${registry.outputs.loginServer}/optima-api@${validatedApiImageDigest}'
-    applicationInsightsConnectionString: monitoring.outputs.connectionString
+    apiIdentityClientId: deployContainerApps ? identities.outputs.apiClientId : null
+    apiIdentityPrincipalId: deployContainerApps
+      ? (validatedSemanticCacheEnabled ? identities.outputs.apiPrincipalId : null)
+      : null
+    apiIdentityResourceId: deployContainerApps ? identities.outputs.apiResourceId : null
+    apiImage: deployContainerApps ? '${registry.outputs.loginServer}/optima-api@${validatedApiImageDigest}' : null
+    applicationInsightsConnectionString: deployContainerApps ? monitoring.outputs.connectionString : null
     applicationInsightsSamplingRatio: applicationInsightsSamplingRatio
     containerAppsEnvironmentName: resourceNames.containerAppsEnvironment
-    cosmosContainerName: cosmos.outputs.containerName
-    cosmosDatabaseName: cosmos.outputs.databaseName
-    cosmosEndpoint: cosmos.outputs.endpoint
+    cosmosContainerName: deployContainerApps ? cosmos.outputs.containerName : null
+    cosmosDatabaseName: deployContainerApps ? cosmos.outputs.databaseName : null
+    cosmosEndpoint: deployContainerApps ? cosmos.outputs.endpoint : null
     deploymentCommitSha: validatedDeploymentCommitSha
     deploymentWorkflowRunId: deploymentWorkflowRunId
     deployApplications: deployContainerApps
@@ -622,9 +624,9 @@ module containerApps 'modules/container-apps.bicep' = {
     redisEmbeddingDeployment: redisEmbeddingDeployment
     redisEmbeddingDimension: redisEmbeddingDimension
     redisEmbeddingModel: redisEmbeddingModel
-    redisHost: validatedSemanticCacheEnabled ? redis!.outputs.hostName : null
-    redisIndexName: validatedSemanticCacheEnabled ? 'optima-cache-v1' : null
-    registryLoginServer: registry.outputs.loginServer
+    redisHost: deployContainerApps ? (validatedSemanticCacheEnabled ? redis!.outputs.hostName : null) : null
+    redisIndexName: deployContainerApps ? (validatedSemanticCacheEnabled ? 'optima-cache-v1' : null) : null
+    registryLoginServer: deployContainerApps ? registry.outputs.loginServer : null
     semanticCacheEnabled: validatedSemanticCacheEnabled
     smokeJobName: resourceNames.smokeJob
     smokeRunMarker: smokeRunMarker
@@ -634,8 +636,8 @@ module containerApps 'modules/container-apps.bicep' = {
     uiAuthClientSecret: uiAuthClientSecret
     uiAuthTenantId: validatedUiAuthTenantId
     uiContainerAppName: resourceNames.uiContainerApp
-    uiIdentityResourceId: identities.outputs.uiResourceId
-    uiImage: '${registry.outputs.loginServer}/optima-ui@${validatedUiImageDigest}'
+    uiIdentityResourceId: deployContainerApps ? identities.outputs.uiResourceId : null
+    uiImage: deployContainerApps ? '${registry.outputs.loginServer}/optima-ui@${validatedUiImageDigest}' : null
   }
 }
 
