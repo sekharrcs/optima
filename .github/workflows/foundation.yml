@@ -132,8 +132,6 @@ jobs:
           set -euo pipefail
           az bicep install --version "v$BICEP_VERSION"
           test "$(az bicep version | sed -n 's/.*Bicep CLI version \([^ ]*\).*/\1/p')" = "$BICEP_VERSION"
-          OPTIMA_BICEP_COMMAND="${AZURE_CONFIG_DIR:-$HOME/.azure}/bin/bicep" \
-            uv run --no-sync python -m pytest tests/test_foundation_dependencies.py -v
           test -f infra/environments/hackathon.foundation.bicepparam
           formatted_dir="$(mktemp -d)"
           trap 'rm -rf "$formatted_dir"' EXIT
@@ -147,6 +145,13 @@ jobs:
             az bicep format --file "$file" --outfile "$formatted_dir/$(basename "$file")"
             diff --unified "$file" "$formatted_dir/$(basename "$file")"
           done
+
+      - name: Validate compiled foundation dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          OPTIMA_BICEP_COMMAND="${AZURE_CONFIG_DIR:-$HOME/.azure}/bin/bicep" \
+            uv run --no-sync python -m pytest tests/test_foundation_dependencies.py -v
 
   foundation-plan:
     name: Read-only foundation plan
