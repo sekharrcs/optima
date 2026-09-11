@@ -177,6 +177,8 @@ jobs:
           az version
           az bicep install --version "v$BICEP_VERSION"
           uv run --no-sync python -m pytest tests/test_foundation_workflow.py -k live_bicep -v -s
+          OPTIMA_BICEP_COMMAND="$AZURE_CONFIG_DIR/bin/bicep" \
+            uv run --no-sync python -m pytest tests/test_foundation_dependencies.py -v
 
       - name: Bundle validation evidence for container job
         id: bundle-validation-evidence
