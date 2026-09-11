@@ -401,6 +401,29 @@ def test_enabled_applications_keep_all_four_resources_and_identity_wiring(
     ]
 
 
+@pytest.mark.parametrize("deploy_applications", [False, True])
+@pytest.mark.parametrize("semantic_cache_enabled", [False, True])
+def test_environment_disables_platform_log_storage_for_all_execution_modes(
+    compiled_foundation: dict[str, Any],
+    deploy_applications: bool,
+    semantic_cache_enabled: bool,
+) -> None:
+    """Use the CLI's null destination, not its unsupported literal 'none' option."""
+    child = compiled_foundation["resources"]["containerApps"]["properties"]["template"]
+    environment = child["resources"]["managedEnvironment"]
+    parameters = child_parameters(child) | {
+        "deployApplications": deploy_applications,
+        "semanticCacheEnabled": semantic_cache_enabled,
+    }
+    assert "condition" not in environment
+    assert environment["apiVersion"] == "2025-07-01"
+    assert evaluate_arm(
+        environment["properties"]["appLogsConfiguration"],
+        parameters,
+        child["variables"],
+    ) == {"destination": None}
+
+
 def test_compiled_foundation_retains_exact_nine_resource_graph(
     compiled_foundation: dict[str, Any],
 ) -> None:
@@ -466,8 +489,10 @@ def test_compiled_foundation_retains_exact_nine_resource_graph(
     environment = child["resources"]["managedEnvironment"]
     assert environment["location"] == "[parameters('location')]"
     assert environment["tags"] == "[parameters('tags')]"
-    assert environment["properties"] == {
-        "appLogsConfiguration": {"destination": "none"},
+    assert evaluate_arm(
+        environment["properties"], child_parameters(child), child["variables"]
+    ) == {
+        "appLogsConfiguration": {"destination": None},
         "publicNetworkAccess": "Enabled",
         "zoneRedundant": False,
     }
