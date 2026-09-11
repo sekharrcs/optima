@@ -9,7 +9,14 @@ from typing import cast
 import streamlit as st
 from pydantic import ValidationError
 
-from optima.comparison import BaselineComparison
+from optima.comparison import (
+    BaselineComparison,
+    BaselineComparisonRequest,
+    BaselineComparisonService,
+    BenchmarkCaseIdentity,
+    ComparableRun,
+    ComparisonArm,
+)
 from optima.domain.execution import ModelRole
 from optima.domain.quality_contract import OptimizationMode, QualityProfile, RiskTier
 from optima.domain.request_profile import Complexity, TaskType
@@ -35,6 +42,7 @@ from ui.presentation import (
 
 PRIMARY_VIEWS = ("Execute", "Dashboard", "Run History")
 HISTORY_KEY = "optima_session_history"
+DEMO_BASELINE_ENABLED_ENV = "OPTIMA_DEMO_BASELINE_ENABLED"
 
 
 def _history() -> tuple[HistoryEntry, ...]:
@@ -56,6 +64,35 @@ def _store_result(
     st.session_state[HISTORY_KEY] = add_entry(
         _history(),
         HistoryEntry(result=result, comparison=comparison),
+    )
+
+
+def _build_demo_comparison(
+    *,
+    baseline: RunResult,
+    optima: RunResult,
+) -> BaselineComparison:
+    """Validate and compare two measured runs of the same demo benchmark case."""
+    binding = optima.execution_plan.request_binding
+    if baseline.execution_plan.request_binding != binding:
+        raise ValueError("demo comparison request bindings do not match")
+    identity = BenchmarkCaseIdentity(
+        benchmark_case_id=f"local-demo-{binding.digest[:12]}",
+        input_fingerprint=binding.digest,
+    )
+    return BaselineComparisonService().compare(
+        BaselineComparisonRequest(
+            baseline=ComparableRun(
+                arm=ComparisonArm.BASELINE,
+                identity=identity,
+                run_result=baseline,
+            ),
+            optima=ComparableRun(
+                arm=ComparisonArm.OPTIMA,
+                identity=identity,
+                run_result=optima,
+            ),
+        )
     )
 
 
@@ -195,9 +232,22 @@ def execute_page() -> None:
                 ).to_run_request()
                 with st.status("Executing the selected OPTIMA plan...", expanded=True):
                     st.write("Submitting the supplied request and profile to FastAPI")
-                    result = OptimaApiClient.from_environment().execute(request)
+                    client = OptimaApiClient.from_environment()
+                    result = client.execute(request)
                     st.write("Validating returned RunResult evidence")
-                _store_result(result)
+                    comparison = None
+                    if (
+                        os.getenv(DEMO_BASELINE_ENABLED_ENV, "false").casefold()
+                        == "true"
+                    ):
+                        st.write("Executing the measured fixed-strong baseline")
+                        baseline = client.execute_fixed_strong_baseline(request)
+                        comparison = _build_demo_comparison(
+                            baseline=baseline,
+                            optima=result,
+                        )
+                        st.write("Validating compatible comparison evidence")
+                _store_result(result, comparison)
             except ValidationError:
                 st.error("The supplied request exceeds an API field limit.")
             except (ApiClientError, ValueError) as error:

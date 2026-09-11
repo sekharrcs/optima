@@ -80,6 +80,14 @@ class OptimaApiClient:
 
     def execute(self, request: RunRequest) -> RunResult:
         """Execute one request and return only a validated RunResult."""
+        return self._execute_path("/api/v1/runs", request)
+
+    def execute_fixed_strong_baseline(self, request: RunRequest) -> RunResult:
+        """Execute the local demo's measured fixed-strong benchmark arm."""
+        return self._execute_path("/api/v1/demo/fixed-strong-baseline", request)
+
+    def _execute_path(self, path: str, request: RunRequest) -> RunResult:
+        """Execute one request path and return only a validated RunResult."""
         try:
             with httpx.Client(
                 base_url=self._base_url,
@@ -88,7 +96,7 @@ class OptimaApiClient:
                 follow_redirects=False,
             ) as client:
                 response = client.post(
-                    "/api/v1/runs",
+                    path,
                     json=request.model_dump(mode="json", exclude_none=True),
                 )
         except httpx.TimeoutException as error:

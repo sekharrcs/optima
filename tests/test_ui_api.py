@@ -1,5 +1,7 @@
 """Tests for UI request construction, API transport, and local demo composition."""
 
+from decimal import Decimal
+
 import httpx
 import pytest
 from fastapi.testclient import TestClient
@@ -90,6 +92,50 @@ def test_api_client_serializes_request_and_parses_run_result() -> None:
     assert result.total_calculated_cost is not None
     assert result.total_cost_provenance is not None
     assert result.total_cost_provenance.catalog_version == "local-demo-v1"
+
+
+def test_demo_fixed_strong_baseline_is_compatible_measured_evidence() -> None:
+    """Compare the same request under fixed-strong and OPTIMA execution."""
+    request = ExecuteInputs(input_text="Summarize this").to_run_request()
+    with TestClient(demo_app) as test_client:
+        optima_response = test_client.post(
+            "/api/v1/runs",
+            json=request.model_dump(mode="json", exclude_none=True),
+        )
+        baseline_response = test_client.post(
+            "/api/v1/demo/fixed-strong-baseline",
+            json=request.model_dump(mode="json", exclude_none=True),
+        )
+
+    responses = {
+        "/api/v1/runs": optima_response,
+        "/api/v1/demo/fixed-strong-baseline": baseline_response,
+    }
+    transport = httpx.MockTransport(
+        lambda incoming: httpx.Response(
+            responses[incoming.url.path].status_code,
+            json=responses[incoming.url.path].json(),
+        )
+    )
+    client = OptimaApiClient(transport=transport)
+    optima = client.execute(request)
+    baseline = client.execute_fixed_strong_baseline(request)
+
+    from ui.app import _build_demo_comparison
+
+    comparison = _build_demo_comparison(baseline=baseline, optima=optima)
+
+    assert optima.contract_met is True
+    assert baseline.contract_met is True
+    assert baseline.execution_plan.model_policy is ModelPolicy.STRONG_DIRECT
+    assert baseline.request_profile == optima.request_profile
+    assert baseline.quality_contract == optima.quality_contract
+    assert str(baseline.total_calculated_cost) == "0.00277"
+    assert str(optima.total_calculated_cost) == "0.0001536"
+    assert comparison.cost_reduction_percentage is not None
+    assert round(comparison.cost_reduction_percentage, 2) == Decimal("94.45")
+    assert comparison.token_reduction_percentage is not None
+    assert round(comparison.token_reduction_percentage, 2) == Decimal("4.66")
 
 
 def test_api_client_parses_typed_context_reduction_evidence() -> None:
