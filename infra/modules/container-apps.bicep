@@ -336,7 +336,7 @@ resource managedEnvironment 'Microsoft.App/managedEnvironments@2025-07-01' = {
   tags: tags
   properties: {
     appLogsConfiguration: {
-      destination: 'none'
+      destination: null
     }
     publicNetworkAccess: 'Enabled'
     zoneRedundant: false

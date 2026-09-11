@@ -122,6 +122,16 @@ OPTIMA UI  --HTTPS-------------> internal OPTIMA API
 | API managed identity           | User-assigned                                                                          | Stable pre-assignable API runtime identity   |
 | UI managed identity            | User-assigned                                                                          | Pull only the UI image from ACR               |
 
+Platform log storage remains disabled in both foundation and runtime deployments.
+The managed environment uses `appLogsConfiguration.destination: null`, not the
+literal string `'none'`. Azure CLI 2.89.1
+[maps its `--logs-destination none` option to a null destination](https://github.com/Azure/azure-cli/blob/azure-cli-2.89.1/src/azure-cli/azure/cli/command_modules/containerapp/containerapp_env_decorator.py).
+The API 2025-07-01 reference lists `'none'`, but the service rejected that literal
+during the foundation plan. Compiled tests enforce the null representation; they
+do not substitute for a separately authorized live plan. This setting does not
+disable the API's Application Insights OpenTelemetry export or remove its
+Log Analytics workspace.
+
 The API and UI remain separate deployment units because the UI is an HTTP
 client of the API, they use different ports and processes, and only the API
 needs model, Cosmos, and telemetry configuration. Redis is conditional on the
