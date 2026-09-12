@@ -973,6 +973,8 @@ def test_plan_capture_blocks_contain_raw_streams_and_preserve_status(
         "what-if",
         "--name",
         "optima-foundation-promotion-whatif",
+        "--mode",
+        "Incremental",
         "--resource-group",
         "rg-optima-hackathon",
         "--template-file",
