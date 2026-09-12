@@ -29,12 +29,28 @@ from typing import Any, cast
 EXIT_SUCCESS = 0
 EXIT_FAILURE = 1
 
-EVIDENCE_SCHEMA_VERSION = "optima-foundation-whatif-evidence-v1"
+EVIDENCE_SCHEMA_VERSION = "optima-foundation-whatif-evidence-v2"
 FAILURE_DIAGNOSTICS_SCHEMA_VERSION = "optima-foundation-whatif-failure-v2"
 SCOPE_FINGERPRINT_VERSION = "optima-foundation-scope-v1"
 SOURCE_FINGERPRINT_VERSION = "optima-foundation-deployment-source-v1"
 PARAMETER_FINGERPRINT_VERSION = "optima-foundation-parameters-v1"
-CHANGE_FINGERPRINT_VERSION = "optima-foundation-resource-changes-v1"
+CHANGE_FINGERPRINT_VERSION = "optima-foundation-resource-changes-v2"
+EXTERNAL_POLICY_SCHEMA_VERSION = "optima-foundation-external-policy-v1"
+EXTERNAL_POLICY_FINGERPRINT_VERSION = "optima-foundation-external-policy-digest-v1"
+RESOURCE_ID_FINGERPRINT_VERSION = "optima-foundation-resource-id-v1"
+EXTERNAL_PAYLOAD_FINGERPRINT_VERSION = "optima-foundation-external-payload-v1"
+_EXTERNAL_POLICY_FIELDS = frozenset(
+    {
+        "schema_version",
+        "deployment_mode",
+        "scope_fingerprint",
+        "resource_type",
+        "resource_id_fingerprint_version",
+        "resource_id_fingerprint",
+    }
+)
+_REVIEWED_EXTERNAL_TYPES = frozenset({"microsoft.cognitiveservices/accounts"})
+EXTERNAL_POLICY_ENV = "OPTIMA_FOUNDATION_EXTERNAL_OBSERVATION_POLICY"
 
 ALLOWED_CHANGE_TYPES = frozenset({"Create", "NoChange"})
 _OFFICIAL_CHANGE_TYPES = frozenset(
@@ -147,6 +163,9 @@ class WhatIfClassificationCode(StrEnum):
     RESOURCE_GRAPH_MISMATCH = "WHATIF_RESOURCE_GRAPH_MISMATCH"
     INVALID_PARAMETERS = "WHATIF_INVALID_PARAMETERS"
     INVALID_DEPLOYMENT_SOURCE = "WHATIF_INVALID_DEPLOYMENT_SOURCE"
+    INVALID_EXTERNAL_POLICY = "WHATIF_INVALID_EXTERNAL_POLICY"
+    EXTERNAL_OBSERVATION_MISMATCH = "WHATIF_EXTERNAL_OBSERVATION_MISMATCH"
+    INVALID_DEPLOYMENT_MODE = "WHATIF_INVALID_DEPLOYMENT_MODE"
     PROMOTION_MISMATCH = "WHATIF_PROMOTION_MISMATCH"
 
 
@@ -156,6 +175,54 @@ class WhatIfClassificationError(RuntimeError):
     def __init__(self, code: WhatIfClassificationCode, message: str) -> None:
         self.code = code
         super().__init__(f"{code.value}: {message}")
+
+
+@dataclass(frozen=True)
+class ExternalObservationPolicy:
+    """Immutable, explicitly configured binding for one reviewed observation."""
+
+    schema_version: str
+    deployment_mode: str
+    scope_fingerprint: str
+    resource_type: str
+    resource_id_fingerprint_version: str
+    resource_id_fingerprint: str
+
+    def __post_init__(self) -> None:
+        if (
+            not all(isinstance(value, str) for value in self.to_document().values())
+            or self.schema_version != EXTERNAL_POLICY_SCHEMA_VERSION
+            or self.deployment_mode != "Incremental"
+            or self.resource_type not in _REVIEWED_EXTERNAL_TYPES
+            or self.resource_id_fingerprint_version != RESOURCE_ID_FINGERPRINT_VERSION
+            or not _validate_fingerprint(self.scope_fingerprint)
+            or not _validate_fingerprint(self.resource_id_fingerprint)
+        ):
+            raise WhatIfClassificationError(
+                WhatIfClassificationCode.INVALID_EXTERNAL_POLICY,
+                "External observation policy has invalid fields",
+            )
+
+    def to_document(self) -> dict[str, str]:
+        """Return the closed, non-sensitive policy definition."""
+        return {
+            "schema_version": self.schema_version,
+            "deployment_mode": self.deployment_mode,
+            "scope_fingerprint": self.scope_fingerprint,
+            "resource_type": self.resource_type,
+            "resource_id_fingerprint_version": self.resource_id_fingerprint_version,
+            "resource_id_fingerprint": self.resource_id_fingerprint,
+        }
+
+
+def parse_external_observation_policy(document: Any) -> ExternalObservationPolicy:
+    """Parse a complete policy object; disabled configuration is handled by CLI."""
+    if not isinstance(document, dict) or set(document) != _EXTERNAL_POLICY_FIELDS:
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.INVALID_EXTERNAL_POLICY,
+            "External observation policy has an unsupported schema",
+        )
+    return ExternalObservationPolicy(**document)
 
 
 @dataclass(frozen=True)
@@ -178,6 +245,28 @@ class AllowedChange:
 
 
 @dataclass(frozen=True)
+class ExternalObservation:
+    """Sanitized evidence of one nonmutating, policy-bound external resource."""
+
+    resource_type: str
+    resource_id_fingerprint: str
+    scope_fingerprint: str
+    policy_fingerprint: str
+    payload_fingerprint: str
+
+    def to_document(self) -> dict[str, str]:
+        """Project no raw resource identities, names or payload values."""
+        return {
+            "change_type": "Ignore",
+            "resource_type": self.resource_type,
+            "resource_id_fingerprint": self.resource_id_fingerprint,
+            "scope_fingerprint": self.scope_fingerprint,
+            "policy_fingerprint": self.policy_fingerprint,
+            "payload_fingerprint": self.payload_fingerprint,
+        }
+
+
+@dataclass(frozen=True)
 class FoundationWhatIfClassification:
     """Result of classifying a foundation what-if as safe to apply."""
 
@@ -187,6 +276,9 @@ class FoundationWhatIfClassification:
     change_counts: Mapping[str, int]
     scope_fingerprint: str
     change_fingerprint: str
+    deployment_mode: str
+    external_policy: ExternalObservationPolicy | None
+    external_observations: tuple[ExternalObservation, ...]
 
 
 def _raise_malformed(message: str) -> None:
@@ -241,10 +333,10 @@ def _canonical_number(value: int | float | Decimal) -> str:
     if number.is_zero():
         return "0"
 
-    normalized = number.normalize()
-    sign, digits, exponent = normalized.as_tuple()
-    finite_exponent = cast(int, exponent)
-    digit_text = "".join(str(digit) for digit in digits)
+    sign, digits, exponent = number.as_tuple()
+    exact_digits = "".join(str(digit) for digit in digits)
+    digit_text = exact_digits.rstrip("0")
+    finite_exponent = cast(int, exponent) + len(exact_digits) - len(digit_text)
     adjusted = len(digit_text) + finite_exponent - 1
     prefix = "-" if sign else ""
     if -6 <= adjusted < 21:
@@ -357,6 +449,16 @@ def _parse_resource_id(
     )
 
 
+def resource_identity_fingerprint(
+    resource_id: str, *, subscription_id: str, resource_group: str
+) -> str:
+    """Fingerprint an explicitly supplied full ARM identity, never discover one."""
+    parsed = _parse_resource_id(
+        resource_id, subscription_id=subscription_id, resource_group=resource_group
+    )
+    return _versioned_fingerprint(RESOURCE_ID_FINGERPRINT_VERSION, parsed.canonical_id)
+
+
 def _denied_type_code(resource_type: str) -> WhatIfClassificationCode:
     """Map a rejected resource type to its most specific denial code."""
     if resource_type.startswith("microsoft.cognitiveservices/"):
@@ -438,7 +540,9 @@ def _validate_change_shape(change: Any) -> dict[str, Any]:
     return change
 
 
-def _validate_change_semantics(change: Mapping[str, Any]) -> str:
+def _validate_change_semantics(
+    change: Mapping[str, Any], *, allow_external_ignore: bool = False
+) -> str:
     """Accept only internally consistent Create and NoChange operations."""
     change_type = cast(str, change["changeType"])
     if change.get("unsupportedReason") not in (None, ""):
@@ -461,6 +565,18 @@ def _validate_change_semantics(change: Mapping[str, Any]) -> str:
             WhatIfClassificationCode.UNEXPECTED_MODIFY,
             "Foundation what-if must not modify existing resources",
         )
+    if change_type == "Ignore" and allow_external_ignore:
+        if (
+            not change.get("before")
+            or change.get("after") is not None
+            or change.get("delta") not in (None, [])
+            or change.get("extension") is not None
+        ):
+            raise WhatIfClassificationError(
+                WhatIfClassificationCode.EXTERNAL_OBSERVATION_MISMATCH,
+                "External observation contains an unreviewed or mutating payload",
+            )
+        return change_type
     if change_type not in ALLOWED_CHANGE_TYPES:
         raise WhatIfClassificationError(
             WhatIfClassificationCode.UNSUPPORTED_CHANGE,
@@ -573,8 +689,29 @@ def classify_foundation_whatif(
     subscription_id: str,
     resource_group: str,
     environment_name: str = "hackathon",
+    deployment_mode: str = "Incremental",
+    external_policy: ExternalObservationPolicy | None = None,
 ) -> FoundationWhatIfClassification:
     """Classify a structured what-if result, raising on any unsafe evidence."""
+    if deployment_mode != "Incremental":
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.INVALID_DEPLOYMENT_MODE,
+            "Foundation classification requires Incremental deployment mode",
+        )
+    if external_policy is not None:
+        if type(external_policy) is not ExternalObservationPolicy:
+            raise WhatIfClassificationError(
+                WhatIfClassificationCode.INVALID_EXTERNAL_POLICY,
+                "External observation policy must be explicitly typed",
+            )
+        external_policy.__post_init__()
+        if external_policy.scope_fingerprint != _scope_fingerprint(
+            subscription_id, resource_group
+        ):
+            raise WhatIfClassificationError(
+                WhatIfClassificationCode.INVALID_EXTERNAL_POLICY,
+                "External observation policy is not bound to the target scope",
+            )
     if not isinstance(document, dict):
         _raise_malformed("What-if output is not a JSON object")
     _validate_json_value(document)
@@ -633,34 +770,69 @@ def classify_foundation_whatif(
     counts = {"Create": 0, "NoChange": 0}
     for raw_change in changes:
         change = _validate_change_shape(raw_change)
-        change_type = _validate_change_semantics(change)
+        change_type = _validate_change_semantics(
+            change, allow_external_ignore=external_policy is not None
+        )
         resource_id = _parse_resource_id(
             change["resourceId"],
             subscription_id=subscription_id,
             resource_group=resource_group,
         )
-        if resource_id.resource_type not in EXPECTED_FOUNDATION_RESOURCE_TYPES:
-            raise WhatIfClassificationError(
-                _denied_type_code(resource_id.resource_type),
-                "Foundation what-if contains a resource type outside the contract",
-            )
         if resource_id.canonical_id in seen_resource_ids:
             raise WhatIfClassificationError(
                 WhatIfClassificationCode.DUPLICATE_RESOURCE,
                 "Foundation what-if contains a duplicate resource",
             )
         seen_resource_ids.add(resource_id.canonical_id)
-        counts[change_type] += 1
         parsed_changes.append((change, change_type, resource_id))
+
+    managed_changes: list[tuple[dict[str, Any], str, ParsedResourceId]] = []
+    observations: list[ExternalObservation] = []
+    canonical_payloads: list[dict[str, Any]] = []
+    for change, change_type, resource_id in parsed_changes:
+        if change_type == "Ignore":
+            canonical_change = _canonical_external_change(
+                change,
+                resource_id=resource_id,
+                subscription_id=subscription_id,
+                resource_group=resource_group,
+                policy=external_policy,
+            )
+            assert external_policy is not None
+            observations.append(
+                ExternalObservation(
+                    resource_type=resource_id.resource_type,
+                    resource_id_fingerprint=external_policy.resource_id_fingerprint,
+                    scope_fingerprint=external_policy.scope_fingerprint,
+                    policy_fingerprint=external_policy_fingerprint(external_policy),
+                    payload_fingerprint=_versioned_fingerprint(
+                        EXTERNAL_PAYLOAD_FINGERPRINT_VERSION, canonical_change
+                    ),
+                )
+            )
+            canonical_payloads.append(canonical_change)
+        else:
+            if resource_id.resource_type not in EXPECTED_FOUNDATION_RESOURCE_TYPES:
+                raise WhatIfClassificationError(
+                    _denied_type_code(resource_id.resource_type),
+                    "Foundation what-if contains a resource type outside the contract",
+                )
+            counts[change_type] += 1
+            managed_changes.append((change, change_type, resource_id))
+    if len(observations) != (1 if external_policy is not None else 0):
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.EXTERNAL_OBSERVATION_MISMATCH,
+            "Foundation what-if does not contain the configured observation count",
+        )
 
     registries = [
         parsed
-        for _, _, parsed in parsed_changes
+        for _, _, parsed in managed_changes
         if parsed.resource_type == "microsoft.containerregistry/registries"
     ]
     accounts = [
         parsed
-        for _, _, parsed in parsed_changes
+        for _, _, parsed in managed_changes
         if parsed.resource_type == "microsoft.documentdb/databaseaccounts"
     ]
     if len(registries) != 1 or len(accounts) != 1:
@@ -690,15 +862,14 @@ def classify_foundation_whatif(
         environment_name=environment_name.casefold(),
         unique_suffix=registry_match.group(1),
     )
-    if seen_resource_ids != set(expected_graph):
+    if {parsed.canonical_id for _, _, parsed in managed_changes} != set(expected_graph):
         raise WhatIfClassificationError(
             WhatIfClassificationCode.RESOURCE_GRAPH_MISMATCH,
             "Foundation what-if does not match the exact nine-resource graph",
         )
 
     allowed: list[AllowedChange] = []
-    canonical_payloads: list[dict[str, Any]] = []
-    for change, change_type, resource_id in parsed_changes:
+    for change, change_type, resource_id in managed_changes:
         role, resource_type, resource_name = expected_graph[resource_id.canonical_id]
         allowed.append(
             AllowedChange(
@@ -723,7 +894,127 @@ def classify_foundation_whatif(
         change_fingerprint=_versioned_fingerprint(
             CHANGE_FINGERPRINT_VERSION, canonical_payloads
         ),
+        deployment_mode=deployment_mode,
+        external_policy=external_policy,
+        external_observations=tuple(observations),
     )
+
+
+def external_policy_fingerprint(policy: ExternalObservationPolicy | None) -> str:
+    """Bind the full configured policy, including the explicit disabled state."""
+    return _versioned_fingerprint(
+        EXTERNAL_POLICY_FINGERPRINT_VERSION,
+        None if policy is None else policy.to_document(),
+    )
+
+
+def _canonical_external_change(
+    change: Mapping[str, Any],
+    *,
+    resource_id: ParsedResourceId,
+    subscription_id: str,
+    resource_group: str,
+    policy: ExternalObservationPolicy | None,
+) -> dict[str, Any]:
+    """Validate exact binding and canonicalize only structural ARM identities."""
+    if policy is None:
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.UNSUPPORTED_CHANGE,
+            "Foundation what-if contains a disallowed resource change type",
+        )
+    if (
+        resource_id.resource_type != policy.resource_type
+        or _versioned_fingerprint(
+            RESOURCE_ID_FINGERPRINT_VERSION, resource_id.canonical_id
+        )
+        != policy.resource_id_fingerprint
+    ):
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.EXTERNAL_OBSERVATION_MISMATCH,
+            "External observation does not match its configured identity",
+        )
+    before = dict(change["before"])
+    if (
+        set(before)
+        - {
+            "id",
+            "resourceId",
+            "type",
+            "name",
+            "location",
+            "kind",
+            "apiVersion",
+            "sku",
+            "tags",
+            "properties",
+            "identity",
+        }
+        or not {"id", "type"}.issubset(before)
+        or before.get("identity") is not None
+    ):
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.EXTERNAL_OBSERVATION_MISMATCH,
+            "External before payload contains unreviewed identity or fields",
+        )
+    for field in ("location", "kind", "apiVersion"):
+        if field in before and (
+            not isinstance(before[field], str) or not before[field].strip()
+        ):
+            raise WhatIfClassificationError(
+                WhatIfClassificationCode.EXTERNAL_OBSERVATION_MISMATCH,
+                "External before payload has invalid metadata",
+            )
+    for field in ("sku", "tags", "properties"):
+        if field in before and not isinstance(before[field], dict):
+            raise WhatIfClassificationError(
+                WhatIfClassificationCode.EXTERNAL_OBSERVATION_MISMATCH,
+                "External before payload has invalid properties",
+            )
+    expected = {
+        "id": resource_id.canonical_id,
+        "resourceId": resource_id.canonical_id,
+        "type": resource_id.resource_type,
+        "name": resource_id.resource_name,
+    }
+    identifiers = change.get("identifiers")
+    if identifiers is not None and set(identifiers) - set(expected):
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.EXTERNAL_OBSERVATION_MISMATCH,
+            "External observation has unreviewed identifiers",
+        )
+    canonical_identifiers = None if identifiers is None else dict(identifiers)
+    for container in (before, canonical_identifiers):
+        if container is None:
+            continue
+        for field, value in expected.items():
+            if field in container:
+                if (
+                    not isinstance(container[field], str)
+                    or container[field].casefold() != value
+                ):
+                    raise WhatIfClassificationError(
+                        WhatIfClassificationCode.EXTERNAL_OBSERVATION_MISMATCH,
+                        "External observation has contradictory identity metadata",
+                    )
+                container[field] = value
+    canonical = dict(change)
+    canonical["resourceId"] = resource_id.canonical_id
+    canonical["before"] = before
+    if "identifiers" in change:
+        canonical["identifiers"] = canonical_identifiers
+    if change.get("deploymentId") is not None:
+        deployment = _parse_resource_id(
+            change["deploymentId"],
+            subscription_id=subscription_id,
+            resource_group=resource_group,
+        )
+        if deployment.resource_type != "microsoft.resources/deployments":
+            raise WhatIfClassificationError(
+                WhatIfClassificationCode.EXTERNAL_OBSERVATION_MISMATCH,
+                "External observation has invalid deployment metadata",
+            )
+        canonical["deploymentId"] = deployment.canonical_id
+    return canonical
 
 
 def parameter_fingerprint(parameters: Mapping[str, str]) -> str:
@@ -1018,13 +1309,77 @@ def _validate_resource_facts(
         )
 
 
+def _validate_external_evidence(document: Mapping[str, Any]) -> None:
+    """Check closed policy/observation projections and their exact binding."""
+    policy_evidence = document["external_policy"]
+    if (
+        not isinstance(policy_evidence, dict)
+        or set(policy_evidence) != {"definition", "fingerprint"}
+        or not _validate_fingerprint(policy_evidence["fingerprint"])
+    ):
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.PROMOTION_MISMATCH,
+            "Promotion external policy evidence has an unsupported schema",
+        )
+    policy = None
+    if policy_evidence["definition"] is not None:
+        try:
+            policy = parse_external_observation_policy(policy_evidence["definition"])
+        except WhatIfClassificationError as error:
+            raise WhatIfClassificationError(
+                WhatIfClassificationCode.PROMOTION_MISMATCH,
+                "Promotion external policy evidence is invalid",
+            ) from error
+        if policy.scope_fingerprint != document["target"]["scope_fingerprint"]:
+            raise WhatIfClassificationError(
+                WhatIfClassificationCode.PROMOTION_MISMATCH,
+                "Promotion external policy is not bound to the target",
+            )
+    if policy_evidence["fingerprint"] != external_policy_fingerprint(policy):
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.PROMOTION_MISMATCH,
+            "Promotion external policy digest does not match its definition",
+        )
+    observations = document["external_observations"]
+    if not isinstance(observations, list) or len(observations) != (
+        0 if policy is None else 1
+    ):
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.PROMOTION_MISMATCH,
+            "Promotion external observation count contradicts the policy",
+        )
+    if policy is None:
+        return
+    observed = observations[0]
+    binding = {
+        "change_type": "Ignore",
+        "resource_type": policy.resource_type,
+        "resource_id_fingerprint": policy.resource_id_fingerprint,
+        "scope_fingerprint": policy.scope_fingerprint,
+        "policy_fingerprint": policy_evidence["fingerprint"],
+    }
+    if (
+        not isinstance(observed, dict)
+        or set(observed) != {*binding, "payload_fingerprint"}
+        or any(observed[field] != value for field, value in binding.items())
+        or not _validate_fingerprint(observed["payload_fingerprint"])
+    ):
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.PROMOTION_MISMATCH,
+            "Promotion external observation is not exactly policy-bound",
+        )
+
+
 def _validate_evidence(document: Any) -> dict[str, Any]:
     """Validate and return one closed, versioned promotion evidence document."""
     if not isinstance(document, dict) or set(document) != {
         "changes",
         "classification",
         "commit_sha",
+        "deployment_mode",
         "deployment_source",
+        "external_policy",
+        "external_observations",
         "parameters",
         "schema_version",
         "target",
@@ -1036,6 +1391,7 @@ def _validate_evidence(document: Any) -> dict[str, Any]:
     if (
         document["schema_version"] != EVIDENCE_SCHEMA_VERSION
         or document["classification"] != "APPROVED"
+        or document["deployment_mode"] != "Incremental"
         or not isinstance(document["commit_sha"], str)
         or _COMMIT_SHA.fullmatch(document["commit_sha"]) is None
     ):
@@ -1126,6 +1482,7 @@ def _validate_evidence(document: Any) -> dict[str, Any]:
             WhatIfClassificationCode.PROMOTION_MISMATCH,
             "Promotion change counts contradict the resource facts",
         )
+    _validate_external_evidence(document)
     return document
 
 
@@ -1142,6 +1499,17 @@ def build_foundation_evidence(
         "schema_version": EVIDENCE_SCHEMA_VERSION,
         "classification": "APPROVED",
         "commit_sha": commit_sha.casefold(),
+        "deployment_mode": classification.deployment_mode,
+        "external_policy": {
+            "definition": None
+            if classification.external_policy is None
+            else classification.external_policy.to_document(),
+            "fingerprint": external_policy_fingerprint(classification.external_policy),
+        },
+        "external_observations": [
+            observation.to_document()
+            for observation in classification.external_observations
+        ],
         "target": {
             "resource_group": classification.resource_group,
             "environment_name": classification.environment_name,
@@ -1180,6 +1548,35 @@ def compare_promotion_evidence(plan: Any, apply: Any) -> None:
         )
 
 
+def compare_convergence_evidence(plan: Any, converged: Any) -> None:
+    """Require managed convergence with unchanged target/source/external evidence."""
+    validated_plan = _validate_evidence(plan)
+    validated_converged = _validate_evidence(converged)
+    plan_binding = {
+        key: value for key, value in validated_plan.items() if key != "changes"
+    }
+    converged_binding = {
+        key: value for key, value in validated_converged.items() if key != "changes"
+    }
+    plan_resources = [
+        {key: value for key, value in fact.items() if key != "change_type"}
+        for fact in validated_plan["changes"]["resources"]
+    ]
+    converged_resources = [
+        {key: value for key, value in fact.items() if key != "change_type"}
+        for fact in validated_converged["changes"]["resources"]
+    ]
+    if (
+        plan_binding != converged_binding
+        or plan_resources != converged_resources
+        or validated_converged["changes"]["counts"] != {"Create": 0, "NoChange": 9}
+    ):
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.PROMOTION_MISMATCH,
+            "Foundation convergence does not preserve the approved bindings",
+        )
+
+
 def _summarize(evidence: Mapping[str, Any]) -> str:
     """Render a readable summary containing no subscription or full resource ID."""
     target = evidence["target"]
@@ -1190,6 +1587,9 @@ def _summarize(evidence: Mapping[str, Any]) -> str:
         "Foundation what-if classification: APPROVED",
         f"  schema: {evidence['schema_version']}",
         f"  commit: {evidence['commit_sha']}",
+        f"  deployment mode: {evidence['deployment_mode']}",
+        f"  external policy fingerprint: {evidence['external_policy']['fingerprint']}",
+        f"  external observations: {len(evidence['external_observations'])}",
         f"  resource group: {target['resource_group']}",
         f"  environment: {target['environment_name']}",
         f"  scope fingerprint: {target['scope_fingerprint']}",
@@ -1477,8 +1877,43 @@ def _run_classify(arguments: argparse.Namespace) -> None:
         ) from error
 
 
+def _external_policy_from_environment(
+    name: str | None,
+) -> ExternalObservationPolicy | None:
+    """Read only the explicitly named policy variable, once, with strict JSON."""
+    if name is None:
+        return None
+    if name != EXTERNAL_POLICY_ENV:
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.INVALID_EXTERNAL_POLICY,
+            "External policy environment argument is not the reviewed variable",
+        )
+    text = os.environ.get(name)
+    if text is None or text == "":
+        return None
+    try:
+        document = json.loads(
+            text,
+            object_pairs_hook=_reject_duplicate_pairs,
+            parse_constant=_reject_json_constant,
+            parse_float=Decimal,
+        )
+        return parse_external_observation_policy(document)
+    except (ValueError, RecursionError, WhatIfClassificationError):
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.INVALID_EXTERNAL_POLICY,
+            "External observation policy is not a complete strict JSON policy",
+        ) from None
+
+
 def _classify_document(arguments: argparse.Namespace, document: Any) -> None:
     """Classify a what-if result and write sanitized plan evidence."""
+    if arguments.deployment_mode != "Incremental":
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.INVALID_DEPLOYMENT_MODE,
+            "Foundation classification requires Incremental deployment mode",
+        )
+    external_policy = _external_policy_from_environment(arguments.external_policy_env)
     parameters = _read_parameter_file(arguments.parameters_file)
     _validate_foundation_parameters(parameters, resource_group=arguments.resource_group)
     source_fingerprint, source_file_count = deployment_source_fingerprint(
@@ -1489,6 +1924,8 @@ def _classify_document(arguments: argparse.Namespace, document: Any) -> None:
         subscription_id=arguments.subscription_id,
         resource_group=arguments.resource_group,
         environment_name=parameters["environmentName"],
+        deployment_mode=arguments.deployment_mode,
+        external_policy=external_policy,
     )
     evidence = build_foundation_evidence(
         classification,
@@ -1512,6 +1949,16 @@ def _run_promote_check(arguments: argparse.Namespace) -> None:
     print("Foundation promotion evidence matches the approved plan\n", end="")
 
 
+def _run_convergence_check(arguments: argparse.Namespace) -> None:
+    """Validate converged managed facts while preserving external observations."""
+    plan = _load_json(arguments.plan, WhatIfClassificationCode.PROMOTION_MISMATCH)
+    converged = _load_json(
+        arguments.converged, WhatIfClassificationCode.PROMOTION_MISMATCH
+    )
+    compare_convergence_evidence(plan, converged)
+    print("Foundation convergence preserves the approved bindings")
+
+
 def create_parser() -> argparse.ArgumentParser:
     """Create the foundation what-if classification command-line parser."""
     parser = argparse.ArgumentParser(
@@ -1526,6 +1973,8 @@ def create_parser() -> argparse.ArgumentParser:
     classify.add_argument("--subscription-id", required=True)
     classify.add_argument("--resource-group", required=True)
     classify.add_argument("--commit-sha", required=True)
+    classify.add_argument("--deployment-mode", default="Incremental")
+    classify.add_argument("--external-policy-env")
     classify.add_argument("--parameters-file", type=Path, required=True)
     classify.add_argument(
         "--source-root",
@@ -1547,6 +1996,12 @@ def create_parser() -> argparse.ArgumentParser:
     promote.add_argument("--plan", type=Path, required=True)
     promote.add_argument("--apply", type=Path, required=True)
     promote.set_defaults(handler=_run_promote_check)
+    convergence = subparsers.add_parser(
+        "convergence-check", help="Verify managed convergence and external stability."
+    )
+    convergence.add_argument("--plan", type=Path, required=True)
+    convergence.add_argument("--converged", type=Path, required=True)
+    convergence.set_defaults(handler=_run_convergence_check)
     return parser
 
 

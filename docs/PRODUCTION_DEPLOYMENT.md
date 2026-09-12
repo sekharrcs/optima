@@ -76,10 +76,12 @@ Container App, and creates no role assignment. It:
    canonical identity resource ID, federation, exact effective role assignments,
    and custom role definition.
 3. Runs exactly one structured `az deployment group what-if` against the existing
-   resource group with `--validation-level ProviderNoRbac`.
+   resource group with `--mode Incremental`, `--validation-level ProviderNoRbac`,
+   and `--result-format FullResourcePayloads`, without excluding change types.
 4. Classifies the full structured result with
-   `scripts/whatif_classification.py classify`, which fails closed on anything the
-   foundation profile does not create.
+   `scripts/whatif_classification.py classify`, which requires the exact managed
+   graph and rejects other entries except the optional exact-bound external
+   observation defined below.
 5. Uploads the sole sanitized artifact,
    `foundation-plan-evidence-<commit>`, with 30-day retention and no compression.
 
@@ -88,6 +90,8 @@ it requires only the plan identity and role variables, Azure target and OIDC
 values, the fixed monthly cost review, and the fixed disabled-cache decision. Its
 cost gate validates the review date and a finite, positive Decimal estimate within
 the infrastructure limit. It does not validate active models or model pricing.
+The optional external-observation policy is separate from model configuration and
+defaults to disabled; it does not authorize changes to the observed resource.
 
 ### Review and promote the plan
 
@@ -98,7 +102,9 @@ Use this exact operator sequence:
 2. After the workflow succeeds, download its only artifact,
    `foundation-plan-evidence-<commit>`. Inspect the single
    `foundation-plan-evidence.json` file and confirm the commit, `APPROVED`
-   classification, target, fingerprints, counts, and nine resource facts.
+   classification, target, fingerprints, counts, and nine managed resource facts.
+   Also confirm `deployment_mode`, the explicit disabled or independently
+   approved external policy, and its zero or one external observation.
 3. Record the plan run ID, the dispatch actor, and the GitHub artifact metadata
    digest in exact `sha256:<64-lowercase-hex>` form. Use GitHub's artifact digest,
    not a new digest calculated from the downloaded JSON or archive.
@@ -124,11 +130,14 @@ non-symlink evidence file and no other extracted entry.
 The plan artifact is retained for 30 days but can authorize promotion for only 24
 hours. It is visible to principals allowed to read repository Actions artifacts.
 It contains no secrets, raw subscription ID, or full resource IDs, but it remains
-deployment metadata and should not be redistributed.
+deployment metadata and should not be redistributed. Unsalted identity and payload
+digests are correlatable metadata, not anonymization; known candidate identities
+can be checked against them.
 
 ### Foundation evidence contract
 
-The closed, versioned evidence schema binds these canonical fingerprints:
+The closed evidence schema `optima-foundation-whatif-evidence-v2` records
+`deployment_mode: Incremental` and binds these canonical fingerprints:
 
 * The target fingerprint hashes the non-redacted subscription ID and exact
   resource group before the artifact exposes only the resource group and digest
@@ -137,11 +146,16 @@ The closed, versioned evidence schema binds these canonical fingerprints:
 * The parameter fingerprint hashes the complete closed foundation parameter set,
   including source paths, target profile, and all four disabled deployment flags
 * The resource-change fingerprint hashes every field of every accepted structured
-  change after full resource-ID canonicalization, with the change objects sorted
-  by canonical JSON so equivalent response ordering produces the same digest
+   change, including an approved external payload, after structural identity
+   canonicalization, with the change objects sorted by canonical JSON so equivalent
+   response ordering produces the same digest
+* The external-policy fingerprint binds the complete configured policy or the
+   explicit disabled `null` definition; a separate external-payload fingerprint
+   binds the entire accepted external change, not a selected property projection
 
-The human-readable projection must contain exactly these nine facts, in canonical
-role order. Every fact is either `Create` or `NoChange`.
+The managed human-readable projection must contain exactly these nine facts, in
+canonical role order. Every managed fact is either `Create` or `NoChange`; external
+observations never enter these facts or their counts.
 
 | Resource role           | Exact name or parent path                 | Resource type                                                   |
 |-------------------------|-------------------------------------------|-----------------------------------------------------------------|
@@ -160,13 +174,101 @@ The exact Cosmos account is `cosmos-optima-<same-suffix>`. The shared
 rejects missing or duplicate resources, extra same-type resources, wrong parents,
 malformed IDs, non-success status, service errors, diagnostics, potential changes,
 deletions, modifications, unsupported changes, contradictory payloads, and unknown
-schema fields.
+schema fields. The optional external observation cannot replace a managed fact or
+expand the managed type or change-type allowlist.
 
 Sanitizing the readable evidence does not weaken comparison. The target digest is
 computed from the original non-redacted scope, and the change digest is computed
 from complete canonical resource IDs and payloads before those values are omitted
 from the artifact. Apply recomputes those digests from its fresh unredacted result
-and compares the entire strict evidence document.
+and compares the entire strict evidence document. Version-one or unknown evidence
+schemas are rejected, even with the policy disabled. There is no conversion or
+grandfathering of old evidence, and no historical failed plan becomes promotable.
+
+### Optional exact-bound external observation
+
+`OPTIMA_FOUNDATION_EXTERNAL_OBSERVATION_POLICY` is an optional protected
+`hackathon` environment variable. Missing or exactly empty means disabled and
+requires zero external observations. Whitespace-only text, JSON `null`, duplicate
+keys, unknown fields, wrong types, and malformed JSON fail closed, not back to the
+disabled behavior. Each privileged plan/apply job captures the variable once in
+its job environment. It is not exposed to the unprivileged validation job or
+rewritten through `GITHUB_ENV`.
+
+When enabled, its value must be a JSON object with exactly six string fields:
+
+| Field | Required value or binding |
+|-------|---------------------------|
+| `schema_version` | `optima-foundation-external-policy-v1` |
+| `deployment_mode` | `Incremental` |
+| `scope_fingerprint` | Lowercase 64-hex SHA-256 of the independently approved exact subscription and resource group |
+| `resource_type` | `microsoft.cognitiveservices/accounts` |
+| `resource_id_fingerprint_version` | `optima-foundation-resource-id-v1` |
+| `resource_id_fingerprint` | Lowercase 64-hex SHA-256 of the independently approved exact full resource identity |
+
+No active binding values or default binding are supplied. Establish the identity
+from independently approved inventory, not by taking the observed `Ignore` entry
+or its digest as approval. This conservative implementation supports only one
+top-level Cognitive Services account type; it makes no assertion about the type
+or identity of an owner's ignored resource. Model-deployment children, Redis,
+RBAC, Container Apps, nested deployment placeholders, wildcards, and broad
+same-type exemptions are not supported. This is observation only, not permission
+to create, modify, delete, or rebind that resource.
+
+Fingerprint construction is authoritative in
+[whatif_classification.py](../scripts/whatif_classification.py):
+`_versioned_fingerprint` computes SHA-256 over ASCII bytes of the domain/version,
+one newline, and `_canonical_json_text(value)`. Canonical JSON sorts object keys,
+preserves array order, ASCII-escapes strings, uses compact separators, and renders
+finite numbers exactly through `_canonical_number` without Decimal-context
+rounding. `_parse_resource_id` rejects malformed or out-of-scope IDs and case-folds
+their structural segments; `_canonical_external_change` canonicalizes matching
+structural identity fields without changing arbitrary property strings or
+dropping volatile fields.
+
+* Scope uses domain `optima-foundation-scope-v1` with the case-folded
+   `subscription_id` and `resource_group` object from `_scope_fingerprint`.
+* Exact identity uses domain `optima-foundation-resource-id-v1` with the canonical
+   full ID string from `resource_identity_fingerprint`.
+* Policy uses domain `optima-foundation-external-policy-digest-v1` with the complete
+   policy object or `null`, as implemented by `external_policy_fingerprint`.
+* External payload uses domain `optima-foundation-external-payload-v1` with the
+   complete canonical external change. The combined change digest uses
+   `optima-foundation-resource-changes-v2` for all canonical accepted changes.
+
+An enabled policy requires exactly one matching `Ignore` entry in every result.
+Its nonempty `before` object must contain the matching `id` and `type`; `name`
+and other identity metadata, when present, must also match. `after` must be absent
+or null; `delta` must be absent, null, or empty. Non-null identity or extension
+payloads, unsupported reasons, unknown fields, and contradictory metadata are
+rejected. The closed payload rules in the classifier remain authoritative.
+Synthetic tests do not establish compatibility with a live payload: even benign
+service fields or volatility may cause a conservative rejection and need a
+separate review, not filtering or automatic normalization.
+
+Evidence adds `external_policy` with `definition` and `fingerprint`, plus
+`external_observations` containing zero or one record. That record has exactly
+`change_type` (`Ignore`), `resource_type`, `resource_id_fingerprint`,
+`scope_fingerprint`, `policy_fingerprint`, and `payload_fingerprint`. The raw
+external ID and payload are not published in that record.
+
+All three classifications (plan, pre-apply, and convergence) pass
+`--deployment-mode Incremental` and
+`--external-policy-env OPTIMA_FOUNDATION_EXTERNAL_OBSERVATION_POLICY`. The four
+ARM calls (plan what-if, pre-apply what-if, apply create, and convergence what-if)
+each explicitly pass `--mode Incremental`. No call filters excluded change types.
+Plan establishes the bindings, `promote-check` requires exact fresh evidence
+equality before create, and `convergence-check` compares the generated convergence
+evidence against the authenticated original plan after final classification and
+before the success summary. It preserves commit, target, source, parameters, mode,
+policy, external evidence, and the same managed graph, while requiring all nine
+managed facts to be `NoChange`. Enabling, disabling, or changing policy between
+plan and apply invalidates promotion.
+
+Offline implementation is not activation. Approval of an exact inventory binding,
+authorization to set the protected variable, and authorization for a hosted run
+are separate decisions. No resource, identity binding, role, pricing, production
+workflow, or runtime configuration changes follow from this optional contract.
 
 ### foundation-apply
 
@@ -180,11 +282,14 @@ It:
 4. Runs a fresh structured `ProviderNoRbac` what-if with the reviewed plan's run
    provenance, exact source, and exact parameters, then rebuilds strict evidence.
 5. Compares the complete plan and apply evidence documents, including commit,
-   target, source, parameters, full change payload, counts, and resource facts.
+   target, source, parameters, mode, policy, external observation, full change
+   payload, counts, and managed resource facts.
 6. Immediately executes only the foundation `az deployment group create` after a
    successful comparison.
 7. Reconciles the exact deployment, requires `Succeeded`, and runs a classified
-   convergence what-if.
+   convergence what-if. Before reporting success, compares it with the original
+   authenticated plan and requires the same bindings and external evidence with
+   all nine managed facts `NoChange`.
 
 `foundation-apply` never builds or publishes an image, deploys a Container App,
 creates a runtime role assignment, configures Entra, provisions Redis or
@@ -207,6 +312,11 @@ eliminate it: a principal outside these workflows can still mutate Azure manuall
 during the interval. The workflow does not claim stronger plan immutability than
 Azure provides.
 
+The three external-observation snapshots likewise do not lock the resource or
+prove uninterrupted stability. Concurrent changes between snapshots, including a
+change that is reverted before the next observation, can be missed. Convergence
+detects observed drift after apply; it is not a transaction or rollback guarantee.
+
 The independent production path performs the same orphan check at both resource
 group and subscription deployment scope before its first mutation. This covers
 an interrupted initial subscription bootstrap as well as a later group-scoped
@@ -217,12 +327,18 @@ group or subscription deployment branch.
 
 ### Failure and recovery
 
-Any classifier failure, promotion mismatch, malformed or truncated what-if,
-absent plan evidence, or preflight rejection stops the run before Azure mutation.
+Any pre-apply classifier failure, promotion mismatch, malformed or truncated
+what-if, absent plan evidence, or preflight rejection stops the run before Azure
+mutation.
 Correct the underlying prerequisite, re-run `foundation-plan` for the same commit,
 review the new evidence, and dispatch `foundation-apply` again with the new
 provenance inputs. Do not weaken the profile, confirmation, or classifier to
 bypass a failed gate.
+
+A post-apply classification or convergence-comparison failure stops before the
+success summary but does not roll back an already completed Azure mutation. Treat
+the run as failed, reconcile the resulting state, and obtain separate
+authorization before any recovery or new plan.
 
 Runner interruption does not prove that Azure stopped. An accepted deployment may
 continue after workflow failure, timeout, or manual cancellation. The always-run
@@ -291,6 +407,7 @@ final-image scanning before Azure login.
 | `AZURE_FOUNDATION_PLAN_CLIENT_ID` | Client ID of the separate read-only foundation-plan identity |
 | `AZURE_FOUNDATION_PLAN_IDENTITY_RESOURCE_ID` | Full resource ID of the foundation-plan user-assigned identity |
 | `AZURE_FOUNDATION_PLAN_ROLE_DEFINITION_ID` | GUID of the custom role that allows only target-group deployment what-if |
+| `OPTIMA_FOUNDATION_EXTERNAL_OBSERVATION_POLICY` | Optional foundation-only strict six-string JSON policy; absent or exactly empty disables external observations; binding and activation require separate approval |
 | `AZURE_TENANT_ID` | Reviewed tenant ID |
 | `AZURE_SUBSCRIPTION_ID` | Reviewed subscription ID |
 | `AZURE_RESOURCE_GROUP` | `rg-optima-hackathon` |

@@ -175,6 +175,7 @@ jobs:
       AZURE_TENANT_ID: "${{ vars.AZURE_TENANT_ID }}"
       OPTIMA_COST_REVIEWED_ON: "${{ vars.OPTIMA_COST_REVIEWED_ON }}"
       OPTIMA_EXPECTED_FIXED_MONTHLY_COST_INR: "${{ vars.OPTIMA_EXPECTED_FIXED_MONTHLY_COST_INR }}"
+      OPTIMA_FOUNDATION_EXTERNAL_OBSERVATION_POLICY: '${{ vars.OPTIMA_FOUNDATION_EXTERNAL_OBSERVATION_POLICY }}'
       OPTIMA_GITHUB_ENVIRONMENT: hackathon
       OPTIMA_SEMANTIC_CACHE_ENABLED: "false"
       OPTIMA_DIAGNOSTIC_CERTIFICATE_BASE64: "${{ vars.OPTIMA_DIAGNOSTIC_CERTIFICATE_BASE64 }}"
@@ -289,6 +290,7 @@ jobs:
           fi
           capture_started=true
           az deployment group what-if --name optima-foundation-promotion-whatif \
+            --mode Incremental \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --template-file infra/resource-group.bicep \
             --parameters infra/environments/hackathon.foundation.bicepparam \
@@ -309,6 +311,8 @@ jobs:
           umask 077
           trap 'rm -f -- "$RUNNER_TEMP/foundation-whatif.json" "$RUNNER_TEMP/foundation-whatif.stderr"' EXIT
           python scripts/whatif_classification.py classify \
+            --deployment-mode Incremental \
+            --external-policy-env OPTIMA_FOUNDATION_EXTERNAL_OBSERVATION_POLICY \
             --whatif "$RUNNER_TEMP/foundation-whatif.json" \
             --subscription-id "$AZURE_SUBSCRIPTION_ID" \
             --resource-group "$AZURE_RESOURCE_GROUP" \
@@ -392,6 +396,7 @@ jobs:
       AZURE_FOUNDATION_PLAN_CLIENT_ID: "${{ vars.AZURE_FOUNDATION_PLAN_CLIENT_ID }}"
       AZURE_FOUNDATION_PLAN_IDENTITY_RESOURCE_ID: "${{ vars.AZURE_FOUNDATION_PLAN_IDENTITY_RESOURCE_ID }}"
       AZURE_LOCATION: "${{ vars.AZURE_LOCATION }}"
+      OPTIMA_FOUNDATION_EXTERNAL_OBSERVATION_POLICY: '${{ vars.OPTIMA_FOUNDATION_EXTERNAL_OBSERVATION_POLICY }}'
       AZURE_RESOURCE_GROUP: "${{ vars.AZURE_RESOURCE_GROUP }}"
       AZURE_SUBSCRIPTION_ID: "${{ vars.AZURE_SUBSCRIPTION_ID }}"
       AZURE_TENANT_ID: "${{ vars.AZURE_TENANT_ID }}"
@@ -549,6 +554,7 @@ jobs:
           fi
           az deployment group what-if --name optima-foundation-promotion-whatif \
             --resource-group "$AZURE_RESOURCE_GROUP" \
+            --mode Incremental \
             --template-file infra/resource-group.bicep \
             --parameters infra/environments/hackathon.foundation.bicepparam \
             --parameters \
@@ -560,6 +566,8 @@ jobs:
             > "$RUNNER_TEMP/foundation-whatif.json"
           python scripts/whatif_classification.py classify \
             --whatif "$RUNNER_TEMP/foundation-whatif.json" \
+            --deployment-mode Incremental \
+            --external-policy-env OPTIMA_FOUNDATION_EXTERNAL_OBSERVATION_POLICY \
             --subscription-id "$AZURE_SUBSCRIPTION_ID" \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --commit-sha "$GITHUB_SHA" \
@@ -591,6 +599,7 @@ jobs:
             +refs/heads/main:refs/remotes/origin/main
           test "$GITHUB_SHA" = "$(git rev-parse origin/main)"
           az deployment group create \
+            --mode Incremental \
             --name "$deployment_name" \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --template-file infra/resource-group.bicep \
@@ -662,6 +671,7 @@ jobs:
         run: |
           set -euo pipefail
           az deployment group what-if --name optima-foundation-converged-whatif \
+            --mode Incremental \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --template-file infra/resource-group.bicep \
             --parameters infra/environments/hackathon.foundation.bicepparam \
@@ -673,6 +683,8 @@ jobs:
             --no-pretty-print --only-show-errors \
             > "$RUNNER_TEMP/foundation-converged-whatif.json"
           python scripts/whatif_classification.py classify \
+            --deployment-mode Incremental \
+            --external-policy-env OPTIMA_FOUNDATION_EXTERNAL_OBSERVATION_POLICY \
             --whatif "$RUNNER_TEMP/foundation-converged-whatif.json" \
             --subscription-id "$AZURE_SUBSCRIPTION_ID" \
             --resource-group "$AZURE_RESOURCE_GROUP" \
@@ -680,6 +692,9 @@ jobs:
             --parameters-file "$RUNNER_TEMP/foundation-parameters.txt" \
             --output "$RUNNER_TEMP/foundation-converged-evidence.json"
           rm -f "$RUNNER_TEMP/foundation-converged-whatif.json"
+          python scripts/whatif_classification.py convergence-check \
+            --plan "$RUNNER_TEMP/plan-evidence/foundation-plan-evidence.json" \
+            --converged "$RUNNER_TEMP/foundation-converged-evidence.json"
           {
             printf '## OPTIMA foundation apply\n\n'
             printf -- '- Operation: `foundation-apply` (foundation resources only)\n'
