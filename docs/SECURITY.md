@@ -235,7 +235,7 @@ Both Dockerfiles use these registry-resolved manifest-list digests:
 * Azure Linux Python 3.12 builder:
   `sha256:0b729c82c0ddc0769248e287d7414f0cc4e42ae4aa5b786aa99883c247e42bdb`
 * Azure Linux non-root distroless Python 3.12 runtime:
-  `sha256:d921452dba64944bf959f22450bb3740f5b2fff4a59faa64bd6b8eaf4c57b5b8`
+  `sha256:6f7e96128ee1c66f167d8512178c0f6b43eca6dcdd9cd544a591f27ee5d75a4b`
 
 The uv, builder, and runtime bases each produced zero Trivy vulnerability and
 secret findings at the reviewed digests. The rejected Debian base had applicable
