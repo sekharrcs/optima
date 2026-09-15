@@ -804,3 +804,226 @@ def test_canonical_object_order_numeric_equivalence_and_input_immutability() -> 
     reordered["changes"][-1]["before"]["properties"]["capacity"] = Decimal("1.00")
     assert classify(reordered) == first
     assert document == snapshot
+
+
+# --- Regression: non-mutating echoed ``after`` and resourceGroup metadata ---
+# Redacted structural shape observed in foundation-plan run 34939984245: an
+# unchanged Microsoft.CognitiveServices/accounts Ignore whose before/after are
+# canonically identical identity/metadata (id, kind, location, name,
+# resourceGroup, sku, tags, type), with delta null and extension null.
+
+
+def echoed_before() -> dict[str, Any]:
+    """Identity/metadata-only payload matching the run 34939984245 shape."""
+    return {
+        "id": EXTERNAL_ID,
+        "type": EXTERNAL_TYPE,
+        "name": "synthetic-external",
+        "kind": "OpenAI",
+        "location": "eastus2",
+        "resourceGroup": GROUP,
+        "sku": {"name": "S0"},
+        "tags": {
+            "application": "optima",
+            "environment": "hackathon",
+            "managedBy": "bicep",
+            "workload": "optima",
+        },
+    }
+
+
+def echoed_observation() -> dict[str, Any]:
+    """One Ignore whose non-empty after echoes an unchanged before."""
+    before = echoed_before()
+    return {
+        "resourceId": EXTERNAL_ID,
+        "changeType": "Ignore",
+        "before": before,
+        "after": copy.deepcopy(before),
+        "delta": None,
+        "extension": None,
+    }
+
+
+def echoed_document() -> dict[str, Any]:
+    """Foundation what-if with the echoed-after external observation."""
+    document = foundation_document()
+    document["changes"][-1] = echoed_observation()
+    return document
+
+
+def echoed_classify(document: Any = None) -> classifier.FoundationWhatIfClassification:
+    """Classify the echoed document with the synthetic bound policy."""
+    return classifier.classify_foundation_whatif(
+        echoed_document() if document is None else document,
+        subscription_id=SUBSCRIPTION,
+        resource_group=GROUP,
+        external_policy=classifier.parse_external_observation_policy(policy_document()),
+    )
+
+
+def test_echoed_after_equal_to_before_is_accepted() -> None:
+    """A non-empty after canonically equal to before is a valid unchanged Ignore."""
+    result = echoed_classify()
+    assert len(result.allowed_changes) == 9
+    assert result.change_counts == {"Create": 9, "NoChange": 0}
+    assert len(result.external_observations) == 1
+    assert result.external_observations[0].resource_type == EXTERNAL_TYPE
+
+
+def test_echoed_after_key_order_does_not_change_acceptance() -> None:
+    """Different object-key order in after remains canonically equal to before."""
+    baseline = echoed_classify()
+    document = echoed_document()
+    after = document["changes"][-1]["after"]
+    reordered = {key: after[key] for key in reversed(list(after))}
+    document["changes"][-1]["after"] = reordered
+    assert echoed_classify(document) == baseline
+
+
+def test_echoed_after_is_fingerprinted_not_discarded() -> None:
+    """The accepted after is bound into evidence rather than silently dropped."""
+    without_after = echoed_document()
+    without_after["changes"][-1].pop("after")
+    assert (
+        echoed_classify().external_observations
+        != echoed_classify(without_after).external_observations
+    )
+    assert (
+        echoed_classify().change_fingerprint
+        != echoed_classify(without_after).change_fingerprint
+    )
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda a: a.update({"location": "westus2"}),
+        lambda a: a.update({"kind": "FormRecognizer"}),
+        lambda a: a.update({"name": "synthetic-external-2"}),
+        lambda a: a.update({"sku": {"name": "S1"}}),
+        lambda a: a["tags"].update({"environment": "prod"}),
+        lambda a: a.update({"extra": "unreviewed"}),
+        lambda a: a.pop("tags"),
+    ],
+    ids=["location", "kind", "name", "sku", "tag", "extra", "removed"],
+)
+def test_differing_after_is_rejected(mutate: Any) -> None:
+    """Any after not canonically identical to before is rejected."""
+    document = echoed_document()
+    mutate(document["changes"][-1]["after"])
+    with pytest.raises(classifier.WhatIfClassificationError):
+        echoed_classify(document)
+
+
+@pytest.mark.parametrize("value", [[], "string", 1, True, 0, {}])
+def test_scalar_array_or_empty_after_is_rejected(value: Any) -> None:
+    """after must be a non-empty object to represent an unchanged echo."""
+    document = echoed_document()
+    document["changes"][-1]["after"] = value
+    with pytest.raises(classifier.WhatIfClassificationError):
+        echoed_classify(document)
+
+
+@pytest.mark.parametrize("value", [None, {}, "string", 1])
+def test_present_after_never_substitutes_for_missing_before(value: Any) -> None:
+    """A present after can never authorize a missing or non-object before."""
+    document = echoed_document()
+    document["changes"][-1]["before"] = value
+    with pytest.raises(classifier.WhatIfClassificationError):
+        echoed_classify(document)
+
+
+def test_resource_group_case_insensitive_match_is_accepted() -> None:
+    """resourceGroup may differ only in casing from the bound scope."""
+    document = echoed_document()
+    for payload in ("before", "after"):
+        document["changes"][-1][payload]["resourceGroup"] = GROUP.upper()
+    result = echoed_classify(document)
+    assert len(result.external_observations) == 1
+
+
+@pytest.mark.parametrize("value", ["wrong-group", GROUP + "-x", "", 1, None, {}])
+def test_wrong_or_nonstring_resource_group_is_rejected(value: Any) -> None:
+    """resourceGroup must be a string agreeing with the bound scope."""
+    document = echoed_document()
+    for payload in ("before", "after"):
+        document["changes"][-1][payload]["resourceGroup"] = value
+    with pytest.raises(classifier.WhatIfClassificationError):
+        echoed_classify(document)
+
+
+def test_unreviewed_field_in_payload_is_rejected() -> None:
+    """The allowlist rejects an unexpected field even when before==after."""
+    document = echoed_document()
+    for payload in ("before", "after"):
+        document["changes"][-1][payload]["systemData"] = {"createdBy": "x"}
+    with pytest.raises(classifier.WhatIfClassificationError):
+        echoed_classify(document)
+
+
+def test_non_null_identity_in_payload_is_rejected() -> None:
+    """Non-null identity remains prohibited in both before and after."""
+    document = echoed_document()
+    for payload in ("before", "after"):
+        document["changes"][-1][payload]["identity"] = {"type": "SystemAssigned"}
+    with pytest.raises(classifier.WhatIfClassificationError):
+        echoed_classify(document)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"id": EXTERNAL_ID, "type": EXTERNAL_TYPE, "systemData": {}},
+        {"id": EXTERNAL_ID, "type": EXTERNAL_TYPE, "identity": {"type": "x"}},
+        {"id": EXTERNAL_ID},
+        {"id": EXTERNAL_ID, "type": EXTERNAL_TYPE, "resourceGroup": "wrong-group"},
+        {"id": EXTERNAL_ID, "type": EXTERNAL_TYPE, "resourceGroup": 1},
+        {"id": EXTERNAL_ID, "type": EXTERNAL_TYPE, "sku": []},
+        {"id": EXTERNAL_ID, "type": EXTERNAL_TYPE, "location": " "},
+    ],
+)
+def test_normalize_external_payload_validates_any_payload(bad: dict[str, Any]) -> None:
+    """The shared validator applies identically to whichever payload is supplied."""
+    parsed = classifier._parse_resource_id(
+        EXTERNAL_ID, subscription_id=SUBSCRIPTION, resource_group=GROUP
+    )
+    expected = {
+        "id": parsed.canonical_id,
+        "resourceId": parsed.canonical_id,
+        "type": parsed.resource_type,
+        "name": parsed.resource_name,
+    }
+    with pytest.raises(classifier.WhatIfClassificationError):
+        classifier._normalize_external_payload(
+            bad, expected=expected, resource_group=GROUP
+        )
+
+
+@pytest.mark.parametrize("change_type", ["Create", "Modify", "Delete"])
+def test_external_account_non_ignore_change_is_rejected(change_type: str) -> None:
+    """The external account may only be observed, never created/modified/deleted."""
+    document = echoed_document()
+    document["changes"][-1]["changeType"] = change_type
+    with pytest.raises(classifier.WhatIfClassificationError):
+        echoed_classify(document)
+
+
+def test_echoed_evidence_is_sanitized_and_replayable() -> None:
+    """Echoed-after evidence stays hashed and passes promotion replay and tamper."""
+    result = classifier.build_foundation_evidence(
+        echoed_classify(),
+        commit_sha="a" * 40,
+        parameter_fingerprint_value="b" * 64,
+        deployment_source_fingerprint_value="c" * 64,
+        deployment_source_file_count=3,
+    )
+    serialized = json.dumps(result)
+    for sensitive in (SUBSCRIPTION, EXTERNAL_ID, "synthetic-external", "eastus2"):
+        assert sensitive not in serialized
+    assert len(result["external_observations"]) == 1
+    classifier.compare_promotion_evidence(result, copy.deepcopy(result))
+    tampered = copy.deepcopy(result)
+    tampered["external_observations"][0]["payload_fingerprint"] = "d" * 64
+    with pytest.raises(classifier.WhatIfClassificationError):
+        classifier.compare_promotion_evidence(result, tampered)
