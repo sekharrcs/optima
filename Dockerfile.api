@@ -14,7 +14,7 @@ RUN uv sync --frozen --no-dev --no-editable --no-cache \
     && ./.venv/bin/python scripts/prune_runtime_artifacts.py --environment-root /app/.venv --verify-only \
     && ./.venv/bin/python scripts/generate_sbom.py --component api --output /app/sbom/api.cdx.json
 
-FROM mcr.microsoft.com/azurelinux/distroless/python:3.12-nonroot@sha256:d921452dba64944bf959f22450bb3740f5b2fff4a59faa64bd6b8eaf4c57b5b8 AS runtime
+FROM mcr.microsoft.com/azurelinux/distroless/python:3.12-nonroot@sha256:6f7e96128ee1c66f167d8512178c0f6b43eca6dcdd9cd544a591f27ee5d75a4b AS runtime
 ENV PATH=/app/.venv/bin:$PATH \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1

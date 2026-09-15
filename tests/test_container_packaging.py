@@ -20,17 +20,17 @@ ROOT = Path(__file__).resolve().parents[1]
 VERIFY_SCRIPT = ROOT / "scripts" / "verify_container_artifacts.py"
 TRUSTED_BASE_MANIFEST = ROOT / "security" / "config" / "pinned-runtime-base.json"
 RUNTIME_BASE_INDEX = (
-    "sha256:d921452dba64944bf959f22450bb3740f5b2fff4a59faa64bd6b8eaf4c57b5b8"
+    "sha256:6f7e96128ee1c66f167d8512178c0f6b43eca6dcdd9cd544a591f27ee5d75a4b"
 )
 RUNTIME_BASE_MANIFEST = (
-    "sha256:62e947ec7edfe308b97cebfab4e89e413c66a63ffcb3c021cb25ff3b70332639"
+    "sha256:6bd6ddfae11fbfd0704d6bdb16f4e654c42582795d970abf117525359cc1bb3c"
 )
 RUNTIME_BASE_CONFIG = (
-    "sha256:18da20740c8286c11f78700fe506957a8009f2cc3291c8cc8288454b2cae7511"
+    "sha256:0c760acdff9fd44b562faf244839b09d530c1634fb011f2b30dd9433a663dc4a"
 )
 RUNTIME_BASE_DIFF_IDS = [
-    "sha256:e7cf7da29bd85aa6f70e9b80640e82141e6e20112096c8adbb3ebd8174aa3965",
-    "sha256:81d1727fb374caf1bbd1183d3fd22d4bc8d87a48a25f51a4b07bac7ebb200b79",
+    "sha256:8da9a9f4d5465b0a2b1004e7fdc8d1a4b124aed6fb5922c293e3e37ebb5e7b93",
+    "sha256:c46e5b9a9b7da5fec9e77b741a6f961a5d88d7b2dccd88d89813e5c57e9c3802",
 ]
 
 
@@ -642,7 +642,7 @@ def test_container_base_images_pin_reviewed_manifest_digests() -> None:
     )
     expected_runtime = (
         "mcr.microsoft.com/azurelinux/distroless/python:3.12-nonroot@"
-        "sha256:d921452dba64944bf959f22450bb3740f5b2fff4a59faa64bd6b8eaf4c57b5b8"
+        "sha256:6f7e96128ee1c66f167d8512178c0f6b43eca6dcdd9cd544a591f27ee5d75a4b"
     )
     expected_uv = (
         "ghcr.io/astral-sh/uv:0.12.5@"
@@ -795,9 +795,9 @@ def test_trusted_runtime_base_manifest_pins_reviewed_provenance() -> None:
             "mode": "0600",
             "path": "var/cache/ldconfig/aux-cache",
             "sha256": (
-                "4730ffbcc3c3ab820172649e4422c98dbcbf4f1fa5692913341537e3be894584"
+                "17c2fad567fbc99026f0b9942d6e6c31818c90c4d4c2da2dc7af979e6e24f21b"
             ),
-            "size": 3567,
+            "size": 3447,
             "type": "file",
             "uid": 0,
         },

@@ -40,15 +40,15 @@ Component = Literal["api", "ui"]
 
 PINNED_BASE_IDENTITIES = {
     (
-        "sha256:d921452dba64944bf959f22450bb3740f5b2fff4a59faa64bd6b8eaf4c57b5b8",
+        "sha256:6f7e96128ee1c66f167d8512178c0f6b43eca6dcdd9cd544a591f27ee5d75a4b",
         "linux",
         "amd64",
     ): {
         "config_digest": (
-            "sha256:18da20740c8286c11f78700fe506957a8009f2cc3291c8cc8288454b2cae7511"
+            "sha256:0c760acdff9fd44b562faf244839b09d530c1634fb011f2b30dd9433a663dc4a"
         ),
         "manifest_digest": (
-            "sha256:62e947ec7edfe308b97cebfab4e89e413c66a63ffcb3c021cb25ff3b70332639"
+            "sha256:6bd6ddfae11fbfd0704d6bdb16f4e654c42582795d970abf117525359cc1bb3c"
         ),
     }
 }
