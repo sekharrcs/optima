@@ -642,11 +642,15 @@ def _validate_change_semantics(
             before is not None
             and after is not None
             and _canonical_json_text(before) != _canonical_json_text(after)
-        ) or change.get("delta") not in (None, []):
+        ):
             raise WhatIfClassificationError(
                 WhatIfClassificationCode.MALFORMED_CHANGE,
                 "NoChange evidence contains a contradictory payload",
             )
+        # A non-empty NoChange delta is deferred here: it is accepted only by the
+        # dedicated LAW NoEffect validator after the resource is mapped to its
+        # exact managed role/type, and otherwise fails closed. An empty or absent
+        # delta keeps the existing default NoChange contract.
     return change_type
 
 
@@ -809,23 +813,60 @@ _PROVIDER_ECHO_INDEX = {
     for rule in _PROVIDER_ECHO_RULES
 }
 
+# The single approved NoChange/NoEffect exception. ARM what-if annotates the Log
+# Analytics workspace `properties.features` desired-state block as `NoEffect` on
+# an otherwise unchanged resource. This is validated by a dedicated closed-schema
+# validator, never by the Modify provider-echo flattener.
+_LAW_NOEFFECT_ROLE = "log_analytics_workspace"
+_LAW_NOEFFECT_TYPE = "microsoft.operationalinsights/workspaces"
+_LAW_NOEFFECT_PATH = "properties.features"
+_LAW_NOEFFECT_OPERATION = "NoEffect"
+_LAW_NOEFFECT_NODE_FIELDS = frozenset(
+    {"path", "propertyChangeType", "before", "after", "children"}
+)
+_LAW_FEATURES_DESIRED_STATE = {
+    "disableLocalAuth": True,
+    "enableDataExport": False,
+    "enableLogAccessUsingOnlyResourcePermissions": True,
+    "immediatePurgeDataOn30Days": True,
+}
+_LAW_FEATURES_FINGERPRINT = (
+    "07b68d0b7cd33c7cdb95fc85fe98768406c8d4ba1b20719d8768a0dca0cdb413"
+)
+
 
 def convergence_policy_fingerprint() -> str:
-    """Bind the exact set of approved provider-echo rules for tamper detection."""
+    """Bind the approved provider-echo rules and NoEffect exception for tamper
+    detection."""
     return _versioned_fingerprint(
         CONVERGENCE_POLICY_FINGERPRINT_VERSION,
-        [
-            {
-                "resource_role": rule.resource_role,
-                "resource_type": rule.resource_type,
-                "json_path": rule.json_path,
-                "operation": rule.operation,
-                "before_kind": rule.before_kind,
-                "after_kind": rule.after_kind,
-                "profile": rule.profile,
-            }
-            for rule in _PROVIDER_ECHO_RULES
-        ],
+        {
+            "provider_echo_rules": [
+                {
+                    "resource_role": rule.resource_role,
+                    "resource_type": rule.resource_type,
+                    "json_path": rule.json_path,
+                    "operation": rule.operation,
+                    "before_kind": rule.before_kind,
+                    "after_kind": rule.after_kind,
+                    "profile": rule.profile,
+                }
+                for rule in _PROVIDER_ECHO_RULES
+            ],
+            "noeffect_nochange_exceptions": [
+                {
+                    "resource_role": _LAW_NOEFFECT_ROLE,
+                    "resource_type": _LAW_NOEFFECT_TYPE,
+                    "json_path": _LAW_NOEFFECT_PATH,
+                    "operation": _LAW_NOEFFECT_OPERATION,
+                    "before_kind": "null",
+                    "children_kind": "null",
+                    "after_fingerprint": _LAW_FEATURES_FINGERPRINT,
+                    "requires_resource_before_after_identical": True,
+                    "requires_extension_null": True,
+                }
+            ],
+        },
     )
 
 
@@ -999,6 +1040,64 @@ def _normalize_managed_change(
             )
         )
     return observations
+
+
+def _validate_law_noeffect_nochange(
+    change: dict[str, Any],
+    *,
+    resource_role: str,
+    resource_type: str,
+) -> None:
+    """Accept exactly the observed Log Analytics NoChange/NoEffect delta.
+
+    This closed-schema validator is intentionally separate from the Modify
+    provider-echo flattener. It fails closed on any deviation from the single
+    captured shape: a resource-level NoChange (before and after identical
+    non-empty objects, extension null) carrying exactly one leaf delta node that
+    annotates ``properties.features`` as ``NoEffect`` with a null before, a null
+    children, and an after equal to the pinned desired-state features object.
+    """
+    before = change.get("before")
+    after = change.get("after")
+    delta = change.get("delta")
+
+    reject = (
+        resource_role != _LAW_NOEFFECT_ROLE
+        or resource_type != _LAW_NOEFFECT_TYPE
+        or not isinstance(before, dict)
+        or not before
+        or not isinstance(after, dict)
+        or not after
+        or _canonical_json_text(before) != _canonical_json_text(after)
+        or change.get("extension") is not None
+        or not isinstance(delta, list)
+        or len(delta) != 1
+    )
+
+    if not reject and isinstance(delta, list):
+        node = delta[0]
+        node_after = node.get("after") if isinstance(node, dict) else None
+        reject = (
+            not isinstance(node, dict)
+            or set(node) != _LAW_NOEFFECT_NODE_FIELDS
+            or node.get("path") != _LAW_NOEFFECT_PATH
+            or node.get("propertyChangeType") != _LAW_NOEFFECT_OPERATION
+            or node.get("before") is not None
+            or node.get("children") is not None
+            or not isinstance(node_after, dict)
+            or _canonical_json_text(node_after)
+            != _canonical_json_text(_LAW_FEATURES_DESIRED_STATE)
+            or hashlib.sha256(
+                _canonical_json_text(node_after).encode("utf-8")
+            ).hexdigest()
+            != _LAW_FEATURES_FINGERPRINT
+        )
+
+    if reject:
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.MALFORMED_CHANGE,
+            "NoChange evidence contains a contradictory payload",
+        )
 
 
 def classify_foundation_whatif(
@@ -1200,6 +1299,12 @@ def classify_foundation_whatif(
             )
             effective_type = "NoChange"
         else:
+            if change_type == "NoChange" and change.get("delta") not in (None, []):
+                _validate_law_noeffect_nochange(
+                    change,
+                    resource_role=role,
+                    resource_type=resource_type,
+                )
             effective_type = change_type
         counts[effective_type] += 1
         allowed.append(

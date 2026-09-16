@@ -11,7 +11,12 @@ that evidence v3 binds the normalization policy without leaking sensitive values
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
+import os
+import shutil
+import subprocess
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -149,10 +154,64 @@ def _appi_change(*, delta: list[dict[str, Any]] | None = None) -> dict[str, Any]
     }
 
 
+LAW_ID = _ID_BY_ROLE["log_analytics_workspace"]
+
+_UNSET = object()
+
+
+def _law_features() -> dict[str, Any]:
+    """The pinned Log Analytics desired-state features object."""
+    return {
+        "disableLocalAuth": True,
+        "enableDataExport": False,
+        "enableLogAccessUsingOnlyResourcePermissions": True,
+        "immediatePurgeDataOn30Days": True,
+    }
+
+
+def _law_payload() -> dict[str, Any]:
+    """A representative non-empty Log Analytics resource payload."""
+    return {"properties": {"retentionInDays": 30, "features": _law_features()}}
+
+
+def _law_noeffect_delta() -> list[dict[str, Any]]:
+    """The single observed Log Analytics NoChange/NoEffect leaf node."""
+    return [
+        {
+            "path": "properties.features",
+            "propertyChangeType": "NoEffect",
+            "before": None,
+            "after": _law_features(),
+            "children": None,
+        }
+    ]
+
+
+def _law_change(
+    *,
+    before: dict[str, Any] | None = None,
+    after: dict[str, Any] | None = None,
+    delta: Any = _UNSET,
+    extension: Any = _UNSET,
+) -> dict[str, Any]:
+    """Build the observed Log Analytics NoChange resource carrying a NoEffect delta."""
+    change: dict[str, Any] = {
+        "resourceId": LAW_ID,
+        "changeType": "NoChange",
+        "before": _law_payload() if before is None else before,
+        "after": _law_payload() if after is None else after,
+        "delta": _law_noeffect_delta() if delta is _UNSET else delta,
+    }
+    if extension is not _UNSET:
+        change["extension"] = extension
+    return change
+
+
 def deployed_document(
     *,
     cosmos: dict[str, Any] | None = None,
     appi: dict[str, Any] | None = None,
+    law: dict[str, Any] | None = None,
     extra: tuple[dict[str, Any], ...] = (),
 ) -> dict[str, Any]:
     """Reproduce the observed deployed-state what-if for the ten-resource graph."""
@@ -162,6 +221,8 @@ def deployed_document(
             changes.append(cosmos if cosmos is not None else _cosmos_change())
         elif role == "application_insights":
             changes.append(appi if appi is not None else _appi_change())
+        elif role == "log_analytics_workspace":
+            changes.append(law if law is not None else _law_change())
         else:
             changes.append(
                 {
@@ -774,3 +835,230 @@ def test_captured_azure_delta_tree_normalizes_exactly_five() -> None:
         ),
         ("cosmos_account", "properties.sqlEndpoint", "Delete"),
     ]
+
+
+# --- LAW NoChange/NoEffect exception -----------------------------------------
+
+_LAW_FEATURES_FINGERPRINT = (
+    "07b68d0b7cd33c7cdb95fc85fe98768406c8d4ba1b20719d8768a0dca0cdb413"
+)
+_CONVERGENCE_POLICY_FINGERPRINT = (
+    "2f6482033f271c0504e2ef14c8a54e9170ca1e530c18c307613c1735b9bd21c6"
+)
+
+
+def _law_node(**overrides: Any) -> dict[str, Any]:
+    """Build the observed NoEffect leaf node, applying field overrides."""
+    node: dict[str, Any] = {
+        "path": "properties.features",
+        "propertyChangeType": "NoEffect",
+        "before": None,
+        "after": _law_features(),
+        "children": None,
+    }
+    node.update(overrides)
+    return node
+
+
+def test_law_noeffect_nochange_is_accepted_as_a_normal_nochange() -> None:
+    """The observed Log Analytics NoEffect delta classifies as a NoChange fact."""
+    result = classify(deployed_document())
+    assert result.change_counts == {"Create": 0, "NoChange": 10}
+    law = next(
+        item
+        for item in result.allowed_changes
+        if item.resource_role == "log_analytics_workspace"
+    )
+    assert law.change_type == "NoChange"
+    # The exception adds no sixth normalized Modify observation.
+    assert len(result.normalized_observations) == 5
+    assert "log_analytics_workspace" not in {
+        obs.resource_role for obs in result.normalized_observations
+    }
+    assert result.residual_unapproved_change_count == 0
+
+
+def test_law_noeffect_delta_binds_into_the_raw_change_fingerprint() -> None:
+    """The accepted NoEffect delta is bound into the raw change fingerprint."""
+    with_delta = classify(deployed_document()).change_fingerprint
+    without_delta = classify(
+        deployed_document(
+            law={
+                "resourceId": LAW_ID,
+                "changeType": "NoChange",
+                "before": {"p": 1},
+                "after": {"p": 1},
+                "delta": [],
+            }
+        )
+    ).change_fingerprint
+    assert with_delta != without_delta
+
+
+def test_law_noeffect_evidence_keeps_residual_zero_and_schema_v3() -> None:
+    """Evidence v3 records LAW as a NoChange fact with residual zero."""
+    result = evidence(deployed_document())
+    assert result["schema_version"].endswith("-v3")
+    normalizations = result["normalizations"]
+    assert normalizations["residual_unapproved_change_count"] == 0
+    assert len(normalizations["observations"]) == 5
+
+
+_LAW_NEGATIVE_DELTAS: dict[str, Any] = {
+    "absent_children": lambda: _law_change(
+        delta=[{k: v for k, v in _law_node().items() if k != "children"}]
+    ),
+    "empty_children_list": lambda: _law_change(delta=[_law_node(children=[])]),
+    "nonempty_children_list": lambda: _law_change(
+        delta=[_law_node(children=[_law_node()])]
+    ),
+    "recursive_descendants": lambda: _law_change(
+        delta=[_law_node(children=[{"path": "x", "children": [_law_node()]}])]
+    ),
+    "wrong_path": lambda: _law_change(
+        delta=[_law_node(path="properties.retentionInDays")]
+    ),
+    "wrong_operation": lambda: _law_change(
+        delta=[_law_node(propertyChangeType="Modify")]
+    ),
+    "unknown_field": lambda: _law_change(delta=[{**_law_node(), "unexpected": True}]),
+    "missing_before_field": lambda: _law_change(
+        delta=[{k: v for k, v in _law_node().items() if k != "before"}]
+    ),
+    "before_not_null": lambda: _law_change(delta=[_law_node(before={"x": 1})]),
+    "arbitrary_after_object": lambda: _law_change(
+        delta=[_law_node(after={"disableLocalAuth": True})]
+    ),
+    "tampered_after_value": lambda: _law_change(
+        delta=[_law_node(after={**_law_features(), "disableLocalAuth": False})]
+    ),
+    "more_than_one_delta_entry": lambda: _law_change(delta=[_law_node(), _law_node()]),
+    "resource_before_after_inequality": lambda: _law_change(
+        after={"properties": {"retentionInDays": 90, "features": _law_features()}}
+    ),
+    "empty_before_after_objects": lambda: _law_change(before={}, after={}),
+    "non_null_extension": lambda: _law_change(extension={"resourceId": "x"}),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_LAW_NEGATIVE_DELTAS))
+def test_law_noeffect_variants_fail_closed(name: str) -> None:
+    """Every deviation from the single captured LAW NoEffect shape fails closed."""
+    _assert_code(
+        deployed_document(law=_LAW_NEGATIVE_DELTAS[name]()),
+        WhatIfClassificationCode.MALFORMED_CHANGE,
+    )
+
+
+def test_law_noeffect_delta_on_a_non_law_resource_fails_closed() -> None:
+    """A NoEffect delta on any non-LAW managed role is rejected via the validator."""
+    with pytest.raises(WhatIfClassificationError) as error:
+        classifier._validate_law_noeffect_nochange(
+            _law_change(),
+            resource_role="cosmos_account",
+            resource_type="microsoft.documentdb/databaseaccounts",
+        )
+    assert error.value.code is WhatIfClassificationCode.MALFORMED_CHANGE
+
+
+def test_plain_nochange_without_delta_keeps_default_contract() -> None:
+    """An empty/absent NoChange delta stays accepted under existing semantics."""
+    result = classify(
+        deployed_document(
+            law={
+                "resourceId": LAW_ID,
+                "changeType": "NoChange",
+                "before": {"p": 1},
+                "after": {"p": 1},
+                "delta": [],
+            }
+        )
+    )
+    assert result.change_counts == {"Create": 0, "NoChange": 10}
+
+
+def test_contradictory_nochange_before_after_still_rejected() -> None:
+    """A contradictory NoChange before/after payload still fails closed."""
+    _assert_code(
+        deployed_document(
+            law={
+                "resourceId": LAW_ID,
+                "changeType": "NoChange",
+                "before": {"p": 1},
+                "after": {"p": 2},
+                "delta": [],
+            }
+        ),
+        WhatIfClassificationCode.MALFORMED_CHANGE,
+    )
+
+
+def test_convergence_policy_fingerprint_binds_the_law_exception() -> None:
+    """The convergence-policy fingerprint deterministically binds the LAW rule."""
+    assert (
+        classifier.convergence_policy_fingerprint() == _CONVERGENCE_POLICY_FINGERPRINT
+    )
+    assert classifier._LAW_FEATURES_FINGERPRINT == _LAW_FEATURES_FINGERPRINT
+    canonical = classifier._canonical_json_text(classifier._LAW_FEATURES_DESIRED_STATE)
+    assert (
+        hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        == _LAW_FEATURES_FINGERPRINT
+    )
+
+
+def test_convergence_policy_fingerprint_changed_from_echo_only() -> None:
+    """Binding the LAW exception changes the fingerprint from the echo-only value."""
+    echo_only = classifier._versioned_fingerprint(
+        classifier.CONVERGENCE_POLICY_FINGERPRINT_VERSION,
+        [
+            {
+                "resource_role": rule.resource_role,
+                "resource_type": rule.resource_type,
+                "json_path": rule.json_path,
+                "operation": rule.operation,
+                "before_kind": rule.before_kind,
+                "after_kind": rule.after_kind,
+                "profile": rule.profile,
+            }
+            for rule in classifier._PROVIDER_ECHO_RULES
+        ],
+    )
+    assert classifier.convergence_policy_fingerprint() != echo_only
+
+
+def test_five_provider_echo_rules_remain_unchanged() -> None:
+    """The five Modify provider-echo rules stay intact alongside the exception."""
+    assert len(classifier._PROVIDER_ECHO_RULES) == 5
+    result = classify(deployed_document())
+    assert len(result.normalized_observations) == 5
+
+
+@pytest.fixture(scope="module")
+def compiled_monitoring() -> dict[str, Any]:
+    """Compile the monitoring module with the pinned standalone Bicep executable."""
+    command = os.environ.get("OPTIMA_BICEP_COMMAND") or shutil.which("bicep")
+    if command is None:
+        pytest.skip("Set OPTIMA_BICEP_COMMAND to the Bicep 0.46.1 executable")
+    root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(  # noqa: S603
+        [command, "build", str(root / "infra/modules/monitoring.bicep"), "--stdout"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    template: dict[str, Any] = json.loads(result.stdout)
+    return template
+
+
+def test_compiled_monitoring_features_match_classifier_expectation(
+    compiled_monitoring: dict[str, Any],
+) -> None:
+    """The compiled Log Analytics features stay synchronized with the classifier."""
+    workspace = compiled_monitoring["resources"]["workspace"]
+    features = workspace["properties"]["features"]
+    assert features == classifier._LAW_FEATURES_DESIRED_STATE
+    canonical = classifier._canonical_json_text(features)
+    assert (
+        hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        == classifier._LAW_FEATURES_FINGERPRINT
+    )
