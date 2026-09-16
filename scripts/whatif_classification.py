@@ -829,8 +829,21 @@ def convergence_policy_fingerprint() -> str:
     )
 
 
+_DELTA_NODE_FIELDS = frozenset(
+    {"path", "propertyChangeType", "before", "after", "children"}
+)
+
+
 def _flatten_delta(delta: Any, prefix: str) -> list[tuple[str, str, Any, Any]]:
-    """Flatten a what-if delta tree into fully qualified leaf property changes."""
+    """Flatten a what-if delta tree into fully qualified leaf property changes.
+
+    Every node is validated against the closed what-if delta schema. Leaf nodes
+    must carry both an explicit before and after key (an absent key is rejected
+    even when the reviewed value is null). Parent nodes must be a ``Modify`` that
+    carries no reviewed before/after payload and a non-empty children list. Path
+    segments must be single, unambiguous, control-free property names. Every
+    malformed shape fails closed as a sanitized normalization rejection.
+    """
     leaves: list[tuple[str, str, Any, Any]] = []
     if delta is None:
         return leaves
@@ -840,7 +853,7 @@ def _flatten_delta(delta: Any, prefix: str) -> list[tuple[str, str, Any, Any]]:
             "Managed modification has a malformed delta payload",
         )
     for entry in delta:
-        if not isinstance(entry, dict):
+        if not isinstance(entry, dict) or set(entry) - _DELTA_NODE_FIELDS:
             raise WhatIfClassificationError(
                 WhatIfClassificationCode.NORMALIZATION_REJECTED,
                 "Managed modification has a malformed delta entry",
@@ -851,21 +864,37 @@ def _flatten_delta(delta: Any, prefix: str) -> list[tuple[str, str, Any, Any]]:
             not isinstance(segment, str)
             or not segment
             or "/" in segment
+            or "." in segment
             or _has_control_character(segment)
             or not isinstance(operation, str)
+            or not operation
         ):
             raise WhatIfClassificationError(
                 WhatIfClassificationCode.NORMALIZATION_REJECTED,
                 "Managed modification has a malformed delta entry",
             )
         full_path = f"{prefix}.{segment}" if prefix else segment
-        children = entry.get("children")
-        if children not in (None, []):
+        if "children" in entry:
+            children = entry["children"]
+            if (
+                operation != "Modify"
+                or "before" in entry
+                or "after" in entry
+                or not isinstance(children, list)
+                or not children
+            ):
+                raise WhatIfClassificationError(
+                    WhatIfClassificationCode.NORMALIZATION_REJECTED,
+                    "Managed modification has a malformed delta parent",
+                )
             leaves.extend(_flatten_delta(children, full_path))
         else:
-            leaves.append(
-                (full_path, operation, entry.get("before"), entry.get("after"))
-            )
+            if "before" not in entry or "after" not in entry:
+                raise WhatIfClassificationError(
+                    WhatIfClassificationCode.NORMALIZATION_REJECTED,
+                    "Managed modification delta leaf omits before or after",
+                )
+            leaves.append((full_path, operation, entry["before"], entry["after"]))
     return leaves
 
 

@@ -641,3 +641,136 @@ def test_external_aoai_policy_stays_separate_and_unchanged() -> None:
     assert result.external_observations[0].policy_fingerprint == (
         classifier.external_policy_fingerprint(policy)
     )
+
+
+# --- Delta-parser hardening (closed field schema, fail closed) ---------------
+
+
+def _cosmos_with(delta: list[dict[str, Any]]) -> dict[str, Any]:
+    return deployed_document(cosmos=_cosmos_change(delta=delta))
+
+
+_APPROVED_SQL_LEAF = {
+    "path": "sqlEndpoint",
+    "propertyChangeType": "Delete",
+    "before": COSMOS_ENDPOINT,
+    "after": None,
+}
+
+
+MALFORMED_DELTAS = {
+    "missing_before_where_null_expected": lambda: deployed_document(
+        appi=_appi_change(
+            delta=[
+                {
+                    "path": "properties",
+                    "propertyChangeType": "Modify",
+                    "children": [
+                        {
+                            "path": "Flow_Type",
+                            "propertyChangeType": "Create",
+                            "after": "Bluefield",
+                        }
+                    ],
+                }
+            ]
+        )
+    ),
+    "missing_after_where_null_expected": lambda: _cosmos_with(
+        [
+            {
+                "path": "properties",
+                "propertyChangeType": "Modify",
+                "children": [
+                    {
+                        "path": "sqlEndpoint",
+                        "propertyChangeType": "Delete",
+                        "before": COSMOS_ENDPOINT,
+                    }
+                ],
+            }
+        ]
+    ),
+    "parent_delete_operation": lambda: _cosmos_with(
+        [
+            {
+                "path": "properties",
+                "propertyChangeType": "Delete",
+                "children": [dict(_APPROVED_SQL_LEAF)],
+            }
+        ]
+    ),
+    "parent_unknown_operation": lambda: _cosmos_with(
+        [
+            {
+                "path": "properties",
+                "propertyChangeType": "Frobnicate",
+                "children": [dict(_APPROVED_SQL_LEAF)],
+            }
+        ]
+    ),
+    "parent_before_after_mutation": lambda: _cosmos_with(
+        [
+            {
+                "path": "properties",
+                "propertyChangeType": "Modify",
+                "before": {"analyticalStorageSchemaType": "WellDefined"},
+                "after": {"analyticalStorageSchemaType": "FullFidelity"},
+                "children": [dict(_APPROVED_SQL_LEAF)],
+            }
+        ]
+    ),
+    "unknown_node_field": lambda: _cosmos_with(
+        [
+            {
+                "path": "properties",
+                "propertyChangeType": "Modify",
+                "children": [{**_APPROVED_SQL_LEAF, "unexpected": True}],
+            }
+        ]
+    ),
+    "empty_children": lambda: _cosmos_with(
+        [{"path": "properties", "propertyChangeType": "Modify", "children": []}]
+    ),
+    "malformed_children": lambda: _cosmos_with(
+        [{"path": "properties", "propertyChangeType": "Modify", "children": "nope"}]
+    ),
+    "ambiguous_path_segmentation": lambda: _cosmos_with(
+        [
+            {
+                "path": "properties.sqlEndpoint",
+                "propertyChangeType": "Delete",
+                "before": COSMOS_ENDPOINT,
+                "after": None,
+            }
+        ]
+    ),
+}
+
+
+@pytest.mark.parametrize("name", sorted(MALFORMED_DELTAS))
+def test_malformed_delta_nodes_fail_closed(name: str) -> None:
+    """Every malformed delta node fails closed as a sanitized normalization."""
+    _assert_code(
+        MALFORMED_DELTAS[name](), WhatIfClassificationCode.NORMALIZATION_REJECTED
+    )
+
+
+def test_captured_azure_delta_tree_normalizes_exactly_five() -> None:
+    """A valid nested Azure delta tree normalizes exactly the five approved echoes."""
+    result = classify(deployed_document())
+    observed = sorted(
+        (obs.resource_role, obs.json_path, obs.operation)
+        for obs in result.normalized_observations
+    )
+    assert observed == [
+        ("application_insights", "properties.Flow_Type", "Create"),
+        ("application_insights", "properties.Request_Source", "Create"),
+        ("cosmos_account", "properties.analyticalStorageConfiguration", "Delete"),
+        (
+            "cosmos_account",
+            "properties.enablePerRegionPerPartitionAutoscale",
+            "Delete",
+        ),
+        ("cosmos_account", "properties.sqlEndpoint", "Delete"),
+    ]
