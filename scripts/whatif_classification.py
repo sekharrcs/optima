@@ -566,11 +566,27 @@ def _validate_change_semantics(
             "Foundation what-if must not modify existing resources",
         )
     if change_type == "Ignore" and allow_external_ignore:
+        before = change.get("before")
+        after = change.get("after")
+        # A non-null after is permitted only when it echoes an unchanged
+        # resource: a non-empty object whose canonical JSON equals before.
+        # This raw canonical-equality gate is intentionally exact and
+        # case-sensitive, and it runs before identity normalization: only an
+        # Azure echo that is canonically byte-identical to before is accepted.
+        # Individual identity and resourceGroup binding checks stay
+        # case-insensitive by design; this stricter whole-payload equality is a
+        # deliberate fail-closed choice grounded in the observed identical echo.
+        after_is_mutating = after is not None and (
+            not isinstance(after, dict)
+            or not after
+            or _canonical_json_text(after) != _canonical_json_text(before)
+        )
         if (
-            not change.get("before")
-            or change.get("after") is not None
+            not isinstance(before, dict)
+            or not before
             or change.get("delta") not in (None, [])
             or change.get("extension") is not None
+            or after_is_mutating
         ):
             raise WhatIfClassificationError(
                 WhatIfClassificationCode.EXTERNAL_OBSERVATION_MISMATCH,
@@ -908,6 +924,77 @@ def external_policy_fingerprint(policy: ExternalObservationPolicy | None) -> str
     )
 
 
+_EXTERNAL_PAYLOAD_FIELDS = frozenset(
+    {
+        "id",
+        "resourceId",
+        "type",
+        "name",
+        "location",
+        "kind",
+        "apiVersion",
+        "resourceGroup",
+        "sku",
+        "tags",
+        "properties",
+        "identity",
+    }
+)
+
+
+def _normalize_external_payload(
+    payload: Mapping[str, Any],
+    *,
+    expected: Mapping[str, str],
+    resource_group: str,
+) -> dict[str, Any]:
+    """Validate one external before/after payload and canonicalize its identity.
+
+    The identical field allowlist and structural checks apply to whichever
+    payload is supplied, never accepting unreviewed identity, an unexpected
+    field, or a resource group outside the bound scope.
+    """
+    obj = dict(payload)
+    if (
+        set(obj) - _EXTERNAL_PAYLOAD_FIELDS
+        or not {"id", "type"}.issubset(obj)
+        or obj.get("identity") is not None
+    ):
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.EXTERNAL_OBSERVATION_MISMATCH,
+            "External payload contains unreviewed identity or fields",
+        )
+    for field in ("location", "kind", "apiVersion"):
+        if field in obj and (not isinstance(obj[field], str) or not obj[field].strip()):
+            raise WhatIfClassificationError(
+                WhatIfClassificationCode.EXTERNAL_OBSERVATION_MISMATCH,
+                "External payload has invalid metadata",
+            )
+    for field in ("sku", "tags", "properties"):
+        if field in obj and not isinstance(obj[field], dict):
+            raise WhatIfClassificationError(
+                WhatIfClassificationCode.EXTERNAL_OBSERVATION_MISMATCH,
+                "External payload has invalid properties",
+            )
+    if "resourceGroup" in obj:
+        group = obj["resourceGroup"]
+        if not isinstance(group, str) or group.casefold() != resource_group.casefold():
+            raise WhatIfClassificationError(
+                WhatIfClassificationCode.EXTERNAL_OBSERVATION_MISMATCH,
+                "External payload has an unreviewed resource group",
+            )
+        obj["resourceGroup"] = resource_group.casefold()
+    for field, value in expected.items():
+        if field in obj:
+            if not isinstance(obj[field], str) or obj[field].casefold() != value:
+                raise WhatIfClassificationError(
+                    WhatIfClassificationCode.EXTERNAL_OBSERVATION_MISMATCH,
+                    "External observation has contradictory identity metadata",
+                )
+            obj[field] = value
+    return obj
+
+
 def _canonical_external_change(
     change: Mapping[str, Any],
     *,
@@ -933,49 +1020,26 @@ def _canonical_external_change(
             WhatIfClassificationCode.EXTERNAL_OBSERVATION_MISMATCH,
             "External observation does not match its configured identity",
         )
-    before = dict(change["before"])
-    if (
-        set(before)
-        - {
-            "id",
-            "resourceId",
-            "type",
-            "name",
-            "location",
-            "kind",
-            "apiVersion",
-            "sku",
-            "tags",
-            "properties",
-            "identity",
-        }
-        or not {"id", "type"}.issubset(before)
-        or before.get("identity") is not None
-    ):
-        raise WhatIfClassificationError(
-            WhatIfClassificationCode.EXTERNAL_OBSERVATION_MISMATCH,
-            "External before payload contains unreviewed identity or fields",
-        )
-    for field in ("location", "kind", "apiVersion"):
-        if field in before and (
-            not isinstance(before[field], str) or not before[field].strip()
-        ):
-            raise WhatIfClassificationError(
-                WhatIfClassificationCode.EXTERNAL_OBSERVATION_MISMATCH,
-                "External before payload has invalid metadata",
-            )
-    for field in ("sku", "tags", "properties"):
-        if field in before and not isinstance(before[field], dict):
-            raise WhatIfClassificationError(
-                WhatIfClassificationCode.EXTERNAL_OBSERVATION_MISMATCH,
-                "External before payload has invalid properties",
-            )
     expected = {
         "id": resource_id.canonical_id,
         "resourceId": resource_id.canonical_id,
         "type": resource_id.resource_type,
         "name": resource_id.resource_name,
     }
+    before = _normalize_external_payload(
+        change["before"], expected=expected, resource_group=resource_group
+    )
+    after = change.get("after")
+    normalized_after: dict[str, Any] | None = None
+    if after is not None:
+        normalized_after = _normalize_external_payload(
+            after, expected=expected, resource_group=resource_group
+        )
+        if _canonical_json_text(normalized_after) != _canonical_json_text(before):
+            raise WhatIfClassificationError(
+                WhatIfClassificationCode.EXTERNAL_OBSERVATION_MISMATCH,
+                "External after payload is not identical to the before payload",
+            )
     identifiers = change.get("identifiers")
     if identifiers is not None and set(identifiers) - set(expected):
         raise WhatIfClassificationError(
@@ -983,23 +1047,23 @@ def _canonical_external_change(
             "External observation has unreviewed identifiers",
         )
     canonical_identifiers = None if identifiers is None else dict(identifiers)
-    for container in (before, canonical_identifiers):
-        if container is None:
-            continue
+    if canonical_identifiers is not None:
         for field, value in expected.items():
-            if field in container:
+            if field in canonical_identifiers:
                 if (
-                    not isinstance(container[field], str)
-                    or container[field].casefold() != value
+                    not isinstance(canonical_identifiers[field], str)
+                    or canonical_identifiers[field].casefold() != value
                 ):
                     raise WhatIfClassificationError(
                         WhatIfClassificationCode.EXTERNAL_OBSERVATION_MISMATCH,
                         "External observation has contradictory identity metadata",
                     )
-                container[field] = value
+                canonical_identifiers[field] = value
     canonical = dict(change)
     canonical["resourceId"] = resource_id.canonical_id
     canonical["before"] = before
+    if normalized_after is not None:
+        canonical["after"] = normalized_after
     if "identifiers" in change:
         canonical["identifiers"] = canonical_identifiers
     if change.get("deploymentId") is not None:
