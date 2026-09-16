@@ -643,3 +643,30 @@ production. Restoring cache requires an explicit true mode plus the same exact
 East US 2 `Balanced_B0`, provider, SKU, restriction, quota, RediSearch, embedding,
 pricing, access, and smoke gates. The absent East US 2 SKU remains a hard blocker;
 no SKU, region, service, or authentication fallback is selected automatically.
+
+## ADR-039: Manage the Smart Detection action group and normalize provider echoes
+
+The foundation now manages ten resources. Creating the workspace-based
+Application Insights component makes Azure auto-provision a global
+`Application Insights Smart Detection` action group, so the foundation adopts it
+in Bicep at its exact identity (enabled, `SmartDetect` short name, Monitoring
+Contributor and Monitoring Reader ARM-role receivers, no other receivers). The
+action group is a normal managed resource; any receiver, enabled, short-name, or
+location drift fails closed. The companion Failure Anomalies smart-detector alert
+rule is intentionally absent for the hackathon profile and
+`Microsoft.AlertsManagement` remains unregistered. Enabling failure-anomaly
+alerting later requires a separately approved provider registration plus an
+explicitly managed `smartDetectorAlertRules` resource. Adoption adds no fixed or
+usage cost.
+
+Seven category-A provider defaults are declared as explicit desired state so they
+converge to `NoChange`, and any later drift on them fails closed. Five category-B
+provider echoes that cannot be authored without semantic inconsistency are
+normalized only under an exact managed role, canonical resource type, JSON path,
+ARM delta operation, and constrained before/after value binding, gated by the
+required Cosmos analytical-disabled and serverless profiles and a canonical Cosmos
+endpoint derived from the managed account name. Evidence advances to v3, which
+rejects v2 documents, records each normalized delta as sanitized fingerprints,
+binds a convergence-policy fingerprint recomputed by promotion and convergence,
+and requires a residual unapproved-change count of zero. The single Azure OpenAI
+external observation policy stays separate and is never widened.

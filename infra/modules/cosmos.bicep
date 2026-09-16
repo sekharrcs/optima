@@ -36,6 +36,7 @@ resource account 'Microsoft.DocumentDB/databaseAccounts@2024-11-15' = {
       defaultConsistencyLevel: 'Session'
     }
     databaseAccountOfferType: 'Standard'
+    defaultIdentity: 'FirstPartyIdentity'
     disableKeyBasedMetadataWriteAccess: true
     disableLocalAuth: true
     enableAnalyticalStorage: false
@@ -76,6 +77,10 @@ resource runHistoryContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases
   properties: {
     options: {}
     resource: {
+      conflictResolutionPolicy: {
+        conflictResolutionPath: '/_ts'
+        mode: 'LastWriterWins'
+      }
       id: containerName
       indexingPolicy: {
         automatic: true

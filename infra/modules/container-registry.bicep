@@ -7,7 +7,7 @@ param registryName string
 @description('Common resource tags.')
 param tags object
 
-resource registry 'Microsoft.ContainerRegistry/registries@2023-07-01' = {
+resource registry 'Microsoft.ContainerRegistry/registries@2025-04-01' = {
   name: registryName
   location: location
   tags: tags
@@ -16,8 +16,17 @@ resource registry 'Microsoft.ContainerRegistry/registries@2023-07-01' = {
   }
   properties: {
     adminUserEnabled: false
+    anonymousPullEnabled: false
     dataEndpointEnabled: false
+    encryption: {
+      status: 'disabled'
+    }
     networkRuleBypassOptions: 'AzureServices'
+    policies: {
+      azureADAuthenticationAsArmPolicy: {
+        status: 'enabled'
+      }
+    }
     publicNetworkAccess: 'Enabled'
     zoneRedundancy: 'Disabled'
   }

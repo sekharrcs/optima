@@ -424,7 +424,7 @@ def test_environment_disables_platform_log_storage_for_all_execution_modes(
     ) == {"destination": None}
 
 
-def test_compiled_foundation_retains_exact_nine_resource_graph(
+def test_compiled_foundation_retains_exact_ten_resource_graph(
     compiled_foundation: dict[str, Any],
 ) -> None:
     """Keep foundation resources and conditions without claiming a live ARM preview."""
@@ -479,6 +479,7 @@ def test_compiled_foundation_retains_exact_nine_resource_graph(
             "Microsoft.ContainerRegistry/registries": 1,
             "Microsoft.OperationalInsights/workspaces": 1,
             "Microsoft.Insights/components": 1,
+            "Microsoft.Insights/actionGroups": 1,
             "Microsoft.DocumentDB/databaseAccounts": 1,
             "Microsoft.DocumentDB/databaseAccounts/sqlDatabases": 1,
             "Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers": 1,
@@ -493,6 +494,8 @@ def test_compiled_foundation_retains_exact_nine_resource_graph(
         environment["properties"], child_parameters(child), child["variables"]
     ) == {
         "appLogsConfiguration": {"destination": None},
+        "peerAuthentication": {"mtls": {"enabled": False}},
+        "peerTrafficConfiguration": {"encryption": {"enabled": False}},
         "publicNetworkAccess": "Enabled",
         "zoneRedundant": False,
     }

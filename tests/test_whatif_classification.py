@@ -47,6 +47,7 @@ FOUNDATION_IDS = (
         "/sqlDatabases/optima/containers/runs"
     ),
     f"{SCOPE}/Microsoft.App/managedEnvironments/cae-optima-hackathon",
+    f"{SCOPE}/Microsoft.Insights/actionGroups/Application Insights Smart Detection",
 )
 
 FOUNDATION_PARAMETERS = (
@@ -170,8 +171,8 @@ def test_expected_foundation_creates_are_approved() -> None:
     """Approve a first foundation deployment of only the expected resources."""
     classification = _classification()
 
-    assert classification.change_counts == {"Create": 9, "NoChange": 0}
-    assert len(classification.allowed_changes) == 9
+    assert classification.change_counts == {"Create": 10, "NoChange": 0}
+    assert len(classification.allowed_changes) == 10
     assert {change.resource_role for change in classification.allowed_changes} == {
         "api_identity",
         "application_insights",
@@ -181,6 +182,7 @@ def test_expected_foundation_creates_are_approved() -> None:
         "cosmos_database",
         "log_analytics_workspace",
         "managed_environment",
+        "smart_detection_action_group",
         "ui_identity",
     }
 
@@ -189,7 +191,7 @@ def test_idempotent_nochange_is_approved() -> None:
     """Approve an idempotent re-plan that reports only NoChange results."""
     classification = _classification(_foundation_nochanges())
 
-    assert classification.change_counts == {"Create": 0, "NoChange": 9}
+    assert classification.change_counts == {"Create": 0, "NoChange": 10}
 
 
 def test_missing_status_fails_closed() -> None:
@@ -232,11 +234,46 @@ def test_replacement_fails_closed() -> None:
 
 
 def test_unexpected_modify_fails_closed() -> None:
-    """Reject a modification of an existing foundation resource."""
-    _assert_code(
-        _document(_change("Microsoft.DocumentDB/databaseAccounts", "Modify")),
-        WhatIfClassificationCode.UNEXPECTED_MODIFY,
+    """Reject a genuine managed modification that is not an approved echo."""
+    cosmos_account_id = (
+        f"{SCOPE}/Microsoft.DocumentDB/databaseAccounts/{COSMOS_ACCOUNT}"
     )
+    changes = []
+    for resource_id in FOUNDATION_IDS:
+        if resource_id == cosmos_account_id:
+            changes.append(
+                _change_id(
+                    resource_id,
+                    "Modify",
+                    before={"properties": {}},
+                    after={"properties": {}},
+                    delta=[
+                        {
+                            "path": "properties",
+                            "propertyChangeType": "Modify",
+                            "children": [
+                                {
+                                    "path": "publicNetworkAccess",
+                                    "propertyChangeType": "Modify",
+                                    "before": "Enabled",
+                                    "after": "Disabled",
+                                }
+                            ],
+                        }
+                    ],
+                )
+            )
+        else:
+            changes.append(
+                _change_id(
+                    resource_id,
+                    "NoChange",
+                    before={"p": 1},
+                    after={"p": 1},
+                    delta=[],
+                )
+            )
+    _assert_code(_document(*changes), WhatIfClassificationCode.NORMALIZATION_REJECTED)
 
 
 def test_role_assignment_fails_closed() -> None:
@@ -466,7 +503,7 @@ def test_empty_reviewed_official_fields_are_accepted() -> None:
     document = _foundation_creates()
     document.update(potentialChanges=[], diagnostics=[], error=None)
 
-    assert len(_classification(document).allowed_changes) == 9
+    assert len(_classification(document).allowed_changes) == 10
 
 
 @pytest.mark.parametrize("potential_changes", [None, []])
@@ -765,7 +802,7 @@ def test_evidence_redacts_subscription_and_omits_resource_ids() -> None:
     assert "/subscriptions/" not in serialized
     assert evidence["schema_version"] == EVIDENCE_SCHEMA_VERSION
     assert evidence["classification"] == "APPROVED"
-    assert len(evidence["changes"]["resources"]) == 9
+    assert len(evidence["changes"]["resources"]) == 10
     assert (
         evidence["target"]["scope_fingerprint"] == _classification().scope_fingerprint
     )
@@ -811,7 +848,7 @@ def test_promotion_rejects_different_approved_change_set() -> None:
     plan = _evidence()
     apply = copy.deepcopy(plan)
     apply["changes"]["resources"][2]["change_type"] = "NoChange"
-    apply["changes"]["counts"] = {"Create": 8, "NoChange": 1}
+    apply["changes"]["counts"] = {"Create": 9, "NoChange": 1}
 
     with pytest.raises(WhatIfClassificationError) as error:
         compare_promotion_evidence(plan, apply)
@@ -855,7 +892,7 @@ def test_promotion_rejects_unknown_missing_or_contradictory_schema(
     elif mutation == "noncanonical_resource_order":
         apply["changes"]["resources"].reverse()
     elif mutation == "count_contradiction":
-        apply["changes"]["counts"] = {"Create": 8, "NoChange": 1}
+        apply["changes"]["counts"] = {"Create": 9, "NoChange": 1}
 
     with pytest.raises(WhatIfClassificationError) as error:
         compare_promotion_evidence(plan, apply)
@@ -897,7 +934,7 @@ def test_cli_classify_writes_sanitized_evidence(tmp_path: Path) -> None:
     assert evidence["classification"] == "APPROVED"
     assert evidence["commit_sha"] == COMMIT_SHA
     assert evidence["schema_version"] == EVIDENCE_SCHEMA_VERSION
-    assert len(evidence["changes"]["resources"]) == 9
+    assert len(evidence["changes"]["resources"]) == 10
     assert evidence["deployment_source"]["file_count"] == 9
     assert SUBSCRIPTION_ID not in output.read_text(encoding="utf-8")
     assert "/subscriptions/" not in output.read_text(encoding="utf-8")

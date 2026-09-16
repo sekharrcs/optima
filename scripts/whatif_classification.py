@@ -29,7 +29,7 @@ from typing import Any, cast
 EXIT_SUCCESS = 0
 EXIT_FAILURE = 1
 
-EVIDENCE_SCHEMA_VERSION = "optima-foundation-whatif-evidence-v2"
+EVIDENCE_SCHEMA_VERSION = "optima-foundation-whatif-evidence-v3"
 FAILURE_DIAGNOSTICS_SCHEMA_VERSION = "optima-foundation-whatif-failure-v2"
 SCOPE_FINGERPRINT_VERSION = "optima-foundation-scope-v1"
 SOURCE_FINGERPRINT_VERSION = "optima-foundation-deployment-source-v1"
@@ -39,6 +39,8 @@ EXTERNAL_POLICY_SCHEMA_VERSION = "optima-foundation-external-policy-v1"
 EXTERNAL_POLICY_FINGERPRINT_VERSION = "optima-foundation-external-policy-digest-v1"
 RESOURCE_ID_FINGERPRINT_VERSION = "optima-foundation-resource-id-v1"
 EXTERNAL_PAYLOAD_FINGERPRINT_VERSION = "optima-foundation-external-payload-v1"
+CONVERGENCE_POLICY_FINGERPRINT_VERSION = "optima-foundation-convergence-policy-v1"
+NORMALIZED_DELTA_FINGERPRINT_VERSION = "optima-foundation-normalized-delta-v1"
 _EXTERNAL_POLICY_FIELDS = frozenset(
     {
         "schema_version",
@@ -110,9 +112,12 @@ _RESOURCE_ROLE_TYPES = {
     "cosmos_database": "microsoft.documentdb/databaseaccounts/sqldatabases",
     "log_analytics_workspace": "microsoft.operationalinsights/workspaces",
     "managed_environment": "microsoft.app/managedenvironments",
+    "smart_detection_action_group": "microsoft.insights/actiongroups",
     "ui_identity": "microsoft.managedidentity/userassignedidentities",
 }
 EXPECTED_FOUNDATION_RESOURCE_TYPES = frozenset(_RESOURCE_ROLE_TYPES.values())
+_SMART_DETECTION_ACTION_GROUP_NAME = "application insights smart detection"
+_MANAGED_FOUNDATION_RESOURCE_COUNT = len(_RESOURCE_ROLE_TYPES)
 
 _DIAGNOSTIC_CODES = ("NestedDeploymentShortCircuited",)
 _DIAGNOSTIC_LEVELS = ("Info", "Warning", "Error")
@@ -167,6 +172,8 @@ class WhatIfClassificationCode(StrEnum):
     EXTERNAL_OBSERVATION_MISMATCH = "WHATIF_EXTERNAL_OBSERVATION_MISMATCH"
     INVALID_DEPLOYMENT_MODE = "WHATIF_INVALID_DEPLOYMENT_MODE"
     PROMOTION_MISMATCH = "WHATIF_PROMOTION_MISMATCH"
+    NORMALIZATION_REJECTED = "WHATIF_NORMALIZATION_REJECTED"
+    RESIDUAL_UNAPPROVED_CHANGE = "WHATIF_RESIDUAL_UNAPPROVED_CHANGE"
 
 
 class WhatIfClassificationError(RuntimeError):
@@ -267,6 +274,29 @@ class ExternalObservation:
 
 
 @dataclass(frozen=True)
+class NormalizedObservation:
+    """Sanitized record of one approved provider-echo delta that was normalized."""
+
+    resource_role: str
+    resource_type: str
+    json_path: str
+    operation: str
+    before_fingerprint: str
+    after_fingerprint: str
+
+    def to_document(self) -> dict[str, str]:
+        """Project no raw endpoint, resource-id, or subscription value."""
+        return {
+            "resource_role": self.resource_role,
+            "resource_type": self.resource_type,
+            "json_path": self.json_path,
+            "operation": self.operation,
+            "before_fingerprint": self.before_fingerprint,
+            "after_fingerprint": self.after_fingerprint,
+        }
+
+
+@dataclass(frozen=True)
 class FoundationWhatIfClassification:
     """Result of classifying a foundation what-if as safe to apply."""
 
@@ -279,6 +309,9 @@ class FoundationWhatIfClassification:
     deployment_mode: str
     external_policy: ExternalObservationPolicy | None
     external_observations: tuple[ExternalObservation, ...]
+    normalized_observations: tuple[NormalizedObservation, ...]
+    convergence_policy_fingerprint: str
+    residual_unapproved_change_count: int
 
 
 def _raise_malformed(message: str) -> None:
@@ -561,10 +594,9 @@ def _validate_change_semantics(
             "Foundation what-if must not delete any resource",
         )
     if change_type == "Modify":
-        raise WhatIfClassificationError(
-            WhatIfClassificationCode.UNEXPECTED_MODIFY,
-            "Foundation what-if must not modify existing resources",
-        )
+        # A managed Modify is deferred: every property delta must later match an
+        # approved category-B provider echo or the resource fails closed.
+        return change_type
     if change_type == "Ignore" and allow_external_ignore:
         before = change.get("before")
         after = change.get("after")
@@ -667,6 +699,10 @@ def _expected_resource_graph(
             "microsoft.app/managedenvironments",
             f"cae-optima-{environment_name}",
         ),
+        "smart_detection_action_group": (
+            "microsoft.insights/actiongroups",
+            _SMART_DETECTION_ACTION_GROUP_NAME,
+        ),
     }
     graph: dict[str, tuple[str, str, str]] = {}
     for role, (resource_type, resource_name) in resources.items():
@@ -697,6 +733,243 @@ def _scope_fingerprint(subscription_id: str, resource_group: str) -> str:
             "subscription_id": subscription_id.casefold(),
         },
     )
+
+
+@dataclass(frozen=True)
+class ProviderEchoRule:
+    """One exact, tightly-bound approved provider-generated what-if echo.
+
+    Each rule matches exactly one managed role, canonical resource type, JSON
+    path, ARM delta operation, and constrained before/after values, optionally
+    gated by a required resource profile. No wildcard path, generic Modify
+    allowance, or cross-role reuse is permitted.
+    """
+
+    resource_role: str
+    resource_type: str
+    json_path: str
+    operation: str
+    before_kind: str
+    after_kind: str
+    profile: str
+
+
+# The five approved category-B provider echoes. Category-A properties are
+# declared in Bicep and must never appear here; any remaining category-A drift
+# fails closed as a genuine Modify.
+_PROVIDER_ECHO_RULES: tuple[ProviderEchoRule, ...] = (
+    ProviderEchoRule(
+        "cosmos_account",
+        "microsoft.documentdb/databaseaccounts",
+        "properties.analyticalStorageConfiguration",
+        "Delete",
+        "object_well_defined",
+        "null",
+        "analytical_storage_disabled",
+    ),
+    ProviderEchoRule(
+        "cosmos_account",
+        "microsoft.documentdb/databaseaccounts",
+        "properties.enablePerRegionPerPartitionAutoscale",
+        "Delete",
+        "false",
+        "null",
+        "serverless",
+    ),
+    ProviderEchoRule(
+        "cosmos_account",
+        "microsoft.documentdb/databaseaccounts",
+        "properties.sqlEndpoint",
+        "Delete",
+        "cosmos_endpoint",
+        "null",
+        "any",
+    ),
+    ProviderEchoRule(
+        "application_insights",
+        "microsoft.insights/components",
+        "properties.Flow_Type",
+        "Create",
+        "null",
+        "const_bluefield",
+        "any",
+    ),
+    ProviderEchoRule(
+        "application_insights",
+        "microsoft.insights/components",
+        "properties.Request_Source",
+        "Create",
+        "null",
+        "const_rest",
+        "any",
+    ),
+)
+_PROVIDER_ECHO_INDEX = {
+    (rule.resource_role, rule.resource_type, rule.json_path, rule.operation): rule
+    for rule in _PROVIDER_ECHO_RULES
+}
+
+
+def convergence_policy_fingerprint() -> str:
+    """Bind the exact set of approved provider-echo rules for tamper detection."""
+    return _versioned_fingerprint(
+        CONVERGENCE_POLICY_FINGERPRINT_VERSION,
+        [
+            {
+                "resource_role": rule.resource_role,
+                "resource_type": rule.resource_type,
+                "json_path": rule.json_path,
+                "operation": rule.operation,
+                "before_kind": rule.before_kind,
+                "after_kind": rule.after_kind,
+                "profile": rule.profile,
+            }
+            for rule in _PROVIDER_ECHO_RULES
+        ],
+    )
+
+
+def _flatten_delta(delta: Any, prefix: str) -> list[tuple[str, str, Any, Any]]:
+    """Flatten a what-if delta tree into fully qualified leaf property changes."""
+    leaves: list[tuple[str, str, Any, Any]] = []
+    if delta is None:
+        return leaves
+    if not isinstance(delta, list):
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.NORMALIZATION_REJECTED,
+            "Managed modification has a malformed delta payload",
+        )
+    for entry in delta:
+        if not isinstance(entry, dict):
+            raise WhatIfClassificationError(
+                WhatIfClassificationCode.NORMALIZATION_REJECTED,
+                "Managed modification has a malformed delta entry",
+            )
+        segment = entry.get("path")
+        operation = entry.get("propertyChangeType")
+        if (
+            not isinstance(segment, str)
+            or not segment
+            or "/" in segment
+            or _has_control_character(segment)
+            or not isinstance(operation, str)
+        ):
+            raise WhatIfClassificationError(
+                WhatIfClassificationCode.NORMALIZATION_REJECTED,
+                "Managed modification has a malformed delta entry",
+            )
+        full_path = f"{prefix}.{segment}" if prefix else segment
+        children = entry.get("children")
+        if children not in (None, []):
+            leaves.extend(_flatten_delta(children, full_path))
+        else:
+            leaves.append(
+                (full_path, operation, entry.get("before"), entry.get("after"))
+            )
+    return leaves
+
+
+def _resource_payload(change: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Return the predicted resource payload, preferring the after state."""
+    for key in ("after", "before"):
+        payload = change.get(key)
+        if isinstance(payload, dict):
+            return payload
+    return {}
+
+
+def _echo_profile_satisfied(rule: ProviderEchoRule, change: Mapping[str, Any]) -> bool:
+    """Require the exact resource profile the approved echo depends on."""
+    if rule.profile == "any":
+        return True
+    properties = _resource_payload(change).get("properties")
+    if not isinstance(properties, dict):
+        return False
+    if rule.profile == "analytical_storage_disabled":
+        return properties.get("enableAnalyticalStorage") is False
+    if rule.profile == "serverless":
+        capabilities = properties.get("capabilities")
+        return isinstance(capabilities, list) and any(
+            isinstance(item, dict) and item.get("name") == "EnableServerless"
+            for item in capabilities
+        )
+    return False
+
+
+def _echo_before_matches(
+    rule: ProviderEchoRule, before: Any, *, resource_name: str
+) -> bool:
+    """Validate the constrained before value and JSON type of one echo."""
+    if rule.before_kind == "null":
+        return before is None
+    if rule.before_kind == "false":
+        return before is False
+    if rule.before_kind == "object_well_defined":
+        return bool(before == {"schemaType": "WellDefined"})
+    if rule.before_kind == "cosmos_endpoint":
+        expected = f"https://{resource_name}.documents.azure.com:443/"
+        return isinstance(before, str) and before == expected
+    return False
+
+
+def _echo_after_matches(rule: ProviderEchoRule, after: Any) -> bool:
+    """Validate the constrained after value and JSON type of one echo."""
+    if rule.after_kind == "null":
+        return after is None
+    if rule.after_kind == "const_bluefield":
+        return bool(after == "Bluefield")
+    if rule.after_kind == "const_rest":
+        return bool(after == "rest")
+    return False
+
+
+def _normalize_managed_change(
+    change: Mapping[str, Any],
+    *,
+    resource_role: str,
+    resource_type: str,
+    resource_name: str,
+) -> list[NormalizedObservation]:
+    """Normalize a managed Modify only if every delta is an approved echo."""
+    leaves = _flatten_delta(change.get("delta"), "")
+    if not leaves:
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.NORMALIZATION_REJECTED,
+            "Managed modification has no reviewable property delta",
+        )
+    if change.get("extension") is not None:
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.NORMALIZATION_REJECTED,
+            "Managed modification carries an unreviewed extension payload",
+        )
+    observations: list[NormalizedObservation] = []
+    for path, operation, before, after in leaves:
+        rule = _PROVIDER_ECHO_INDEX.get((resource_role, resource_type, path, operation))
+        if (
+            rule is None
+            or not _echo_profile_satisfied(rule, change)
+            or not _echo_before_matches(rule, before, resource_name=resource_name)
+            or not _echo_after_matches(rule, after)
+        ):
+            raise WhatIfClassificationError(
+                WhatIfClassificationCode.NORMALIZATION_REJECTED,
+                "Managed modification contains an unapproved change",
+            )
+        observations.append(
+            NormalizedObservation(
+                resource_role=resource_role,
+                resource_type=resource_type,
+                json_path=path,
+                operation=operation,
+                before_fingerprint=_versioned_fingerprint(
+                    NORMALIZED_DELTA_FINGERPRINT_VERSION, before
+                ),
+                after_fingerprint=_versioned_fingerprint(
+                    NORMALIZED_DELTA_FINGERPRINT_VERSION, after
+                ),
+            )
+        )
+    return observations
 
 
 def classify_foundation_whatif(
@@ -833,7 +1106,6 @@ def classify_foundation_whatif(
                     _denied_type_code(resource_id.resource_type),
                     "Foundation what-if contains a resource type outside the contract",
                 )
-            counts[change_type] += 1
             managed_changes.append((change, change_type, resource_id))
     if len(observations) != (1 if external_policy is not None else 0):
         raise WhatIfClassificationError(
@@ -881,15 +1153,29 @@ def classify_foundation_whatif(
     if {parsed.canonical_id for _, _, parsed in managed_changes} != set(expected_graph):
         raise WhatIfClassificationError(
             WhatIfClassificationCode.RESOURCE_GRAPH_MISMATCH,
-            "Foundation what-if does not match the exact nine-resource graph",
+            "Foundation what-if does not match the exact ten-resource graph",
         )
 
     allowed: list[AllowedChange] = []
+    normalized: list[NormalizedObservation] = []
     for change, change_type, resource_id in managed_changes:
         role, resource_type, resource_name = expected_graph[resource_id.canonical_id]
+        if change_type == "Modify":
+            normalized.extend(
+                _normalize_managed_change(
+                    change,
+                    resource_role=role,
+                    resource_type=resource_type,
+                    resource_name=resource_name,
+                )
+            )
+            effective_type = "NoChange"
+        else:
+            effective_type = change_type
+        counts[effective_type] += 1
         allowed.append(
             AllowedChange(
-                change_type=change_type,
+                change_type=effective_type,
                 resource_type=resource_type,
                 resource_name=resource_name,
                 resource_role=role,
@@ -901,6 +1187,9 @@ def classify_foundation_whatif(
 
     canonical_payloads.sort(key=_canonical_json_text)
     allowed.sort(key=lambda item: item.resource_role)
+    normalized.sort(
+        key=lambda item: (item.resource_role, item.json_path, item.operation)
+    )
     return FoundationWhatIfClassification(
         resource_group=resource_group.casefold(),
         environment_name=environment_name.casefold(),
@@ -913,6 +1202,9 @@ def classify_foundation_whatif(
         deployment_mode=deployment_mode,
         external_policy=external_policy,
         external_observations=tuple(observations),
+        normalized_observations=tuple(normalized),
+        convergence_policy_fingerprint=convergence_policy_fingerprint(),
+        residual_unapproved_change_count=0,
     )
 
 
@@ -1289,12 +1581,12 @@ def _validate_resource_facts(
     """Validate the closed sanitized resource-fact projection."""
     if (
         not isinstance(resources, list)
-        or len(resources) != 9
+        or len(resources) != _MANAGED_FOUNDATION_RESOURCE_COUNT
         or not all(isinstance(fact, dict) for fact in resources)
     ):
         raise WhatIfClassificationError(
             WhatIfClassificationCode.PROMOTION_MISMATCH,
-            "Promotion evidence does not contain nine resource facts",
+            "Promotion evidence does not contain the ten managed resource facts",
         )
     facts_by_role: dict[str, dict[str, str]] = {}
     for fact in resources:
@@ -1361,6 +1653,7 @@ def _validate_resource_facts(
         "cosmos_database": "optima",
         "log_analytics_workspace": f"law-optima-{environment_name}",
         "managed_environment": f"cae-optima-{environment_name}",
+        "smart_detection_action_group": _SMART_DETECTION_ACTION_GROUP_NAME,
         "ui_identity": f"id-optima-ui-{environment_name}",
     }
     if any(
@@ -1434,6 +1727,85 @@ def _validate_external_evidence(document: Mapping[str, Any]) -> None:
         )
 
 
+def _validate_normalization_evidence(document: Mapping[str, Any]) -> None:
+    """Validate the closed provider-echo normalization projection."""
+    normalizations = document["normalizations"]
+    if not isinstance(normalizations, dict) or set(normalizations) != {
+        "convergence_policy_fingerprint",
+        "residual_unapproved_change_count",
+        "observations",
+    }:
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.PROMOTION_MISMATCH,
+            "Promotion normalization evidence has an unsupported schema",
+        )
+    if normalizations["convergence_policy_fingerprint"] != (
+        convergence_policy_fingerprint()
+    ):
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.PROMOTION_MISMATCH,
+            "Promotion normalization policy fingerprint does not match",
+        )
+    residual = normalizations["residual_unapproved_change_count"]
+    if not isinstance(residual, int) or isinstance(residual, bool) or residual != 0:
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.RESIDUAL_UNAPPROVED_CHANGE,
+            "Promotion normalization evidence has unapproved residual changes",
+        )
+    observations = normalizations["observations"]
+    if not isinstance(observations, list) or len(observations) > len(
+        _PROVIDER_ECHO_RULES
+    ):
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.PROMOTION_MISMATCH,
+            "Promotion normalization observations are invalid",
+        )
+    seen: set[tuple[str, str, str, str]] = set()
+    for observation in observations:
+        if not isinstance(observation, dict) or set(observation) != {
+            "resource_role",
+            "resource_type",
+            "json_path",
+            "operation",
+            "before_fingerprint",
+            "after_fingerprint",
+        }:
+            raise WhatIfClassificationError(
+                WhatIfClassificationCode.PROMOTION_MISMATCH,
+                "Promotion normalization observation has an unsupported schema",
+            )
+        key = (
+            observation["resource_role"],
+            observation["resource_type"],
+            observation["json_path"],
+            observation["operation"],
+        )
+        if (
+            key not in _PROVIDER_ECHO_INDEX
+            or key in seen
+            or not _validate_fingerprint(observation["before_fingerprint"])
+            or not _validate_fingerprint(observation["after_fingerprint"])
+        ):
+            raise WhatIfClassificationError(
+                WhatIfClassificationCode.PROMOTION_MISMATCH,
+                "Promotion normalization observation is not exactly policy-bound",
+            )
+        seen.add(key)
+    ordered = sorted(
+        observations,
+        key=lambda item: (
+            item["resource_role"],
+            item["json_path"],
+            item["operation"],
+        ),
+    )
+    if observations != ordered:
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.PROMOTION_MISMATCH,
+            "Promotion normalization observations are not in canonical order",
+        )
+
+
 def _validate_evidence(document: Any) -> dict[str, Any]:
     """Validate and return one closed, versioned promotion evidence document."""
     if not isinstance(document, dict) or set(document) != {
@@ -1444,6 +1816,7 @@ def _validate_evidence(document: Any) -> dict[str, Any]:
         "deployment_source",
         "external_policy",
         "external_observations",
+        "normalizations",
         "parameters",
         "schema_version",
         "target",
@@ -1529,7 +1902,7 @@ def _validate_evidence(document: Any) -> dict[str, Any]:
             not isinstance(count, int) or isinstance(count, bool) or count < 0
             for count in counts.values()
         )
-        or sum(counts.values()) != 9
+        or sum(counts.values()) != _MANAGED_FOUNDATION_RESOURCE_COUNT
     ):
         raise WhatIfClassificationError(
             WhatIfClassificationCode.PROMOTION_MISMATCH,
@@ -1547,6 +1920,7 @@ def _validate_evidence(document: Any) -> dict[str, Any]:
             "Promotion change counts contradict the resource facts",
         )
     _validate_external_evidence(document)
+    _validate_normalization_evidence(document)
     return document
 
 
@@ -1597,6 +1971,18 @@ def build_foundation_evidence(
                 for change in classification.allowed_changes
             ],
         },
+        "normalizations": {
+            "convergence_policy_fingerprint": (
+                classification.convergence_policy_fingerprint
+            ),
+            "residual_unapproved_change_count": (
+                classification.residual_unapproved_change_count
+            ),
+            "observations": [
+                observation.to_document()
+                for observation in classification.normalized_observations
+            ],
+        },
     }
     return _validate_evidence(evidence)
 
@@ -1616,11 +2002,12 @@ def compare_convergence_evidence(plan: Any, converged: Any) -> None:
     """Require managed convergence with unchanged target/source/external evidence."""
     validated_plan = _validate_evidence(plan)
     validated_converged = _validate_evidence(converged)
+    excluded = {"changes", "normalizations"}
     plan_binding = {
-        key: value for key, value in validated_plan.items() if key != "changes"
+        key: value for key, value in validated_plan.items() if key not in excluded
     }
     converged_binding = {
-        key: value for key, value in validated_converged.items() if key != "changes"
+        key: value for key, value in validated_converged.items() if key not in excluded
     }
     plan_resources = [
         {key: value for key, value in fact.items() if key != "change_type"}
@@ -1630,10 +2017,17 @@ def compare_convergence_evidence(plan: Any, converged: Any) -> None:
         {key: value for key, value in fact.items() if key != "change_type"}
         for fact in validated_converged["changes"]["resources"]
     ]
+    # The static provider-echo policy must be identical across plan and
+    # convergence, but the observed echoes may legitimately differ (a fresh plan
+    # over pre-existing resources emits Create; convergence emits normalized
+    # echoes). Convergence must reach an all-NoChange managed graph.
     if (
         plan_binding != converged_binding
         or plan_resources != converged_resources
-        or validated_converged["changes"]["counts"] != {"Create": 0, "NoChange": 9}
+        or validated_converged["changes"]["counts"]
+        != {"Create": 0, "NoChange": _MANAGED_FOUNDATION_RESOURCE_COUNT}
+        or validated_plan["normalizations"]["convergence_policy_fingerprint"]
+        != validated_converged["normalizations"]["convergence_policy_fingerprint"]
     ):
         raise WhatIfClassificationError(
             WhatIfClassificationCode.PROMOTION_MISMATCH,
@@ -1647,6 +2041,7 @@ def _summarize(evidence: Mapping[str, Any]) -> str:
     source = evidence["deployment_source"]
     parameters = evidence["parameters"]
     changes = evidence["changes"]
+    normalizations = evidence["normalizations"]
     lines = [
         "Foundation what-if classification: APPROVED",
         f"  schema: {evidence['schema_version']}",
@@ -1661,6 +2056,11 @@ def _summarize(evidence: Mapping[str, Any]) -> str:
         f"  parameter fingerprint: {parameters['fingerprint']}",
         f"  change fingerprint: {changes['fingerprint']}",
         f"  change counts: {changes['counts']}",
+        "  convergence policy fingerprint: "
+        f"{normalizations['convergence_policy_fingerprint']}",
+        "  normalized provider echoes: "
+        f"{len(normalizations['observations'])} "
+        f"(residual {normalizations['residual_unapproved_change_count']})",
     ]
     for change in changes["resources"]:
         lines.append(

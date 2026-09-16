@@ -122,8 +122,8 @@ def classify(document: Any = None) -> classifier.FoundationWhatIfClassification:
 def test_exact_observation_keeps_nine_managed_changes() -> None:
     """Exactly one external Ignore does not become a managed fact or count."""
     result = classify()
-    assert len(result.allowed_changes) == 9
-    assert result.change_counts == {"Create": 9, "NoChange": 0}
+    assert len(result.allowed_changes) == 10
+    assert result.change_counts == {"Create": 10, "NoChange": 0}
     assert len(result.external_observations) == 1
     assert result.external_observations[0].resource_type == EXTERNAL_TYPE
     with pytest.raises(classifier.WhatIfClassificationError):
@@ -241,15 +241,15 @@ def converged_document() -> dict[str, Any]:
     return document
 
 
-def test_evidence_is_closed_sanitized_and_v2() -> None:
-    """Only nine managed facts and hashed external evidence are published."""
+def test_evidence_is_closed_sanitized_and_v3() -> None:
+    """Only ten managed facts and hashed external evidence are published."""
     result = evidence()
-    assert result["schema_version"] == "optima-foundation-whatif-evidence-v2"
+    assert result["schema_version"] == classifier.EVIDENCE_SCHEMA_VERSION
     assert classifier.CHANGE_FINGERPRINT_VERSION.endswith("-v2")
     assert result["deployment_mode"] == "Incremental"
     assert result["external_policy"]["definition"] == policy_document()
-    assert len(result["changes"]["resources"]) == 9
-    assert result["changes"]["counts"] == {"Create": 9, "NoChange": 0}
+    assert len(result["changes"]["resources"]) == 10
+    assert result["changes"]["counts"] == {"Create": 10, "NoChange": 0}
     assert len(result["external_observations"]) == 1
     serialized = json.dumps(result)
     for sensitive in (SUBSCRIPTION, EXTERNAL_ID, "synthetic-external", "PreserveCase"):
@@ -513,7 +513,7 @@ def test_cli_missing_or_empty_policy_disables_only_explicitly(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Missing/empty policy permits nine managed changes but never an Ignore."""
+    """Missing/empty policy permits ten managed changes but never an Ignore."""
     monkeypatch.setattr(
         os,
         "environ",
@@ -613,9 +613,9 @@ def test_valid_but_wrong_policy_fingerprint_rejects_observation(field: str) -> N
         )
 
 
-@pytest.mark.parametrize("index", range(9))
+@pytest.mark.parametrize("index", range(10))
 def test_external_observation_cannot_replace_any_managed_role(index: int) -> None:
-    """All nine original graph members remain required and managed."""
+    """All ten original graph members remain required and managed."""
     document = foundation_document()
     document["changes"].pop(index)
     with pytest.raises(classifier.WhatIfClassificationError):
@@ -865,8 +865,8 @@ def echoed_classify(document: Any = None) -> classifier.FoundationWhatIfClassifi
 def test_echoed_after_equal_to_before_is_accepted() -> None:
     """A non-empty after canonically equal to before is a valid unchanged Ignore."""
     result = echoed_classify()
-    assert len(result.allowed_changes) == 9
-    assert result.change_counts == {"Create": 9, "NoChange": 0}
+    assert len(result.allowed_changes) == 10
+    assert result.change_counts == {"Create": 10, "NoChange": 0}
     assert len(result.external_observations) == 1
     assert result.external_observations[0].resource_type == EXTERNAL_TYPE
 
@@ -1092,8 +1092,8 @@ def test_echoed_after_accepted_plan_converges_on_identical_echo() -> None:
     plan = echoed_evidence()
     converged = echoed_evidence(echoed_converged_document())
     # The plan accepts one Ignore whose equal echoed after is bound into evidence.
-    assert plan["changes"]["counts"] == {"Create": 9, "NoChange": 0}
-    assert converged["changes"]["counts"] == {"Create": 0, "NoChange": 9}
+    assert plan["changes"]["counts"] == {"Create": 10, "NoChange": 0}
+    assert converged["changes"]["counts"] == {"Create": 0, "NoChange": 10}
     assert len(plan["external_observations"]) == 1
     # The external observation (payload fingerprint included) is preserved exactly.
     assert plan["external_observations"] == converged["external_observations"]

@@ -413,12 +413,12 @@ def test_actual_workflow_policy_gates_with_synthetic_providers(
             (tmp_path / "foundation-converged-evidence.json").read_text()
         )
         assert (
-            final_evidence["schema_version"] == "optima-foundation-whatif-evidence-v2"
+            final_evidence["schema_version"] == "optima-foundation-whatif-evidence-v3"
         )
-        assert len(final_evidence["changes"]["resources"]) == 9
+        assert len(final_evidence["changes"]["resources"]) == 10
         assert len(final_evidence["external_observations"]) == int(apply_enabled)
         if expected_failure is None:
-            assert final_evidence["changes"]["counts"] == {"Create": 0, "NoChange": 9}
+            assert final_evidence["changes"]["counts"] == {"Create": 0, "NoChange": 10}
             assert final_evidence["external_policy"]["definition"] == (
                 policy_document() if apply_enabled else None
             )
