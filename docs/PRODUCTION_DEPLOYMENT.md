@@ -102,9 +102,11 @@ Use this exact operator sequence:
 2. After the workflow succeeds, download its only artifact,
    `foundation-plan-evidence-<commit>`. Inspect the single
    `foundation-plan-evidence.json` file and confirm the commit, `APPROVED`
-   classification, target, fingerprints, counts, and nine managed resource facts.
+   classification, target, fingerprints, counts, and ten managed resource facts.
    Also confirm `deployment_mode`, the explicit disabled or independently
-   approved external policy, and its zero or one external observation.
+   approved external policy, and its zero or one external observation, plus the
+   evidence-v3 normalization section (convergence-policy fingerprint and a
+   residual-change count of zero).
 3. Record the plan run ID, the dispatch actor, and the GitHub artifact metadata
    digest in exact `sha256:<64-lowercase-hex>` form. Use GitHub's artifact digest,
    not a new digest calculated from the downloaded JSON or archive.
@@ -289,7 +291,8 @@ It:
 7. Reconciles the exact deployment, requires `Succeeded`, and runs a classified
    convergence what-if. Before reporting success, compares it with the original
    authenticated plan and requires the same bindings and external evidence with
-   all nine managed facts `NoChange`.
+   all ten managed facts `NoChange`, only the exact approved provider echoes
+   normalized, and zero residual unapproved changes.
 
 `foundation-apply` never builds or publishes an image, deploys a Container App,
 creates a runtime role assignment, configures Entra, provisions Redis or

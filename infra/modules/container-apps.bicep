@@ -338,6 +338,16 @@ resource managedEnvironment 'Microsoft.App/managedEnvironments@2025-07-01' = {
     appLogsConfiguration: {
       destination: null
     }
+    peerAuthentication: {
+      mtls: {
+        enabled: false
+      }
+    }
+    peerTrafficConfiguration: {
+      encryption: {
+        enabled: false
+      }
+    }
     publicNetworkAccess: 'Enabled'
     zoneRedundant: false
   }

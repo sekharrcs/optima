@@ -119,6 +119,7 @@ OPTIMA UI  --HTTPS-------------> internal OPTIMA API
 | Redis database                 | Omitted in the selected profile; enabled mode uses port `10000`, Enterprise clustering, NoEviction, and RediSearch | Support filtered `FT.SEARCH` when enabled |
 | Log Analytics workspace        | PerGB2018, 30-day immediate purge, 0.25 GB/day emergency cap                          | Store Application Insights telemetry         |
 | Application Insights           | Workspace-based, public ingestion, 30 days, local ingestion auth retained             | Preserve Slice 10D traces and metrics        |
+| Smart Detection action group   | Global, `SmartDetect` short name, Monitoring Contributor and Monitoring Reader ARM-role receivers, no email/SMS/webhook | Adopt the Application Insights auto-created companion so convergence stays exact |
 | API managed identity           | User-assigned                                                                          | Stable pre-assignable API runtime identity   |
 | UI managed identity            | User-assigned                                                                          | Pull only the UI image from ACR               |
 
@@ -411,12 +412,43 @@ register them.
 | `Microsoft.DocumentDB`          | Cosmos DB account, database, and container          |
 | `Microsoft.Cache`               | Cache-enabled only: Azure Managed Redis cluster and database |
 | `Microsoft.OperationalInsights` | Log Analytics workspace                             |
-| `Microsoft.Insights`            | Application Insights component                      |
+| `Microsoft.Insights`            | Application Insights component and Smart Detection action group |
 
 `Microsoft.Authorization` is needed when the reviewed runtime-access bootstrap
 enables the two ACR role assignments. `Microsoft.CognitiveServices` is needed
 only if a later slice deploys Foundry/OpenAI resources. `Microsoft.KeyVault` is
 not required by this architecture.
+
+## Foundation convergence and the Failure Anomalies companion
+
+The foundation manages exactly ten resources: the two managed identities, the
+container registry, Log Analytics workspace, Application Insights component, the
+Cosmos account/database/container, the Container Apps managed environment, and
+the adopted `Application Insights Smart Detection` action group. Creating the
+Application Insights component makes Azure auto-provision that global action
+group, so the foundation adopts it in Bicep at its exact identity to keep a true
+no-change plan; it is a normal managed resource whose receiver, enabled, short
+name, or location drift fails closed.
+
+The companion Failure Anomalies smart-detector alert rule is intentionally not
+managed for the hackathon profile, and `Microsoft.AlertsManagement` is left
+unregistered. Enabling failure-anomaly alerting later requires a separately
+approved provider registration plus an explicitly managed
+`Microsoft.AlertsManagement/smartDetectorAlertRules` resource; adopting the
+action group and its ARM-role receivers adds no fixed or usage cost.
+
+Seven category-A provider defaults are now declared as explicit desired state
+(managed-environment `peerAuthentication.mtls.enabled` and
+`peerTrafficConfiguration.encryption.enabled`; registry `anonymousPullEnabled`,
+`encryption.status`, and `policies.azureADAuthenticationAsArmPolicy.status`;
+Cosmos `defaultIdentity` and the run container `conflictResolutionPolicy`). Five
+category-B provider echoes that cannot be authored (Cosmos
+`analyticalStorageConfiguration`, `enablePerRegionPerPartitionAutoscale`, and
+`sqlEndpoint`; Application Insights `Flow_Type` and `Request_Source`) are
+normalized only under an exact role, type, path, operation, and value binding,
+recorded as sanitized fingerprints in evidence v3 with a convergence-policy
+fingerprint and a residual-change count of zero. The single Azure OpenAI
+external observation policy is unchanged and is never widened.
 
 ## Cost assessment
 
