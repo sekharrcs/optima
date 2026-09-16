@@ -1027,3 +1027,119 @@ def test_echoed_evidence_is_sanitized_and_replayable() -> None:
     tampered["external_observations"][0]["payload_fingerprint"] = "d" * 64
     with pytest.raises(classifier.WhatIfClassificationError):
         classifier.compare_promotion_evidence(result, tampered)
+
+
+# --- Review hardening: raw case-sensitive equality and echoed convergence ---
+
+
+def test_raw_gate_rejects_case_only_after_before_normalization() -> None:
+    """The raw canonical-equality gate alone rejects a case-only echoed after.
+
+    ``name`` is casefolded to the bound identity during normalization, so a
+    purely case-different value would fold to equal there; only the raw
+    pre-normalization gate in ``_validate_change_semantics`` distinguishes it.
+    """
+    before = {"id": EXTERNAL_ID, "type": EXTERNAL_TYPE, "name": "synthetic-external"}
+    change = {
+        "resourceId": EXTERNAL_ID,
+        "changeType": "Ignore",
+        "before": before,
+        "after": {**before, "name": "SYNTHETIC-EXTERNAL"},
+        "delta": None,
+        "extension": None,
+    }
+    with pytest.raises(classifier.WhatIfClassificationError) as caught:
+        classifier._validate_change_semantics(change, allow_external_ignore=True)
+    assert (
+        caught.value.code
+        is classifier.WhatIfClassificationCode.EXTERNAL_OBSERVATION_MISMATCH
+    )
+
+
+def test_case_only_after_difference_is_rejected_end_to_end() -> None:
+    """A case-only after difference fails full classification, not just the unit."""
+    document = echoed_document()
+    document["changes"][-1]["after"]["name"] = "SYNTHETIC-EXTERNAL"
+    with pytest.raises(classifier.WhatIfClassificationError) as caught:
+        echoed_classify(document)
+    assert (
+        caught.value.code
+        is classifier.WhatIfClassificationCode.EXTERNAL_OBSERVATION_MISMATCH
+    )
+
+
+def echoed_converged_document() -> dict[str, Any]:
+    """Converge only the managed graph while preserving the echoed payload."""
+    document = echoed_document()
+    for change in document["changes"][:-1]:
+        change["changeType"] = "NoChange"
+    return document
+
+
+def echoed_evidence(document: Any = None) -> dict[str, Any]:
+    """Build real v2 evidence from the echoed-after synthetic input."""
+    return classifier.build_foundation_evidence(
+        echoed_classify(echoed_document() if document is None else document),
+        commit_sha="a" * 40,
+        parameter_fingerprint_value="b" * 64,
+        deployment_source_fingerprint_value="c" * 64,
+        deployment_source_file_count=3,
+    )
+
+
+def test_echoed_after_accepted_plan_converges_on_identical_echo() -> None:
+    """An accepted, fingerprinted echoed after replays through managed convergence."""
+    plan = echoed_evidence()
+    converged = echoed_evidence(echoed_converged_document())
+    # The plan accepts one Ignore whose equal echoed after is bound into evidence.
+    assert plan["changes"]["counts"] == {"Create": 9, "NoChange": 0}
+    assert converged["changes"]["counts"] == {"Create": 0, "NoChange": 9}
+    assert len(plan["external_observations"]) == 1
+    # The external observation (payload fingerprint included) is preserved exactly.
+    assert plan["external_observations"] == converged["external_observations"]
+    classifier.compare_convergence_evidence(plan, converged)
+    classifier.compare_convergence_evidence(converged, converged)
+
+
+def test_convergence_rejects_removed_echoed_after() -> None:
+    """Removing the echoed after rebinds the fingerprint and blocks convergence."""
+    plan = echoed_evidence()
+    # Removal: after is optional, so classification still succeeds, but the bound
+    # payload fingerprint changes and can no longer converge onto the plan.
+    without_after = echoed_converged_document()
+    without_after["changes"][-1].pop("after")
+    converged_without = echoed_evidence(without_after)
+    assert converged_without["external_observations"] != plan["external_observations"]
+    with pytest.raises(classifier.WhatIfClassificationError):
+        classifier.compare_convergence_evidence(plan, converged_without)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda after: after.update({"name": "synthetic-external-2"}),
+        lambda after: after.clear(),
+        lambda after: after.update({"location": "westus2"}),
+    ],
+    ids=["alter-name", "substitute-empty", "alter-location"],
+)
+def test_convergence_rejects_altered_or_substituted_echoed_after(mutate: Any) -> None:
+    """An after no longer echoing before is rejected before any evidence is built."""
+    broken = echoed_converged_document()
+    mutate(broken["changes"][-1]["after"])
+    with pytest.raises(classifier.WhatIfClassificationError):
+        echoed_evidence(broken)
+
+
+def test_changed_external_payload_cannot_be_treated_as_converged() -> None:
+    """A different (still self-consistent) external payload never converges the plan."""
+    plan = echoed_evidence()
+    changed = echoed_converged_document()
+    for payload in ("before", "after"):
+        changed["changes"][-1][payload]["tags"]["environment"] = "prod"
+    converged_changed = echoed_evidence(changed)
+    assert converged_changed["external_observations"] != plan["external_observations"]
+    with pytest.raises(classifier.WhatIfClassificationError):
+        classifier.compare_convergence_evidence(plan, converged_changed)
+    with pytest.raises(classifier.WhatIfClassificationError):
+        classifier.compare_promotion_evidence(plan, converged_changed)

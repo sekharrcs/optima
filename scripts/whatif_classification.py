@@ -570,6 +570,12 @@ def _validate_change_semantics(
         after = change.get("after")
         # A non-null after is permitted only when it echoes an unchanged
         # resource: a non-empty object whose canonical JSON equals before.
+        # This raw canonical-equality gate is intentionally exact and
+        # case-sensitive, and it runs before identity normalization: only an
+        # Azure echo that is canonically byte-identical to before is accepted.
+        # Individual identity and resourceGroup binding checks stay
+        # case-insensitive by design; this stricter whole-payload equality is a
+        # deliberate fail-closed choice grounded in the observed identical echo.
         after_is_mutating = after is not None and (
             not isinstance(after, dict)
             or not after
