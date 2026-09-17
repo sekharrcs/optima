@@ -129,6 +129,53 @@ def _appi_echo_delta() -> list[dict[str, Any]]:
     ]
 
 
+def _cosmos_flat_echo_delta() -> list[dict[str, Any]]:
+    """The three approved cosmos echoes in the captured live flat encoding."""
+    return [
+        {
+            "path": "properties.analyticalStorageConfiguration",
+            "propertyChangeType": "Delete",
+            "before": {"schemaType": "WellDefined"},
+            "after": None,
+            "children": None,
+        },
+        {
+            "path": "properties.enablePerRegionPerPartitionAutoscale",
+            "propertyChangeType": "Delete",
+            "before": False,
+            "after": None,
+            "children": None,
+        },
+        {
+            "path": "properties.sqlEndpoint",
+            "propertyChangeType": "Delete",
+            "before": COSMOS_ENDPOINT,
+            "after": None,
+            "children": None,
+        },
+    ]
+
+
+def _appi_flat_echo_delta() -> list[dict[str, Any]]:
+    """The two approved App Insights echoes in the captured live flat encoding."""
+    return [
+        {
+            "path": "properties.Flow_Type",
+            "propertyChangeType": "Create",
+            "before": None,
+            "after": "Bluefield",
+            "children": None,
+        },
+        {
+            "path": "properties.Request_Source",
+            "propertyChangeType": "Create",
+            "before": None,
+            "after": "rest",
+            "children": None,
+        },
+    ]
+
+
 def _cosmos_change(
     *,
     delta: list[dict[str, Any]] | None = None,
@@ -817,8 +864,8 @@ def test_malformed_delta_nodes_fail_closed(name: str) -> None:
     )
 
 
-def test_captured_azure_delta_tree_normalizes_exactly_five() -> None:
-    """A valid nested Azure delta tree normalizes exactly the five approved echoes."""
+def test_supported_nested_encoding_normalizes_exactly_five() -> None:
+    """The supported nested encoding normalizes exactly the five approved echoes."""
     result = classify(deployed_document())
     observed = sorted(
         (obs.resource_role, obs.json_path, obs.operation)
@@ -843,7 +890,7 @@ _LAW_FEATURES_FINGERPRINT = (
     "07b68d0b7cd33c7cdb95fc85fe98768406c8d4ba1b20719d8768a0dca0cdb413"
 )
 _CONVERGENCE_POLICY_FINGERPRINT = (
-    "2f6482033f271c0504e2ef14c8a54e9170ca1e530c18c307613c1735b9bd21c6"
+    "b918016ab13437ff16f32d1a69b565b12d69c4f5617707abb9f572e6f86bcad5"
 )
 
 
@@ -1062,3 +1109,308 @@ def test_compiled_monitoring_features_match_classifier_expectation(
         hashlib.sha256(canonical.encode("utf-8")).hexdigest()
         == classifier._LAW_FEATURES_FINGERPRINT
     )
+
+
+# --- Flat (Encoding B) provider-echo representation --------------------------
+
+_PRIOR_LAW_ONLY_FINGERPRINT = (
+    "2f6482033f271c0504e2ef14c8a54e9170ca1e530c18c307613c1735b9bd21c6"
+)
+
+
+def _flat_deployed_document(
+    extra: tuple[dict[str, Any], ...] = (),
+) -> dict[str, Any]:
+    """Deployed-state what-if with both providers in the captured flat encoding."""
+    return deployed_document(
+        cosmos=_cosmos_change(delta=_cosmos_flat_echo_delta()),
+        appi=_appi_change(delta=_appi_flat_echo_delta()),
+        extra=extra,
+    )
+
+
+def _aoai_ignore_and_policy() -> tuple[dict[str, Any], Any]:
+    """Build the single policy-bound AOAI external Ignore and its policy."""
+    policy_document = {
+        "schema_version": classifier.EXTERNAL_POLICY_SCHEMA_VERSION,
+        "deployment_mode": "Incremental",
+        "scope_fingerprint": classifier._scope_fingerprint(SUBSCRIPTION, GROUP),
+        "resource_type": "microsoft.cognitiveservices/accounts",
+        "resource_id_fingerprint_version": classifier.RESOURCE_ID_FINGERPRINT_VERSION,
+        "resource_id_fingerprint": classifier.resource_identity_fingerprint(
+            EXTERNAL_ID, subscription_id=SUBSCRIPTION, resource_group=GROUP
+        ),
+    }
+    policy = classifier.parse_external_observation_policy(policy_document)
+    ignore = {
+        "resourceId": EXTERNAL_ID,
+        "changeType": "Ignore",
+        "before": {
+            "id": EXTERNAL_ID,
+            "type": "microsoft.cognitiveservices/accounts",
+            "name": "synthetic-external",
+            "properties": {"state": "PreserveCase"},
+        },
+    }
+    return ignore, policy
+
+
+def _flat_all_children(value: Any) -> list[dict[str, Any]]:
+    return [{**node, "children": value} for node in _cosmos_flat_echo_delta()]
+
+
+def _flat_first_path(path: str) -> list[dict[str, Any]]:
+    delta = _cosmos_flat_echo_delta()
+    delta[0] = {**delta[0], "path": path}
+    return delta
+
+
+def _flat_node(idx: int, **overrides: Any) -> list[dict[str, Any]]:
+    delta = _cosmos_flat_echo_delta()
+    delta[idx] = {**delta[idx], **overrides}
+    return delta
+
+
+def test_live_flat_cosmos_delta_normalizes_three_echoes() -> None:
+    """The captured flat Cosmos delta normalizes its three exact echoes."""
+    result = classify(
+        deployed_document(cosmos=_cosmos_change(delta=_cosmos_flat_echo_delta()))
+    )
+    cosmos_obs = sorted(
+        (obs.json_path, obs.operation)
+        for obs in result.normalized_observations
+        if obs.resource_role == "cosmos_account"
+    )
+    assert cosmos_obs == [
+        ("properties.analyticalStorageConfiguration", "Delete"),
+        ("properties.enablePerRegionPerPartitionAutoscale", "Delete"),
+        ("properties.sqlEndpoint", "Delete"),
+    ]
+    assert len(result.normalized_observations) == 5
+    assert result.change_counts == {"Create": 0, "NoChange": 10}
+    assert result.residual_unapproved_change_count == 0
+
+
+def test_live_flat_appi_delta_normalizes_two_echoes() -> None:
+    """The captured flat App Insights delta normalizes its two exact echoes."""
+    result = classify(
+        deployed_document(appi=_appi_change(delta=_appi_flat_echo_delta()))
+    )
+    appi_obs = sorted(
+        (obs.json_path, obs.operation)
+        for obs in result.normalized_observations
+        if obs.resource_role == "application_insights"
+    )
+    assert appi_obs == [
+        ("properties.Flow_Type", "Create"),
+        ("properties.Request_Source", "Create"),
+    ]
+    assert len(result.normalized_observations) == 5
+
+
+def test_complete_flat_deployed_state_converges_with_residual_zero() -> None:
+    """The full flat deployed state converges to ten managed NoChange, residual 0."""
+    ignore, policy = _aoai_ignore_and_policy()
+    document = _flat_deployed_document(extra=(ignore,))
+    raw_counts: dict[str, int] = {}
+    for change in document["changes"]:
+        raw_counts[change["changeType"]] = raw_counts.get(change["changeType"], 0) + 1
+    assert raw_counts == {"Modify": 2, "NoChange": 8, "Ignore": 1}
+    result = classify(document, policy=policy)
+    assert result.change_counts == {"Create": 0, "NoChange": 10}
+    assert len(result.normalized_observations) == 5
+    assert len(result.external_observations) == 1
+    assert result.residual_unapproved_change_count == 0
+    assert (
+        result.convergence_policy_fingerprint
+        == classifier.convergence_policy_fingerprint()
+    )
+
+
+def test_nested_encoding_remains_accepted() -> None:
+    """The existing nested encoding still normalizes exactly five echoes."""
+    result = classify(deployed_document())
+    assert len(result.normalized_observations) == 5
+    assert result.change_counts == {"Create": 0, "NoChange": 10}
+
+
+def test_flat_and_nested_produce_identical_semantic_observations() -> None:
+    """Flat and nested encodings yield the same five sanitized observations."""
+    nested = classify(deployed_document())
+    flat = classify(_flat_deployed_document())
+    nested_docs = sorted(
+        json.dumps(obs.to_document(), sort_keys=True)
+        for obs in nested.normalized_observations
+    )
+    flat_docs = sorted(
+        json.dumps(obs.to_document(), sort_keys=True)
+        for obs in flat.normalized_observations
+    )
+    assert flat_docs == nested_docs
+    assert len(flat_docs) == 5
+
+
+def test_flat_and_nested_raw_change_fingerprints_differ() -> None:
+    """The raw change fingerprint binds the exact structural representation."""
+    nested = classify(deployed_document())
+    flat = classify(_flat_deployed_document())
+    assert flat.change_fingerprint != nested.change_fingerprint
+
+
+_FLAT_NEGATIVE: dict[str, Any] = {
+    "mixed_flat_and_nested": lambda: _cosmos_change(
+        delta=[_cosmos_flat_echo_delta()[0], _cosmos_echo_delta()[0]]
+    ),
+    "flat_children_absent": lambda: _cosmos_change(
+        delta=[
+            {k: v for k, v in node.items() if k != "children"}
+            for node in _cosmos_flat_echo_delta()
+        ]
+    ),
+    "flat_children_empty_list": lambda: _cosmos_change(delta=_flat_all_children([])),
+    "flat_children_non_empty_list": lambda: _cosmos_change(
+        delta=_flat_all_children(
+            [{"path": "x", "propertyChangeType": "Delete", "before": 1, "after": None}]
+        )
+    ),
+    "flat_children_object": lambda: _cosmos_change(delta=_flat_all_children({})),
+    "flat_children_string": lambda: _cosmos_change(delta=_flat_all_children("nope")),
+    "missing_before_field": lambda: _cosmos_change(
+        delta=[
+            {k: v for k, v in node.items() if k != "before"}
+            for node in _cosmos_flat_echo_delta()
+        ]
+    ),
+    "missing_after_field": lambda: _cosmos_change(
+        delta=[
+            {k: v for k, v in node.items() if k != "after"}
+            for node in _cosmos_flat_echo_delta()
+        ]
+    ),
+    "extra_node_field": lambda: _cosmos_change(
+        delta=[{**node, "unexpected": True} for node in _cosmos_flat_echo_delta()]
+    ),
+    "leading_dot": lambda: _cosmos_change(
+        delta=_flat_first_path(".properties.analyticalStorageConfiguration")
+    ),
+    "trailing_dot": lambda: _cosmos_change(
+        delta=_flat_first_path("properties.analyticalStorageConfiguration.")
+    ),
+    "double_dot": lambda: _cosmos_change(
+        delta=_flat_first_path("properties..analyticalStorageConfiguration")
+    ),
+    "path_slash": lambda: _cosmos_change(
+        delta=_flat_first_path("properties/analyticalStorageConfiguration")
+    ),
+    "path_backslash": lambda: _cosmos_change(
+        delta=_flat_first_path("properties\\analyticalStorageConfiguration")
+    ),
+    "path_control": lambda: _cosmos_change(
+        delta=_flat_first_path("properties.\x01config")
+    ),
+    "path_percent": lambda: _cosmos_change(
+        delta=_flat_first_path("properties.%2econfig")
+    ),
+    "path_query": lambda: _cosmos_change(delta=_flat_first_path("properties.config?x")),
+    "path_fragment": lambda: _cosmos_change(
+        delta=_flat_first_path("properties.config#x")
+    ),
+    "single_segment_flat": lambda: _cosmos_change(
+        delta=_flat_first_path("analyticalStorageConfiguration")
+    ),
+    "wrong_operation": lambda: _cosmos_change(
+        delta=_flat_node(0, propertyChangeType="Create")
+    ),
+    "wrong_before_value": lambda: _cosmos_change(
+        delta=_flat_node(2, before="https://not-the-endpoint.example:443/")
+    ),
+    "wrong_role_type_path": lambda: _cosmos_change(
+        delta=_flat_node(
+            0,
+            path="properties.Flow_Type",
+            propertyChangeType="Create",
+            before=None,
+            after="Bluefield",
+        )
+    ),
+    "arbitrary_dotted_path": lambda: _cosmos_change(
+        delta=_flat_node(0, path="properties.mysteryField")
+    ),
+    "extra_sixth_leaf": lambda: _cosmos_change(
+        delta=_cosmos_flat_echo_delta()
+        + [
+            {
+                "path": "properties.extraEcho",
+                "propertyChangeType": "Delete",
+                "before": None,
+                "after": None,
+                "children": None,
+            }
+        ]
+    ),
+    "duplicate_approved_leaf": lambda: _cosmos_change(
+        delta=_cosmos_flat_echo_delta() + [dict(_cosmos_flat_echo_delta()[2])]
+    ),
+    "wrong_profile_not_serverless": lambda: _cosmos_change(
+        delta=_cosmos_flat_echo_delta(), payload=_cosmos_profile(serverless=False)
+    ),
+    "wrong_profile_not_analytical_disabled": lambda: _cosmos_change(
+        delta=_cosmos_flat_echo_delta(),
+        payload=_cosmos_profile(analytical_disabled=False),
+    ),
+    "non_null_extension": lambda: {
+        **_cosmos_change(delta=_cosmos_flat_echo_delta()),
+        "extension": {"resourceId": "x"},
+    },
+    "empty_flat_delta": lambda: _cosmos_change(delta=[]),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_FLAT_NEGATIVE))
+def test_flat_encoding_negatives_fail_closed(name: str) -> None:
+    """Every malformed, mixed, or off-policy flat delta fails closed."""
+    _assert_code(
+        deployed_document(cosmos=_FLAT_NEGATIVE[name]()),
+        WhatIfClassificationCode.NORMALIZATION_REJECTED,
+    )
+
+
+def test_convergence_fingerprint_binds_both_encodings() -> None:
+    """The convergence fingerprint binds both encodings and changed."""
+    assert (
+        classifier.convergence_policy_fingerprint() == _CONVERGENCE_POLICY_FINGERPRINT
+    )
+    assert classifier.convergence_policy_fingerprint() != _PRIOR_LAW_ONLY_FINGERPRINT
+
+
+def test_old_convergence_fingerprint_is_rejected_on_promotion() -> None:
+    """Evidence carrying the prior fingerprint fails exact promotion equality."""
+    plan = evidence(_flat_deployed_document())
+    stale = copy.deepcopy(plan)
+    stale["normalizations"]["convergence_policy_fingerprint"] = (
+        _PRIOR_LAW_ONLY_FINGERPRINT
+    )
+    with pytest.raises(WhatIfClassificationError) as error:
+        classifier.compare_promotion_evidence(plan, stale)
+    assert error.value.code is WhatIfClassificationCode.PROMOTION_MISMATCH
+
+
+def test_flat_and_nested_evidence_observations_are_byte_identical() -> None:
+    """The five observation documents are identical across encodings."""
+    nested = evidence(deployed_document())
+    flat = evidence(_flat_deployed_document())
+    assert (
+        flat["normalizations"]["observations"]
+        == nested["normalizations"]["observations"]
+    )
+    assert len(flat["normalizations"]["observations"]) == 5
+
+
+def test_flat_vs_nested_raw_encoding_breaks_promotion_equality() -> None:
+    """Plan/apply evidence with different raw encodings fails promotion equality."""
+    nested = evidence(deployed_document())
+    flat = evidence(_flat_deployed_document())
+    assert flat["changes"]["fingerprint"] != nested["changes"]["fingerprint"]
+    with pytest.raises(WhatIfClassificationError) as error:
+        classifier.compare_promotion_evidence(nested, flat)
+    assert error.value.code is WhatIfClassificationCode.PROMOTION_MISMATCH
