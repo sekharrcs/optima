@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import shlex
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -362,3 +363,60 @@ def test_smoke_job_receives_the_same_explicit_cache_mode_as_api() -> None:
     assert module.count("name: 'OPTIMA_SEMANTIC_CACHE_ENABLED'") == 2
     assert "name: 'OPTIMA_SEMANTIC_CACHE_ENABLED'" in smoke_job
     assert "value: validatedSemanticCacheEnabled ? 'true' : 'false'" in smoke_job
+
+
+IMAGE_LOAD_STEP_NAME = "Load the exact verified image objects"
+
+
+def _image_load_run_body() -> str:
+    """Return the exact indented shell body of the image-load step."""
+    content = workflow()
+    start = content.index(f"- name: {IMAGE_LOAD_STEP_NAME}")
+    after_run = content[start:].split("run: |\n", 1)[1]
+    body: list[str] = []
+    for line in after_run.splitlines():
+        if line.strip() and not line.startswith(" " * 10):
+            break
+        body.append(line)
+    return "\n".join(body)
+
+
+def test_image_load_step_passes_valid_go_template_without_backslash() -> None:
+    """The docker --format operands must reach the Go-template parser unescaped.
+
+    The single-quoted format string is passed to docker verbatim, so a literal
+    backslash inside it reaches Go's text/template and fails with
+    ``unexpected "\\" in operand`` (production run 35208289537). This asserts the
+    corrected, backslash-free operands and that they round-trip through a POSIX
+    shell tokenizer exactly as GitHub Actions executes them.
+    """
+    body = _image_load_run_body()
+
+    # bash single-quoted content is literal and terminated by the next quote
+    formats = re.findall(r"docker image inspect --format '([^']*)'", body)
+    assert len(formats) == 3, f"expected three --format operands, got {formats!r}"
+
+    for tmpl in formats:
+        assert "\\" not in tmpl, f"backslash reaches Go-template operand: {tmpl!r}"
+        # a real POSIX tokenizer must yield the identical literal operand
+        argv = shlex.split(f"docker image inspect --format '{tmpl}' img")
+        assert argv[argv.index("--format") + 1] == tmpl
+
+    assert '{{index .Config.Labels "org.opencontainers.image.revision"}}' in formats
+    assert "{{.Id}}" in formats
+    assert "{{.Os}}/{{.Architecture}}" in formats
+
+    # API and UI are verified by the same shared loop
+    assert "for component in api ui; do" in body
+
+    # integrity, identity, platform, revision, and cardinality checks remain
+    assert "set -euo pipefail" in body
+    assert "sha256sum --check --strict exact-images.sha256" in body
+    assert "docker image load --input exact-images.tar" in body
+    assert 'expected_id="$(tr -d ' in body
+    assert 'test "$actual_id" = "$expected_id"' in body
+    assert '= "linux/amd64"' in body
+    assert '= "$GITHUB_SHA"' in body
+
+    # no mutable tag is accepted in place of the immutable checked identity
+    assert body.count("optima-$component:production-check") == 3

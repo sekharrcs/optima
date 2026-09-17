@@ -347,7 +347,7 @@ jobs:
             actual_id="$(docker image inspect --format '{{.Id}}' "optima-$component:production-check")"
             test "$actual_id" = "$expected_id"
             test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "optima-$component:production-check")" = "linux/amd64"
-            test "$(docker image inspect --format '{{index .Config.Labels \"org.opencontainers.image.revision\"}}' "optima-$component:production-check")" = "$GITHUB_SHA"
+            test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "optima-$component:production-check")" = "$GITHUB_SHA"
           done
 
       - name: Verify protected main deployment context
