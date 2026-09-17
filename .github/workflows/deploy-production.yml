@@ -376,7 +376,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python scripts/azure_preflight.py --phase foundation \
+          python scripts/azure_preflight.py --phase production-foundation \
             --output "$RUNNER_TEMP/foundation-preflight.json"
 
       - name: Reject interrupted foundation deployments before mutation

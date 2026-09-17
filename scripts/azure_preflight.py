@@ -31,6 +31,7 @@ PREFLIGHT_PHASES = (
     "foundation-plan",
     "foundation-apply",
     "foundation",
+    "production-foundation",
     "publish",
     "artifacts",
     "rollout",
@@ -1563,7 +1564,9 @@ def _check_deployment_role_allowlist(
                 EffectiveRoleAssignment(READER_ROLE_ID, subscription_scope),
                 EffectiveRoleAssignment(CONTRIBUTOR_ROLE_ID, resource_group_scope),
             }
-    else:
+    elif phase in {"production-foundation", "publish", "artifacts", "rollout"}:
+        # production-foundation and the runtime-composition phases require the
+        # exact three-role deployer contract, binding AcrPush to the approved ACR.
         if configuration.registry_name is None:
             raise PreflightError("Container registry name is unavailable")
         registry_scope = _canonical_arm_scope(
@@ -1579,6 +1582,8 @@ def _check_deployment_role_allowlist(
             raise PreflightError(
                 "OIDC deployment identity lacks AcrPush on the OPTIMA registry"
             )
+    else:
+        raise PreflightError(f"Unsupported preflight role phase {phase}")
     if assignments != expected:
         if any(
             assignment.role_definition_id in FORBIDDEN_DEPLOYMENT_ROLE_IDS

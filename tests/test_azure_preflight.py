@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 from dataclasses import replace
 from datetime import date, timedelta
 from decimal import Decimal
@@ -13,6 +14,7 @@ from typing import Any
 import pytest
 
 from scripts.azure_preflight import (
+    ACR_PULL_ROLE_ID,
     ACR_PUSH_ROLE_ID,
     CONTRIBUTOR_ROLE_ID,
     MICROSOFT_GRAPH_HOST,
@@ -3166,3 +3168,288 @@ def test_unsupported_preflight_phase_is_rejected() -> None:
     """Reject an unknown preflight phase instead of inferring a contract."""
     with pytest.raises(PreflightError, match="Unsupported preflight phase"):
         load_configuration(foundation_environment(), phase="bootstrap")
+
+
+PRODUCTION_SUBSCRIPTION_SCOPE = f"/subscriptions/{SUBSCRIPTION_ID}"
+PRODUCTION_RESOURCE_GROUP_SCOPE = (
+    f"{PRODUCTION_SUBSCRIPTION_SCOPE}/resourceGroups/rg-optima-hackathon"
+)
+PRODUCTION_REGISTRY_SCOPE = (
+    f"{PRODUCTION_RESOURCE_GROUP_SCOPE}/providers/Microsoft.ContainerRegistry/"
+    "registries/acroptima123456789"
+)
+
+
+def production_effective_assignments() -> list[dict[str, str]]:
+    """Return the exact approved production-foundation deployer three-role set."""
+    return [
+        effective_assignment(
+            READER_ROLE_ID,
+            PRODUCTION_SUBSCRIPTION_SCOPE,
+            principal_id=DEPLOYMENT_PRINCIPAL_ID,
+        ),
+        effective_assignment(
+            CONTRIBUTOR_ROLE_ID,
+            PRODUCTION_RESOURCE_GROUP_SCOPE,
+            principal_id=DEPLOYMENT_PRINCIPAL_ID,
+        ),
+        effective_assignment(
+            ACR_PUSH_ROLE_ID,
+            PRODUCTION_REGISTRY_SCOPE,
+            principal_id=DEPLOYMENT_PRINCIPAL_ID,
+        ),
+    ]
+
+
+def _authenticated_production_azure(azure: FakeAzure) -> None:
+    azure.access_token = synthetic_access_token(
+        tenant_id=azure.configuration.tenant_id,
+        client_id=azure.configuration.deployment_client_id,
+        principal_id=azure.deployment_principal_id,
+    )
+
+
+def test_ordinary_foundation_accepts_reader_and_contributor_only() -> None:
+    """Ordinary foundation still passes with exactly Reader and Contributor."""
+    configuration = load_configuration(valid_environment())
+    azure = FakeAzure(configuration, foundation_exists=True, acr_push=False)
+    _authenticated_production_azure(azure)
+
+    evidence = run_preflight(
+        configuration, azure, phase="foundation", repository_root=ROOT
+    )
+
+    assert evidence["phase"] == "foundation"
+
+
+def test_ordinary_foundation_rejects_added_acr_push() -> None:
+    """Ordinary foundation rejects AcrPush exactly as production run 35231953191."""
+    configuration = load_configuration(valid_environment())
+    azure = FakeAzure(configuration, foundation_exists=True)
+
+    with pytest.raises(PreflightError, match="exactly the approved effective roles"):
+        run_preflight(configuration, azure, phase="foundation", repository_root=ROOT)
+
+
+def test_production_foundation_accepts_exact_three_role_contract() -> None:
+    """Production-foundation accepts exactly Reader, Contributor, and AcrPush@ACR."""
+    configuration = load_configuration(valid_environment())
+    azure = FakeAzure(configuration, foundation_exists=True)
+    _authenticated_production_azure(azure)
+
+    evidence = run_preflight(
+        configuration, azure, phase="production-foundation", repository_root=ROOT
+    )
+
+    assert evidence["phase"] == "production-foundation"
+
+
+def test_production_foundation_requires_acr_push() -> None:
+    """Missing AcrPush fails the production-foundation contract closed."""
+    configuration = load_configuration(valid_environment())
+    azure = FakeAzure(configuration, foundation_exists=True, acr_push=False)
+
+    with pytest.raises(PreflightError, match="lacks AcrPush"):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+def test_production_foundation_rejects_acr_push_on_another_registry() -> None:
+    """AcrPush on a different ACR does not satisfy the approved binding."""
+    configuration = load_configuration(valid_environment())
+    azure = FakeAzure(configuration, foundation_exists=True)
+    other_registry = (
+        f"{PRODUCTION_RESOURCE_GROUP_SCOPE}/providers/Microsoft.ContainerRegistry/"
+        "registries/acrimposter000000"
+    )
+    azure.effective_assignments = [
+        production_effective_assignments()[0],
+        production_effective_assignments()[1],
+        effective_assignment(
+            ACR_PUSH_ROLE_ID, other_registry, principal_id=DEPLOYMENT_PRINCIPAL_ID
+        ),
+    ]
+
+    with pytest.raises(PreflightError, match="lacks AcrPush"):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+def test_production_foundation_rejects_acr_push_at_broader_scope() -> None:
+    """AcrPush at the resource-group scope does not satisfy the ACR binding."""
+    configuration = load_configuration(valid_environment())
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.effective_assignments = [
+        production_effective_assignments()[0],
+        production_effective_assignments()[1],
+        effective_assignment(
+            ACR_PUSH_ROLE_ID,
+            PRODUCTION_RESOURCE_GROUP_SCOPE,
+            principal_id=DEPLOYMENT_PRINCIPAL_ID,
+        ),
+    ]
+
+    with pytest.raises(PreflightError, match="lacks AcrPush"):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+def test_production_foundation_rejects_acr_pull_instead_of_push() -> None:
+    """AcrPull at the approved ACR does not satisfy the AcrPush requirement."""
+    configuration = load_configuration(valid_environment())
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.effective_assignments = [
+        production_effective_assignments()[0],
+        production_effective_assignments()[1],
+        effective_assignment(
+            ACR_PULL_ROLE_ID,
+            PRODUCTION_REGISTRY_SCOPE,
+            principal_id=DEPLOYMENT_PRINCIPAL_ID,
+        ),
+    ]
+
+    with pytest.raises(PreflightError, match="lacks AcrPush"):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+def test_production_foundation_rejects_duplicate_acr_push() -> None:
+    """A duplicated AcrPush assignment fails closed."""
+    configuration = load_configuration(valid_environment())
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.effective_assignments = [
+        *production_effective_assignments(),
+        effective_assignment(
+            ACR_PUSH_ROLE_ID,
+            PRODUCTION_REGISTRY_SCOPE,
+            principal_id=DEPLOYMENT_PRINCIPAL_ID,
+        ),
+    ]
+
+    with pytest.raises(PreflightError, match="duplicate role assignments"):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+def test_production_foundation_rejects_forbidden_owner_role() -> None:
+    """An added Owner assignment is rejected as a forbidden role."""
+    configuration = load_configuration(valid_environment())
+    azure = FakeAzure(
+        configuration, foundation_exists=True, forbidden_deployment_role=True
+    )
+
+    with pytest.raises(PreflightError, match="forbidden Owner"):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+def test_production_foundation_rejects_lingering_subscription_contributor() -> None:
+    """A broader Contributor assignment fails the exact-scope contract."""
+    configuration = load_configuration(valid_environment())
+    azure = FakeAzure(
+        configuration,
+        foundation_exists=True,
+        lingering_subscription_contributor=True,
+    )
+
+    with pytest.raises(PreflightError, match="Contributor only"):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+def test_production_foundation_rejects_extra_unrelated_role() -> None:
+    """Any additional unrelated role breaks the exact three-role set."""
+    configuration = load_configuration(valid_environment())
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.effective_assignments = [
+        *production_effective_assignments(),
+        effective_assignment(
+            OPENAI_USER_ROLE_ID,
+            PRODUCTION_RESOURCE_GROUP_SCOPE,
+            principal_id=DEPLOYMENT_PRINCIPAL_ID,
+        ),
+    ]
+
+    with pytest.raises(PreflightError, match="exactly the approved effective roles"):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+def test_production_foundation_rejects_group_derived_acr_push() -> None:
+    """Group-derived access cannot silently satisfy the AcrPush requirement."""
+    configuration = load_configuration(valid_environment())
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.effective_assignments = [
+        production_effective_assignments()[0],
+        production_effective_assignments()[1],
+        effective_assignment(
+            ACR_PUSH_ROLE_ID,
+            PRODUCTION_REGISTRY_SCOPE,
+            principal_id=DEPLOYMENT_PRINCIPAL_ID,
+            principal_type="Group",
+        ),
+    ]
+
+    with pytest.raises(PreflightError, match="group-derived role"):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+def test_production_foundation_rejects_wrong_deployer_principal() -> None:
+    """An assignment for another principal fails closed."""
+    configuration = load_configuration(valid_environment())
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.effective_assignments = [
+        production_effective_assignments()[0],
+        production_effective_assignments()[1],
+        effective_assignment(
+            ACR_PUSH_ROLE_ID,
+            PRODUCTION_REGISTRY_SCOPE,
+            principal_id="99999999-0000-1111-2222-333333333333",
+        ),
+    ]
+
+    with pytest.raises(PreflightError, match="principal is malformed"):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+def test_deploy_production_selects_explicit_production_foundation_context() -> None:
+    """The production workflow requests the closed production-foundation context."""
+    deploy = (ROOT / ".github" / "workflows" / "deploy-production.yml").read_text(
+        encoding="utf-8"
+    )
+    phases = re.findall(r"--phase (\S+)", deploy)
+    assert set(phases) == {
+        "production-foundation",
+        "publish",
+        "artifacts",
+        "rollout",
+    }
+    assert "foundation" not in phases
+    assert deploy.count("id-token: write") == 1
+    assert deploy.index("--phase production-foundation") < deploy.index(
+        "What-if and converge the Azure foundation"
+    )
+    assert deploy.index("--phase production-foundation") < deploy.index(
+        "Push the exact verified images"
+    )
+
+    foundation = (ROOT / ".github" / "workflows" / "foundation.yml").read_text(
+        encoding="utf-8"
+    )
+    assert set(re.findall(r"--phase (\S+)", foundation)) == {
+        "foundation-plan",
+        "foundation-apply",
+    }
+    assert "production-foundation" not in foundation

@@ -48,7 +48,9 @@ def test_azure_oidc_permission_exists_only_after_validation() -> None:
     assert "uv run pytest" not in content
     assert "PYTHONPATH" not in content
     assert content.index("id-token: write") < content.index("azure/login@")
-    assert content.index("azure/login@") < content.index("--phase foundation")
+    assert content.index("azure/login@") < content.index(
+        "--phase production-foundation"
+    )
     assert "client-secret:" not in content
     assert "persist-credentials: false" in content
 
@@ -71,7 +73,7 @@ def test_all_actions_are_pinned_to_full_commit_shas() -> None:
 def test_preflight_and_mutation_order_is_fail_closed() -> None:
     """Run each read-only gate before the mutation it authorizes."""
     content = workflow()
-    foundation = content.index("--phase foundation")
+    foundation = content.index("--phase production-foundation")
     foundation_create = content.index("az deployment group create", foundation)
     publish = content.index("--phase publish", foundation_create)
     image_push = content.index('docker push "$api_image"', publish)
@@ -171,7 +173,7 @@ def test_cache_mode_is_strictly_canonically_validated_before_azure_login() -> No
     )
     assert canonical_gate < error_message
     assert canonical_gate < content.index("azure/login@")
-    assert canonical_gate < content.index("--phase foundation")
+    assert canonical_gate < content.index("--phase production-foundation")
 
 
 def test_disabled_cache_is_verified_before_pre_exposure_smoke() -> None:
