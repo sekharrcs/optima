@@ -866,6 +866,22 @@ def convergence_policy_fingerprint() -> str:
                     "requires_extension_null": True,
                 }
             ],
+            "provider_echo_encodings": {
+                "uniform_per_resource": True,
+                "mixed_encoding_rejected": True,
+                "nested": {
+                    "path_segments": "single_token",
+                    "modify_parent_children": "non_empty_list",
+                    "leaf_requires_before_after": True,
+                },
+                "flat": {
+                    "node_shape": "depth_0_leaf",
+                    "field_set": sorted(_FLAT_DELTA_NODE_FIELDS),
+                    "children_invariant": "null",
+                    "path": "dotted_fully_qualified",
+                    "requires_before_after": True,
+                },
+            },
         },
     )
 
@@ -993,6 +1009,92 @@ def _echo_after_matches(rule: ProviderEchoRule, after: Any) -> bool:
     return False
 
 
+# The captured flat provider-echo node carries the fully-qualified dotted path
+# directly on a depth-0 leaf that also declares an explicit null children field.
+_FLAT_DELTA_NODE_FIELDS = frozenset(
+    {"path", "propertyChangeType", "before", "after", "children"}
+)
+
+
+def _is_flat_echo_marker(entry: Any) -> bool:
+    """A flat (Encoding B) node is marked by an explicit null children field."""
+    return isinstance(entry, dict) and "children" in entry and entry["children"] is None
+
+
+def _flatten_flat_delta(delta: list[Any]) -> list[tuple[str, str, Any, Any]]:
+    """Extract fully-qualified leaves from the captured flat echo encoding.
+
+    Every node must be a depth-0 leaf whose field set is exactly
+    ``{path, propertyChangeType, before, after, children}`` with children exactly
+    JSON null, an explicit before and after, and a dotted, canonical,
+    fully-qualified path. Any deviation fails closed. This recognizer performs no
+    semantic approval; the caller still enforces the unchanged echo rules.
+    """
+    leaves: list[tuple[str, str, Any, Any]] = []
+    for entry in delta:
+        if not isinstance(entry, dict) or set(entry) != _FLAT_DELTA_NODE_FIELDS:
+            raise WhatIfClassificationError(
+                WhatIfClassificationCode.NORMALIZATION_REJECTED,
+                "Flat managed modification has a malformed delta entry",
+            )
+        if entry["children"] is not None:
+            raise WhatIfClassificationError(
+                WhatIfClassificationCode.NORMALIZATION_REJECTED,
+                "Flat managed modification delta requires a null children field",
+            )
+        path = entry["path"]
+        operation = entry["propertyChangeType"]
+        if (
+            not isinstance(path, str)
+            or "." not in path
+            or "/" in path
+            or "\\" in path
+            or "%" in path
+            or "?" in path
+            or "#" in path
+            or _has_control_character(path)
+            or any(not segment for segment in path.split("."))
+        ):
+            raise WhatIfClassificationError(
+                WhatIfClassificationCode.NORMALIZATION_REJECTED,
+                "Flat managed modification has a malformed dotted path",
+            )
+        if not isinstance(operation, str) or not operation:
+            raise WhatIfClassificationError(
+                WhatIfClassificationCode.NORMALIZATION_REJECTED,
+                "Flat managed modification has an invalid operation",
+            )
+        leaves.append((path, operation, entry["before"], entry["after"]))
+    return leaves
+
+
+def _extract_provider_echo_leaves(delta: Any) -> list[tuple[str, str, Any, Any]]:
+    """Select the resource-delta encoding and extract fully-qualified leaves.
+
+    A managed Modify delta must use exactly one encoding across every top-level
+    node: the existing nested single-token form (Encoding A) or the captured flat
+    dotted-leaf form (Encoding B). A mixture of the two fails closed.
+    """
+    if delta is None:
+        return []
+    if not isinstance(delta, list):
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.NORMALIZATION_REJECTED,
+            "Managed modification has a malformed delta payload",
+        )
+    if not delta:
+        return []
+    flat_markers = [_is_flat_echo_marker(entry) for entry in delta]
+    if all(flat_markers):
+        return _flatten_flat_delta(delta)
+    if any(flat_markers):
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.NORMALIZATION_REJECTED,
+            "Managed modification mixes flat and nested delta encodings",
+        )
+    return _flatten_delta(delta, "")
+
+
 def _normalize_managed_change(
     change: Mapping[str, Any],
     *,
@@ -1001,7 +1103,7 @@ def _normalize_managed_change(
     resource_name: str,
 ) -> list[NormalizedObservation]:
     """Normalize a managed Modify only if every delta is an approved echo."""
-    leaves = _flatten_delta(change.get("delta"), "")
+    leaves = _extract_provider_echo_leaves(change.get("delta"))
     if not leaves:
         raise WhatIfClassificationError(
             WhatIfClassificationCode.NORMALIZATION_REJECTED,
@@ -1013,7 +1115,14 @@ def _normalize_managed_change(
             "Managed modification carries an unreviewed extension payload",
         )
     observations: list[NormalizedObservation] = []
+    seen_paths: set[tuple[str, str]] = set()
     for path, operation, before, after in leaves:
+        if (path, operation) in seen_paths:
+            raise WhatIfClassificationError(
+                WhatIfClassificationCode.NORMALIZATION_REJECTED,
+                "Managed modification repeats a delta path",
+            )
+        seen_paths.add((path, operation))
         rule = _PROVIDER_ECHO_INDEX.get((resource_role, resource_type, path, operation))
         if (
             rule is None
