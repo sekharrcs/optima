@@ -1612,3 +1612,54 @@ def test_pr_security_aggregate_gate_enforces_every_collector_status(
     assert gate["status"] == "fail"
     assert gate["command_statuses"][status_name] == 9
     assert any(status_name in finding for finding in gate["findings"])
+
+
+GITLEAKS_IGNORE = ROOT / ".gitleaksignore"
+
+# Exact Gitleaks 8.30.1 fingerprints for the eleven synthetic private-key false
+# positives surfaced by the full-history `gitleaks git --redact=100 .` scan.
+EXPECTED_GITLEAKS_FINGERPRINTS = (
+    "b9dde2236e2a9271b4ea40165a5d7208c12c043f:tests/test_container_packaging.py:private-key:671",
+    "b9dde2236e2a9271b4ea40165a5d7208c12c043f:tests/test_container_packaging.py:private-key:675",
+    "b9dde2236e2a9271b4ea40165a5d7208c12c043f:tests/test_container_packaging.py:private-key:677",
+    "1fce589ade7571ee94c00ea0db59f56a38a6c587:scripts/verify_container_artifacts.py:private-key:36",
+    "1fce589ade7571ee94c00ea0db59f56a38a6c587:scripts/verify_container_artifacts.py:private-key:39",
+    "1fce589ade7571ee94c00ea0db59f56a38a6c587:tests/test_container_packaging.py:private-key:335",
+    "f9eed3c870ade4c6bf0ee8c06109243b5d5d34ad:scripts/verify_container_artifacts.py:private-key:89",
+    "f9eed3c870ade4c6bf0ee8c06109243b5d5d34ad:scripts/verify_container_artifacts.py:private-key:92",
+    "f9eed3c870ade4c6bf0ee8c06109243b5d5d34ad:tests/test_container_packaging.py:private-key:2110",
+    "f9eed3c870ade4c6bf0ee8c06109243b5d5d34ad:tests/test_container_packaging.py:private-key:2114",
+    "f9eed3c870ade4c6bf0ee8c06109243b5d5d34ad:tests/test_container_packaging.py:private-key:2116",
+)
+
+# commit(40 hex):path(no colon/backslash):private-key:line
+_GITLEAKS_FINGERPRINT_PATTERN = re.compile(r"[0-9a-f]{40}:[^:\\]+:private-key:[0-9]+")
+_FORBIDDEN_EXCLUSION_CHARS = set("*?[]()^$|")
+
+
+def test_gitleaksignore_pins_exact_false_positive_fingerprints() -> None:
+    """Pin the eleven synthetic private-key false positives by exact fingerprint.
+
+    The eleven matches are synthetic test fixtures (marker literals, malformed
+    fragments, and explicit sentinels such as ``TOP-SECRET-MATERIAL``) plus the
+    verifier's own PEM header detection constants; none contain real key material.
+    Suppression is exact-fingerprint only -- no regex, globs, path exclusions,
+    rule-wide exclusions, or allowlists.
+    """
+    assert GITLEAKS_IGNORE.is_file(), (
+        ".gitleaksignore must exist at the repository root"
+    )
+    raw = GITLEAKS_IGNORE.read_text(encoding="utf-8")
+    assert "\\" not in raw, ".gitleaksignore must not contain backslashes"
+
+    entries = [line.strip() for line in raw.splitlines() if line.strip()]
+    assert len(entries) == 11, "exactly eleven nonblank fingerprints are expected"
+    assert len(set(entries)) == 11, "fingerprints must be unique"
+
+    for entry in entries:
+        assert _GITLEAKS_FINGERPRINT_PATTERN.fullmatch(entry), entry
+        assert not (_FORBIDDEN_EXCLUSION_CHARS & set(entry)), entry
+        assert entry.count(":") == 3, entry
+        assert ":private-key:" in entry, entry
+
+    assert set(entries) == set(EXPECTED_GITLEAKS_FINGERPRINTS)
