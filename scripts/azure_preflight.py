@@ -55,6 +55,16 @@ REDIS_MAX_RESPONSE_PAGES = 32
 REDIS_ARM_HOST = "management.azure.com"
 MICROSOFT_GRAPH_HOST = "graph.microsoft.com"
 MAX_TRANSITIVE_GROUPS = 999
+MAX_GRAPH_APP_ROLE_ASSIGNMENTS = 999
+# Microsoft Graph first-party application (appId) and the exact application
+# permission the deployment identities require to read directory evidence.
+MICROSOFT_GRAPH_APP_ID = "00000003-0000-0000-c000-000000000000"
+GRAPH_APPLICATION_READ_ALL_ROLE_ID = "9a5d68dd-52b0-4cc2-bd40-abcf44ac3a30"
+# Casefolded ARM resource type of an Azure Container Registry, used to bind the
+# approved registry from live inventory instead of trusting configuration alone.
+ACR_REGISTRY_RESOURCE_TYPE = "microsoft.containerregistry/registries"
+# An Azure Container Registry name is exactly 5-50 ASCII alphanumeric characters.
+ACR_NAME_PATTERN = re.compile(r"[A-Za-z0-9]{5,50}")
 ACR_PUSH_ROLE_ID = "8311e382-0749-4cb8-b61a-304f252e45ec"
 ACR_PULL_ROLE_ID = "7f951dda-4ed3-4680-a7ca-43fe172d538d"
 CONTRIBUTOR_ROLE_ID = "b24988ac-6180-42a0-ab88-20f7382dd24c"
@@ -514,6 +524,22 @@ def _load_pricing(
     )
 
 
+def _validated_registry_name(value: str) -> str:
+    """Return ``value`` when it is a syntactically valid ACR name.
+
+    Azure Container Registry names are exactly 5-50 ASCII alphanumeric
+    characters. Malformed names such as ``bad_name`` must fail configuration
+    load rather than reaching generic ARM-segment validation deeper in the
+    preflight. The original value is returned unchanged so the canonical
+    inventory binding, not this validator, performs case-insensitive matching.
+    """
+    if ACR_NAME_PATTERN.fullmatch(value) is None:
+        raise PreflightError(
+            "AZURE_CONTAINER_REGISTRY_NAME must be 5-50 ASCII alphanumeric characters"
+        )
+    return value
+
+
 def load_configuration(
     environment: Mapping[str, str], *, phase: str = "rollout"
 ) -> DeploymentConfiguration:
@@ -627,7 +653,9 @@ def load_configuration(
         resource_group=_required(environment, "AZURE_RESOURCE_GROUP"),
         location=_required(environment, "AZURE_LOCATION"),
         registry_name=(
-            _required(environment, "AZURE_CONTAINER_REGISTRY_NAME")
+            _validated_registry_name(
+                _required(environment, "AZURE_CONTAINER_REGISTRY_NAME")
+            )
             if runtime_composition or requires_registry_identity
             else None
         ),
@@ -1516,6 +1544,233 @@ def _check_foundation_plan_role_definition(
         )
 
 
+def _resolve_graph_service_principal(azure: AzureQuery) -> tuple[str, frozenset[str]]:
+    """Return the Microsoft Graph service-principal ID and enabled app roles.
+
+    The resource identity for every Graph application permission must be the
+    Microsoft Graph first-party service principal. The returned app-role set is
+    limited to enabled application-membership roles so a granted permission can
+    be proven to be a real, enabled application permission.
+    """
+    document = azure.json(
+        "rest",
+        "--method",
+        "get",
+        "--url",
+        (
+            f"https://{MICROSOFT_GRAPH_HOST}/v1.0/servicePrincipals(appId="
+            f"'{MICROSOFT_GRAPH_APP_ID}')?$select=id,appId,appRoles"
+        ),
+        "--resource",
+        "https://graph.microsoft.com/",
+    )
+    if not isinstance(document, dict) or set(document) - {
+        "@odata.context",
+        "id",
+        "appId",
+        "appRoles",
+    }:
+        raise PreflightError("Microsoft Graph service principal is malformed")
+    if document.get("appId") != MICROSOFT_GRAPH_APP_ID:
+        raise PreflightError("Resolved Microsoft Graph service principal is unexpected")
+    graph_principal_id = _canonical_guid(
+        document.get("id"),
+        label="Microsoft Graph service principal ID",
+    )
+    app_roles = document.get("appRoles")
+    if not isinstance(app_roles, list):
+        raise PreflightError("Microsoft Graph application roles are malformed")
+    enabled_application_roles: set[str] = set()
+    for app_role in app_roles:
+        if not isinstance(app_role, dict):
+            raise PreflightError("Microsoft Graph application roles are malformed")
+        member_types = app_role.get("allowedMemberTypes")
+        if not isinstance(member_types, list) or any(
+            not isinstance(member_type, str) for member_type in member_types
+        ):
+            raise PreflightError("Microsoft Graph application roles are malformed")
+        if app_role.get("isEnabled") is True and "Application" in member_types:
+            enabled_application_roles.add(
+                _canonical_guid(
+                    app_role.get("id"),
+                    label="Microsoft Graph application role ID",
+                )
+            )
+    return graph_principal_id, frozenset(enabled_application_roles)
+
+
+def _check_graph_application_permissions(
+    azure: AzureQuery, *, principal_id: str
+) -> None:
+    """Verify the identity holds exactly Application.Read.All on Microsoft Graph.
+
+    Proving Graph access indirectly is insufficient: the executing deployment
+    identity must carry exactly one Microsoft Graph application permission and
+    it must be the approved Application.Read.All app role, granted on the real
+    Graph service principal. Additional Graph application permissions such as
+    Directory.Read.All or Application.ReadWrite.All are rejected. Non-Graph
+    enterprise-application assignments are outside this check.
+    """
+    graph_principal_id, enabled_application_roles = _resolve_graph_service_principal(
+        azure
+    )
+    document = azure.json(
+        "rest",
+        "--method",
+        "get",
+        "--url",
+        (
+            f"https://{MICROSOFT_GRAPH_HOST}/v1.0/servicePrincipals/"
+            f"{principal_id}/appRoleAssignments"
+            "?$select=appRoleId,principalId,resourceId&$top=999&$count=true"
+        ),
+        "--headers",
+        "ConsistencyLevel=eventual",
+        "--resource",
+        "https://graph.microsoft.com/",
+    )
+    if not isinstance(document, dict) or set(document) - {
+        "@odata.count",
+        "@odata.context",
+        "@odata.nextLink",
+        "value",
+    }:
+        raise PreflightError("Microsoft Graph app role assignments are malformed")
+    if document.get("@odata.nextLink") not in (None, ""):
+        raise PreflightError("Microsoft Graph app role assignments exceed the limit")
+    values = document.get("value")
+    count = document.get("@odata.count")
+    if (
+        not isinstance(values, list)
+        or len(values) > MAX_GRAPH_APP_ROLE_ASSIGNMENTS
+        or not isinstance(count, int)
+        or isinstance(count, bool)
+        or count != len(values)
+    ):
+        raise PreflightError("Microsoft Graph app role assignments are malformed")
+    graph_role_ids: list[str] = []
+    for value in values:
+        if not isinstance(value, dict) or set(value) - {
+            "@odata.type",
+            "appRoleId",
+            "principalId",
+            "resourceId",
+        }:
+            raise PreflightError("Microsoft Graph app role assignment is malformed")
+        resource_id = _canonical_guid(
+            value.get("resourceId"),
+            label="Microsoft Graph app role assignment resource",
+        )
+        if resource_id != graph_principal_id:
+            # Enterprise-application permissions on other resources are outside
+            # the Microsoft Graph application-permission contract.
+            continue
+        assigned_principal_id = _canonical_guid(
+            value.get("principalId"),
+            label="Microsoft Graph app role assignment principal",
+        )
+        if assigned_principal_id != principal_id:
+            raise PreflightError(
+                "Microsoft Graph app role assignment targets another principal"
+            )
+        graph_role_ids.append(
+            _canonical_guid(
+                value.get("appRoleId"),
+                label="Microsoft Graph app role ID",
+            )
+        )
+    if len(graph_role_ids) != 1:
+        raise PreflightError(
+            "OIDC deployment identity must have exactly the Application.Read.All "
+            "Microsoft Graph permission"
+        )
+    if graph_role_ids[0] != GRAPH_APPLICATION_READ_ALL_ROLE_ID:
+        raise PreflightError(
+            "OIDC deployment identity Microsoft Graph permission is not "
+            "Application.Read.All"
+        )
+    if GRAPH_APPLICATION_READ_ALL_ROLE_ID not in enabled_application_roles:
+        raise PreflightError(
+            "Application.Read.All is not an enabled Microsoft Graph application "
+            "permission"
+        )
+
+
+def _resolve_approved_registry_scope(
+    configuration: DeploymentConfiguration,
+    azure: AzureQuery,
+    *,
+    resource_group_scope: str,
+) -> str:
+    """Return the canonical AcrPush scope bound to the approved live registry.
+
+    The trusted expected scope must not be derived from configuration alone. A
+    different valid configured registry paired with a matching role assignment
+    would otherwise pass while inventory still holds the approved registry. The
+    live inventory independently establishes the approved registry: exactly one
+    Container Registry in the approved resource group whose canonical name and
+    resource ID match the validated configuration and the managed identity.
+    """
+    if configuration.registry_name is None:
+        raise PreflightError("Container registry name is unavailable")
+    validated_name = _validated_registry_name(configuration.registry_name)
+    registries = azure.json(
+        "acr",
+        "list",
+        "--resource-group",
+        configuration.resource_group,
+    )
+    if not isinstance(registries, list):
+        raise PreflightError("Azure Container Registry inventory response is malformed")
+    typed_registries = [
+        registry for registry in registries if isinstance(registry, dict)
+    ]
+    if len(typed_registries) != len(registries):
+        raise PreflightError("Azure Container Registry inventory response is malformed")
+    container_registries = [
+        registry
+        for registry in typed_registries
+        if str(registry.get("type", "")).casefold() == ACR_REGISTRY_RESOURCE_TYPE
+    ]
+    if len(container_registries) != len(typed_registries):
+        raise PreflightError(
+            "Azure Container Registry inventory contains a non-registry resource"
+        )
+    if len(container_registries) != 1:
+        raise PreflightError(
+            "OPTIMA resource group must contain exactly one Azure Container Registry"
+        )
+    registry = container_registries[0]
+    provisioning_state = registry.get("provisioningState")
+    if (
+        not isinstance(provisioning_state, str)
+        or provisioning_state.casefold() != "succeeded"
+    ):
+        raise PreflightError(
+            "Approved Azure Container Registry is not fully provisioned"
+        )
+    live_name = registry.get("name")
+    if not isinstance(live_name, str) or ACR_NAME_PATTERN.fullmatch(live_name) is None:
+        raise PreflightError("Approved Azure Container Registry name is malformed")
+    if live_name.casefold() != validated_name.casefold():
+        raise PreflightError(
+            "Configured container registry does not match the approved live registry"
+        )
+    expected_scope = _canonical_arm_scope(
+        f"{resource_group_scope}/providers/Microsoft.ContainerRegistry/"
+        f"registries/{validated_name}"
+    )
+    if not expected_scope.startswith(f"{resource_group_scope}/"):
+        raise PreflightError("Approved Azure Container Registry scope is malformed")
+    live_scope = _canonical_arm_scope(registry.get("id"))
+    if live_scope != expected_scope:
+        raise PreflightError(
+            "Approved Azure Container Registry resource ID does not match the "
+            "managed identity"
+        )
+    return live_scope
+
+
 def _check_deployment_role_allowlist(
     configuration: DeploymentConfiguration,
     azure: AzureQuery,
@@ -1523,6 +1778,7 @@ def _check_deployment_role_allowlist(
     phase: str,
     principal_id: str,
 ) -> None:
+    _check_graph_application_permissions(azure, principal_id=principal_id)
     _reject_transitive_group_roles(
         configuration,
         azure,
@@ -1573,12 +1829,12 @@ def _check_deployment_role_allowlist(
             }
     elif phase in {"production-foundation", "publish", "artifacts", "rollout"}:
         # production-foundation and the runtime-composition phases require the
-        # exact three-role deployer contract, binding AcrPush to the approved ACR.
-        if configuration.registry_name is None:
-            raise PreflightError("Container registry name is unavailable")
-        registry_scope = _canonical_arm_scope(
-            f"{resource_group_scope}/providers/Microsoft.ContainerRegistry/"
-            f"registries/{configuration.registry_name}"
+        # exact three-role deployer contract, binding AcrPush to the approved
+        # ACR that live inventory verifies -- never the configured name alone.
+        registry_scope = _resolve_approved_registry_scope(
+            configuration,
+            azure,
+            resource_group_scope=resource_group_scope,
         )
         expected = {
             EffectiveRoleAssignment(READER_ROLE_ID, subscription_scope),
