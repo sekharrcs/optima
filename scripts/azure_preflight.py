@@ -37,6 +37,11 @@ PREFLIGHT_PHASES = (
     "rollout",
 )
 RUNTIME_COMPOSITION_PHASES = frozenset({"publish", "artifacts", "rollout"})
+# Phases whose exact deployer role contract binds AcrPush to the approved ACR;
+# these must load the registry identity even without runtime composition.
+ACR_ROLE_IDENTITY_PHASES = frozenset(
+    {"production-foundation", "publish", "artifacts", "rollout"}
+)
 EXPECTED_LOCATION = "eastus2"
 EXPECTED_ENVIRONMENT = "hackathon"
 EXPECTED_REPOSITORY = "sekharrcs/optima"
@@ -530,6 +535,8 @@ def load_configuration(
     if foundation_plan and semantic_cache_enabled:
         raise PreflightError("foundation-plan does not support enabled semantic cache")
     runtime_composition = phase in RUNTIME_COMPOSITION_PHASES or semantic_cache_enabled
+    # ACR identity loads for its exact role contract without runtime composition.
+    requires_registry_identity = phase in ACR_ROLE_IDENTITY_PHASES
     supplied_cache_settings = sorted(
         name
         for name in PREFLIGHT_CACHE_ONLY_SETTINGS
@@ -621,7 +628,7 @@ def load_configuration(
         location=_required(environment, "AZURE_LOCATION"),
         registry_name=(
             _required(environment, "AZURE_CONTAINER_REGISTRY_NAME")
-            if runtime_composition
+            if runtime_composition or requires_registry_identity
             else None
         ),
         openai_resource_id=(

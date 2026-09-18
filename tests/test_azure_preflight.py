@@ -2254,6 +2254,7 @@ def test_foundation_apply_rejects_forbidden_owner_role() -> None:
         "foundation-plan",
         "foundation-apply",
         "foundation",
+        "production-foundation",
         "publish",
         "artifacts",
         "rollout",
@@ -2308,6 +2309,7 @@ def test_foundation_plan_still_requires_cost_governance() -> None:
         ("foundation-plan", foundation_plan_environment),
         ("foundation-apply", foundation_apply_environment),
         ("foundation", foundation_environment),
+        ("production-foundation", disabled_environment),
         ("publish", disabled_environment),
     ],
 )
@@ -3209,9 +3211,15 @@ def _authenticated_production_azure(azure: FakeAzure) -> None:
     )
 
 
+def _production_foundation_configuration() -> DeploymentConfiguration:
+    """Load the real cache-disabled production-foundation configuration."""
+    return load_configuration(disabled_environment(), phase="production-foundation")
+
+
 def test_ordinary_foundation_accepts_reader_and_contributor_only() -> None:
     """Ordinary foundation still passes with exactly Reader and Contributor."""
-    configuration = load_configuration(valid_environment())
+    configuration = load_configuration(disabled_environment(), phase="foundation")
+    assert configuration.registry_name is None
     azure = FakeAzure(configuration, foundation_exists=True, acr_push=False)
     _authenticated_production_azure(azure)
 
@@ -3224,16 +3232,47 @@ def test_ordinary_foundation_accepts_reader_and_contributor_only() -> None:
 
 def test_ordinary_foundation_rejects_added_acr_push() -> None:
     """Ordinary foundation rejects AcrPush exactly as production run 35231953191."""
-    configuration = load_configuration(valid_environment())
+    configuration = load_configuration(disabled_environment(), phase="foundation")
     azure = FakeAzure(configuration, foundation_exists=True)
+    azure.effective_assignments = production_effective_assignments()
 
     with pytest.raises(PreflightError, match="exactly the approved effective roles"):
         run_preflight(configuration, azure, phase="foundation", repository_root=ROOT)
 
 
+def test_production_foundation_loads_acr_identity_with_cache_disabled() -> None:
+    """Cache-disabled production-foundation loads only the ACR identity and passes.
+
+    Blocking-review regression for run 35231953191: the real production setting
+    keeps semantic cache disabled, so configuration must load the approved ACR
+    name for the exact role contract without enabling runtime composition. On the
+    pre-fix head this failed with "Container registry name is unavailable".
+    """
+    environment = disabled_environment()
+    assert environment["OPTIMA_SEMANTIC_CACHE_ENABLED"] == "false"
+    configuration = load_configuration(environment, phase="production-foundation")
+
+    assert configuration.registry_name == "acroptima123456789"
+    assert configuration.semantic_cache_enabled is False
+    assert configuration.models == ()
+    assert configuration.openai_resource_id is None
+    assert configuration.pricing is None
+    assert configuration.embedding_dimension is None
+
+    azure = FakeAzure(configuration, foundation_exists=True)
+    _authenticated_production_azure(azure)
+    evidence = run_preflight(
+        configuration, azure, phase="production-foundation", repository_root=ROOT
+    )
+
+    assert evidence["phase"] == "production-foundation"
+    # no Redis or embedding queries are issued for the ACR-only identity load
+    assert not any("Microsoft.Cache" in " ".join(call) for call in azure.calls)
+
+
 def test_production_foundation_accepts_exact_three_role_contract() -> None:
     """Production-foundation accepts exactly Reader, Contributor, and AcrPush@ACR."""
-    configuration = load_configuration(valid_environment())
+    configuration = _production_foundation_configuration()
     azure = FakeAzure(configuration, foundation_exists=True)
     _authenticated_production_azure(azure)
 
@@ -3244,9 +3283,40 @@ def test_production_foundation_accepts_exact_three_role_contract() -> None:
     assert evidence["phase"] == "production-foundation"
 
 
+def test_production_foundation_requires_acr_name() -> None:
+    """A missing ACR name fails configuration closed even with cache disabled."""
+    environment = disabled_environment()
+    environment.pop("AZURE_CONTAINER_REGISTRY_NAME")
+
+    with pytest.raises(
+        PreflightError, match="AZURE_CONTAINER_REGISTRY_NAME is missing"
+    ):
+        load_configuration(environment, phase="production-foundation")
+
+
+def test_production_foundation_rejects_blank_acr_name() -> None:
+    """A blank ACR name fails configuration closed; cache state cannot suppress it."""
+    environment = disabled_environment()
+    environment["AZURE_CONTAINER_REGISTRY_NAME"] = "   "
+
+    with pytest.raises(
+        PreflightError, match="AZURE_CONTAINER_REGISTRY_NAME is missing"
+    ):
+        load_configuration(environment, phase="production-foundation")
+
+
+def test_production_foundation_rejects_placeholder_acr_name() -> None:
+    """A placeholder ACR name fails configuration closed."""
+    environment = disabled_environment()
+    environment["AZURE_CONTAINER_REGISTRY_NAME"] = "replace-acr"
+
+    with pytest.raises(PreflightError, match="placeholder"):
+        load_configuration(environment, phase="production-foundation")
+
+
 def test_production_foundation_requires_acr_push() -> None:
     """Missing AcrPush fails the production-foundation contract closed."""
-    configuration = load_configuration(valid_environment())
+    configuration = _production_foundation_configuration()
     azure = FakeAzure(configuration, foundation_exists=True, acr_push=False)
 
     with pytest.raises(PreflightError, match="lacks AcrPush"):
@@ -3257,15 +3327,16 @@ def test_production_foundation_requires_acr_push() -> None:
 
 def test_production_foundation_rejects_acr_push_on_another_registry() -> None:
     """AcrPush on a different ACR does not satisfy the approved binding."""
-    configuration = load_configuration(valid_environment())
+    configuration = _production_foundation_configuration()
     azure = FakeAzure(configuration, foundation_exists=True)
     other_registry = (
         f"{PRODUCTION_RESOURCE_GROUP_SCOPE}/providers/Microsoft.ContainerRegistry/"
         "registries/acrimposter000000"
     )
+    base = production_effective_assignments()
     azure.effective_assignments = [
-        production_effective_assignments()[0],
-        production_effective_assignments()[1],
+        base[0],
+        base[1],
         effective_assignment(
             ACR_PUSH_ROLE_ID, other_registry, principal_id=DEPLOYMENT_PRINCIPAL_ID
         ),
@@ -3279,11 +3350,12 @@ def test_production_foundation_rejects_acr_push_on_another_registry() -> None:
 
 def test_production_foundation_rejects_acr_push_at_broader_scope() -> None:
     """AcrPush at the resource-group scope does not satisfy the ACR binding."""
-    configuration = load_configuration(valid_environment())
+    configuration = _production_foundation_configuration()
     azure = FakeAzure(configuration, foundation_exists=True)
+    base = production_effective_assignments()
     azure.effective_assignments = [
-        production_effective_assignments()[0],
-        production_effective_assignments()[1],
+        base[0],
+        base[1],
         effective_assignment(
             ACR_PUSH_ROLE_ID,
             PRODUCTION_RESOURCE_GROUP_SCOPE,
@@ -3299,11 +3371,12 @@ def test_production_foundation_rejects_acr_push_at_broader_scope() -> None:
 
 def test_production_foundation_rejects_acr_pull_instead_of_push() -> None:
     """AcrPull at the approved ACR does not satisfy the AcrPush requirement."""
-    configuration = load_configuration(valid_environment())
+    configuration = _production_foundation_configuration()
     azure = FakeAzure(configuration, foundation_exists=True)
+    base = production_effective_assignments()
     azure.effective_assignments = [
-        production_effective_assignments()[0],
-        production_effective_assignments()[1],
+        base[0],
+        base[1],
         effective_assignment(
             ACR_PULL_ROLE_ID,
             PRODUCTION_REGISTRY_SCOPE,
@@ -3319,7 +3392,7 @@ def test_production_foundation_rejects_acr_pull_instead_of_push() -> None:
 
 def test_production_foundation_rejects_duplicate_acr_push() -> None:
     """A duplicated AcrPush assignment fails closed."""
-    configuration = load_configuration(valid_environment())
+    configuration = _production_foundation_configuration()
     azure = FakeAzure(configuration, foundation_exists=True)
     azure.effective_assignments = [
         *production_effective_assignments(),
@@ -3338,7 +3411,7 @@ def test_production_foundation_rejects_duplicate_acr_push() -> None:
 
 def test_production_foundation_rejects_forbidden_owner_role() -> None:
     """An added Owner assignment is rejected as a forbidden role."""
-    configuration = load_configuration(valid_environment())
+    configuration = _production_foundation_configuration()
     azure = FakeAzure(
         configuration, foundation_exists=True, forbidden_deployment_role=True
     )
@@ -3351,7 +3424,7 @@ def test_production_foundation_rejects_forbidden_owner_role() -> None:
 
 def test_production_foundation_rejects_lingering_subscription_contributor() -> None:
     """A broader Contributor assignment fails the exact-scope contract."""
-    configuration = load_configuration(valid_environment())
+    configuration = _production_foundation_configuration()
     azure = FakeAzure(
         configuration,
         foundation_exists=True,
@@ -3366,7 +3439,7 @@ def test_production_foundation_rejects_lingering_subscription_contributor() -> N
 
 def test_production_foundation_rejects_extra_unrelated_role() -> None:
     """Any additional unrelated role breaks the exact three-role set."""
-    configuration = load_configuration(valid_environment())
+    configuration = _production_foundation_configuration()
     azure = FakeAzure(configuration, foundation_exists=True)
     azure.effective_assignments = [
         *production_effective_assignments(),
@@ -3385,11 +3458,12 @@ def test_production_foundation_rejects_extra_unrelated_role() -> None:
 
 def test_production_foundation_rejects_group_derived_acr_push() -> None:
     """Group-derived access cannot silently satisfy the AcrPush requirement."""
-    configuration = load_configuration(valid_environment())
+    configuration = _production_foundation_configuration()
     azure = FakeAzure(configuration, foundation_exists=True)
+    base = production_effective_assignments()
     azure.effective_assignments = [
-        production_effective_assignments()[0],
-        production_effective_assignments()[1],
+        base[0],
+        base[1],
         effective_assignment(
             ACR_PUSH_ROLE_ID,
             PRODUCTION_REGISTRY_SCOPE,
@@ -3405,12 +3479,13 @@ def test_production_foundation_rejects_group_derived_acr_push() -> None:
 
 
 def test_production_foundation_rejects_wrong_deployer_principal() -> None:
-    """An assignment for another principal fails closed."""
-    configuration = load_configuration(valid_environment())
+    """An assignment for another principal fails closed before role acceptance."""
+    configuration = _production_foundation_configuration()
     azure = FakeAzure(configuration, foundation_exists=True)
+    base = production_effective_assignments()
     azure.effective_assignments = [
-        production_effective_assignments()[0],
-        production_effective_assignments()[1],
+        base[0],
+        base[1],
         effective_assignment(
             ACR_PUSH_ROLE_ID,
             PRODUCTION_REGISTRY_SCOPE,
@@ -3424,8 +3499,30 @@ def test_production_foundation_rejects_wrong_deployer_principal() -> None:
         )
 
 
+def test_production_foundation_is_not_runtime_composition() -> None:
+    """Production-foundation must never load runtime-composition inputs."""
+    from scripts.azure_preflight import (
+        ACR_ROLE_IDENTITY_PHASES,
+        RUNTIME_COMPOSITION_PHASES,
+    )
+
+    assert "production-foundation" not in RUNTIME_COMPOSITION_PHASES
+    assert "production-foundation" in ACR_ROLE_IDENTITY_PHASES
+    configuration = _production_foundation_configuration()
+    assert configuration.models == ()
+    assert configuration.openai_resource_id is None
+    assert configuration.ui_auth_client_id is None
+    assert configuration.pricing is None
+    assert configuration.embedding_dimension is None
+
+
 def test_deploy_production_selects_explicit_production_foundation_context() -> None:
-    """The production workflow requests the closed production-foundation context."""
+    """The production workflow requests the closed production-foundation context.
+
+    PyYAML is not a project dependency, so an independent structural YAML parse
+    would broaden scope; this exact-set regex assertion over ``--phase`` tokens
+    is retained as the structural contract for each workflow.
+    """
     deploy = (ROOT / ".github" / "workflows" / "deploy-production.yml").read_text(
         encoding="utf-8"
     )
