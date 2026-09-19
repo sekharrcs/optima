@@ -16,6 +16,7 @@ import os
 import platform
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import unicodedata
@@ -28,6 +29,11 @@ from typing import Any, cast
 
 EXIT_SUCCESS = 0
 EXIT_FAILURE = 1
+MAX_CLASSIFICATION_FILE_BYTES = 64 * 1024 * 1024
+MAX_EFFECTIVE_PARAMETER_FILE_BYTES = 2 * 1024 * 1024
+DEPLOYMENT_PARAMETERS_SCHEMA = (
+    "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#"
+)
 
 EVIDENCE_SCHEMA_VERSION = "optima-foundation-whatif-evidence-v3"
 FAILURE_DIAGNOSTICS_SCHEMA_VERSION = "optima-foundation-whatif-failure-v2"
@@ -101,7 +107,7 @@ _MODULE_DECLARATION = re.compile(
 _MODULE_LINE = re.compile(r"(?m)^\s*module\b")
 _USING_DECLARATION = re.compile(r"(?m)^\s*using\s+'([^'\r\n]+)'\s*$")
 
-_RESOURCE_ROLE_TYPES = {
+_BASE_RESOURCE_ROLE_TYPES = {
     "api_identity": "microsoft.managedidentity/userassignedidentities",
     "application_insights": "microsoft.insights/components",
     "container_registry": "microsoft.containerregistry/registries",
@@ -115,9 +121,15 @@ _RESOURCE_ROLE_TYPES = {
     "smart_detection_action_group": "microsoft.insights/actiongroups",
     "ui_identity": "microsoft.managedidentity/userassignedidentities",
 }
+_CACHE_RESOURCE_ROLE_TYPES = {
+    "managed_redis": "microsoft.cache/redisenterprise",
+    "managed_redis_database": "microsoft.cache/redisenterprise/databases",
+}
+_RESOURCE_ROLE_TYPES = _BASE_RESOURCE_ROLE_TYPES | _CACHE_RESOURCE_ROLE_TYPES
 EXPECTED_FOUNDATION_RESOURCE_TYPES = frozenset(_RESOURCE_ROLE_TYPES.values())
 _SMART_DETECTION_ACTION_GROUP_NAME = "application insights smart detection"
-_MANAGED_FOUNDATION_RESOURCE_COUNT = len(_RESOURCE_ROLE_TYPES)
+_BASE_MANAGED_FOUNDATION_RESOURCE_COUNT = len(_BASE_RESOURCE_ROLE_TYPES)
+_CACHE_MANAGED_FOUNDATION_RESOURCE_COUNT = len(_RESOURCE_ROLE_TYPES)
 
 _DIAGNOSTIC_CODES = ("NestedDeploymentShortCircuited",)
 _DIAGNOSTIC_LEVELS = ("Info", "Warning", "Error")
@@ -660,6 +672,7 @@ def _expected_resource_graph(
     resource_group: str,
     environment_name: str,
     unique_suffix: str,
+    semantic_cache_enabled: bool = False,
 ) -> dict[str, tuple[str, str, str]]:
     """Return canonical IDs mapped to resource role, type, and final name."""
     scope = (
@@ -708,6 +721,19 @@ def _expected_resource_graph(
             _SMART_DETECTION_ACTION_GROUP_NAME,
         ),
     }
+    if semantic_cache_enabled:
+        resources.update(
+            {
+                "managed_redis": (
+                    "microsoft.cache/redisenterprise",
+                    f"redis-optima-{unique_suffix}",
+                ),
+                "managed_redis_database": (
+                    "microsoft.cache/redisenterprise/databases",
+                    "default",
+                ),
+            }
+        )
     graph: dict[str, tuple[str, str, str]] = {}
     for role, (resource_type, resource_name) in resources.items():
         namespace, *type_segments = resource_type.split("/")
@@ -717,6 +743,11 @@ def _expected_resource_graph(
             tail = (
                 f"{namespace}/databaseaccounts/{cosmos_account}/sqldatabases/"
                 "optima/containers/runs"
+            )
+        elif role == "managed_redis_database":
+            tail = (
+                f"{namespace}/redisenterprise/redis-optima-{unique_suffix}/"
+                "databases/default"
             )
         else:
             tail = f"{namespace}/{type_segments[0]}/{resource_name}"
@@ -1216,6 +1247,7 @@ def classify_foundation_whatif(
     resource_group: str,
     environment_name: str = "hackathon",
     deployment_mode: str = "Incremental",
+    semantic_cache_enabled: bool = False,
     external_policy: ExternalObservationPolicy | None = None,
 ) -> FoundationWhatIfClassification:
     """Classify a structured what-if result, raising on any unsafe evidence."""
@@ -1338,6 +1370,13 @@ def classify_foundation_whatif(
             )
             canonical_payloads.append(canonical_change)
         else:
+            if not semantic_cache_enabled and resource_id.resource_type in frozenset(
+                _CACHE_RESOURCE_ROLE_TYPES.values()
+            ):
+                raise WhatIfClassificationError(
+                    WhatIfClassificationCode.REDIS_CHANGE,
+                    "Managed Redis changes require the enabled cache profile",
+                )
             if resource_id.resource_type not in EXPECTED_FOUNDATION_RESOURCE_TYPES:
                 raise WhatIfClassificationError(
                     _denied_type_code(resource_id.resource_type),
@@ -1386,11 +1425,12 @@ def classify_foundation_whatif(
         resource_group=resource_group,
         environment_name=environment_name.casefold(),
         unique_suffix=registry_match.group(1),
+        semantic_cache_enabled=semantic_cache_enabled,
     )
     if {parsed.canonical_id for _, _, parsed in managed_changes} != set(expected_graph):
         raise WhatIfClassificationError(
             WhatIfClassificationCode.RESOURCE_GRAPH_MISMATCH,
-            "Foundation what-if does not match the exact ten-resource graph",
+            "Foundation what-if does not match the exact selected-profile graph",
         )
 
     allowed: list[AllowedChange] = []
@@ -1616,9 +1656,9 @@ def _canonical_external_change(
     return canonical
 
 
-def parameter_fingerprint(parameters: Mapping[str, str]) -> str:
+def parameter_fingerprint(parameters: Mapping[str, Any]) -> str:
     """Return a versioned fingerprint over the complete effective parameters."""
-    document = {str(key): str(value) for key, value in parameters.items()}
+    document = {str(key): value for key, value in parameters.items()}
     return _versioned_fingerprint(PARAMETER_FINGERPRINT_VERSION, document)
 
 
@@ -1645,21 +1685,35 @@ def _parse_parameter_lines(text: str) -> dict[str, str]:
     return parameters
 
 
+def _parameter_boolean(value: Any, *, name: str) -> bool:
+    """Parse a canonical Boolean from a summary string or ARM JSON value."""
+    if value is True or value == "true":
+        return True
+    if value is False or value == "false":
+        return False
+    raise WhatIfClassificationError(
+        WhatIfClassificationCode.INVALID_PARAMETERS,
+        f"Deployment parameter {name} is not a canonical Boolean",
+    )
+
+
 def _validate_foundation_parameters(
-    parameters: Mapping[str, str],
+    parameters: Mapping[str, Any],
     *,
     resource_group: str,
-) -> None:
+) -> bool:
     """Require the exact non-application foundation deployment profile."""
-    expected = {
-        "deployContainerApps": "false",
-        "deployRuntimeAccess": "false",
-        "exposePublicUi": "false",
-        "location": "eastus2",
-        "resourceGroup": resource_group,
-        "semanticCacheEnabled": "false",
-    }
-    if any(parameters.get(key) != value for key, value in expected.items()):
+    if (
+        _parameter_boolean(
+            parameters.get("deployContainerApps"), name="deployContainerApps"
+        )
+        or _parameter_boolean(
+            parameters.get("deployRuntimeAccess"), name="deployRuntimeAccess"
+        )
+        or _parameter_boolean(parameters.get("exposePublicUi"), name="exposePublicUi")
+        or parameters.get("location") != "eastus2"
+        or parameters.get("resourceGroup") != resource_group
+    ):
         raise WhatIfClassificationError(
             WhatIfClassificationCode.INVALID_PARAMETERS,
             "Deployment parameters are not the approved foundation profile",
@@ -1674,6 +1728,9 @@ def _validate_foundation_parameters(
             WhatIfClassificationCode.INVALID_PARAMETERS,
             "Deployment environment name is not canonical",
         )
+    return _parameter_boolean(
+        parameters.get("semanticCacheEnabled"), name="semanticCacheEnabled"
+    )
 
 
 def _resolve_source_reference(
@@ -1717,7 +1774,7 @@ def _resolve_source_reference(
 
 
 def deployment_source_fingerprint(
-    parameters: Mapping[str, str],
+    parameters: Mapping[str, Any],
     *,
     source_root: Path | None = None,
 ) -> tuple[str, int]:
@@ -1728,16 +1785,25 @@ def deployment_source_fingerprint(
             WhatIfClassificationCode.INVALID_DEPLOYMENT_SOURCE,
             "Deterministic deployment source root is unavailable",
         )
+    template_reference = parameters.get("templateFile")
+    parameter_reference = parameters.get("parameterFile")
+    if not isinstance(template_reference, str) or not isinstance(
+        parameter_reference, str
+    ):
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.INVALID_DEPLOYMENT_SOURCE,
+            "Deployment source references are malformed",
+        )
     template = _resolve_source_reference(
         root=root,
         parent=root,
-        reference=parameters.get("templateFile", ""),
+        reference=template_reference,
         allow_parent=False,
     )
     parameter_file = _resolve_source_reference(
         root=root,
         parent=root,
-        reference=parameters.get("parameterFile", ""),
+        reference=parameter_reference,
         allow_parent=False,
     )
 
@@ -1820,16 +1886,20 @@ def _validate_resource_facts(
     resources: Any,
     *,
     environment_name: str,
-) -> None:
+) -> bool:
     """Validate the closed sanitized resource-fact projection."""
     if (
         not isinstance(resources, list)
-        or len(resources) != _MANAGED_FOUNDATION_RESOURCE_COUNT
+        or len(resources)
+        not in {
+            _BASE_MANAGED_FOUNDATION_RESOURCE_COUNT,
+            _CACHE_MANAGED_FOUNDATION_RESOURCE_COUNT,
+        }
         or not all(isinstance(fact, dict) for fact in resources)
     ):
         raise WhatIfClassificationError(
             WhatIfClassificationCode.PROMOTION_MISMATCH,
-            "Promotion evidence does not contain the ten managed resource facts",
+            "Promotion evidence does not contain the exact selected-profile facts",
         )
     facts_by_role: dict[str, dict[str, str]] = {}
     for fact in resources:
@@ -1863,7 +1933,12 @@ def _validate_resource_facts(
             WhatIfClassificationCode.PROMOTION_MISMATCH,
             "Promotion resource facts are not in canonical order",
         )
-    if set(facts_by_role) != set(_RESOURCE_ROLE_TYPES):
+    roles = set(facts_by_role)
+    if roles == set(_BASE_RESOURCE_ROLE_TYPES):
+        semantic_cache_enabled = False
+    elif roles == set(_RESOURCE_ROLE_TYPES):
+        semantic_cache_enabled = True
+    else:
         raise WhatIfClassificationError(
             WhatIfClassificationCode.PROMOTION_MISMATCH,
             "Promotion resource roles do not match the foundation contract",
@@ -1899,6 +1974,13 @@ def _validate_resource_facts(
         "smart_detection_action_group": _SMART_DETECTION_ACTION_GROUP_NAME,
         "ui_identity": f"id-optima-ui-{environment_name}",
     }
+    if semantic_cache_enabled:
+        expected_names.update(
+            {
+                "managed_redis": f"redis-optima-{suffixes[0]}",
+                "managed_redis_database": "default",
+            }
+        )
     if any(
         facts_by_role[role]["resource_name"] != name
         for role, name in expected_names.items()
@@ -1907,6 +1989,7 @@ def _validate_resource_facts(
             WhatIfClassificationCode.PROMOTION_MISMATCH,
             "Promotion resource names do not match the foundation contract",
         )
+    return semantic_cache_enabled
 
 
 def _validate_external_evidence(document: Mapping[str, Any]) -> None:
@@ -2145,7 +2228,11 @@ def _validate_evidence(document: Any) -> dict[str, Any]:
             not isinstance(count, int) or isinstance(count, bool) or count < 0
             for count in counts.values()
         )
-        or sum(counts.values()) != _MANAGED_FOUNDATION_RESOURCE_COUNT
+        or sum(counts.values())
+        not in {
+            _BASE_MANAGED_FOUNDATION_RESOURCE_COUNT,
+            _CACHE_MANAGED_FOUNDATION_RESOURCE_COUNT,
+        }
     ):
         raise WhatIfClassificationError(
             WhatIfClassificationCode.PROMOTION_MISMATCH,
@@ -2268,7 +2355,10 @@ def compare_convergence_evidence(plan: Any, converged: Any) -> None:
         plan_binding != converged_binding
         or plan_resources != converged_resources
         or validated_converged["changes"]["counts"]
-        != {"Create": 0, "NoChange": _MANAGED_FOUNDATION_RESOURCE_COUNT}
+        != {
+            "Create": 0,
+            "NoChange": len(validated_converged["changes"]["resources"]),
+        }
         or validated_plan["normalizations"]["convergence_policy_fingerprint"]
         != validated_converged["normalizations"]["convergence_policy_fingerprint"]
     ):
@@ -2328,14 +2418,97 @@ def _reject_json_constant(value: str) -> None:
     raise ValueError(f"unsupported JSON constant {value}")
 
 
-def _load_json(path: Path, code: WhatIfClassificationCode) -> Any:
+def read_regular_file(
+    path: Path,
+    *,
+    maximum_bytes: int = MAX_CLASSIFICATION_FILE_BYTES,
+    expected_sha256: str | None = None,
+) -> bytes:
+    """Read one bounded single-link regular file from a verified descriptor."""
+    if maximum_bytes <= 0:
+        raise ValueError("maximum_bytes must be positive")
+    if expected_sha256 is not None and _HEX_SHA256.fullmatch(expected_sha256) is None:
+        raise ValueError("expected_sha256 must be lowercase SHA-256")
+    original = path.lstat()
+    if (
+        not stat.S_ISREG(original.st_mode)
+        or original.st_nlink != 1
+        or original.st_size > maximum_bytes
+    ):
+        raise OSError("input is not a bounded single-link regular file")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_BINARY", 0)
+    descriptor = os.open(path, flags)
+    with os.fdopen(descriptor, "rb") as stream:
+        opened = os.fstat(stream.fileno())
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or not os.path.samestat(original, opened)
+        ):
+            raise OSError("input changed before it was opened")
+        content = stream.read(maximum_bytes + 1)
+        finished = os.fstat(stream.fileno())
+    if (
+        len(content) > maximum_bytes
+        or len(content) != original.st_size
+        or finished.st_size != original.st_size
+        or finished.st_mtime_ns != original.st_mtime_ns
+        or finished.st_nlink != 1
+    ):
+        raise OSError("input changed while it was read")
+    current = path.lstat()
+    if current.st_nlink != 1 or not os.path.samestat(original, current):
+        raise OSError("input path changed while it was read")
+    digest = hashlib.sha256(content).hexdigest()
+    if expected_sha256 is not None and digest != expected_sha256:
+        raise OSError("input digest does not match the captured value")
+    return content
+
+
+def _load_json(
+    path: Path,
+    code: WhatIfClassificationCode,
+    *,
+    expected_sha256: str | None = None,
+) -> Any:
     """Load strict JSON from disk and convert failures to sanitized errors."""
     try:
-        text = path.read_text(encoding="utf-8")
-    except OSError as error:
+        content = read_regular_file(path, expected_sha256=expected_sha256)
+    except (OSError, ValueError) as error:
         raise WhatIfClassificationError(code, f"Cannot read {path.name}") from error
+    return parse_strict_json(content, code=code, label=path.name)
+
+
+def parse_strict_json(
+    content: bytes,
+    *,
+    code: WhatIfClassificationCode,
+    label: str,
+) -> Any:
+    """Parse strict UTF-8 JSON already read through the safe-file boundary."""
     try:
+        text = content.decode("utf-8")
         return json.loads(
+            text,
+            object_pairs_hook=_reject_duplicate_pairs,
+            parse_constant=_reject_json_constant,
+            parse_float=Decimal,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise WhatIfClassificationError(code, f"{label} is not strict JSON") from error
+
+
+def _parse_effective_parameter_document(
+    text: str,
+    *,
+    template_file: str,
+    parameter_source_file: str,
+    resource_group: str,
+) -> dict[str, Any]:
+    """Parse one canonical ARM parameter artifact into fingerprinted values."""
+    try:
+        document = json.loads(
             text,
             object_pairs_hook=_reject_duplicate_pairs,
             parse_constant=_reject_json_constant,
@@ -2343,20 +2516,117 @@ def _load_json(path: Path, code: WhatIfClassificationCode) -> Any:
         )
     except (json.JSONDecodeError, ValueError) as error:
         raise WhatIfClassificationError(
-            code, f"{path.name} is not strict JSON"
+            WhatIfClassificationCode.INVALID_PARAMETERS,
+            "Effective deployment parameters are not strict JSON",
         ) from error
-
-
-def _read_parameter_file(path: Path) -> dict[str, str]:
-    """Read and parse the effective deployment parameter summary."""
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError as error:
+    if (
+        not isinstance(document, dict)
+        or set(document) != {"$schema", "contentVersion", "parameters"}
+        or document["$schema"] != DEPLOYMENT_PARAMETERS_SCHEMA
+        or document["contentVersion"] != "1.0.0.0"
+        or not isinstance(document["parameters"], dict)
+    ):
         raise WhatIfClassificationError(
             WhatIfClassificationCode.INVALID_PARAMETERS,
-            "Cannot read deployment parameter summary",
+            "Effective deployment parameters have an unsupported schema",
+        )
+    parameters: dict[str, Any] = {}
+    for name, binding in document["parameters"].items():
+        if (
+            not isinstance(name, str)
+            or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None
+            or not isinstance(binding, dict)
+            or set(binding) != {"value"}
+            or name in parameters
+        ):
+            raise WhatIfClassificationError(
+                WhatIfClassificationCode.INVALID_PARAMETERS,
+                "Effective deployment parameter binding is malformed",
+            )
+        _validate_json_value(binding["value"])
+        if isinstance(binding["value"], (dict, list)):
+            raise WhatIfClassificationError(
+                WhatIfClassificationCode.INVALID_PARAMETERS,
+                "Effective deployment parameter values must be scalar",
+            )
+        parameters[name] = binding["value"]
+    if "uiAuthClientSecret" in parameters:
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.INVALID_PARAMETERS,
+            "Foundation parameters must not contain the UI client secret",
+        )
+    parameters.update(
+        {
+            "parameterFile": parameter_source_file,
+            "resourceGroup": resource_group,
+            "templateFile": template_file,
+        }
+    )
+    return parameters
+
+
+def parse_foundation_parameters(
+    content: bytes,
+    *,
+    label: str,
+    template_file: str | None = None,
+    parameter_source_file: str | None = None,
+    resource_group: str | None = None,
+) -> dict[str, Any]:
+    """Parse a safely read effective parameter artifact or legacy summary."""
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.INVALID_PARAMETERS,
+            "Cannot read effective deployment parameters",
         ) from error
+    if text.lstrip().startswith("{"):
+        if (
+            template_file is None
+            or parameter_source_file is None
+            or resource_group is None
+        ):
+            raise WhatIfClassificationError(
+                WhatIfClassificationCode.INVALID_PARAMETERS,
+                "Effective deployment parameters require exact source metadata",
+            )
+        return _parse_effective_parameter_document(
+            text,
+            template_file=template_file,
+            parameter_source_file=parameter_source_file,
+            resource_group=resource_group,
+        )
     return _parse_parameter_lines(text)
+
+
+def read_foundation_parameters(
+    path: Path,
+    *,
+    template_file: str | None = None,
+    parameter_source_file: str | None = None,
+    resource_group: str | None = None,
+    expected_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Read one bounded effective parameter artifact or legacy summary."""
+    try:
+        content = read_regular_file(
+            path,
+            maximum_bytes=MAX_EFFECTIVE_PARAMETER_FILE_BYTES,
+            expected_sha256=expected_sha256,
+        )
+    except (OSError, ValueError) as error:
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.INVALID_PARAMETERS,
+            "Cannot read effective deployment parameters",
+        ) from error
+    return parse_foundation_parameters(
+        content,
+        label=path.name,
+        template_file=template_file,
+        parameter_source_file=parameter_source_file,
+        resource_group=resource_group,
+    )
 
 
 def _json_type(value: Any) -> str:
@@ -2557,7 +2827,9 @@ def _run_classify(arguments: argparse.Namespace) -> None:
             if path is not None:
                 path.unlink(missing_ok=True)
         document = _load_json(
-            arguments.whatif, WhatIfClassificationCode.MALFORMED_DOCUMENT
+            arguments.whatif,
+            WhatIfClassificationCode.MALFORMED_DOCUMENT,
+            expected_sha256=arguments.whatif_sha256,
         )
         loaded = True
         _classify_document(arguments, document)
@@ -2613,38 +2885,76 @@ def _external_policy_from_environment(
         ) from None
 
 
-def _classify_document(arguments: argparse.Namespace, document: Any) -> None:
-    """Classify a what-if result and write sanitized plan evidence."""
-    if arguments.deployment_mode != "Incremental":
+def build_evidence_from_whatif(
+    document: Any,
+    *,
+    parameters: Mapping[str, Any],
+    source_root: Path | None,
+    subscription_id: str,
+    resource_group: str,
+    commit_sha: str,
+    deployment_mode: str,
+    external_policy: ExternalObservationPolicy | None,
+) -> dict[str, Any]:
+    """Recompute complete evidence from raw what-if and effective parameters."""
+    if deployment_mode != "Incremental":
         raise WhatIfClassificationError(
             WhatIfClassificationCode.INVALID_DEPLOYMENT_MODE,
             "Foundation classification requires Incremental deployment mode",
         )
-    external_policy = _external_policy_from_environment(arguments.external_policy_env)
-    parameters = _read_parameter_file(arguments.parameters_file)
-    _validate_foundation_parameters(parameters, resource_group=arguments.resource_group)
+    semantic_cache_enabled = _validate_foundation_parameters(
+        parameters, resource_group=resource_group
+    )
     source_fingerprint, source_file_count = deployment_source_fingerprint(
-        parameters, source_root=arguments.source_root
+        parameters, source_root=source_root
     )
     classification = classify_foundation_whatif(
         document,
-        subscription_id=arguments.subscription_id,
-        resource_group=arguments.resource_group,
+        subscription_id=subscription_id,
+        resource_group=resource_group,
         environment_name=parameters["environmentName"],
-        deployment_mode=arguments.deployment_mode,
+        deployment_mode=deployment_mode,
+        semantic_cache_enabled=semantic_cache_enabled,
         external_policy=external_policy,
     )
-    evidence = build_foundation_evidence(
+    return build_foundation_evidence(
         classification,
-        commit_sha=arguments.commit_sha,
+        commit_sha=commit_sha,
         parameter_fingerprint_value=parameter_fingerprint(parameters),
         deployment_source_fingerprint_value=source_fingerprint,
         deployment_source_file_count=source_file_count,
     )
-    serialized = json.dumps(evidence, indent=2, sort_keys=True) + "\n"
+
+
+def serialize_evidence(evidence: Mapping[str, Any]) -> bytes:
+    """Serialize validated evidence to its one canonical on-disk representation."""
+    return (json.dumps(evidence, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def _classify_document(arguments: argparse.Namespace, document: Any) -> None:
+    """Classify a what-if result and write sanitized plan evidence."""
+    external_policy = _external_policy_from_environment(arguments.external_policy_env)
+    parameters = read_foundation_parameters(
+        arguments.parameters_file,
+        template_file=arguments.template_file,
+        parameter_source_file=arguments.parameter_source_file,
+        resource_group=arguments.resource_group,
+        expected_sha256=arguments.parameters_sha256,
+    )
+    evidence = build_evidence_from_whatif(
+        document,
+        parameters=parameters,
+        source_root=arguments.source_root,
+        subscription_id=arguments.subscription_id,
+        resource_group=arguments.resource_group,
+        commit_sha=arguments.commit_sha,
+        deployment_mode=arguments.deployment_mode,
+        external_policy=external_policy,
+    )
+    serialized = serialize_evidence(evidence)
     if arguments.output is not None:
         arguments.output.parent.mkdir(parents=True, exist_ok=True)
-        arguments.output.write_text(serialized, encoding="utf-8")
+        arguments.output.write_bytes(serialized)
     print(_summarize(evidence), end="")
 
 
@@ -2677,12 +2987,16 @@ def create_parser() -> argparse.ArgumentParser:
         "classify", help="Classify structured what-if output and emit evidence."
     )
     classify.add_argument("--whatif", type=Path, required=True)
+    classify.add_argument("--whatif-sha256")
     classify.add_argument("--subscription-id", required=True)
     classify.add_argument("--resource-group", required=True)
     classify.add_argument("--commit-sha", required=True)
     classify.add_argument("--deployment-mode", default="Incremental")
     classify.add_argument("--external-policy-env")
     classify.add_argument("--parameters-file", type=Path, required=True)
+    classify.add_argument("--parameters-sha256")
+    classify.add_argument("--template-file")
+    classify.add_argument("--parameter-source-file")
     classify.add_argument(
         "--source-root",
         type=Path,

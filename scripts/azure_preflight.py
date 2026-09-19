@@ -32,12 +32,15 @@ PREFLIGHT_PHASES = (
     "foundation-plan",
     "foundation-apply",
     "foundation",
+    "production-session",
     "production-foundation",
     "publish",
     "artifacts",
     "rollout",
 )
-RUNTIME_COMPOSITION_PHASES = frozenset({"publish", "artifacts", "rollout"})
+RUNTIME_COMPOSITION_PHASES = frozenset(
+    {"production-foundation", "publish", "artifacts", "rollout"}
+)
 # Phases whose exact deployer role contract binds AcrPush to the approved ACR;
 # these must load the registry identity even without runtime composition.
 ACR_ROLE_IDENTITY_PHASES = frozenset(
@@ -75,7 +78,7 @@ ACR_PLACEHOLDER_NAMES = frozenset(
 # fail-closed classifier approves. The production-foundation registry identity
 # is derived from that classified evidence, never from configuration alone.
 FOUNDATION_TEMPLATE_FILE = "infra/resource-group.bicep"
-FOUNDATION_PARAMETER_FILE = "infra/environments/hackathon.foundation.bicepparam"
+FOUNDATION_PARAMETER_FILE = "infra/environments/hackathon.runtime.bicepparam"
 CONTAINER_REGISTRY_RESOURCE_ROLE = "container_registry"
 ACR_PUSH_ROLE_ID = "8311e382-0749-4cb8-b61a-304f252e45ec"
 ACR_PULL_ROLE_ID = "7f951dda-4ed3-4680-a7ca-43fe172d538d"
@@ -591,9 +594,12 @@ def load_configuration(
     )
     foundation_plan = phase == "foundation-plan"
     separated_foundation_apply = phase == "foundation-apply"
+    session_only = phase == "production-session"
     if foundation_plan and semantic_cache_enabled:
         raise PreflightError("foundation-plan does not support enabled semantic cache")
-    runtime_composition = phase in RUNTIME_COMPOSITION_PHASES or semantic_cache_enabled
+    runtime_composition = not session_only and (
+        phase in RUNTIME_COMPOSITION_PHASES or semantic_cache_enabled
+    )
     # ACR identity loads for its exact role contract without runtime composition.
     requires_registry_identity = phase in ACR_ROLE_IDENTITY_PHASES
     supplied_cache_settings = sorted(
@@ -601,13 +607,13 @@ def load_configuration(
         for name in PREFLIGHT_CACHE_ONLY_SETTINGS
         if environment.get(name, "").strip()
     )
-    if not semantic_cache_enabled and supplied_cache_settings:
+    if not session_only and not semantic_cache_enabled and supplied_cache_settings:
         raise PreflightError(
             "Disabled semantic cache cannot configure cache-only deployment "
             f"settings: {', '.join(supplied_cache_settings)}"
         )
     embedding_dimension: int | None = None
-    if semantic_cache_enabled:
+    if semantic_cache_enabled and not session_only:
         try:
             embedding_dimension = int(
                 _required(environment, "OPTIMA_REDIS_EMBEDDING_DIMENSION")
@@ -990,6 +996,29 @@ def _canonical_guid(value: object, *, label: str) -> str:
     ):
         raise PreflightError(f"{label} is not a canonical GUID")
     return normalized
+
+
+def _canonical_graph_assignment_id(value: object) -> str:
+    """Return one canonical bounded Microsoft Graph assignment identifier."""
+    if (
+        not isinstance(value, str)
+        or re.fullmatch(r"[A-Za-z0-9_-]{20,128}", value) is None
+    ):
+        raise PreflightError("Microsoft Graph app role assignment ID is malformed")
+    try:
+        decoded = base64.b64decode(
+            value + ("=" * (-len(value) % 4)),
+            altchars=b"-_",
+            validate=True,
+        )
+    except binascii.Error as error:
+        raise PreflightError(
+            "Microsoft Graph app role assignment ID is malformed"
+        ) from error
+    canonical = base64.urlsafe_b64encode(decoded).decode("ascii").rstrip("=")
+    if not 16 <= len(decoded) <= 64 or canonical != value:
+        raise PreflightError("Microsoft Graph app role assignment ID is malformed")
+    return value
 
 
 def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -1653,10 +1682,11 @@ def _check_graph_application_permissions(
         (
             f"https://{MICROSOFT_GRAPH_HOST}/v1.0/servicePrincipals/"
             f"{principal_id}/appRoleAssignments"
-            "?$select=appRoleId,principalId,resourceId&$top=999&$count=true"
+            "?$select=id,appRoleId,principalId,resourceId&$top=999&$count=true"
         ),
         "--headers",
         "ConsistencyLevel=eventual",
+        "Accept=application/json;odata.metadata=full",
         "--resource",
         "https://graph.microsoft.com/",
     )
@@ -1680,13 +1710,27 @@ def _check_graph_application_permissions(
     ):
         raise PreflightError("Microsoft Graph app role assignments are malformed")
     graph_role_ids: list[str] = []
+    assignment_ids: set[str] = set()
     for value in values:
-        if not isinstance(value, dict) or set(value) - {
+        required_fields = {
             "@odata.type",
+            "id",
             "appRoleId",
             "principalId",
             "resourceId",
-        }:
+        }
+        allowed_fields = required_fields | {
+            "@odata.editLink",
+            "@odata.id",
+            "appRoleId@odata.type",
+            "principalId@odata.type",
+            "resourceId@odata.type",
+        }
+        if (
+            not isinstance(value, dict)
+            or not required_fields <= set(value) <= allowed_fields
+            or value.get("@odata.type") != "#microsoft.graph.appRoleAssignment"
+        ):
             raise PreflightError("Microsoft Graph app role assignment is malformed")
         # Validate every structural field before deciding whether the assignment
         # targets Microsoft Graph. A malformed unrelated assignment must fail
@@ -1703,15 +1747,31 @@ def _check_graph_application_permissions(
             value.get("appRoleId"),
             label="Microsoft Graph app role ID",
         )
+        assignment_id = _canonical_graph_assignment_id(value.get("id"))
+        if assignment_id in assignment_ids:
+            raise PreflightError(
+                "Microsoft Graph app role assignments contain duplicate IDs"
+            )
+        assignment_ids.add(assignment_id)
+        for annotation in (
+            "appRoleId@odata.type",
+            "principalId@odata.type",
+            "resourceId@odata.type",
+        ):
+            if annotation in value and value[annotation] != "#Guid":
+                raise PreflightError("Microsoft Graph app role assignment is malformed")
+        for link in ("@odata.id", "@odata.editLink"):
+            if link in value and (not isinstance(value[link], str) or not value[link]):
+                raise PreflightError("Microsoft Graph app role assignment is malformed")
+        if assigned_principal_id != principal_id:
+            raise PreflightError(
+                "Microsoft Graph app role assignment targets another principal"
+            )
         if resource_id != graph_principal_id:
             # A structurally valid enterprise-application permission on another
             # resource is outside the Microsoft Graph application-permission
             # contract and is ignored only after full validation.
             continue
-        if assigned_principal_id != principal_id:
-            raise PreflightError(
-                "Microsoft Graph app role assignment targets another principal"
-            )
         graph_role_ids.append(assigned_role_id)
     if len(graph_role_ids) != 1:
         raise PreflightError(
@@ -1730,36 +1790,115 @@ def _check_graph_application_permissions(
         )
 
 
-def _foundation_deployment_parameters(
+def _validate_effective_production_parameters(
     configuration: DeploymentConfiguration,
-) -> dict[str, str]:
-    """Return the closed foundation deployment parameters the classifier binds.
-
-    These are the exact effective parameters the production deploy job writes
-    before the authoritative foundation what-if, so the source and parameter
-    fingerprints recomputed here match the classified evidence deterministically.
-    """
-    return {
-        "location": configuration.location,
+    parameters: Mapping[str, Any],
+    *,
+    expected_commit_sha: str,
+) -> None:
+    """Bind the effective ARM parameters to the protected runtime configuration."""
+    models = {binding.role: binding for binding in configuration.models}
+    pricing = configuration.pricing
+    if (
+        configuration.ui_auth_client_id is None
+        or configuration.ui_auth_tenant_id is None
+        or configuration.foundry_base_url is None
+        or pricing is None
+        or set(models) < {"SMALL", "STRONG", "JUDGE"}
+    ):
+        raise PreflightError(
+            "Production-foundation runtime configuration is incomplete"
+        )
+    expected: dict[str, Any] = {
+        "deploymentCommitSha": expected_commit_sha,
+        "deployContainerApps": False,
+        "deployRuntimeAccess": False,
         "environmentName": EXPECTED_ENVIRONMENT,
-        "resourceGroup": configuration.resource_group,
-        "templateFile": FOUNDATION_TEMPLATE_FILE,
-        "parameterFile": FOUNDATION_PARAMETER_FILE,
-        "deployContainerApps": "false",
-        "exposePublicUi": "false",
-        "deployRuntimeAccess": "false",
-        "semanticCacheEnabled": "false",
+        "exposePublicUi": False,
+        "foundryBaseUrl": configuration.foundry_base_url,
+        "foundrySmallDeployment": models["SMALL"].deployment,
+        "foundrySmallModel": models["SMALL"].model,
+        "foundrySmallModelVersion": models["SMALL"].version,
+        "foundryStrongDeployment": models["STRONG"].deployment,
+        "foundryStrongModel": models["STRONG"].model,
+        "foundryStrongModelVersion": models["STRONG"].version,
+        "judgeDeployment": models["JUDGE"].deployment,
+        "judgeModel": models["JUDGE"].model,
+        "judgeModelVersion": models["JUDGE"].version,
+        "location": configuration.location,
+        "pricingCatalogVersion": pricing.catalog_version,
+        "pricingCurrency": pricing.currency,
+        "pricingJudgeCachedInputRatePerMillionTokens": (
+            str(pricing.judge_cached_input)
+            if pricing.judge_cached_input is not None
+            else None
+        ),
+        "pricingJudgeInputRatePerMillionTokens": str(pricing.judge_input),
+        "pricingJudgeOutputRatePerMillionTokens": str(pricing.judge_output),
+        "pricingSmallCachedInputRatePerMillionTokens": (
+            str(pricing.small_cached_input)
+            if pricing.small_cached_input is not None
+            else None
+        ),
+        "pricingSmallInputRatePerMillionTokens": str(pricing.small_input),
+        "pricingSmallOutputRatePerMillionTokens": str(pricing.small_output),
+        "pricingStrongCachedInputRatePerMillionTokens": (
+            str(pricing.strong_cached_input)
+            if pricing.strong_cached_input is not None
+            else None
+        ),
+        "pricingStrongInputRatePerMillionTokens": str(pricing.strong_input),
+        "pricingStrongOutputRatePerMillionTokens": str(pricing.strong_output),
+        "productionEvaluatorMode": "LLM_JUDGE",
+        "semanticCacheEnabled": configuration.semantic_cache_enabled,
+        "uiAuthClientId": configuration.ui_auth_client_id,
+        "uiAuthTenantId": configuration.ui_auth_tenant_id,
     }
+    if configuration.semantic_cache_enabled:
+        embedding = models.get("EMBEDDING")
+        if (
+            embedding is None
+            or configuration.embedding_dimension is None
+            or pricing.embedding_input is None
+        ):
+            raise PreflightError(
+                "Enabled semantic cache runtime parameters are incomplete"
+            )
+        expected.update(
+            {
+                "pricingEmbeddingInputRatePerMillionTokens": str(
+                    pricing.embedding_input
+                ),
+                "redisEmbeddingDeployment": embedding.deployment,
+                "redisEmbeddingDimension": configuration.embedding_dimension,
+                "redisEmbeddingModel": embedding.model,
+            }
+        )
+    if any(parameters.get(name) != value for name, value in expected.items()):
+        raise PreflightError(
+            "Effective runtime parameters do not match protected configuration"
+        )
+    workflow_run_id = parameters.get("deploymentWorkflowRunId")
+    if (
+        not isinstance(workflow_run_id, str)
+        or re.fullmatch(r"[1-9][0-9]{0,19}-[1-9][0-9]{0,19}", workflow_run_id) is None
+    ):
+        raise PreflightError("Effective runtime workflow identity is malformed")
 
 
 def _resolve_repository_registry_identity(
     configuration: DeploymentConfiguration,
     *,
     classified_evidence: Path | None,
+    classified_evidence_sha256: str | None,
+    raw_whatif: Path | None,
+    raw_whatif_sha256: str | None,
+    effective_parameters: Path | None,
+    effective_parameters_sha256: str | None,
     expected_commit_sha: str | None,
     repository_root: Path,
 ) -> str:
-    """Return the ARM-evaluated registry name from same-job classified evidence.
+    """Recompute evidence and return its ARM-evaluated registry identity.
 
     The repository/Bicep-derived registry identity is the single
     ``container_registry`` fact emitted by the fail-closed classifier over a
@@ -1773,57 +1912,86 @@ def _resolve_repository_registry_identity(
     before the ACR fact is trusted. A plain command-line registry name is never
     accepted as proof.
     """
-    if classified_evidence is None or expected_commit_sha is None:
-        raise PreflightError(
-            "Production-foundation preflight requires classified foundation evidence"
-        )
-    if classified_evidence.is_symlink():
-        raise PreflightError("Classified foundation evidence must not be a symlink")
-    try:
-        document = whatif_classification._validate_evidence(
-            whatif_classification._load_json(
-                classified_evidence,
-                whatif_classification.WhatIfClassificationCode.PROMOTION_MISMATCH,
-            )
-        )
-    except whatif_classification.WhatIfClassificationError as error:
-        raise PreflightError(
-            "Classified foundation evidence is missing or malformed"
-        ) from error
-    parameters = _foundation_deployment_parameters(configuration)
-    expected_source_fingerprint, expected_file_count = (
-        whatif_classification.deployment_source_fingerprint(
-            parameters, source_root=repository_root
-        )
-    )
-    external_policy = whatif_classification._external_policy_from_environment(
-        whatif_classification.EXTERNAL_POLICY_ENV
-    )
     if (
-        document["commit_sha"] != expected_commit_sha.casefold()
-        or document["target"]["resource_group"]
-        != configuration.resource_group.casefold()
-        or document["target"]["environment_name"] != EXPECTED_ENVIRONMENT
-        or document["target"]["scope_fingerprint"]
-        != whatif_classification._scope_fingerprint(
-            configuration.subscription_id, configuration.resource_group
-        )
-        or document["deployment_source"]["fingerprint"] != expected_source_fingerprint
-        or document["deployment_source"]["file_count"] != expected_file_count
-        or document["parameters"]["fingerprint"]
-        != whatif_classification.parameter_fingerprint(parameters)
-        or document["normalizations"]["convergence_policy_fingerprint"]
-        != whatif_classification.convergence_policy_fingerprint()
-        or document["normalizations"]["residual_unapproved_change_count"] != 0
-        or document["external_policy"]["fingerprint"]
-        != whatif_classification.external_policy_fingerprint(external_policy)
+        classified_evidence is None
+        or classified_evidence_sha256 is None
+        or raw_whatif is None
+        or raw_whatif_sha256 is None
+        or effective_parameters is None
+        or effective_parameters_sha256 is None
+        or expected_commit_sha is None
     ):
         raise PreflightError(
-            "Classified foundation evidence does not bind the approved deployment"
+            "Production-foundation preflight requires complete foundation evidence"
+        )
+    try:
+        evidence_bytes = whatif_classification.read_regular_file(
+            classified_evidence,
+            maximum_bytes=whatif_classification.MAX_EFFECTIVE_PARAMETER_FILE_BYTES,
+            expected_sha256=classified_evidence_sha256,
+        )
+        evidence_document = whatif_classification._validate_evidence(
+            whatif_classification.parse_strict_json(
+                evidence_bytes,
+                code=whatif_classification.WhatIfClassificationCode.PROMOTION_MISMATCH,
+                label=classified_evidence.name,
+            )
+        )
+        raw_bytes = whatif_classification.read_regular_file(
+            raw_whatif,
+            expected_sha256=raw_whatif_sha256,
+        )
+        raw_document = whatif_classification.parse_strict_json(
+            raw_bytes,
+            code=whatif_classification.WhatIfClassificationCode.MALFORMED_DOCUMENT,
+            label=raw_whatif.name,
+        )
+        parameter_bytes = whatif_classification.read_regular_file(
+            effective_parameters,
+            maximum_bytes=whatif_classification.MAX_EFFECTIVE_PARAMETER_FILE_BYTES,
+            expected_sha256=effective_parameters_sha256,
+        )
+        parameters = whatif_classification.parse_foundation_parameters(
+            parameter_bytes,
+            label=effective_parameters.name,
+            template_file=FOUNDATION_TEMPLATE_FILE,
+            parameter_source_file=FOUNDATION_PARAMETER_FILE,
+            resource_group=configuration.resource_group,
+        )
+        _validate_effective_production_parameters(
+            configuration,
+            parameters,
+            expected_commit_sha=expected_commit_sha,
+        )
+        external_policy = whatif_classification._external_policy_from_environment(
+            whatif_classification.EXTERNAL_POLICY_ENV
+        )
+        recomputed = whatif_classification.build_evidence_from_whatif(
+            raw_document,
+            parameters=parameters,
+            source_root=repository_root,
+            subscription_id=configuration.subscription_id,
+            resource_group=configuration.resource_group,
+            commit_sha=expected_commit_sha,
+            deployment_mode="Incremental",
+            external_policy=external_policy,
+        )
+    except (
+        OSError,
+        ValueError,
+        whatif_classification.WhatIfClassificationError,
+    ) as error:
+        raise PreflightError(
+            "Foundation authorization artifacts are missing, changed, or malformed"
+        ) from error
+    canonical_recomputed = whatif_classification.serialize_evidence(recomputed)
+    if evidence_document != recomputed or evidence_bytes != canonical_recomputed:
+        raise PreflightError(
+            "Classified foundation evidence differs from raw what-if reconstruction"
         )
     registry_facts = [
         fact
-        for fact in document["changes"]["resources"]
+        for fact in recomputed["changes"]["resources"]
         if fact["resource_role"] == CONTAINER_REGISTRY_RESOURCE_ROLE
     ]
     if len(registry_facts) != 1:
@@ -1936,6 +2104,11 @@ def _check_deployment_role_allowlist(
     principal_id: str,
     repository_root: Path,
     classified_evidence: Path | None,
+    classified_evidence_sha256: str | None,
+    raw_whatif: Path | None,
+    raw_whatif_sha256: str | None,
+    effective_parameters: Path | None,
+    effective_parameters_sha256: str | None,
     expected_commit_sha: str | None,
 ) -> None:
     _check_graph_application_permissions(azure, principal_id=principal_id)
@@ -1997,6 +2170,11 @@ def _check_deployment_role_allowlist(
         expected_registry_name = _resolve_repository_registry_identity(
             configuration,
             classified_evidence=classified_evidence,
+            classified_evidence_sha256=classified_evidence_sha256,
+            raw_whatif=raw_whatif,
+            raw_whatif_sha256=raw_whatif_sha256,
+            effective_parameters=effective_parameters,
+            effective_parameters_sha256=effective_parameters_sha256,
             expected_commit_sha=expected_commit_sha,
             repository_root=repository_root,
         )
@@ -2055,7 +2233,13 @@ def _check_oidc_federation(
     session_principal_id: str,
     repository_root: Path,
     classified_evidence: Path | None,
+    classified_evidence_sha256: str | None,
+    raw_whatif: Path | None,
+    raw_whatif_sha256: str | None,
+    effective_parameters: Path | None,
+    effective_parameters_sha256: str | None,
     expected_commit_sha: str | None,
+    verify_roles: bool = True,
 ) -> None:
     resource_group, identity_name, configured_identity_id = _identity_parts(
         configuration.deployment_identity_resource_id,
@@ -2114,6 +2298,8 @@ def _check_oidc_federation(
         raise PreflightError(
             "GitHub environment federated credential is missing or mismatched"
         ) from error
+    if not verify_roles:
+        return
     _check_deployment_role_allowlist(
         configuration,
         azure,
@@ -2121,6 +2307,11 @@ def _check_oidc_federation(
         principal_id=identity_principal_id,
         repository_root=repository_root,
         classified_evidence=classified_evidence,
+        classified_evidence_sha256=classified_evidence_sha256,
+        raw_whatif=raw_whatif,
+        raw_whatif_sha256=raw_whatif_sha256,
+        effective_parameters=effective_parameters,
+        effective_parameters_sha256=effective_parameters_sha256,
         expected_commit_sha=expected_commit_sha,
     )
 
@@ -3210,6 +3401,11 @@ def run_preflight(
     api_digest: str | None = None,
     ui_digest: str | None = None,
     classified_evidence: Path | None = None,
+    classified_evidence_sha256: str | None = None,
+    raw_whatif: Path | None = None,
+    raw_whatif_sha256: str | None = None,
+    effective_parameters: Path | None = None,
+    effective_parameters_sha256: str | None = None,
     expected_commit_sha: str | None = None,
 ) -> dict[str, Any]:
     """Run a read-only preflight phase and return secret-free evidence."""
@@ -3217,6 +3413,31 @@ def run_preflight(
         raise PreflightError(f"Unsupported preflight phase {phase}")
     _check_iac_representation(repository_root)
     session_principal_id = _check_account(configuration, azure)
+    if phase == "production-session":
+        _check_oidc_federation(
+            configuration,
+            azure,
+            phase=phase,
+            session_principal_id=session_principal_id,
+            repository_root=repository_root,
+            classified_evidence=None,
+            classified_evidence_sha256=None,
+            raw_whatif=None,
+            raw_whatif_sha256=None,
+            effective_parameters=None,
+            effective_parameters_sha256=None,
+            expected_commit_sha=None,
+            verify_roles=False,
+        )
+        return {
+            "checks": ["account", "github_oidc_federation"],
+            "environment": EXPECTED_ENVIRONMENT,
+            "location": configuration.location,
+            "phase": phase,
+            "resource_group": configuration.resource_group,
+            "subscription_id": _redact_identifier(configuration.subscription_id),
+            "tenant_id": _redact_identifier(configuration.tenant_id),
+        }
     cache_provider = _check_providers(
         azure,
         semantic_cache_enabled=configuration.semantic_cache_enabled,
@@ -3228,6 +3449,11 @@ def run_preflight(
         session_principal_id=session_principal_id,
         repository_root=repository_root,
         classified_evidence=classified_evidence,
+        classified_evidence_sha256=classified_evidence_sha256,
+        raw_whatif=raw_whatif,
+        raw_whatif_sha256=raw_whatif_sha256,
+        effective_parameters=effective_parameters,
+        effective_parameters_sha256=effective_parameters_sha256,
         expected_commit_sha=expected_commit_sha,
     )
     redis_evidence: dict[str, Any] | None = None
@@ -3238,7 +3464,12 @@ def run_preflight(
     model_evidence: dict[str, dict[str, str]] = {}
     if configuration.models:
         model_evidence = _check_model_deployments(configuration, azure)
-    require_foundation = phase in {"publish", "artifacts", "rollout"}
+    require_foundation = phase in {
+        "production-foundation",
+        "publish",
+        "artifacts",
+        "rollout",
+    }
     resources = _check_resource_group(
         configuration,
         azure,
@@ -3358,6 +3589,11 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--api-digest")
     parser.add_argument("--ui-digest")
     parser.add_argument("--classified-evidence", type=Path)
+    parser.add_argument("--classified-evidence-sha256")
+    parser.add_argument("--raw-whatif", type=Path)
+    parser.add_argument("--raw-whatif-sha256")
+    parser.add_argument("--effective-parameters", type=Path)
+    parser.add_argument("--effective-parameters-sha256")
     parser.add_argument("--expected-commit-sha")
     parser.add_argument("--output", type=Path)
     return parser
@@ -3376,6 +3612,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             api_digest=arguments.api_digest,
             ui_digest=arguments.ui_digest,
             classified_evidence=arguments.classified_evidence,
+            classified_evidence_sha256=arguments.classified_evidence_sha256,
+            raw_whatif=arguments.raw_whatif,
+            raw_whatif_sha256=arguments.raw_whatif_sha256,
+            effective_parameters=arguments.effective_parameters,
+            effective_parameters_sha256=arguments.effective_parameters_sha256,
             expected_commit_sha=arguments.expected_commit_sha,
         )
         serialized = json.dumps(evidence, indent=2, sort_keys=True) + "\n"

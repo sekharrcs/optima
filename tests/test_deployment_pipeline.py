@@ -73,6 +73,14 @@ def test_all_actions_are_pinned_to_full_commit_shas() -> None:
 def test_preflight_and_mutation_order_is_fail_closed() -> None:
     """Run each read-only gate before the mutation it authorizes."""
     content = workflow()
+    session = content.index("--phase production-session")
+    parameters = content.index(
+        "Generate one canonical effective runtime parameter artifact"
+    )
+    whatif = content.index(
+        "az deployment group what-if --name optima-production-foundation-whatif"
+    )
+    classification = content.index("scripts/whatif_classification.py classify")
     foundation = content.index("--phase production-foundation")
     foundation_create = content.index("az deployment group create", foundation)
     publish = content.index("--phase publish", foundation_create)
@@ -81,11 +89,12 @@ def test_preflight_and_mutation_order_is_fail_closed() -> None:
     rollout = content.index("--phase rollout", artifacts)
     applications = content.index('"deployContainerApps=true"', rollout)
 
+    assert session < parameters < whatif < classification < foundation
     assert foundation < foundation_create < publish < image_push
     assert image_push < artifacts < rollout < applications
     assert "deployRuntimeAccess=true" not in content
-    assert "az deployment group what-if" in content
-    assert "az deployment sub what-if" in content
+    assert "az deployment sub what-if" not in content
+    assert "az deployment sub create" not in content
 
 
 def test_classified_whatif_runs_before_preflight_and_all_mutation() -> None:
@@ -96,10 +105,10 @@ def test_classified_whatif_runs_before_preflight_and_all_mutation() -> None:
         "az deployment group what-if --name optima-production-foundation-whatif"
     )
     classify = content.index("scripts/whatif_classification.py classify", whatif)
-    evidence = content.index("foundation-plan-evidence.json", classify)
+    evidence = content.index("production-foundation-evidence.json", classify)
     preflight = content.index("--phase production-foundation", evidence)
     consume = content.index(
-        '--classified-evidence "$RUNNER_TEMP/foundation-plan-evidence.json"',
+        '--classified-evidence "$RUNNER_TEMP/production-foundation-evidence.json"',
         preflight,
     )
     create = content.index("az deployment group create", consume)
@@ -110,6 +119,35 @@ def test_classified_whatif_runs_before_preflight_and_all_mutation() -> None:
     # no foundation deployment or image push before classification and preflight
     assert consume < create < image_push
     assert content.index("--expected-commit-sha", preflight) < create
+    assert "- uses:" not in content[classify:consume]
+
+
+def test_exactly_one_foundation_whatif_and_create_share_parameters() -> None:
+    """One exact parameter artifact authorizes one foundation create."""
+    content = workflow()
+    parameter_reference = (
+        '--parameters "@$RUNNER_TEMP/production-foundation.parameters.json"'
+    )
+
+    assert (
+        content.count(
+            "az deployment group what-if --name optima-production-foundation-whatif"
+        )
+        == 1
+    )
+    assert content.count("Deploy the exactly authorized runtime foundation") == 1
+    assert content.count(parameter_reference) == 2
+    assert content.count("python scripts/production_parameters.py") == 1
+    assert content.count("parameter_sha256=") == 1
+    assert content.count("infra/environments/hackathon.foundation.bicepparam") == 0
+    authorization = content[
+        content.index(
+            "Generate one canonical effective runtime parameter artifact"
+        ) : content.index("Require foundation resources and ACR publication access")
+    ]
+    assert authorization.count("infra/environments/hackathon.runtime.bicepparam") == 2
+    assert "--validation-level ProviderNoRbac" in content
+    assert "--result-format FullResourcePayloads" in content
 
 
 def test_every_three_role_preflight_consumes_classified_evidence() -> None:
@@ -117,11 +155,94 @@ def test_every_three_role_preflight_consumes_classified_evidence() -> None:
     content = workflow()
     for phase in ("production-foundation", "publish", "artifacts", "rollout"):
         phase_index = content.index(f"--phase {phase}")
-        window = content[phase_index : phase_index + 320]
-        assert "foundation-plan-evidence.json" in window
+        window = content[phase_index : phase_index + 1100]
+        assert "production-foundation-evidence.json" in window
+        assert "production-foundation-whatif.json" in window
+        assert "production-foundation.parameters.json" in window
+        assert "--classified-evidence-sha256" in window
+        assert "--raw-whatif-sha256" in window
+        assert "--effective-parameters-sha256" in window
         assert "--expected-commit-sha" in window
     # The evidence is generated exactly once before it is consumed.
-    assert content.count('--output "$RUNNER_TEMP/foundation-plan-evidence.json"') == 1
+    assert content.count('--output "$evidence"') == 1
+
+
+def test_production_reverifies_main_and_workflow_before_mutation() -> None:
+    """Environment delay or workflow-file drift invalidates authorization."""
+    content = workflow()
+    deploy = content[content.index("  deploy:") :]
+    first = content.index("Reverify current protected main and workflow")
+    final = content.index(
+        "Reverify authorization immediately before foundation mutation"
+    )
+    create = content.index("Deploy the exactly authorized runtime foundation")
+
+    assert first < content.index("actions/download-artifact@")
+    assert final < create
+    assert deploy.count("refs/heads/main:refs/remotes/origin/main") == 2
+    assert deploy.count('test "$GITHUB_SHA" = "$(git rev-parse origin/main)"') == 2
+    assert deploy.count('git hash-object "$workflow"') == 2
+    assert deploy.count('test "$CONFIRMED_SHA" = "$GITHUB_SHA"') == 2
+    assert deploy.count("--phase production-foundation") == 2
+    freshness = deploy.index("foundation-freshness-preflight.json")
+    mutation = deploy.index("Deploy the exactly authorized runtime foundation")
+    assert freshness < mutation
+
+
+def test_post_approval_main_advancement_fails_before_mutation() -> None:
+    """The final gate compares fetched current main with the authorized SHA."""
+    content = workflow()
+    final = content.index(
+        "Reverify authorization immediately before foundation mutation"
+    )
+    create = content.index("Deploy the exactly authorized runtime foundation", final)
+    commands = content[final:create]
+
+    assert "+refs/heads/main:refs/remotes/origin/main" in commands
+    assert 'test "$GITHUB_SHA" = "$(git rev-parse origin/main)"' in commands
+    assert 'test "$CONFIRMED_SHA" = "$GITHUB_SHA"' in commands
+
+
+def test_wrong_workflow_blob_fails_at_both_freshness_gates() -> None:
+    """The checked-out workflow must equal the authorized commit's blob."""
+    content = workflow()
+    deploy = content[content.index("  deploy:") :]
+
+    assert deploy.count('expected_workflow_blob="$(git rev-parse') == 1
+    assert deploy.count('git hash-object "$workflow"') == 2
+    assert deploy.count('git rev-parse "$GITHUB_SHA:$workflow"') == 2
+
+
+def test_production_requires_existing_successful_foundation() -> None:
+    """Subscription bootstrap belongs only to the dedicated foundation workflow."""
+    content = workflow()
+
+    assert "Production requires a successfully deployed foundation" in content
+    assert "properties.provisioningState=='Succeeded'" in content
+    assert "az deployment sub create" not in content
+    assert "--template-file infra/main.bicep" not in content
+
+
+def test_runbook_requires_foundation_and_complete_evidence_arguments() -> None:
+    """Keep operator examples aligned with the production trust boundary."""
+    runbook = (ROOT / "docs" / "PRODUCTION_DEPLOYMENT.md").read_text(encoding="utf-8")
+
+    assert "successful foundation apply and convergence is a production" in runbook
+    assert "Production has no subscription deployment branch" in runbook
+    assert "--phase production-session" in runbook
+    assert "--phase production-foundation" in runbook
+    for argument in (
+        "--raw-whatif",
+        "--raw-whatif-sha256",
+        "--effective-parameters",
+        "--effective-parameters-sha256",
+        "--classified-evidence",
+        "--classified-evidence-sha256",
+        "--expected-commit-sha",
+    ):
+        assert runbook.count(argument) >= 1
+    assert "does not cryptographically attest" in runbook
+    assert "Windows lacks equivalent `O_NOFOLLOW`" in runbook
 
 
 def test_cache_mode_is_configuration_controlled_and_propagated() -> None:
@@ -134,15 +255,20 @@ def test_cache_mode_is_configuration_controlled_and_propagated() -> None:
     )
     assert 'OPTIMA_SEMANTIC_CACHE_ENABLED: "false"' not in content
     assert 'OPTIMA_SEMANTIC_CACHE_ENABLED: "true"' not in content
-    assert content.count('"semanticCacheEnabled=$OPTIMA_SEMANTIC_CACHE_ENABLED"') == 2
-    assert content.count('if test "$OPTIMA_SEMANTIC_CACHE_ENABLED" = "true"; then') == 3
+    parameter_builder = (ROOT / "scripts" / "production_parameters.py").read_text(
+        encoding="utf-8"
+    )
+    assert content.count('"semanticCacheEnabled=$OPTIMA_SEMANTIC_CACHE_ENABLED"') == 1
+    assert "OPTIMA_SEMANTIC_CACHE_ENABLED" in parameter_builder
+    assert content.count('if test "$OPTIMA_SEMANTIC_CACHE_ENABLED" = "true"; then') == 2
     for parameter in (
         "redisEmbeddingDeployment",
         "redisEmbeddingModel",
         "redisEmbeddingDimension",
         "pricingEmbeddingInputRatePerMillionTokens",
     ):
-        assert content.count(f'"{parameter}=$OPTIMA_') == 2
+        assert content.count(f'"{parameter}=$OPTIMA_') == 1
+        assert parameter in parameter_builder
     foundation_parameters = content.index("parameters=(", content.index("What-if"))
     foundation_cache_branch = content.index(
         'if test "$OPTIMA_SEMANTIC_CACHE_ENABLED" = "true"; then',
@@ -160,6 +286,9 @@ def test_cache_mode_is_configuration_controlled_and_propagated() -> None:
 def test_reviewed_model_versions_reach_both_bicep_deployment_phases() -> None:
     """Pass each protected role version through foundation and rollout unchanged."""
     content = workflow()
+    parameter_builder = (ROOT / "scripts" / "production_parameters.py").read_text(
+        encoding="utf-8"
+    )
     expected = {
         "foundrySmallModelVersion": "OPTIMA_FOUNDRY_SMALL_MODEL_VERSION",
         "foundryStrongModelVersion": "OPTIMA_FOUNDRY_STRONG_MODEL_VERSION",
@@ -168,7 +297,8 @@ def test_reviewed_model_versions_reach_both_bicep_deployment_phases() -> None:
 
     for parameter, variable in expected.items():
         assert f'{variable}: "${{{{ vars.{variable} }}}}"' in content
-        assert content.count(f'"{parameter}=${variable}"') == 2
+        assert content.count(f'"{parameter}=${variable}"') == 1
+        assert parameter in parameter_builder
 
     assert "EXPECTED_RESPONSE_MODEL" not in content
 
