@@ -49,3 +49,6 @@ warn_unused_configs = true
 [tool.pytest.ini_options]
 addopts = "--strict-config --strict-markers -ra"
 testpaths = ["tests"]
+markers = [
+    "real_registry_identity: exercise the real classified-evidence registry binding",
+]

@@ -277,6 +277,7 @@ jobs:
       AZURE_TENANT_ID: "${{ vars.AZURE_TENANT_ID }}"
       OPTIMA_COST_REVIEWED_ON: "${{ vars.OPTIMA_COST_REVIEWED_ON }}"
       OPTIMA_EXPECTED_FIXED_MONTHLY_COST_INR: "${{ vars.OPTIMA_EXPECTED_FIXED_MONTHLY_COST_INR }}"
+      OPTIMA_FOUNDATION_EXTERNAL_OBSERVATION_POLICY: "${{ vars.OPTIMA_FOUNDATION_EXTERNAL_OBSERVATION_POLICY }}"
       OPTIMA_FOUNDRY_BASE_URL: "${{ vars.OPTIMA_FOUNDRY_BASE_URL }}"
       OPTIMA_FOUNDRY_SMALL_DEPLOYMENT: "${{ vars.OPTIMA_FOUNDRY_SMALL_DEPLOYMENT }}"
       OPTIMA_FOUNDRY_SMALL_MODEL: "${{ vars.OPTIMA_FOUNDRY_SMALL_MODEL }}"
@@ -328,6 +329,26 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
+      - name: Reverify current protected main and workflow
+        shell: bash
+        env:
+          CONFIRMED_SHA: "${{ inputs.confirm_commit_sha }}"
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$CONFIRMED_SHA" = "$GITHUB_SHA"
+          test "$GITHUB_SHA" = "$(git rev-parse HEAD)"
+          git fetch --no-tags --prune --depth=1 origin \
+            +refs/heads/main:refs/remotes/origin/main
+          test "$GITHUB_SHA" = "$(git rev-parse origin/main)"
+          workflow=.github/workflows/deploy-production.yml
+          expected_workflow_blob="$(git rev-parse "$GITHUB_SHA:$workflow")"
+          test "$(git hash-object "$workflow")" = "$expected_workflow_blob"
+          if git config --local --get-regexp '^http\..*\.extraheader$'; then
+            echo "Checkout credentials remain configured" >&2
+            exit 1
+          fi
+
       # actions/download-artifact v8.0.1, resolved from the upstream tag with git ls-remote.
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
@@ -372,21 +393,20 @@ jobs:
           tenant-id: "${{ vars.AZURE_TENANT_ID }}"
           subscription-id: "${{ vars.AZURE_SUBSCRIPTION_ID }}"
 
-      - name: Run foundation preflight before Azure mutation
+      - name: Validate the authenticated production session
         shell: bash
         run: |
           set -euo pipefail
-          python scripts/azure_preflight.py --phase foundation \
-            --output "$RUNNER_TEMP/foundation-preflight.json"
+          python scripts/azure_preflight.py --phase production-session \
+            --output "$RUNNER_TEMP/production-session-preflight.json"
 
-      - name: Reject interrupted foundation deployments before mutation
+      - name: Require a deployed foundation and reject interrupted deployments
         shell: bash
         run: |
           set -euo pipefail
           active_filter="[?starts_with(name, 'optima-foundation-') && properties.provisioningState!='Succeeded' && properties.provisioningState!='Failed' && properties.provisioningState!='Canceled' && properties.provisioningState!='Deleted'].name"
           subscription_active="$(az deployment sub list \
             --query "$active_filter" --output tsv)"
-          group_active=""
           group_exists="$(az group exists \
             --name "$AZURE_RESOURCE_GROUP" --output tsv)"
           case "$group_exists" in
@@ -395,7 +415,10 @@ jobs:
                 --resource-group "$AZURE_RESOURCE_GROUP" \
                 --query "$active_filter" --output tsv)"
               ;;
-            false) ;;
+            false)
+              echo "Production requires a successfully deployed foundation" >&2
+              exit 1
+              ;;
             *)
               echo "Resource-group existence returned invalid evidence" >&2
               exit 1
@@ -405,92 +428,141 @@ jobs:
             echo "An interrupted foundation deployment is still active" >&2
             exit 1
           fi
+          succeeded="$(az deployment group list \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --query "[?starts_with(name, 'optima-foundation-') && properties.provisioningState=='Succeeded'].name" \
+            --output tsv)"
+          test -n "$succeeded"
 
-      - name: What-if and converge the Azure foundation
+      - name: Generate one canonical effective runtime parameter artifact
+        id: effective_parameters
+        shell: bash
+        env:
+          AZURE_BICEP_CHECK_VERSION: "false"
+        run: |
+          set -euo pipefail
+          umask 077
+          compiled="$RUNNER_TEMP/runtime-base.parameters.json"
+          effective="$RUNNER_TEMP/production-foundation.parameters.json"
+          test ! -e "$compiled"
+          test ! -e "$effective"
+          az bicep install --version "v$BICEP_VERSION"
+          test "$(az bicep version | sed -n 's/.*Bicep CLI version \([^ ]*\).*/\1/p')" = "$BICEP_VERSION"
+          az bicep build-params \
+            --file infra/environments/hackathon.runtime.bicepparam \
+            --outfile "$compiled"
+          parameter_sha256="$(python scripts/production_parameters.py \
+            --compiled-base "$compiled" \
+            --output "$effective")"
+          [[ "$parameter_sha256" =~ ^[0-9a-f]{64}$ ]]
+          rm -f -- "$compiled"
+          printf 'sha256=%s\n' "$parameter_sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Authoritatively what-if and classify the runtime foundation
+        id: foundation_authorization
         shell: bash
         run: |
           set -euo pipefail
-          parameters=(
-            "location=$AZURE_LOCATION"
-            "environmentName=hackathon"
-            "deploymentCommitSha=$GITHUB_SHA"
-            "deploymentWorkflowRunId=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-            "deployContainerApps=false"
-            "exposePublicUi=false"
-            "deployRuntimeAccess=false"
-            "semanticCacheEnabled=$OPTIMA_SEMANTIC_CACHE_ENABLED"
-            "uiAuthClientId=$OPTIMA_UI_AUTH_CLIENT_ID"
-            "uiAuthTenantId=$OPTIMA_UI_AUTH_TENANT_ID"
-            "foundryBaseUrl=$OPTIMA_FOUNDRY_BASE_URL"
-            "foundrySmallDeployment=$OPTIMA_FOUNDRY_SMALL_DEPLOYMENT"
-            "foundrySmallModel=$OPTIMA_FOUNDRY_SMALL_MODEL"
-            "foundrySmallModelVersion=$OPTIMA_FOUNDRY_SMALL_MODEL_VERSION"
-            "foundryStrongDeployment=$OPTIMA_FOUNDRY_STRONG_DEPLOYMENT"
-            "foundryStrongModel=$OPTIMA_FOUNDRY_STRONG_MODEL"
-            "foundryStrongModelVersion=$OPTIMA_FOUNDRY_STRONG_MODEL_VERSION"
-            "productionEvaluatorMode=LLM_JUDGE"
-            "judgeDeployment=$OPTIMA_JUDGE_DEPLOYMENT"
-            "judgeModel=$OPTIMA_JUDGE_MODEL"
-            "judgeModelVersion=$OPTIMA_JUDGE_MODEL_VERSION"
-            "pricingCatalogVersion=$OPTIMA_PRICING_CATALOG_VERSION"
-            "pricingCurrency=$OPTIMA_PRICING_CURRENCY"
-            "pricingSmallInputRatePerMillionTokens=$OPTIMA_PRICING_SMALL_INPUT_RATE_PER_MILLION_TOKENS"
-            "pricingSmallOutputRatePerMillionTokens=$OPTIMA_PRICING_SMALL_OUTPUT_RATE_PER_MILLION_TOKENS"
-            "pricingStrongInputRatePerMillionTokens=$OPTIMA_PRICING_STRONG_INPUT_RATE_PER_MILLION_TOKENS"
-            "pricingStrongOutputRatePerMillionTokens=$OPTIMA_PRICING_STRONG_OUTPUT_RATE_PER_MILLION_TOKENS"
-            "pricingJudgeInputRatePerMillionTokens=$OPTIMA_PRICING_JUDGE_INPUT_RATE_PER_MILLION_TOKENS"
-            "pricingJudgeOutputRatePerMillionTokens=$OPTIMA_PRICING_JUDGE_OUTPUT_RATE_PER_MILLION_TOKENS"
-          )
-          if test "$OPTIMA_SEMANTIC_CACHE_ENABLED" = "true"; then
-            parameters+=(
-              "redisEmbeddingDeployment=$OPTIMA_REDIS_EMBEDDING_DEPLOYMENT"
-              "redisEmbeddingModel=$OPTIMA_REDIS_EMBEDDING_MODEL"
-              "redisEmbeddingDimension=$OPTIMA_REDIS_EMBEDDING_DIMENSION"
-              "pricingEmbeddingInputRatePerMillionTokens=$OPTIMA_PRICING_EMBEDDING_INPUT_RATE_PER_MILLION_TOKENS"
-            )
-          fi
+          umask 077
+          parameters="$RUNNER_TEMP/production-foundation.parameters.json"
+          raw="$RUNNER_TEMP/production-foundation-whatif.json"
+          evidence="$RUNNER_TEMP/production-foundation-evidence.json"
+          printf '%s  %s\n' \
+            "${{ steps.effective_parameters.outputs.sha256 }}" "$parameters" \
+            | sha256sum --check --strict
+          test ! -e "$raw"
+          test ! -e "$evidence"
+          az deployment group what-if --name optima-production-foundation-whatif \
+            --mode Incremental \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --template-file infra/resource-group.bicep \
+            --parameters "@$RUNNER_TEMP/production-foundation.parameters.json" \
+            --validation-level ProviderNoRbac \
+            --result-format FullResourcePayloads \
+            --no-pretty-print --only-show-errors \
+            > "$raw"
+          raw_sha256="$(sha256sum "$raw" | cut -d ' ' -f 1)"
+          python scripts/whatif_classification.py classify \
+            --deployment-mode Incremental \
+            --external-policy-env OPTIMA_FOUNDATION_EXTERNAL_OBSERVATION_POLICY \
+            --whatif "$raw" \
+            --whatif-sha256 "$raw_sha256" \
+            --subscription-id "$AZURE_SUBSCRIPTION_ID" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --commit-sha "$GITHUB_SHA" \
+            --parameters-file "$parameters" \
+            --parameters-sha256 "${{ steps.effective_parameters.outputs.sha256 }}" \
+            --template-file infra/resource-group.bicep \
+            --parameter-source-file infra/environments/hackathon.runtime.bicepparam \
+            --output "$evidence"
+          evidence_sha256="$(sha256sum "$evidence" | cut -d ' ' -f 1)"
+          [[ "$raw_sha256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$evidence_sha256" =~ ^[0-9a-f]{64}$ ]]
+          printf 'raw_sha256=%s\nevidence_sha256=%s\n' \
+            "$raw_sha256" "$evidence_sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Run foundation preflight before Azure mutation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/azure_preflight.py --phase production-foundation \
+            --raw-whatif "$RUNNER_TEMP/production-foundation-whatif.json" \
+            --raw-whatif-sha256 "${{ steps.foundation_authorization.outputs.raw_sha256 }}" \
+            --effective-parameters "$RUNNER_TEMP/production-foundation.parameters.json" \
+            --effective-parameters-sha256 "${{ steps.effective_parameters.outputs.sha256 }}" \
+            --classified-evidence "$RUNNER_TEMP/production-foundation-evidence.json" \
+            --classified-evidence-sha256 "${{ steps.foundation_authorization.outputs.evidence_sha256 }}" \
+            --expected-commit-sha "$GITHUB_SHA" \
+            --output "$RUNNER_TEMP/foundation-preflight.json"
+
+      - name: Reverify authorization immediately before foundation mutation
+        shell: bash
+        env:
+          CONFIRMED_SHA: "${{ inputs.confirm_commit_sha }}"
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$CONFIRMED_SHA" = "$GITHUB_SHA"
+          test "$GITHUB_SHA" = "$(git rev-parse HEAD)"
+          git fetch --no-tags --prune --depth=1 origin \
+            +refs/heads/main:refs/remotes/origin/main
+          test "$GITHUB_SHA" = "$(git rev-parse origin/main)"
+          workflow=.github/workflows/deploy-production.yml
+          test "$(git hash-object "$workflow")" = \
+            "$(git rev-parse "$GITHUB_SHA:$workflow")"
           active_filter="[?starts_with(name, 'optima-foundation-') && properties.provisioningState!='Succeeded' && properties.provisioningState!='Failed' && properties.provisioningState!='Canceled' && properties.provisioningState!='Deleted'].name"
           subscription_active="$(az deployment sub list \
             --query "$active_filter" --output tsv)"
-          group_exists="$(az group exists \
-            --name "$AZURE_RESOURCE_GROUP" --output tsv)"
-          case "$group_exists" in
-            true)
-              group_active="$(az deployment group list \
-                --resource-group "$AZURE_RESOURCE_GROUP" \
-                --query "$active_filter" --output tsv)"
-              test -z "$subscription_active"
-              test -z "$group_active"
-              ;;
-            false)
-              test -z "$subscription_active"
-              ;;
-            *)
-              echo "Resource-group existence returned invalid evidence" >&2
-              exit 1
-              ;;
-          esac
-          if test "$group_exists" = "true"; then
-            az deployment group what-if --name optima-foundation-what-if \
-              --resource-group "$AZURE_RESOURCE_GROUP" \
-              --template-file infra/resource-group.bicep \
-              --parameters infra/environments/hackathon.runtime.bicepparam \
-              --parameters "${parameters[@]}"
-            az deployment group create --name "optima-foundation-$GITHUB_RUN_ID" \
-              --resource-group "$AZURE_RESOURCE_GROUP" \
-              --template-file infra/resource-group.bicep \
-              --parameters infra/environments/hackathon.runtime.bicepparam \
-              --parameters "${parameters[@]}" >/dev/null
-          else
-            az deployment sub what-if --name optima-foundation-what-if \
-              --location "$AZURE_LOCATION" --template-file infra/main.bicep \
-              --parameters infra/environments/hackathon.bicepparam \
-              --parameters "${parameters[@]}"
-            az deployment sub create --name "optima-foundation-$GITHUB_RUN_ID" \
-              --location "$AZURE_LOCATION" --template-file infra/main.bicep \
-              --parameters infra/environments/hackathon.bicepparam \
-              --parameters "${parameters[@]}" >/dev/null
-          fi
+          group_active="$(az deployment group list \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --query "$active_filter" --output tsv)"
+          test -z "$subscription_active"
+          test -z "$group_active"
+          python scripts/azure_preflight.py --phase production-foundation \
+            --raw-whatif "$RUNNER_TEMP/production-foundation-whatif.json" \
+            --raw-whatif-sha256 "${{ steps.foundation_authorization.outputs.raw_sha256 }}" \
+            --effective-parameters "$RUNNER_TEMP/production-foundation.parameters.json" \
+            --effective-parameters-sha256 "${{ steps.effective_parameters.outputs.sha256 }}" \
+            --classified-evidence "$RUNNER_TEMP/production-foundation-evidence.json" \
+            --classified-evidence-sha256 "${{ steps.foundation_authorization.outputs.evidence_sha256 }}" \
+            --expected-commit-sha "$GITHUB_SHA" \
+            --output "$RUNNER_TEMP/foundation-freshness-preflight.json"
+
+      - name: Deploy the exactly authorized runtime foundation
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s  %s\n' \
+            "${{ steps.effective_parameters.outputs.sha256 }}" \
+            "$RUNNER_TEMP/production-foundation.parameters.json" \
+            | sha256sum --check --strict
+          az deployment group create \
+            --mode Incremental \
+            --name "optima-foundation-$GITHUB_RUN_ID" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --template-file infra/resource-group.bicep \
+            --parameters "@$RUNNER_TEMP/production-foundation.parameters.json" \
+            --only-show-errors >/dev/null
 
       - name: Require foundation resources and ACR publication access
         shell: bash
@@ -507,6 +579,13 @@ jobs:
           test "$OPTIMA_UI_AUTH_REDIRECT_URI" = "$expected_callback"
           test "$OPTIMA_RUNTIME_ACCESS_BOOTSTRAPPED" = "true"
           python scripts/azure_preflight.py --phase publish \
+            --raw-whatif "$RUNNER_TEMP/production-foundation-whatif.json" \
+            --raw-whatif-sha256 "${{ steps.foundation_authorization.outputs.raw_sha256 }}" \
+            --effective-parameters "$RUNNER_TEMP/production-foundation.parameters.json" \
+            --effective-parameters-sha256 "${{ steps.effective_parameters.outputs.sha256 }}" \
+            --classified-evidence "$RUNNER_TEMP/production-foundation-evidence.json" \
+            --classified-evidence-sha256 "${{ steps.foundation_authorization.outputs.evidence_sha256 }}" \
+            --expected-commit-sha "$GITHUB_SHA" \
             --output "$RUNNER_TEMP/publish-preflight.json"
 
       - name: Push the exact verified images with immutable commit tags
@@ -545,6 +624,13 @@ jobs:
           set -euo pipefail
           python scripts/azure_preflight.py --phase artifacts \
             --api-digest "$API_DIGEST" --ui-digest "$UI_DIGEST" \
+            --raw-whatif "$RUNNER_TEMP/production-foundation-whatif.json" \
+            --raw-whatif-sha256 "${{ steps.foundation_authorization.outputs.raw_sha256 }}" \
+            --effective-parameters "$RUNNER_TEMP/production-foundation.parameters.json" \
+            --effective-parameters-sha256 "${{ steps.effective_parameters.outputs.sha256 }}" \
+            --classified-evidence "$RUNNER_TEMP/production-foundation-evidence.json" \
+            --classified-evidence-sha256 "${{ steps.foundation_authorization.outputs.evidence_sha256 }}" \
+            --expected-commit-sha "$GITHUB_SHA" \
             --output "$RUNNER_TEMP/artifact-preflight.json"
 
       - name: Verify all runtime access before rollout
@@ -556,6 +642,13 @@ jobs:
           set -euo pipefail
           python scripts/azure_preflight.py --phase rollout \
             --api-digest "$API_DIGEST" --ui-digest "$UI_DIGEST" \
+            --raw-whatif "$RUNNER_TEMP/production-foundation-whatif.json" \
+            --raw-whatif-sha256 "${{ steps.foundation_authorization.outputs.raw_sha256 }}" \
+            --effective-parameters "$RUNNER_TEMP/production-foundation.parameters.json" \
+            --effective-parameters-sha256 "${{ steps.effective_parameters.outputs.sha256 }}" \
+            --classified-evidence "$RUNNER_TEMP/production-foundation-evidence.json" \
+            --classified-evidence-sha256 "${{ steps.foundation_authorization.outputs.evidence_sha256 }}" \
+            --expected-commit-sha "$GITHUB_SHA" \
             --output "$RUNNER_TEMP/rollout-preflight.json"
 
       - name: Capture the active revision pair for automatic rollback
@@ -903,7 +996,9 @@ jobs:
         with:
           name: production-preflight-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
+            ${{ runner.temp }}/production-session-preflight.json
             ${{ runner.temp }}/foundation-preflight.json
+            ${{ runner.temp }}/foundation-freshness-preflight.json
             ${{ runner.temp }}/publish-preflight.json
             ${{ runner.temp }}/artifact-preflight.json
             ${{ runner.temp }}/rollout-preflight.json

@@ -7,16 +7,22 @@ description: OIDC, Azure preflight, immutable image publication, Container Apps 
 
 The manual `Deploy production` workflow is the production publisher. The
 manual `Foundation plan and apply` workflow is a separate foundation-only
-operational path. Production does not consume foundation plan evidence, and a
-foundation apply is not a prerequisite for production.
+operational path. A successful foundation apply and convergence is a production
+prerequisite. Production does not consume the promoted foundation-plan artifact;
+it builds fresh runtime-foundation authorization evidence in its own protected
+job.
 
 ```text
 Exact Git commit
   -> application, Bicep, secret, and Linux AMD64 container validation
   -> protected GitHub hackathon environment
+   -> current-main and workflow-blob verification
   -> GitHub OIDC login
-  -> read-only foundation preflight
-  -> foundation what-if and incremental convergence
+   -> immediate account, principal, and federation validation
+   -> one canonical effective runtime parameter artifact
+   -> one classified runtime-foundation what-if
+   -> full read-only production-foundation preflight
+   -> foundation deployment using the exact authorized parameter artifact
   -> read-only publication preflight
   -> ACR optima-api:<commit> and optima-ui:<commit>
   -> registry-generated API and UI manifest digests
@@ -53,10 +59,11 @@ model pricing, Redis or embedding settings, runtime-access values, or a callback
 URI. The enabled application and runtime phases in `Deploy production` retain
 their complete fail-closed input contracts.
 
-The separated workflow requires `rg-optima-hackathon` to exist. It adds a
-read-only planning operation and a distinct promotion operation for an existing
-target group. Only `Deploy production` retains compatibility with initial
-subscription-scope resource-group bootstrap.
+The group-scoped plan and apply operations require `rg-optima-hackathon` to
+exist. Initial subscription and resource-group bootstrap remains a
+foundation-only responsibility through `infra/main.bicep`; it is never performed
+by `Deploy production`. A separately reviewed foundation bootstrap must complete
+before the group-scoped plan, apply, and convergence sequence.
 
 The workflow dispatch input `operation` selects one of two mutually exclusive
 Azure jobs. `foundation-plan` is the default and uses the dedicated read-only
@@ -138,7 +145,7 @@ can be checked against them.
 
 ### Foundation evidence contract
 
-The closed evidence schema `optima-foundation-whatif-evidence-v2` records
+The closed evidence schema `optima-foundation-whatif-evidence-v3` records
 `deployment_mode: Incremental` and binds these canonical fingerprints:
 
 * The target fingerprint hashes the non-redacted subscription ID and exact
@@ -155,7 +162,7 @@ The closed evidence schema `optima-foundation-whatif-evidence-v2` records
    explicit disabled `null` definition; a separate external-payload fingerprint
    binds the entire accepted external change, not a selected property projection
 
-The managed human-readable projection must contain exactly these nine facts, in
+The managed human-readable projection must contain exactly these ten facts, in
 canonical role order. Every managed fact is either `Create` or `NoChange`; external
 observations never enter these facts or their counts.
 
@@ -169,7 +176,13 @@ observations never enter these facts or their counts.
 | Cosmos database         | `<exact-account>/optima`                  | `Microsoft.DocumentDB/databaseAccounts/sqlDatabases`            |
 | Log Analytics workspace | `law-optima-hackathon`                    | `Microsoft.OperationalInsights/workspaces`                      |
 | Managed environment     | `cae-optima-hackathon`                    | `Microsoft.App/managedEnvironments`                             |
+| Smart Detection group   | `Application Insights Smart Detection`    | `Microsoft.Insights/actionGroups`                               |
 | UI identity             | `id-optima-ui-hackathon`                  | `Microsoft.ManagedIdentity/userAssignedIdentities`              |
+
+The cache-enabled runtime-foundation profile adds exactly
+`Microsoft.Cache/redisEnterprise` named `redis-optima-<same-suffix>` and its
+`databases/default` child, producing twelve managed facts. A partial Redis graph
+or Redis facts in the disabled profile fail classification.
 
 The exact Cosmos account is `cosmos-optima-<same-suffix>`. The shared
 13-character suffix and exact Cosmos parent chain are mandatory. The classifier
@@ -263,7 +276,7 @@ Plan establishes the bindings, `promote-check` requires exact fresh evidence
 equality before create, and `convergence-check` compares the generated convergence
 evidence against the authenticated original plan after final classification and
 before the success summary. It preserves commit, target, source, parameters, mode,
-policy, external evidence, and the same managed graph, while requiring all nine
+policy, external evidence, and the same managed graph, while requiring all ten
 managed facts to be `NoChange`. Enabling, disabling, or changing policy between
 plan and apply invalidates promotion.
 
@@ -320,13 +333,12 @@ prove uninterrupted stability. Concurrent changes between snapshots, including a
 change that is reverted before the next observation, can be missed. Convergence
 detects observed drift after apply; it is not a transaction or rollback guarantee.
 
-The independent production path performs the same orphan check at both resource
-group and subscription deployment scope before its first mutation. This covers
-an interrupted initial subscription bootstrap as well as a later group-scoped
-foundation apply. Resource-group existence must return literal `true` or `false`;
-authorization, transient, malformed, or unknown query failures stop the run. The
-production mutation step repeats both-scope orphan checks before selecting its
-group or subscription deployment branch.
+The production path checks both subscription and resource-group deployment
+histories for interrupted foundation operations before its first mutation. It
+requires the resource group, a prior successful foundation deployment, and the
+complete expected resource inventory. Resource-group absence fails early and
+read-only. Production has no subscription deployment branch. The mutation step
+repeats active-deployment checks before the group-scoped create.
 
 ### Failure and recovery
 
@@ -355,9 +367,10 @@ or superseded plan/apply attempt invalidates the reviewed plan and requires a ne
 
 Application rollout uses the separate `Deploy production` path, which builds and
 publishes verified images, applies runtime access, configures Entra UI
-authentication, and deploys digest-qualified Container Apps. It does not consume
-foundation evidence and does not require a prior foundation apply. The paths share
-one mutation concurrency group but retain independent authorization and evidence.
+authentication, and deploys digest-qualified Container Apps. It requires a prior
+successful foundation apply and convergence, then creates fresh runtime-specific
+what-if evidence from the current protected source. The paths share one mutation
+concurrency group but retain independent authorization and evidence.
 
 ## Selected East US 2 cache profile
 
@@ -534,9 +547,9 @@ Preflight rejects any assignment outside the exact phase set.
 For `foundation-apply`, the apply identity must have exactly subscription Reader
 plus Contributor at `rg-optima-hackathon`, with no inherited, group-derived, or
 extra assignment. The separated workflow refuses to plan or apply when the group
-is absent. Only the independent `Deploy production` compatibility path permits
-exact subscription Contributor while creating the group; after the group exists,
-remove that assignment and use subscription Reader plus target-group Contributor.
+is absent. Any temporary subscription Contributor used by a separately reviewed
+foundation bootstrap must be removed after the group exists. Routine foundation
+and production jobs use subscription Reader plus target-group Contributor.
 Later production publication and rollout phases enforce their own additional
 phase-specific access, including exact-registry `AcrPush` where required.
 
@@ -558,11 +571,12 @@ contains the Container Apps environment default domain.
    reviewed pricing, UI application, and client secret.
 2. Open the Slice 11C pull request, wait for exact-head validation, and have an
    authorized maintainer merge it after review. This slice does not merge itself.
-3. Dispatch `Deploy production` from `main` for that exact 40-character main
-   commit SHA and set `confirm_deployment` to `DEPLOY`.
-4. The workflow runs read-only preflight, Bicep what-if, and foundation
-   convergence. This creates the existing Consumption Container Apps environment
-   without exposing API or UI applications.
+3. Complete the dedicated foundation plan/apply/convergence sequence. For a new
+   subscription, complete the separately reviewed foundation-only resource-group
+   bootstrap first.
+4. Dispatch `Deploy production` from `main` for that exact 40-character main
+   commit SHA and set `confirm_deployment` to `DEPLOY`. The workflow refuses an
+   absent or incomplete foundation.
 5. Read the exact callback URI from the workflow summary, register it as a Web
    redirect URI on the UI Entra application, require user assignment, and set
    `OPTIMA_UI_AUTH_REDIRECT_URI` to that exact value.
@@ -591,20 +605,62 @@ Azure CLI queries and emits secret-free JSON evidence with redacted subscription
 and tenant IDs.
 
 ```bash
+authorization=(
+   --raw-whatif production-foundation-whatif.json
+   --raw-whatif-sha256 <raw-whatif-sha256>
+   --effective-parameters production-foundation.parameters.json
+   --effective-parameters-sha256 <effective-parameters-sha256>
+   --classified-evidence production-foundation-evidence.json
+   --classified-evidence-sha256 <classified-evidence-sha256>
+   --expected-commit-sha <40-character-current-main-sha>
+)
+python scripts/azure_preflight.py --phase production-session \
+   --output production-session-preflight.json
+python scripts/azure_preflight.py --phase production-foundation \
+   "${authorization[@]}" --output production-foundation-preflight.json
 python scripts/azure_preflight.py --phase foundation-plan \
    --output foundation-plan-preflight.json
 python scripts/azure_preflight.py --phase foundation-apply \
    --output foundation-apply-preflight.json
 python scripts/azure_preflight.py --phase foundation --output foundation-preflight.json
-python scripts/azure_preflight.py --phase publish --output publish-preflight.json
+python scripts/azure_preflight.py --phase publish \
+   "${authorization[@]}" --output publish-preflight.json
 python scripts/azure_preflight.py --phase artifacts \
-  --api-digest sha256:<api-digest> --ui-digest sha256:<ui-digest>
+   "${authorization[@]}" \
+   --api-digest sha256:<api-digest> --ui-digest sha256:<ui-digest>
 python scripts/azure_preflight.py --phase rollout \
+   "${authorization[@]}" \
   --api-digest sha256:<api-digest> --ui-digest sha256:<ui-digest>
 ```
 
+The production phases work only inside the protected GitHub environment after
+OIDC login as the configured deployment identity. The raw what-if, effective
+parameters, and canonical evidence are generated once in that same job. Their
+SHA-256 digests are captured as immutable step outputs and checked before every
+reuse.
+
+Preflight safely opens each authorization artifact once through a bounded file
+descriptor, rejects non-regular files and multiple hard links, and compares the
+opened descriptor with `lstat` and `fstat` evidence. POSIX hosts additionally use
+`O_NOFOLLOW`. Windows lacks equivalent `O_NOFOLLOW` behavior in Python, so the
+before/open/after identity checks are the enforced fallback. Tests cover
+pathname substitution without claiming kernel-level no-follow guarantees.
+
+Preflight rebuilds canonical evidence from the raw Azure CLI result, current
+protected source, effective parameter artifact, external-observation policy, and
+convergence policy. The supplied evidence must match that reconstruction byte
+for byte. The remaining trust boundary is the authenticated same-job Azure CLI
+call and protected workflow/source. Azure does not cryptographically attest the
+raw what-if document, and this workflow does not claim that it does.
+
 The phases prove these progressively stronger conditions:
 
+* `production-session`: exact Azure tenant, subscription, token client/object,
+   deployer managed identity, repository/environment federation, and no ACR or
+   mutation capability
+* `production-foundation`: deterministic evidence reconstruction from the raw
+   runtime what-if and exact parameter artifact, full runtime configuration,
+   foundation inventory, Graph permission, and four-way ACR agreement
 * `foundation-plan`: dedicated read-only identity, providers, checked-in IaC,
    semantically valid fixed-cost governance, explicit disabled cache, and absent
    Redis and embedding configuration

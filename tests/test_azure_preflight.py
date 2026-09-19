@@ -3,18 +3,29 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
+import os
+import re
+import socket
+import tempfile
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
+from scripts import azure_preflight, production_parameters
+from scripts import whatif_classification as classifier
 from scripts.azure_preflight import (
+    ACR_PULL_ROLE_ID,
     ACR_PUSH_ROLE_ID,
     CONTRIBUTOR_ROLE_ID,
+    GRAPH_APPLICATION_READ_ALL_ROLE_ID,
+    MICROSOFT_GRAPH_APP_ID,
     MICROSOFT_GRAPH_HOST,
     OPENAI_USER_ROLE_ID,
     PREFLIGHT_CACHE_ONLY_SETTINGS,
@@ -44,6 +55,17 @@ FOUNDATION_PLAN_CLIENT_ID = "87654321-dcba-1234-dcba-cba987654321"
 FOUNDATION_PLAN_PRINCIPAL_ID = "77777777-6666-5555-4444-333333333333"
 FOUNDATION_PLAN_ROLE_DEFINITION_ID = "99999999-8888-7777-6666-555555555555"
 TRANSITIVE_GROUP_ID = "88888888-7777-6666-5555-444444444444"
+GRAPH_SERVICE_PRINCIPAL_ID = "aaaaaaaa-1111-2222-3333-444444444444"
+GRAPH_ASSIGNMENT_ID = (
+    base64.urlsafe_b64encode(b"synthetic-graph-assignment-primary")
+    .decode("ascii")
+    .rstrip("=")
+)
+SECOND_GRAPH_ASSIGNMENT_ID = (
+    base64.urlsafe_b64encode(b"synthetic-graph-assignment-secondary")
+    .decode("ascii")
+    .rstrip("=")
+)
 UI_AUTH_CLIENT_ID = "ui-auth-client-id"
 UI_AUTH_CLIENT_SECRET_ENV = "".join(("OPTIMA_UI_AUTH_", "CLIENT_SECRET"))
 OPENAI_RESOURCE_ID = (
@@ -59,6 +81,13 @@ REDIS_USAGE_URL = (
     "Microsoft.Cache/locations/eastus2/usages"
     f"?api-version={REDIS_API_VERSION}"
 )
+# The approved container registry name is exactly ``acroptima`` followed by the
+# 13-character ARM ``uniqueString`` suffix that the Bicep contract emits, so the
+# fail-closed classifier accepts it as the ARM-evaluated identity.
+APPROVED_REGISTRY_SUFFIX = "0123456789abc"
+APPROVED_REGISTRY_NAME = f"acroptima{APPROVED_REGISTRY_SUFFIX}"
+PRODUCTION_RESOURCE_GROUP = "rg-optima-hackathon"
+COMMIT_SHA = "a" * 40
 
 
 def role_definition_resource_id(role_id: str) -> str:
@@ -105,6 +134,24 @@ def effective_assignment(
         "principalType": principal_type,
         "roleDefinitionId": role_definition_resource_id(role_id),
         "scope": scope,
+    }
+
+
+def graph_assignment(
+    *,
+    assignment_id: str = GRAPH_ASSIGNMENT_ID,
+    app_role_id: str = GRAPH_APPLICATION_READ_ALL_ROLE_ID,
+    principal_id: str = DEPLOYMENT_PRINCIPAL_ID,
+    resource_id: str = GRAPH_SERVICE_PRINCIPAL_ID,
+    odata_type: str = "#microsoft.graph.appRoleAssignment",
+) -> dict[str, str]:
+    """Return one complete Microsoft Graph app-role assignment fixture."""
+    return {
+        "@odata.type": odata_type,
+        "appRoleId": app_role_id,
+        "id": assignment_id,
+        "principalId": principal_id,
+        "resourceId": resource_id,
     }
 
 
@@ -210,7 +257,7 @@ def valid_environment() -> dict[str, str]:
         "ACTIONS_ID_TOKEN_REQUEST_TOKEN": "present",
         "ACTIONS_ID_TOKEN_REQUEST_URL": "https://actions.invalid/oidc",
         "AZURE_CLIENT_ID": CLIENT_ID,
-        "AZURE_CONTAINER_REGISTRY_NAME": "acroptima123456789",
+        "AZURE_CONTAINER_REGISTRY_NAME": APPROVED_REGISTRY_NAME,
         "AZURE_DEPLOYMENT_IDENTITY_RESOURCE_ID": (
             f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg-identity/providers/"
             "Microsoft.ManagedIdentity/userAssignedIdentities/id-optima-deploy"
@@ -422,6 +469,22 @@ class FakeAzure:
         self.transitive_group_ids: list[str] = []
         self.transitive_group_response: Any = None
         self.group_role_assignments: dict[str, list[dict[str, Any]]] = {}
+        # Live-inventory registry identity is independent of both the configured
+        # registry name and the AcrPush role-assignment scope so tests can prove
+        # the approved registry is bound from inventory, not configuration.
+        self.inventory_registry_name = APPROVED_REGISTRY_NAME
+        self.inventory_registry_resource_group: str | None = None
+        self.inventory_registry_id: str | None = None
+        self.inventory_registry_type = "Microsoft.ContainerRegistry/registries"
+        self.inventory_registry_provisioning_state: Any = "Succeeded"
+        self.inventory_registries: list[dict[str, Any]] | None = None
+        self.acr_assignment_registry_name: str | None = None
+        # Microsoft Graph application-permission evidence for the executing
+        # identity, defaulting to exactly the approved Application.Read.All role.
+        self.graph_service_principal_id = GRAPH_SERVICE_PRINCIPAL_ID
+        self.graph_service_principal_response: Any = None
+        self.graph_app_role_assignments: list[dict[str, Any]] | None = None
+        self.graph_app_role_assignments_response: Any = None
         self.calls: list[tuple[str, ...]] = []
 
     def json(self, *arguments: str, allow_missing: bool = False) -> Any:
@@ -498,6 +561,35 @@ class FakeAzure:
         if arguments[:3] == ("rest", "--method", "get"):
             url = arguments[arguments.index("--url") + 1]
             if url.startswith(f"https://{MICROSOFT_GRAPH_HOST}/v1.0/"):
+                if "servicePrincipals(appId=" in url:
+                    if self.graph_service_principal_response is not None:
+                        return self.graph_service_principal_response
+                    return {
+                        "id": self.graph_service_principal_id,
+                        "appId": MICROSOFT_GRAPH_APP_ID,
+                        "appRoles": [
+                            {
+                                "id": GRAPH_APPLICATION_READ_ALL_ROLE_ID,
+                                "isEnabled": True,
+                                "allowedMemberTypes": ["Application"],
+                            }
+                        ],
+                    }
+                if "/appRoleAssignments" in url:
+                    if self.graph_app_role_assignments_response is not None:
+                        return self.graph_app_role_assignments_response
+                    values = self.graph_app_role_assignments
+                    if values is None:
+                        values = [
+                            graph_assignment(
+                                principal_id=self.deployment_principal_id,
+                                resource_id=self.graph_service_principal_id,
+                            )
+                        ]
+                    return {
+                        "@odata.count": len(values),
+                        "value": values,
+                    }
                 if self.transitive_group_response is not None:
                     return self.transitive_group_response
                 values = [
@@ -582,7 +674,7 @@ class FakeAzure:
                 {
                     "id": (
                         f"{resource_prefix}/Microsoft.ContainerRegistry/registries/"
-                        "acroptima123456789"
+                        f"{APPROVED_REGISTRY_NAME}"
                     ),
                     "type": "Microsoft.ContainerRegistry/registries",
                 },
@@ -626,13 +718,35 @@ class FakeAzure:
                     }
                 )
             return resources
+        if arguments[:2] == ("acr", "list"):
+            if self.inventory_registries is not None:
+                return self.inventory_registries
+            registry_resource_group = (
+                self.inventory_registry_resource_group
+                or self.configuration.resource_group
+            )
+            registry_id = self.inventory_registry_id or (
+                f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/"
+                f"{registry_resource_group}/providers/"
+                "Microsoft.ContainerRegistry/registries/"
+                f"{self.inventory_registry_name}"
+            )
+            return [
+                {
+                    "id": registry_id,
+                    "name": self.inventory_registry_name,
+                    "type": self.inventory_registry_type,
+                    "resourceGroup": registry_resource_group,
+                    "provisioningState": self.inventory_registry_provisioning_state,
+                }
+            ]
         if arguments[:2] == ("acr", "show"):
             return {
                 "adminUserEnabled": False,
                 "id": (
                     f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/"
                     "rg-optima-hackathon/providers/"
-                    "Microsoft.ContainerRegistry/registries/acroptima123456789"
+                    f"Microsoft.ContainerRegistry/registries/{APPROVED_REGISTRY_NAME}"
                 ),
             }
         if arguments[:3] == ("role", "assignment", "list"):
@@ -727,13 +841,16 @@ class FakeAzure:
                         ),
                     ]
                     if self.configuration.registry_name is not None and self.acr_push:
+                        assignment_registry_name = (
+                            self.acr_assignment_registry_name or APPROVED_REGISTRY_NAME
+                        )
                         assignments.append(
                             effective_assignment(
                                 ACR_PUSH_ROLE_ID,
                                 (
                                     f"{resource_group_scope}/providers/"
                                     "Microsoft.ContainerRegistry/registries/"
-                                    f"{self.configuration.registry_name}"
+                                    f"{assignment_registry_name}"
                                 ),
                                 principal_id=self.deployment_principal_id,
                             )
@@ -2129,7 +2246,7 @@ def test_cache_enabled_foundation_loads_complete_runtime_configuration() -> None
     """Validate the complete cache runtime contract before Redis can be created."""
     configuration = load_configuration(valid_environment(), phase="foundation")
 
-    assert configuration.registry_name == "acroptima123456789"
+    assert configuration.registry_name == APPROVED_REGISTRY_NAME
     assert configuration.pricing is not None
     assert {binding.role for binding in configuration.models} == {
         "SMALL",
@@ -2252,6 +2369,7 @@ def test_foundation_apply_rejects_forbidden_owner_role() -> None:
         "foundation-plan",
         "foundation-apply",
         "foundation",
+        "production-foundation",
         "publish",
         "artifacts",
         "rollout",
@@ -2306,6 +2424,7 @@ def test_foundation_plan_still_requires_cost_governance() -> None:
         ("foundation-plan", foundation_plan_environment),
         ("foundation-apply", foundation_apply_environment),
         ("foundation", foundation_environment),
+        ("production-foundation", disabled_environment),
         ("publish", disabled_environment),
     ],
 )
@@ -3123,7 +3242,7 @@ def test_runtime_phases_load_the_complete_runtime_contract(phase: str) -> None:
     """Keep all non-foundation phases on the strict runtime contract."""
     configuration = load_configuration(disabled_environment(), phase=phase)
 
-    assert configuration.registry_name == "acroptima123456789"
+    assert configuration.registry_name == APPROVED_REGISTRY_NAME
     assert configuration.pricing is not None
     assert {binding.role for binding in configuration.models} == {
         "SMALL",
@@ -3166,3 +3285,1795 @@ def test_unsupported_preflight_phase_is_rejected() -> None:
     """Reject an unknown preflight phase instead of inferring a contract."""
     with pytest.raises(PreflightError, match="Unsupported preflight phase"):
         load_configuration(foundation_environment(), phase="bootstrap")
+
+
+PRODUCTION_SUBSCRIPTION_SCOPE = f"/subscriptions/{SUBSCRIPTION_ID}"
+PRODUCTION_RESOURCE_GROUP_SCOPE = (
+    f"{PRODUCTION_SUBSCRIPTION_SCOPE}/resourceGroups/rg-optima-hackathon"
+)
+PRODUCTION_REGISTRY_SCOPE = (
+    f"{PRODUCTION_RESOURCE_GROUP_SCOPE}/providers/Microsoft.ContainerRegistry/"
+    f"registries/{APPROVED_REGISTRY_NAME}"
+)
+
+
+def production_effective_assignments() -> list[dict[str, str]]:
+    """Return the exact approved production-foundation deployer three-role set."""
+    return [
+        effective_assignment(
+            READER_ROLE_ID,
+            PRODUCTION_SUBSCRIPTION_SCOPE,
+            principal_id=DEPLOYMENT_PRINCIPAL_ID,
+        ),
+        effective_assignment(
+            CONTRIBUTOR_ROLE_ID,
+            PRODUCTION_RESOURCE_GROUP_SCOPE,
+            principal_id=DEPLOYMENT_PRINCIPAL_ID,
+        ),
+        effective_assignment(
+            ACR_PUSH_ROLE_ID,
+            PRODUCTION_REGISTRY_SCOPE,
+            principal_id=DEPLOYMENT_PRINCIPAL_ID,
+        ),
+    ]
+
+
+def _authenticated_production_azure(azure: FakeAzure) -> None:
+    azure.access_token = synthetic_access_token(
+        tenant_id=azure.configuration.tenant_id,
+        client_id=azure.configuration.deployment_client_id,
+        principal_id=azure.deployment_principal_id,
+    )
+
+
+def _production_foundation_configuration() -> DeploymentConfiguration:
+    """Load the real cache-disabled production-foundation configuration."""
+    return load_configuration(disabled_environment(), phase="production-foundation")
+
+
+def _foundation_whatif_document(
+    *,
+    registry_name: str = APPROVED_REGISTRY_NAME,
+    subscription_id: str = SUBSCRIPTION_ID,
+    resource_group: str = PRODUCTION_RESOURCE_GROUP,
+    environment: str = "hackathon",
+) -> dict[str, Any]:
+    """Build a canonical ten-resource foundation what-if with all-Create changes."""
+    suffix = registry_name[len("acroptima") :]
+    cosmos = f"cosmos-optima-{suffix}"
+    base = f"/subscriptions/{subscription_id}/resourceGroups/{resource_group}/providers"
+    resource_ids = [
+        f"{base}/Microsoft.ManagedIdentity/userAssignedIdentities/"
+        f"id-optima-api-{environment}",
+        f"{base}/Microsoft.ManagedIdentity/userAssignedIdentities/"
+        f"id-optima-ui-{environment}",
+        f"{base}/Microsoft.ContainerRegistry/registries/{registry_name}",
+        f"{base}/Microsoft.OperationalInsights/workspaces/law-optima-{environment}",
+        f"{base}/Microsoft.Insights/components/appi-optima-{environment}",
+        f"{base}/Microsoft.DocumentDB/databaseAccounts/{cosmos}",
+        f"{base}/Microsoft.DocumentDB/databaseAccounts/{cosmos}/sqlDatabases/optima",
+        f"{base}/Microsoft.DocumentDB/databaseAccounts/{cosmos}/sqlDatabases/optima/"
+        "containers/runs",
+        f"{base}/Microsoft.App/managedEnvironments/cae-optima-{environment}",
+        f"{base}/Microsoft.Insights/actionGroups/application insights smart detection",
+    ]
+    return {
+        "status": "Succeeded",
+        "changes": [
+            {"changeType": "Create", "resourceId": resource_id}
+            for resource_id in resource_ids
+        ],
+    }
+
+
+def _effective_parameter_document(
+    *,
+    environment: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Build the canonical runtime parameter artifact used by production."""
+    values = disabled_environment() if environment is None else dict(environment)
+    values.update(
+        {
+            "GITHUB_RUN_ATTEMPT": "1",
+            "GITHUB_RUN_ID": "123456789",
+            "GITHUB_SHA": COMMIT_SHA,
+        }
+    )
+    parameter_names = (
+        set(production_parameters._REQUIRED_ENVIRONMENT_PARAMETERS)
+        | set(production_parameters._OPTIONAL_ENVIRONMENT_PARAMETERS)
+        | set(production_parameters._CACHE_ENVIRONMENT_PARAMETERS)
+        | {
+            "deploymentCommitSha",
+            "deploymentWorkflowRunId",
+            "deployContainerApps",
+            "deployRuntimeAccess",
+            "environmentName",
+            "exposePublicUi",
+            "productionEvaluatorMode",
+            "redisEmbeddingDimension",
+            "semanticCacheEnabled",
+        }
+    )
+    compiled = {
+        "$schema": production_parameters.DEPLOYMENT_PARAMETERS_SCHEMA,
+        "contentVersion": "1.0.0.0",
+        "parameters": {name: {"value": None} for name in parameter_names},
+    }
+    return production_parameters.build_effective_document(compiled, values)
+
+
+def _parsed_effective_parameters(document: dict[str, Any]) -> dict[str, Any]:
+    return classifier.parse_foundation_parameters(
+        production_parameters.canonical_parameter_bytes(document),
+        label="production-foundation.parameters.json",
+        template_file="infra/resource-group.bicep",
+        parameter_source_file="infra/environments/hackathon.runtime.bicepparam",
+        resource_group=PRODUCTION_RESOURCE_GROUP,
+    )
+
+
+def _classified_evidence_document(
+    *,
+    registry_name: str = APPROVED_REGISTRY_NAME,
+    commit_sha: str = COMMIT_SHA,
+    subscription_id: str = SUBSCRIPTION_ID,
+    resource_group: str = PRODUCTION_RESOURCE_GROUP,
+    environment: str = "hackathon",
+    document: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return sanitized APPROVED evidence for a fresh, source-bound what-if."""
+    whatif = document or _foundation_whatif_document(
+        registry_name=registry_name,
+        subscription_id=subscription_id,
+        resource_group=resource_group,
+        environment=environment,
+    )
+    parameter_document = _effective_parameter_document()
+    parameter_document["parameters"]["environmentName"] = {"value": environment}
+    parameter_document["parameters"]["deploymentCommitSha"] = {"value": commit_sha}
+    parameters = classifier.parse_foundation_parameters(
+        production_parameters.canonical_parameter_bytes(parameter_document),
+        label="production-foundation.parameters.json",
+        template_file="infra/resource-group.bicep",
+        parameter_source_file="infra/environments/hackathon.runtime.bicepparam",
+        resource_group=resource_group,
+    )
+    return classifier.build_evidence_from_whatif(
+        whatif,
+        parameters=parameters,
+        source_root=ROOT,
+        subscription_id=subscription_id,
+        resource_group=resource_group,
+        commit_sha=commit_sha,
+        deployment_mode="Incremental",
+        external_policy=None,
+    )
+
+
+def _write_evidence(evidence: dict[str, Any]) -> Path:
+    """Persist evidence to an isolated temporary file for preflight consumption."""
+    directory = Path(tempfile.mkdtemp(prefix="optima-preflight-evidence-"))
+    path = directory / "foundation-plan-evidence.json"
+    path.write_bytes(classifier.serialize_evidence(evidence))
+    return path
+
+
+_VALID_EVIDENCE_PATH = _write_evidence(_classified_evidence_document())
+_VALID_RAW_WHATIF_PATH = _VALID_EVIDENCE_PATH.with_name("foundation-whatif.json")
+_VALID_RAW_WHATIF_PATH.write_bytes(
+    json.dumps(
+        _foundation_whatif_document(),
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+)
+_VALID_PARAMETERS_PATH = _VALID_EVIDENCE_PATH.with_name(
+    "production-foundation.parameters.json"
+)
+_VALID_PARAMETERS_PATH.write_bytes(
+    production_parameters.canonical_parameter_bytes(_effective_parameter_document())
+)
+
+
+def _sha256(path: Path) -> str:
+    if not path.exists():
+        return "0" * 64
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _run_production_foundation(
+    configuration: DeploymentConfiguration,
+    azure: FakeAzure,
+    *,
+    phase: str = "production-foundation",
+    classified_evidence: Path | None = None,
+    raw_whatif: Path | None = None,
+    effective_parameters: Path | None = None,
+    expected_commit_sha: str = COMMIT_SHA,
+) -> dict[str, Any]:
+    """Run a three-role phase with same-job classified foundation evidence."""
+    return run_preflight(
+        configuration,
+        azure,
+        phase=phase,
+        repository_root=ROOT,
+        classified_evidence=(classified_evidence or _VALID_EVIDENCE_PATH),
+        classified_evidence_sha256=_sha256(classified_evidence or _VALID_EVIDENCE_PATH),
+        raw_whatif=(raw_whatif or _VALID_RAW_WHATIF_PATH),
+        raw_whatif_sha256=_sha256(raw_whatif or _VALID_RAW_WHATIF_PATH),
+        effective_parameters=(effective_parameters or _VALID_PARAMETERS_PATH),
+        effective_parameters_sha256=_sha256(
+            effective_parameters or _VALID_PARAMETERS_PATH
+        ),
+        expected_commit_sha=expected_commit_sha,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _clear_external_policy_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the external-observation policy variable unset for evidence binding."""
+    monkeypatch.delenv("OPTIMA_FOUNDATION_EXTERNAL_OBSERVATION_POLICY", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _stub_repository_registry_identity(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Default three-role tests to the approved repository-derived registry name.
+
+    The four-way classified-evidence binding is exercised by the dedicated tests
+    marked ``real_registry_identity``. Role-contract and inventory-binding tests
+    stub the repository-derived identity to the approved name so they reach the
+    intended validation layer without constructing full classified evidence.
+    """
+    if "real_registry_identity" in request.keywords:
+        return
+    monkeypatch.setattr(
+        azure_preflight,
+        "_resolve_repository_registry_identity",
+        lambda *arguments, **keywords: APPROVED_REGISTRY_NAME,
+    )
+
+
+def test_ordinary_foundation_accepts_reader_and_contributor_only() -> None:
+    """Ordinary foundation still passes with exactly Reader and Contributor."""
+    configuration = load_configuration(disabled_environment(), phase="foundation")
+    assert configuration.registry_name is None
+    azure = FakeAzure(configuration, foundation_exists=True, acr_push=False)
+    _authenticated_production_azure(azure)
+
+    evidence = run_preflight(
+        configuration, azure, phase="foundation", repository_root=ROOT
+    )
+
+    assert evidence["phase"] == "foundation"
+
+
+def test_ordinary_foundation_rejects_added_acr_push() -> None:
+    """Ordinary foundation rejects AcrPush exactly as production run 35231953191."""
+    configuration = load_configuration(disabled_environment(), phase="foundation")
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.effective_assignments = production_effective_assignments()
+
+    with pytest.raises(PreflightError, match="exactly the approved effective roles"):
+        run_preflight(configuration, azure, phase="foundation", repository_root=ROOT)
+
+
+def test_production_foundation_loads_runtime_identity_with_cache_disabled() -> None:
+    """Cache-disabled production-foundation loads the full runtime contract.
+
+    Blocking-review regression for run 35231953191: the real production setting
+    keeps semantic cache disabled, so configuration must load the approved ACR
+    name for the exact role contract without enabling runtime composition. On the
+    pre-fix head this failed with "Container registry name is unavailable".
+    """
+    environment = disabled_environment()
+    assert environment["OPTIMA_SEMANTIC_CACHE_ENABLED"] == "false"
+    configuration = load_configuration(environment, phase="production-foundation")
+
+    assert configuration.registry_name == APPROVED_REGISTRY_NAME
+    assert configuration.semantic_cache_enabled is False
+    assert {binding.role for binding in configuration.models} == {
+        "JUDGE",
+        "SMALL",
+        "STRONG",
+    }
+    assert configuration.openai_resource_id == OPENAI_RESOURCE_ID
+    assert configuration.pricing is not None
+    assert configuration.embedding_dimension is None
+
+    azure = FakeAzure(configuration, foundation_exists=True)
+    _authenticated_production_azure(azure)
+    evidence = run_preflight(
+        configuration, azure, phase="production-foundation", repository_root=ROOT
+    )
+
+    assert evidence["phase"] == "production-foundation"
+    # no Redis or embedding queries are issued for the ACR-only identity load
+    assert not any("Microsoft.Cache" in " ".join(call) for call in azure.calls)
+
+
+def test_production_session_validates_identity_without_acr_or_graph() -> None:
+    """The immediate post-login gate proves session identity before what-if."""
+    configuration = load_configuration(
+        disabled_environment(), phase="production-session"
+    )
+    azure = FakeAzure(configuration, foundation_exists=True)
+    _authenticated_production_azure(azure)
+
+    evidence = run_preflight(
+        configuration, azure, phase="production-session", repository_root=ROOT
+    )
+
+    assert evidence["phase"] == "production-session"
+    assert evidence["checks"] == ["account", "github_oidc_federation"]
+    assert not any(
+        call[:1] in {("acr",), ("provider",), ("role",)} for call in azure.calls
+    )
+    assert not any("graph.microsoft.com" in " ".join(call) for call in azure.calls)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("session_tenant_id", "99999999-0000-1111-2222-333333333333", "tenant"),
+        ("session_client_id", "99999999-0000-1111-2222-333333333333", "client"),
+        ("session_principal_id", "99999999-0000-1111-2222-333333333333", "object"),
+    ],
+)
+def test_production_session_rejects_wrong_token_identity(
+    field: str, value: str, message: str
+) -> None:
+    """Tenant, client, and principal drift fail before the foundation what-if."""
+    configuration = load_configuration(
+        disabled_environment(), phase="production-session"
+    )
+    azure = FakeAzure(configuration, foundation_exists=True)
+    setattr(azure, field, value)
+
+    with pytest.raises(PreflightError, match=message):
+        run_preflight(
+            configuration, azure, phase="production-session", repository_root=ROOT
+        )
+
+
+def test_production_session_rejects_wrong_subscription() -> None:
+    """The Azure CLI account must remain on the protected subscription."""
+    configuration = load_configuration(
+        disabled_environment(), phase="production-session"
+    )
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.configuration = replace(
+        configuration,
+        subscription_id="99999999-0000-1111-2222-333333333333",
+    )
+
+    with pytest.raises(PreflightError, match="subscription"):
+        run_preflight(
+            configuration, azure, phase="production-session", repository_root=ROOT
+        )
+
+
+def test_production_foundation_accepts_exact_three_role_contract() -> None:
+    """Production-foundation accepts exactly Reader, Contributor, and AcrPush@ACR."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    _authenticated_production_azure(azure)
+
+    evidence = run_preflight(
+        configuration, azure, phase="production-foundation", repository_root=ROOT
+    )
+
+    assert evidence["phase"] == "production-foundation"
+
+
+def test_production_foundation_requires_acr_name() -> None:
+    """A missing ACR name fails configuration closed even with cache disabled."""
+    environment = disabled_environment()
+    environment.pop("AZURE_CONTAINER_REGISTRY_NAME")
+
+    with pytest.raises(
+        PreflightError, match="AZURE_CONTAINER_REGISTRY_NAME is missing"
+    ):
+        load_configuration(environment, phase="production-foundation")
+
+
+def test_production_foundation_rejects_blank_acr_name() -> None:
+    """A whitespace-only ACR name fails closed before trimming."""
+    environment = disabled_environment()
+    environment["AZURE_CONTAINER_REGISTRY_NAME"] = "   "
+
+    with pytest.raises(PreflightError, match="contains whitespace"):
+        load_configuration(environment, phase="production-foundation")
+
+
+def test_production_foundation_rejects_placeholder_acr_name() -> None:
+    """A placeholder ACR name fails configuration closed."""
+    environment = disabled_environment()
+    environment["AZURE_CONTAINER_REGISTRY_NAME"] = "placeholder"
+
+    with pytest.raises(PreflightError, match="is a placeholder"):
+        load_configuration(environment, phase="production-foundation")
+
+
+def test_production_foundation_requires_acr_push() -> None:
+    """Missing AcrPush fails the production-foundation contract closed."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True, acr_push=False)
+
+    with pytest.raises(PreflightError, match="lacks AcrPush"):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+def test_production_foundation_rejects_acr_push_on_another_registry() -> None:
+    """AcrPush on a different ACR does not satisfy the approved binding."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    other_registry = (
+        f"{PRODUCTION_RESOURCE_GROUP_SCOPE}/providers/Microsoft.ContainerRegistry/"
+        "registries/acrimposter000000"
+    )
+    base = production_effective_assignments()
+    azure.effective_assignments = [
+        base[0],
+        base[1],
+        effective_assignment(
+            ACR_PUSH_ROLE_ID, other_registry, principal_id=DEPLOYMENT_PRINCIPAL_ID
+        ),
+    ]
+
+    with pytest.raises(PreflightError, match="lacks AcrPush"):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+def test_production_foundation_rejects_acr_push_at_broader_scope() -> None:
+    """AcrPush at the resource-group scope does not satisfy the ACR binding."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    base = production_effective_assignments()
+    azure.effective_assignments = [
+        base[0],
+        base[1],
+        effective_assignment(
+            ACR_PUSH_ROLE_ID,
+            PRODUCTION_RESOURCE_GROUP_SCOPE,
+            principal_id=DEPLOYMENT_PRINCIPAL_ID,
+        ),
+    ]
+
+    with pytest.raises(PreflightError, match="lacks AcrPush"):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+def test_production_foundation_rejects_acr_pull_instead_of_push() -> None:
+    """AcrPull at the approved ACR does not satisfy the AcrPush requirement."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    base = production_effective_assignments()
+    azure.effective_assignments = [
+        base[0],
+        base[1],
+        effective_assignment(
+            ACR_PULL_ROLE_ID,
+            PRODUCTION_REGISTRY_SCOPE,
+            principal_id=DEPLOYMENT_PRINCIPAL_ID,
+        ),
+    ]
+
+    with pytest.raises(PreflightError, match="lacks AcrPush"):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+def test_production_foundation_rejects_duplicate_acr_push() -> None:
+    """A duplicated AcrPush assignment fails closed."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.effective_assignments = [
+        *production_effective_assignments(),
+        effective_assignment(
+            ACR_PUSH_ROLE_ID,
+            PRODUCTION_REGISTRY_SCOPE,
+            principal_id=DEPLOYMENT_PRINCIPAL_ID,
+        ),
+    ]
+
+    with pytest.raises(PreflightError, match="duplicate role assignments"):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+def test_production_foundation_rejects_forbidden_owner_role() -> None:
+    """An added Owner assignment is rejected as a forbidden role."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(
+        configuration, foundation_exists=True, forbidden_deployment_role=True
+    )
+
+    with pytest.raises(PreflightError, match="forbidden Owner"):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+def test_production_foundation_rejects_lingering_subscription_contributor() -> None:
+    """A broader Contributor assignment fails the exact-scope contract."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(
+        configuration,
+        foundation_exists=True,
+        lingering_subscription_contributor=True,
+    )
+
+    with pytest.raises(PreflightError, match="Contributor only"):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+def test_production_foundation_rejects_extra_unrelated_role() -> None:
+    """Any additional unrelated role breaks the exact three-role set."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.effective_assignments = [
+        *production_effective_assignments(),
+        effective_assignment(
+            OPENAI_USER_ROLE_ID,
+            PRODUCTION_RESOURCE_GROUP_SCOPE,
+            principal_id=DEPLOYMENT_PRINCIPAL_ID,
+        ),
+    ]
+
+    with pytest.raises(PreflightError, match="exactly the approved effective roles"):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+def test_production_foundation_rejects_group_derived_acr_push() -> None:
+    """Group-derived access cannot silently satisfy the AcrPush requirement."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    base = production_effective_assignments()
+    azure.effective_assignments = [
+        base[0],
+        base[1],
+        effective_assignment(
+            ACR_PUSH_ROLE_ID,
+            PRODUCTION_REGISTRY_SCOPE,
+            principal_id=DEPLOYMENT_PRINCIPAL_ID,
+            principal_type="Group",
+        ),
+    ]
+
+    with pytest.raises(PreflightError, match="group-derived role"):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+def test_production_foundation_rejects_wrong_deployer_principal() -> None:
+    """An assignment for another principal fails closed before role acceptance."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    base = production_effective_assignments()
+    azure.effective_assignments = [
+        base[0],
+        base[1],
+        effective_assignment(
+            ACR_PUSH_ROLE_ID,
+            PRODUCTION_REGISTRY_SCOPE,
+            principal_id="99999999-0000-1111-2222-333333333333",
+        ),
+    ]
+
+    with pytest.raises(PreflightError, match="principal is malformed"):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+def test_production_foundation_is_runtime_composition() -> None:
+    """Production-foundation validates the exact runtime-composition inputs."""
+    from scripts.azure_preflight import (
+        ACR_ROLE_IDENTITY_PHASES,
+        RUNTIME_COMPOSITION_PHASES,
+    )
+
+    assert "production-foundation" in RUNTIME_COMPOSITION_PHASES
+    assert "production-foundation" in ACR_ROLE_IDENTITY_PHASES
+    configuration = _production_foundation_configuration()
+    assert configuration.models
+    assert configuration.openai_resource_id == OPENAI_RESOURCE_ID
+    assert configuration.ui_auth_client_id == UI_AUTH_CLIENT_ID
+    assert configuration.pricing is not None
+    assert configuration.embedding_dimension is None
+
+
+def test_deploy_production_selects_explicit_production_foundation_context() -> None:
+    """The production workflow requests the closed production-foundation context.
+
+    PyYAML is not a project dependency, so an independent structural YAML parse
+    would broaden scope; this exact-set regex assertion over ``--phase`` tokens
+    is retained as the structural contract for each workflow.
+    """
+    deploy = (ROOT / ".github" / "workflows" / "deploy-production.yml").read_text(
+        encoding="utf-8"
+    )
+    phases = re.findall(r"--phase (\S+)", deploy)
+    assert set(phases) == {
+        "production-session",
+        "production-foundation",
+        "publish",
+        "artifacts",
+        "rollout",
+    }
+    assert "foundation" not in phases
+    assert deploy.count("id-token: write") == 1
+    assert deploy.index("--phase production-foundation") < deploy.index(
+        "Deploy the exactly authorized runtime foundation"
+    )
+    assert deploy.index("--phase production-foundation") < deploy.index(
+        "Push the exact verified images"
+    )
+
+    foundation = (ROOT / ".github" / "workflows" / "foundation.yml").read_text(
+        encoding="utf-8"
+    )
+    assert set(re.findall(r"--phase (\S+)", foundation)) == {
+        "foundation-plan",
+        "foundation-apply",
+    }
+    assert "production-foundation" not in foundation
+
+
+# --- Second independent review: strict ACR-name grammar --------------------
+
+
+@pytest.mark.parametrize("registry_name", ["acr12", "a" * 50, "ACR12345", "0AaZz99999"])
+def test_valid_acr_names_load_at_the_grammar_boundaries(registry_name: str) -> None:
+    """Exactly 5-50 ASCII alphanumeric characters is accepted at configuration load."""
+    environment = disabled_environment()
+    environment["AZURE_CONTAINER_REGISTRY_NAME"] = registry_name
+
+    configuration = load_configuration(environment, phase="production-foundation")
+
+    assert configuration.registry_name == registry_name
+
+
+@pytest.mark.parametrize(
+    "registry_name",
+    [
+        "acr1",  # four characters is below the minimum length
+        "a" * 51,  # fifty-one characters is above the maximum length
+        "bad_name",  # underscore is not ASCII alphanumeric
+        "bad-name",  # hyphen is not ASCII alphanumeric
+        "bad.name",  # period is not ASCII alphanumeric
+        "bad/name",  # forward slash is not ASCII alphanumeric
+        "bad\\name",  # backslash is not ASCII alphanumeric
+        "bad%20name",  # percent-encoding is not ASCII alphanumeric
+        "acr\u00f6ptima",  # non-ASCII Unicode is rejected
+    ],
+)
+def test_malformed_acr_names_fail_configuration_load(registry_name: str) -> None:
+    """Malformed ACR names fail load rather than reaching ARM-segment validation.
+
+    Second-review regression: on the pre-fix head ``bad_name`` passed the generic
+    ``_required`` check and only failed deep inside scope canonicalization.
+    """
+    environment = disabled_environment()
+    environment["AZURE_CONTAINER_REGISTRY_NAME"] = registry_name
+
+    with pytest.raises(PreflightError, match="5-50 ASCII alphanumeric"):
+        load_configuration(environment, phase="production-foundation")
+
+
+@pytest.mark.parametrize("registry_name", ["bad\tname", "bad\nname"])
+def test_control_character_acr_names_fail_configuration_load(
+    registry_name: str,
+) -> None:
+    """Tab and newline ACR names fail load before reaching the preflight."""
+    environment = disabled_environment()
+    environment["AZURE_CONTAINER_REGISTRY_NAME"] = registry_name
+
+    with pytest.raises(PreflightError):
+        load_configuration(environment, phase="production-foundation")
+
+
+@pytest.mark.parametrize("phase", ["publish", "artifacts", "rollout"])
+def test_runtime_phases_reject_malformed_acr_names(phase: str) -> None:
+    """Every ACR-consuming phase enforces the shared registry-name grammar."""
+    environment = disabled_environment()
+    environment["AZURE_CONTAINER_REGISTRY_NAME"] = "bad_name"
+
+    with pytest.raises(PreflightError, match="5-50 ASCII alphanumeric"):
+        load_configuration(environment, phase=phase)
+
+
+# --- Second independent review: inventory-bound ACR scope ------------------
+
+
+def test_fake_azure_acr_assignment_scope_is_independent_of_configuration() -> None:
+    """The fixture no longer derives the AcrPush scope from the configured name.
+
+    This proves the decoupling that the second review requires: configuration
+    registry name, live inventory registry, and the granted role-assignment scope
+    are three independent fixture inputs.
+    """
+    configuration = _production_foundation_configuration()
+    assert configuration.registry_name == APPROVED_REGISTRY_NAME
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.acr_assignment_registry_name = "acrindependent01"
+
+    granted = azure.json(
+        "role",
+        "assignment",
+        "list",
+        "--assignee-object-id",
+        DEPLOYMENT_PRINCIPAL_ID,
+        "--all",
+    )
+    acr_scopes = [
+        assignment["scope"]
+        for assignment in granted
+        if assignment["roleDefinitionId"]
+        == role_definition_resource_id(ACR_PUSH_ROLE_ID)
+    ]
+
+    assert acr_scopes == [
+        f"{PRODUCTION_RESOURCE_GROUP_SCOPE}/providers/Microsoft.ContainerRegistry/"
+        "registries/acrindependent01"
+    ]
+    assert configuration.registry_name not in acr_scopes[0]
+
+
+def test_fake_azure_inventory_does_not_realign_default_acr_assignment() -> None:
+    """Inventory and role scope remain independent without explicit overrides."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.inventory_registry_name = ALTERNATE_REGISTRY_NAME
+
+    granted = azure.json(
+        "role",
+        "assignment",
+        "list",
+        "--assignee-object-id",
+        DEPLOYMENT_PRINCIPAL_ID,
+        "--all",
+    )
+    acr_scopes = [
+        assignment["scope"]
+        for assignment in granted
+        if assignment["roleDefinitionId"]
+        == role_definition_resource_id(ACR_PUSH_ROLE_ID)
+    ]
+
+    assert acr_scopes == [PRODUCTION_REGISTRY_SCOPE]
+    assert ALTERNATE_REGISTRY_NAME not in acr_scopes[0]
+
+
+def test_production_foundation_binds_acr_scope_from_inventory_not_configuration() -> (
+    None
+):
+    """A different valid configured registry cannot pass while inventory holds
+    the approved original.
+
+    Blocking second-review regression: on the pre-fix head the expected AcrPush
+    scope was constructed from the configured name, so an imposter registry plus
+    a matching role assignment passed even though inventory still contained the
+    approved registry.
+    """
+    environment = disabled_environment()
+    environment["AZURE_CONTAINER_REGISTRY_NAME"] = "acrimposter00001"
+    configuration = load_configuration(environment, phase="production-foundation")
+    azure = FakeAzure(configuration, foundation_exists=True)
+    # Live inventory still contains only the approved original registry.
+    azure.inventory_registry_name = APPROVED_REGISTRY_NAME
+    # The deployer even holds a matching AcrPush on the configured imposter.
+    azure.acr_assignment_registry_name = "acrimposter00001"
+    _authenticated_production_azure(azure)
+
+    with pytest.raises(
+        PreflightError, match="does not match the repository-derived registry identity"
+    ):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+def test_production_foundation_rejects_inventory_registry_name_mismatch() -> None:
+    """A live registry whose name differs from configuration fails closed."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.inventory_registry_name = "acrotherlive000001"
+    azure.acr_assignment_registry_name = APPROVED_REGISTRY_NAME
+    _authenticated_production_azure(azure)
+
+    with pytest.raises(
+        PreflightError, match="does not match the repository-derived registry identity"
+    ):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+def test_production_foundation_rejects_acr_push_scoped_off_the_live_registry() -> None:
+    """AcrPush granted on an independent registry fails against the live binding."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    # Configuration and inventory both name the approved registry, but the
+    # granted AcrPush assignment is scoped to an independent registry.
+    azure.acr_assignment_registry_name = "acrindependent01"
+    _authenticated_production_azure(azure)
+
+    with pytest.raises(PreflightError, match="lacks AcrPush"):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+def test_production_foundation_accepts_consistent_inventory_binding() -> None:
+    """Configuration, inventory, and assignment all naming the approved ACR pass."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.inventory_registry_name = APPROVED_REGISTRY_NAME
+    azure.acr_assignment_registry_name = APPROVED_REGISTRY_NAME
+    _authenticated_production_azure(azure)
+
+    evidence = run_preflight(
+        configuration, azure, phase="production-foundation", repository_root=ROOT
+    )
+
+    assert evidence["phase"] == "production-foundation"
+
+
+def test_production_foundation_rejects_missing_registry_inventory() -> None:
+    """An empty container-registry inventory fails the cardinality contract."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.inventory_registries = []
+    _authenticated_production_azure(azure)
+
+    with pytest.raises(PreflightError, match="exactly one Azure Container Registry"):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+def test_production_foundation_rejects_multiple_registry_inventory() -> None:
+    """Two container registries in the group fail the cardinality contract."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.inventory_registries = [
+        {
+            "id": PRODUCTION_REGISTRY_SCOPE,
+            "name": APPROVED_REGISTRY_NAME,
+            "type": "Microsoft.ContainerRegistry/registries",
+            "resourceGroup": "rg-optima-hackathon",
+            "provisioningState": "Succeeded",
+        },
+        {
+            "id": (
+                f"{PRODUCTION_RESOURCE_GROUP_SCOPE}/providers/"
+                "Microsoft.ContainerRegistry/registries/acrsecond00000001"
+            ),
+            "name": "acrsecond00000001",
+            "type": "Microsoft.ContainerRegistry/registries",
+            "resourceGroup": "rg-optima-hackathon",
+            "provisioningState": "Succeeded",
+        },
+    ]
+    _authenticated_production_azure(azure)
+
+    with pytest.raises(PreflightError, match="exactly one Azure Container Registry"):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+def test_production_foundation_rejects_non_registry_inventory_resource() -> None:
+    """A non-registry resource in the ACR inventory is rejected."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.inventory_registry_type = "Microsoft.Storage/storageAccounts"
+    _authenticated_production_azure(azure)
+
+    with pytest.raises(PreflightError, match="non-registry resource"):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+def test_production_foundation_rejects_unprovisioned_registry() -> None:
+    """A registry that is not fully provisioned fails closed."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.inventory_registry_provisioning_state = "Creating"
+    _authenticated_production_azure(azure)
+
+    with pytest.raises(PreflightError, match="not fully provisioned"):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+def test_production_foundation_rejects_registry_id_in_another_group() -> None:
+    """A live registry ID outside the approved group fails the identity binding.
+
+    Even when configuration, inventory name, and assignment all point to the
+    same alternative, an inventory resource ID anchored to a different resource
+    group cannot match the independently constructed managed-resource identity.
+    """
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.inventory_registry_id = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg-attacker/providers/"
+        f"Microsoft.ContainerRegistry/registries/{APPROVED_REGISTRY_NAME}"
+    )
+    _authenticated_production_azure(azure)
+
+    with pytest.raises(
+        PreflightError, match="resource ID does not match the managed identity"
+    ):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+def test_production_foundation_rejects_malformed_registry_inventory() -> None:
+    """A malformed inventory payload fails closed."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.inventory_registries = "not-a-list"  # type: ignore[assignment]
+    _authenticated_production_azure(azure)
+
+    with pytest.raises(PreflightError, match="inventory response is malformed"):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+# --- Second independent review: exact Microsoft Graph permission -----------
+
+
+def test_production_foundation_accepts_exact_graph_application_read_all() -> None:
+    """The default identity holds exactly Application.Read.All on Microsoft Graph."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    _authenticated_production_azure(azure)
+
+    evidence = run_preflight(
+        configuration, azure, phase="production-foundation", repository_root=ROOT
+    )
+
+    assert evidence["phase"] == "production-foundation"
+    assert any("appRoleAssignments" in " ".join(call) for call in azure.calls)
+
+
+def test_production_foundation_rejects_missing_graph_permission() -> None:
+    """No Microsoft Graph application permission fails the exact contract."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.graph_app_role_assignments = []
+    _authenticated_production_azure(azure)
+
+    with pytest.raises(PreflightError, match="exactly the Application.Read.All"):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+def test_production_foundation_rejects_extra_graph_permission() -> None:
+    """Application.Read.All plus another Graph permission fails the exact contract.
+
+    Second-review regression: proving Graph access indirectly is insufficient;
+    the identity must hold exactly one Microsoft Graph application permission.
+    """
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.graph_app_role_assignments = [
+        graph_assignment(),
+        graph_assignment(
+            assignment_id=SECOND_GRAPH_ASSIGNMENT_ID,
+            app_role_id="06da0dbc-49e2-44d2-8312-53f166ab848a",
+        ),
+    ]
+    _authenticated_production_azure(azure)
+
+    with pytest.raises(PreflightError, match="exactly the Application.Read.All"):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+def test_production_foundation_rejects_duplicate_graph_permission() -> None:
+    """A duplicated Application.Read.All grant fails the exact contract."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.graph_app_role_assignments = [
+        graph_assignment(),
+        graph_assignment(assignment_id=SECOND_GRAPH_ASSIGNMENT_ID),
+    ]
+    _authenticated_production_azure(azure)
+
+    with pytest.raises(PreflightError, match="exactly the Application.Read.All"):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+@pytest.mark.parametrize(
+    "app_role_id",
+    [
+        "06da0dbc-49e2-44d2-8312-53f166ab848a",  # Directory.Read.All
+        "1bfefb4e-e0b5-418b-a88f-73c46d2cc8e9",  # Application.ReadWrite.All
+    ],
+)
+def test_production_foundation_rejects_wrong_graph_permission(
+    app_role_id: str,
+) -> None:
+    """A single Graph permission that is not Application.Read.All fails closed."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.graph_app_role_assignments = [graph_assignment(app_role_id=app_role_id)]
+    _authenticated_production_azure(azure)
+
+    with pytest.raises(PreflightError, match="is not Application.Read.All"):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+def test_production_foundation_rejects_graph_permission_for_wrong_principal() -> None:
+    """A Graph permission granted to another principal fails closed."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.graph_app_role_assignments = [
+        graph_assignment(principal_id="99999999-0000-1111-2222-333333333333")
+    ]
+    _authenticated_production_azure(azure)
+
+    with pytest.raises(PreflightError, match="targets another principal"):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+def test_production_foundation_rejects_permission_on_non_graph_service_principal() -> (
+    None
+):
+    """Application.Read.All granted on a non-Graph resource is not accepted."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.graph_app_role_assignments = [
+        graph_assignment(resource_id="cccccccc-1111-2222-3333-444444444444")
+    ]
+    _authenticated_production_azure(azure)
+
+    with pytest.raises(PreflightError, match="exactly the Application.Read.All"):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+def test_production_foundation_rejects_disabled_graph_application_role() -> None:
+    """A disabled Application.Read.All app role fails the enabled-permission check."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.graph_service_principal_response = {
+        "id": GRAPH_SERVICE_PRINCIPAL_ID,
+        "appId": MICROSOFT_GRAPH_APP_ID,
+        "appRoles": [
+            {
+                "id": GRAPH_APPLICATION_READ_ALL_ROLE_ID,
+                "isEnabled": False,
+                "allowedMemberTypes": ["Application"],
+            }
+        ],
+    }
+    _authenticated_production_azure(azure)
+
+    with pytest.raises(
+        PreflightError, match="not an enabled Microsoft Graph application"
+    ):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+def test_production_foundation_allows_unrelated_enterprise_app_permission() -> None:
+    """Non-Graph enterprise-application permissions are outside this check."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.graph_app_role_assignments = [
+        graph_assignment(),
+        graph_assignment(
+            assignment_id=SECOND_GRAPH_ASSIGNMENT_ID,
+            app_role_id="abcdef01-2345-6789-abcd-ef0123456789",
+            resource_id="dddddddd-1111-2222-3333-444444444444",
+        ),
+    ]
+    _authenticated_production_azure(azure)
+
+    evidence = run_preflight(
+        configuration, azure, phase="production-foundation", repository_root=ROOT
+    )
+
+    assert evidence["phase"] == "production-foundation"
+
+
+def test_production_foundation_rejects_unpaginated_graph_permissions() -> None:
+    """A paginated Graph app-role response fails closed rather than truncating."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.graph_app_role_assignments_response = {
+        "@odata.count": 1,
+        "@odata.nextLink": "https://graph.microsoft.com/v1.0/next",
+        "value": [graph_assignment()],
+    }
+    _authenticated_production_azure(azure)
+
+    with pytest.raises(PreflightError, match="exceed the limit"):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+def test_production_foundation_rejects_malformed_graph_permissions() -> None:
+    """A malformed Graph app-role response fails closed."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.graph_app_role_assignments_response = {"value": "not-a-list"}
+    _authenticated_production_azure(azure)
+
+    with pytest.raises(PreflightError, match="app role assignments are malformed"):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+def test_production_foundation_rejects_unexpected_graph_service_principal() -> None:
+    """A resolved Graph service principal with the wrong appId fails closed."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.graph_service_principal_response = {
+        "id": GRAPH_SERVICE_PRINCIPAL_ID,
+        "appId": "11111111-0000-0000-c000-000000000000",
+        "appRoles": [],
+    }
+    _authenticated_production_azure(azure)
+
+    with pytest.raises(
+        PreflightError, match="Microsoft Graph service principal is unexpected"
+    ):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+def test_foundation_plan_requires_exact_graph_permission() -> None:
+    """The Graph permission contract applies to the foundation-plan identity too."""
+    configuration = load_configuration(
+        foundation_plan_environment(), phase="foundation-plan"
+    )
+    azure = FakeAzure(configuration)
+    azure.graph_app_role_assignments = []
+    azure.access_token = synthetic_access_token(
+        tenant_id=configuration.tenant_id,
+        client_id=configuration.deployment_client_id,
+        principal_id=azure.deployment_principal_id,
+    )
+
+    with pytest.raises(PreflightError, match="exactly the Application.Read.All"):
+        run_preflight(
+            configuration, azure, phase="foundation-plan", repository_root=ROOT
+        )
+
+
+# --- Third independent review: four-way classified-evidence ACR binding -----
+
+
+ALTERNATE_REGISTRY_NAME = "acroptimadeadbeef01234"
+
+
+@pytest.mark.real_registry_identity
+def test_production_foundation_binds_all_four_approved_sources() -> None:
+    """The exact approved four-way binding passes end to end."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    _authenticated_production_azure(azure)
+
+    evidence = _run_production_foundation(configuration, azure)
+
+    assert evidence["phase"] == "production-foundation"
+
+
+@pytest.mark.real_registry_identity
+def test_self_consistent_alternate_registry_fails_against_evidence() -> None:
+    """Config, inventory, and AcrPush agreeing on an alternate ACR still fails.
+
+    The ARM-evaluated source identity from the classified what-if remains the
+    approved registry, so a fully self-consistent alternative is rejected.
+    """
+    environment = disabled_environment()
+    environment["AZURE_CONTAINER_REGISTRY_NAME"] = ALTERNATE_REGISTRY_NAME
+    configuration = load_configuration(environment, phase="production-foundation")
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.inventory_registry_name = ALTERNATE_REGISTRY_NAME
+    azure.acr_assignment_registry_name = ALTERNATE_REGISTRY_NAME
+    _authenticated_production_azure(azure)
+
+    with pytest.raises(
+        PreflightError, match="does not match the repository-derived registry identity"
+    ):
+        _run_production_foundation(configuration, azure)
+
+
+@pytest.mark.real_registry_identity
+def test_all_four_alternate_sources_fail_against_fixed_raw_whatif() -> None:
+    """Evidence, config, inventory, and role cannot replace the raw ARM result."""
+    environment = disabled_environment()
+    environment["AZURE_CONTAINER_REGISTRY_NAME"] = ALTERNATE_REGISTRY_NAME
+    configuration = load_configuration(environment, phase="production-foundation")
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.inventory_registry_name = ALTERNATE_REGISTRY_NAME
+    azure.acr_assignment_registry_name = ALTERNATE_REGISTRY_NAME
+    _authenticated_production_azure(azure)
+    evidence = _write_evidence(
+        _classified_evidence_document(registry_name=ALTERNATE_REGISTRY_NAME)
+    )
+
+    with pytest.raises(PreflightError, match="differs from raw what-if reconstruction"):
+        _run_production_foundation(
+            configuration,
+            azure,
+            classified_evidence=evidence,
+            raw_whatif=_VALID_RAW_WHATIF_PATH,
+        )
+
+
+@pytest.mark.real_registry_identity
+def test_alternate_registry_in_evidence_fails_against_approved_sources() -> None:
+    """Alternate-registry evidence with three approved live sources fails closed."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    _authenticated_production_azure(azure)
+    evidence = _write_evidence(
+        _classified_evidence_document(registry_name=ALTERNATE_REGISTRY_NAME)
+    )
+
+    with pytest.raises(PreflightError, match="differs from raw what-if reconstruction"):
+        _run_production_foundation(configuration, azure, classified_evidence=evidence)
+
+
+@pytest.mark.real_registry_identity
+def test_absent_evidence_argument_fails_closed() -> None:
+    """Production-foundation without classified evidence fails closed."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    _authenticated_production_azure(azure)
+
+    with pytest.raises(PreflightError, match="requires complete foundation evidence"):
+        run_preflight(
+            configuration,
+            azure,
+            phase="production-foundation",
+            repository_root=ROOT,
+            expected_commit_sha=COMMIT_SHA,
+        )
+
+
+@pytest.mark.real_registry_identity
+def test_missing_evidence_file_fails_closed() -> None:
+    """A missing classified-evidence file fails closed."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    _authenticated_production_azure(azure)
+    missing = Path(tempfile.mkdtemp()) / "absent-evidence.json"
+
+    with pytest.raises(PreflightError, match="missing, changed, or malformed"):
+        _run_production_foundation(configuration, azure, classified_evidence=missing)
+
+
+@pytest.mark.real_registry_identity
+def test_wrong_commit_sha_evidence_fails() -> None:
+    """Evidence for a different commit SHA fails the binding."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    _authenticated_production_azure(azure)
+    evidence = _write_evidence(_classified_evidence_document(commit_sha="b" * 40))
+
+    with pytest.raises(PreflightError, match="differs from raw what-if reconstruction"):
+        _run_production_foundation(configuration, azure, classified_evidence=evidence)
+
+
+@pytest.mark.real_registry_identity
+def test_wrong_scope_evidence_fails() -> None:
+    """Evidence for a different resource group fails the binding."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    _authenticated_production_azure(azure)
+    evidence = _write_evidence(
+        _classified_evidence_document(resource_group="rg-attacker")
+    )
+
+    with pytest.raises(PreflightError, match="differs from raw what-if reconstruction"):
+        _run_production_foundation(configuration, azure, classified_evidence=evidence)
+
+
+@pytest.mark.real_registry_identity
+def test_tampered_parameter_fingerprint_evidence_fails() -> None:
+    """Evidence whose parameter fingerprint is substituted fails the binding."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    _authenticated_production_azure(azure)
+    document = _classified_evidence_document()
+    document["parameters"]["fingerprint"] = "c" * 64
+    evidence = _write_evidence(document)
+
+    with pytest.raises(PreflightError, match="differs from raw what-if reconstruction"):
+        _run_production_foundation(configuration, azure, classified_evidence=evidence)
+
+
+@pytest.mark.real_registry_identity
+def test_tampered_source_fingerprint_evidence_fails() -> None:
+    """Evidence whose source fingerprint is substituted fails the binding."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    _authenticated_production_azure(azure)
+    document = _classified_evidence_document()
+    document["deployment_source"]["fingerprint"] = "c" * 64
+    evidence = _write_evidence(document)
+
+    with pytest.raises(PreflightError, match="differs from raw what-if reconstruction"):
+        _run_production_foundation(configuration, azure, classified_evidence=evidence)
+
+
+@pytest.mark.real_registry_identity
+def test_changed_parameter_artifact_fails_against_captured_evidence() -> None:
+    """Regenerating parameters after classification invalidates authorization."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    _authenticated_production_azure(azure)
+    document = _effective_parameter_document()
+    document["parameters"]["deploymentWorkflowRunId"] = {"value": "987654321-1"}
+    directory = Path(tempfile.mkdtemp())
+    parameters = directory / "changed.parameters.json"
+    parameters.write_bytes(production_parameters.canonical_parameter_bytes(document))
+
+    with pytest.raises(PreflightError, match="differs from raw what-if reconstruction"):
+        _run_production_foundation(
+            configuration,
+            azure,
+            effective_parameters=parameters,
+        )
+
+
+@pytest.mark.real_registry_identity
+def test_unapproved_classification_evidence_fails() -> None:
+    """Evidence that is not APPROVED fails closed as malformed."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    _authenticated_production_azure(azure)
+    document = _classified_evidence_document()
+    document["classification"] = "REJECTED"
+    evidence = _write_evidence(document)
+
+    with pytest.raises(PreflightError, match="missing, changed, or malformed"):
+        _run_production_foundation(configuration, azure, classified_evidence=evidence)
+
+
+@pytest.mark.real_registry_identity
+def test_wrong_type_registry_fact_evidence_fails() -> None:
+    """Evidence whose container-registry fact has a wrong type fails closed."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    _authenticated_production_azure(azure)
+    document = _classified_evidence_document()
+    for fact in document["changes"]["resources"]:
+        if fact["resource_role"] == "container_registry":
+            fact["resource_type"] = "microsoft.storage/storageaccounts"
+    evidence = _write_evidence(document)
+
+    with pytest.raises(PreflightError, match="missing, changed, or malformed"):
+        _run_production_foundation(configuration, azure, classified_evidence=evidence)
+
+
+@pytest.mark.real_registry_identity
+def test_duplicate_key_evidence_fails() -> None:
+    """Evidence with duplicated JSON keys fails closed."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    _authenticated_production_azure(azure)
+    directory = Path(tempfile.mkdtemp())
+    evidence = directory / "duplicate-evidence.json"
+    evidence.write_text(
+        '{"schema_version": "x", "schema_version": "y"}\n', encoding="utf-8"
+    )
+
+    with pytest.raises(PreflightError, match="missing, changed, or malformed"):
+        _run_production_foundation(configuration, azure, classified_evidence=evidence)
+
+
+@pytest.mark.real_registry_identity
+def test_symlink_evidence_fails() -> None:
+    """A symlinked classified-evidence file fails closed."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    _authenticated_production_azure(azure)
+    directory = Path(tempfile.mkdtemp())
+    link = directory / "evidence-link.json"
+    try:
+        link.symlink_to(_VALID_EVIDENCE_PATH)
+    except OSError:
+        pytest.skip("symlink creation is unavailable on this platform")
+
+    with pytest.raises(PreflightError, match="missing, changed, or malformed"):
+        _run_production_foundation(configuration, azure, classified_evidence=link)
+
+
+@pytest.mark.real_registry_identity
+def test_hard_linked_evidence_fails() -> None:
+    """Evidence with another filesystem name fails the single-link contract."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    _authenticated_production_azure(azure)
+    with tempfile.TemporaryDirectory() as directory:
+        link = Path(directory) / "hard-linked-evidence.json"
+        try:
+            os.link(_VALID_EVIDENCE_PATH, link)
+        except OSError as error:
+            pytest.skip(f"hard-link creation is unavailable: {error}")
+
+        with pytest.raises(PreflightError, match="missing, changed, or malformed"):
+            _run_production_foundation(configuration, azure, classified_evidence=link)
+
+
+def test_safe_reader_rejects_path_substitution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pathname swap between lstat and open cannot substitute evidence."""
+    target = tmp_path / "evidence.json"
+    replacement = tmp_path / "replacement.json"
+    target.write_bytes(b"original")
+    replacement.write_bytes(b"replacement")
+    original_open = os.open
+    swapped = False
+
+    def swapping_open(path: Any, flags: int, mode: int = 0o777) -> int:
+        nonlocal swapped
+        if Path(path) == target and not swapped:
+            swapped = True
+            target.unlink()
+            replacement.replace(target)
+        return original_open(path, flags, mode)
+
+    monkeypatch.setattr(os, "open", swapping_open)
+
+    with pytest.raises(OSError, match="changed before it was opened"):
+        classifier.read_regular_file(target)
+
+
+def test_safe_reader_rejects_directory(tmp_path: Path) -> None:
+    """A directory cannot be consumed as an authorization artifact."""
+    with pytest.raises(OSError, match="not a bounded single-link regular file"):
+        classifier.read_regular_file(tmp_path)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO requires a POSIX host")
+def test_safe_reader_rejects_fifo(tmp_path: Path) -> None:
+    """A FIFO cannot block or stream substituted authorization bytes."""
+    fifo = tmp_path / "evidence.fifo"
+    make_fifo = cast(Callable[[Path], None], os.__dict__["mkfifo"])
+    make_fifo(fifo)
+
+    with pytest.raises(OSError, match="not a bounded single-link regular file"):
+        classifier.read_regular_file(fifo)
+
+
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="Unix socket unavailable")
+def test_safe_reader_rejects_socket(tmp_path: Path) -> None:
+    """A filesystem socket cannot supply authorization bytes."""
+    path = tmp_path / "evidence.socket"
+    unix_family = cast(int, socket.__dict__["AF_UNIX"])
+    server = socket.socket(unix_family, socket.SOCK_STREAM)
+    try:
+        server.bind(str(path))
+        with pytest.raises(OSError, match="not a bounded single-link regular file"):
+            classifier.read_regular_file(path)
+    finally:
+        server.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX device path required")
+def test_safe_reader_rejects_device() -> None:
+    """A character device cannot supply authorization bytes."""
+    with pytest.raises(OSError, match="not a bounded single-link regular file"):
+        classifier.read_regular_file(Path("/dev/null"))
+
+
+@pytest.mark.real_registry_identity
+def test_publish_phase_also_binds_classified_evidence() -> None:
+    """The publish phase reuses the same-job classified evidence for AcrPush."""
+    configuration = load_configuration(disabled_environment(), phase="publish")
+    azure = FakeAzure(configuration, foundation_exists=True)
+    _authenticated_production_azure(azure)
+    environment = disabled_environment()
+    environment["AZURE_CONTAINER_REGISTRY_NAME"] = ALTERNATE_REGISTRY_NAME
+    alternate_configuration = load_configuration(environment, phase="publish")
+    alternate_azure = FakeAzure(alternate_configuration, foundation_exists=True)
+    alternate_azure.inventory_registry_name = ALTERNATE_REGISTRY_NAME
+    alternate_azure.acr_assignment_registry_name = ALTERNATE_REGISTRY_NAME
+    _authenticated_production_azure(alternate_azure)
+
+    passing = _run_production_foundation(configuration, azure, phase="publish")
+    assert passing["phase"] == "publish"
+    with pytest.raises(
+        PreflightError, match="does not match the repository-derived registry identity"
+    ):
+        _run_production_foundation(
+            alternate_configuration, alternate_azure, phase="publish"
+        )
+
+
+# --- Third independent review: Graph validate-before-filter ----------------
+
+
+def test_production_foundation_rejects_malformed_unrelated_graph_assignment() -> None:
+    """A malformed non-Graph assignment fails closed before it is filtered out.
+
+    Third-review regression: on the pre-fix head an unrelated assignment missing
+    principalId and appRoleId was skipped without structural validation.
+    """
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.graph_app_role_assignments = [
+        graph_assignment(),
+        {"resourceId": "dddddddd-1111-2222-3333-444444444444"},
+    ]
+    _authenticated_production_azure(azure)
+
+    with pytest.raises(PreflightError, match="app role assignment is malformed"):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+def test_production_foundation_rejects_malformed_assignment_before_graph_entry() -> (
+    None
+):
+    """A malformed unrelated assignment before the Graph entry fails closed.
+
+    Third-review regression: the pre-fix head skipped a non-Graph assignment on
+    the resourceId check before validating its appRoleId.
+    """
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    malformed = graph_assignment(
+        assignment_id=SECOND_GRAPH_ASSIGNMENT_ID,
+        resource_id="dddddddd-1111-2222-3333-444444444444",
+    )
+    malformed["appRoleId"] = "not-a-canonical-guid"
+    azure.graph_app_role_assignments = [
+        malformed,
+        graph_assignment(),
+    ]
+    _authenticated_production_azure(azure)
+
+    with pytest.raises(PreflightError, match="app role ID is not a canonical GUID"):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+def test_production_foundation_accepts_valid_unrelated_before_graph_entry() -> None:
+    """A structurally valid unrelated assignment before the Graph entry passes."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.graph_app_role_assignments = [
+        graph_assignment(
+            assignment_id=SECOND_GRAPH_ASSIGNMENT_ID,
+            app_role_id="abcdef01-2345-6789-abcd-ef0123456789",
+            resource_id="dddddddd-1111-2222-3333-444444444444",
+        ),
+        graph_assignment(),
+    ]
+    _authenticated_production_azure(azure)
+
+    evidence = run_preflight(
+        configuration, azure, phase="production-foundation", repository_root=ROOT
+    )
+
+    assert evidence["phase"] == "production-foundation"
+
+
+def test_unrelated_graph_assignment_for_wrong_principal_fails() -> None:
+    """An unrelated assignment must still belong to the queried principal."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.graph_app_role_assignments = [
+        graph_assignment(
+            assignment_id=SECOND_GRAPH_ASSIGNMENT_ID,
+            app_role_id="abcdef01-2345-6789-abcd-ef0123456789",
+            principal_id="99999999-0000-1111-2222-333333333333",
+            resource_id="dddddddd-1111-2222-3333-444444444444",
+        ),
+        graph_assignment(),
+    ]
+    _authenticated_production_azure(azure)
+
+    with pytest.raises(PreflightError, match="targets another principal"):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+@pytest.mark.parametrize("missing_field", ["id", "@odata.type"])
+def test_graph_assignment_requires_id_and_type(missing_field: str) -> None:
+    """Every Graph assignment requires identity and canonical type metadata."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    assignment = graph_assignment()
+    del assignment[missing_field]
+    azure.graph_app_role_assignments = [assignment]
+    _authenticated_production_azure(azure)
+
+    with pytest.raises(PreflightError, match="app role assignment is malformed"):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+def test_graph_assignment_rejects_wrong_odata_type() -> None:
+    """A non-app-role OData entity cannot satisfy the assignment contract."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.graph_app_role_assignments = [
+        graph_assignment(odata_type="#microsoft.graph.oauth2PermissionGrant")
+    ]
+    _authenticated_production_azure(azure)
+
+    with pytest.raises(PreflightError, match="app role assignment is malformed"):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+def test_graph_assignment_rejects_duplicate_assignment_id() -> None:
+    """Distinct role rows cannot reuse one Graph assignment identity."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    azure.graph_app_role_assignments = [
+        graph_assignment(),
+        graph_assignment(
+            app_role_id="abcdef01-2345-6789-abcd-ef0123456789",
+            resource_id="dddddddd-1111-2222-3333-444444444444",
+        ),
+    ]
+    _authenticated_production_azure(azure)
+
+    with pytest.raises(PreflightError, match="duplicate IDs"):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+def test_graph_assignment_rejects_null_id() -> None:
+    """A null assignment identity fails before resource filtering."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    assignment: dict[str, Any] = graph_assignment()
+    assignment["id"] = None
+    azure.graph_app_role_assignments = [assignment]
+    _authenticated_production_azure(azure)
+
+    with pytest.raises(PreflightError, match="assignment ID is malformed"):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+def test_graph_assignment_authorization_failure_is_sanitized() -> None:
+    """Graph authorization errors expose only the typed query boundary message."""
+    configuration = _production_foundation_configuration()
+
+    class UnauthorizedGraphAzure(FakeAzure):
+        def json(self, *arguments: str, allow_missing: bool = False) -> Any:
+            if any("appRoleAssignments" in argument for argument in arguments):
+                raise AzureQueryError(AzureQueryFailureKind.UNAUTHORIZED, "rest")
+            return super().json(*arguments, allow_missing=allow_missing)
+
+    azure = UnauthorizedGraphAzure(configuration, foundation_exists=True)
+    _authenticated_production_azure(azure)
+
+    with pytest.raises(
+        AzureQueryError, match=r"Azure rest query failed \(UNAUTHORIZED\)"
+    ):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+# --- Third independent review: raw ACR-name validation ---------------------
+
+
+@pytest.mark.parametrize(
+    "registry_name",
+    [" acr12 ", " acr12", "acr12 ", "acr\t12", "acr\n12", "acr\u00a012"],
+)
+def test_raw_registry_name_rejects_whitespace(registry_name: str) -> None:
+    """Surrounding or internal whitespace fails before any trimming.
+
+    Third-review regression: on the pre-fix head ``_required`` stripped the raw
+    value, so a padded registry name loaded successfully.
+    """
+    environment = disabled_environment()
+    environment["AZURE_CONTAINER_REGISTRY_NAME"] = registry_name
+
+    with pytest.raises(PreflightError, match="contains whitespace"):
+        load_configuration(environment, phase="production-foundation")
+
+
+@pytest.mark.parametrize(
+    "registry_name",
+    ["example", "Example", "placeholder", "PLACEHOLDER", "changeme", "ChangeMe"],
+)
+def test_registry_name_rejects_exact_placeholders(registry_name: str) -> None:
+    """Exact, case-insensitive placeholder names fail closed."""
+    environment = disabled_environment()
+    environment["AZURE_CONTAINER_REGISTRY_NAME"] = registry_name
+
+    with pytest.raises(PreflightError, match="is a placeholder"):
+        load_configuration(environment, phase="production-foundation")
+
+
+@pytest.mark.parametrize("registry_name", ["replace_me", "todo"])
+def test_registry_name_rejects_grammar_invalid_placeholders(
+    registry_name: str,
+) -> None:
+    """replace_me and todo are already rejected by the ACR grammar."""
+    environment = disabled_environment()
+    environment["AZURE_CONTAINER_REGISTRY_NAME"] = registry_name
+
+    with pytest.raises(PreflightError, match="5-50 ASCII alphanumeric"):
+        load_configuration(environment, phase="production-foundation")
+
+
+@pytest.mark.parametrize(
+    "registry_name", ["acrexamplefoo", "placeholderacr01", "changemeregistry"]
+)
+def test_registry_names_with_placeholder_substrings_load(
+    registry_name: str,
+) -> None:
+    """A legitimate name containing a placeholder word as a substring is accepted.
+
+    Third-review regression: on the pre-fix head ``_required`` rejected any name
+    containing ``example`` or ``placeholder`` as a substring.
+    """
+    environment = disabled_environment()
+    environment["AZURE_CONTAINER_REGISTRY_NAME"] = registry_name
+
+    configuration = load_configuration(environment, phase="production-foundation")
+
+    assert configuration.registry_name == registry_name
+
+
+@pytest.mark.parametrize("registry_name", ["acr12", "a" * 50])
+def test_raw_registry_name_length_boundaries_load(registry_name: str) -> None:
+    """The 5 and 50 character boundaries load unchanged."""
+    environment = disabled_environment()
+    environment["AZURE_CONTAINER_REGISTRY_NAME"] = registry_name
+
+    configuration = load_configuration(environment, phase="production-foundation")
+
+    assert configuration.registry_name == registry_name
