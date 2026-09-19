@@ -88,6 +88,42 @@ def test_preflight_and_mutation_order_is_fail_closed() -> None:
     assert "az deployment sub what-if" in content
 
 
+def test_classified_whatif_runs_before_preflight_and_all_mutation() -> None:
+    """The authoritative foundation what-if and classifier precede every mutation."""
+    content = workflow()
+    login = content.index("azure/login@")
+    whatif = content.index(
+        "az deployment group what-if --name optima-production-foundation-whatif"
+    )
+    classify = content.index("scripts/whatif_classification.py classify", whatif)
+    evidence = content.index("foundation-plan-evidence.json", classify)
+    preflight = content.index("--phase production-foundation", evidence)
+    consume = content.index(
+        '--classified-evidence "$RUNNER_TEMP/foundation-plan-evidence.json"',
+        preflight,
+    )
+    create = content.index("az deployment group create", consume)
+    image_push = content.index('docker push "$api_image"', create)
+
+    # login -> authoritative what-if -> classify -> preflight consumes evidence
+    assert login < whatif < classify < evidence < preflight < consume
+    # no foundation deployment or image push before classification and preflight
+    assert consume < create < image_push
+    assert content.index("--expected-commit-sha", preflight) < create
+
+
+def test_every_three_role_preflight_consumes_classified_evidence() -> None:
+    """Each ACR-consuming preflight binds the same-job classified evidence."""
+    content = workflow()
+    for phase in ("production-foundation", "publish", "artifacts", "rollout"):
+        phase_index = content.index(f"--phase {phase}")
+        window = content[phase_index : phase_index + 320]
+        assert "foundation-plan-evidence.json" in window
+        assert "--expected-commit-sha" in window
+    # The evidence is generated exactly once before it is consumed.
+    assert content.count('--output "$RUNNER_TEMP/foundation-plan-evidence.json"') == 1
+
+
 def test_cache_mode_is_configuration_controlled_and_propagated() -> None:
     """Read one protected canonical Boolean; add cache-only values only when enabled."""
     content = workflow()

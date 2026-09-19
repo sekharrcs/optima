@@ -21,9 +21,10 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 from urllib.parse import parse_qs, urljoin, urlparse
 
 if TYPE_CHECKING or __package__:
-    from scripts import oidc_federation
+    from scripts import oidc_federation, whatif_classification
 else:
     import oidc_federation
+    import whatif_classification
 
 EXIT_SUCCESS = 0
 EXIT_FAILURE = 1
@@ -65,6 +66,17 @@ GRAPH_APPLICATION_READ_ALL_ROLE_ID = "9a5d68dd-52b0-4cc2-bd40-abcf44ac3a30"
 ACR_REGISTRY_RESOURCE_TYPE = "microsoft.containerregistry/registries"
 # An Azure Container Registry name is exactly 5-50 ASCII alphanumeric characters.
 ACR_NAME_PATTERN = re.compile(r"[A-Za-z0-9]{5,50}")
+# Exact, case-insensitive placeholder registry names that satisfy the ACR
+# grammar but must never bind a live registry.
+ACR_PLACEHOLDER_NAMES = frozenset(
+    {"example", "placeholder", "changeme", "replace_me", "todo"}
+)
+# The closed foundation deployment profile whose ARM-evaluated what-if the
+# fail-closed classifier approves. The production-foundation registry identity
+# is derived from that classified evidence, never from configuration alone.
+FOUNDATION_TEMPLATE_FILE = "infra/resource-group.bicep"
+FOUNDATION_PARAMETER_FILE = "infra/environments/hackathon.foundation.bicepparam"
+CONTAINER_REGISTRY_RESOURCE_ROLE = "container_registry"
 ACR_PUSH_ROLE_ID = "8311e382-0749-4cb8-b61a-304f252e45ec"
 ACR_PULL_ROLE_ID = "7f951dda-4ed3-4680-a7ca-43fe172d538d"
 CONTRIBUTOR_ROLE_ID = "b24988ac-6180-42a0-ab88-20f7382dd24c"
@@ -540,6 +552,27 @@ def _validated_registry_name(value: str) -> str:
     return value
 
 
+def _required_raw_registry_name(environment: Mapping[str, str], name: str) -> str:
+    """Validate the raw registry name before any trimming or normalization.
+
+    The generic ``_required`` helper strips surrounding whitespace, which would
+    silently accept a padded value. The Azure Container Registry name must be
+    exactly 5-50 ASCII alphanumeric characters with no surrounding or internal
+    whitespace, and it must not be a recognized placeholder. A narrowly scoped
+    loader keeps the strict raw contract off the global configuration helper.
+    """
+    raw = environment.get(name)
+    if raw is None or raw == "":
+        raise PreflightError(f"Required deployment setting {name} is missing")
+    if raw != raw.strip() or any(character.isspace() for character in raw):
+        raise PreflightError(f"Deployment setting {name} contains whitespace")
+    if ACR_NAME_PATTERN.fullmatch(raw) is None:
+        raise PreflightError(f"{name} must be 5-50 ASCII alphanumeric characters")
+    if raw.casefold() in ACR_PLACEHOLDER_NAMES:
+        raise PreflightError(f"Deployment setting {name} is a placeholder")
+    return raw
+
+
 def load_configuration(
     environment: Mapping[str, str], *, phase: str = "rollout"
 ) -> DeploymentConfiguration:
@@ -653,9 +686,7 @@ def load_configuration(
         resource_group=_required(environment, "AZURE_RESOURCE_GROUP"),
         location=_required(environment, "AZURE_LOCATION"),
         registry_name=(
-            _validated_registry_name(
-                _required(environment, "AZURE_CONTAINER_REGISTRY_NAME")
-            )
+            _required_raw_registry_name(environment, "AZURE_CONTAINER_REGISTRY_NAME")
             if runtime_composition or requires_registry_identity
             else None
         ),
@@ -1657,28 +1688,31 @@ def _check_graph_application_permissions(
             "resourceId",
         }:
             raise PreflightError("Microsoft Graph app role assignment is malformed")
+        # Validate every structural field before deciding whether the assignment
+        # targets Microsoft Graph. A malformed unrelated assignment must fail
+        # closed rather than be silently filtered out of the equality check.
         resource_id = _canonical_guid(
             value.get("resourceId"),
             label="Microsoft Graph app role assignment resource",
         )
-        if resource_id != graph_principal_id:
-            # Enterprise-application permissions on other resources are outside
-            # the Microsoft Graph application-permission contract.
-            continue
         assigned_principal_id = _canonical_guid(
             value.get("principalId"),
             label="Microsoft Graph app role assignment principal",
         )
+        assigned_role_id = _canonical_guid(
+            value.get("appRoleId"),
+            label="Microsoft Graph app role ID",
+        )
+        if resource_id != graph_principal_id:
+            # A structurally valid enterprise-application permission on another
+            # resource is outside the Microsoft Graph application-permission
+            # contract and is ignored only after full validation.
+            continue
         if assigned_principal_id != principal_id:
             raise PreflightError(
                 "Microsoft Graph app role assignment targets another principal"
             )
-        graph_role_ids.append(
-            _canonical_guid(
-                value.get("appRoleId"),
-                label="Microsoft Graph app role ID",
-            )
-        )
+        graph_role_ids.append(assigned_role_id)
     if len(graph_role_ids) != 1:
         raise PreflightError(
             "OIDC deployment identity must have exactly the Application.Read.All "
@@ -1696,24 +1730,146 @@ def _check_graph_application_permissions(
         )
 
 
+def _foundation_deployment_parameters(
+    configuration: DeploymentConfiguration,
+) -> dict[str, str]:
+    """Return the closed foundation deployment parameters the classifier binds.
+
+    These are the exact effective parameters the production deploy job writes
+    before the authoritative foundation what-if, so the source and parameter
+    fingerprints recomputed here match the classified evidence deterministically.
+    """
+    return {
+        "location": configuration.location,
+        "environmentName": EXPECTED_ENVIRONMENT,
+        "resourceGroup": configuration.resource_group,
+        "templateFile": FOUNDATION_TEMPLATE_FILE,
+        "parameterFile": FOUNDATION_PARAMETER_FILE,
+        "deployContainerApps": "false",
+        "exposePublicUi": "false",
+        "deployRuntimeAccess": "false",
+        "semanticCacheEnabled": "false",
+    }
+
+
+def _resolve_repository_registry_identity(
+    configuration: DeploymentConfiguration,
+    *,
+    classified_evidence: Path | None,
+    expected_commit_sha: str | None,
+    repository_root: Path,
+) -> str:
+    """Return the ARM-evaluated registry name from same-job classified evidence.
+
+    The repository/Bicep-derived registry identity is the single
+    ``container_registry`` fact emitted by the fail-closed classifier over a
+    fresh, source-bound foundation what-if. ARM evaluates the exact reviewed
+    ``uniqueString(subscription, environment)`` expression, so this identity is
+    independent of the mutable configured name, live inventory, and the AcrPush
+    scope. Every binding field -- schema, classification, commit SHA,
+    deployment mode, target scope, source fingerprint, parameter fingerprint,
+    convergence-policy fingerprint, external-policy fingerprint, residual
+    change count, and resource cardinality -- is re-derived here and compared
+    before the ACR fact is trusted. A plain command-line registry name is never
+    accepted as proof.
+    """
+    if classified_evidence is None or expected_commit_sha is None:
+        raise PreflightError(
+            "Production-foundation preflight requires classified foundation evidence"
+        )
+    if classified_evidence.is_symlink():
+        raise PreflightError("Classified foundation evidence must not be a symlink")
+    try:
+        document = whatif_classification._validate_evidence(
+            whatif_classification._load_json(
+                classified_evidence,
+                whatif_classification.WhatIfClassificationCode.PROMOTION_MISMATCH,
+            )
+        )
+    except whatif_classification.WhatIfClassificationError as error:
+        raise PreflightError(
+            "Classified foundation evidence is missing or malformed"
+        ) from error
+    parameters = _foundation_deployment_parameters(configuration)
+    expected_source_fingerprint, expected_file_count = (
+        whatif_classification.deployment_source_fingerprint(
+            parameters, source_root=repository_root
+        )
+    )
+    external_policy = whatif_classification._external_policy_from_environment(
+        whatif_classification.EXTERNAL_POLICY_ENV
+    )
+    if (
+        document["commit_sha"] != expected_commit_sha.casefold()
+        or document["target"]["resource_group"]
+        != configuration.resource_group.casefold()
+        or document["target"]["environment_name"] != EXPECTED_ENVIRONMENT
+        or document["target"]["scope_fingerprint"]
+        != whatif_classification._scope_fingerprint(
+            configuration.subscription_id, configuration.resource_group
+        )
+        or document["deployment_source"]["fingerprint"] != expected_source_fingerprint
+        or document["deployment_source"]["file_count"] != expected_file_count
+        or document["parameters"]["fingerprint"]
+        != whatif_classification.parameter_fingerprint(parameters)
+        or document["normalizations"]["convergence_policy_fingerprint"]
+        != whatif_classification.convergence_policy_fingerprint()
+        or document["normalizations"]["residual_unapproved_change_count"] != 0
+        or document["external_policy"]["fingerprint"]
+        != whatif_classification.external_policy_fingerprint(external_policy)
+    ):
+        raise PreflightError(
+            "Classified foundation evidence does not bind the approved deployment"
+        )
+    registry_facts = [
+        fact
+        for fact in document["changes"]["resources"]
+        if fact["resource_role"] == CONTAINER_REGISTRY_RESOURCE_ROLE
+    ]
+    if len(registry_facts) != 1:
+        raise PreflightError(
+            "Classified foundation evidence must contain exactly one container "
+            "registry fact"
+        )
+    registry_fact = registry_facts[0]
+    if registry_fact["resource_type"] != ACR_REGISTRY_RESOURCE_TYPE:
+        raise PreflightError(
+            "Classified foundation registry fact has an unexpected resource type"
+        )
+    registry_name = registry_fact["resource_name"]
+    if (
+        not isinstance(registry_name, str)
+        or ACR_NAME_PATTERN.fullmatch(registry_name) is None
+    ):
+        raise PreflightError("Classified foundation registry name is malformed")
+    return registry_name
+
+
 def _resolve_approved_registry_scope(
     configuration: DeploymentConfiguration,
     azure: AzureQuery,
     *,
     resource_group_scope: str,
+    expected_registry_name: str,
 ) -> str:
-    """Return the canonical AcrPush scope bound to the approved live registry.
+    """Return the canonical AcrPush scope agreed by all four trusted sources.
 
-    The trusted expected scope must not be derived from configuration alone. A
-    different valid configured registry paired with a matching role assignment
-    would otherwise pass while inventory still holds the approved registry. The
-    live inventory independently establishes the approved registry: exactly one
-    Container Registry in the approved resource group whose canonical name and
-    resource ID match the validated configuration and the managed identity.
+    ``expected_registry_name`` is the repository/Bicep-derived identity from the
+    fail-closed classifier over a fresh ARM-evaluated foundation what-if. The
+    configured name, the single live Container Registry in the approved resource
+    group, and the returned AcrPush scope must all agree canonically with that
+    identity. Because the trusted name is never derived from configuration, live
+    inventory, or the role assignment, a self-consistent alternate registry
+    across those three sources still fails closed.
     """
     if configuration.registry_name is None:
         raise PreflightError("Container registry name is unavailable")
     validated_name = _validated_registry_name(configuration.registry_name)
+    if validated_name.casefold() != expected_registry_name.casefold():
+        raise PreflightError(
+            "Configured container registry does not match the repository-derived "
+            "registry identity"
+        )
     registries = azure.json(
         "acr",
         "list",
@@ -1752,13 +1908,14 @@ def _resolve_approved_registry_scope(
     live_name = registry.get("name")
     if not isinstance(live_name, str) or ACR_NAME_PATTERN.fullmatch(live_name) is None:
         raise PreflightError("Approved Azure Container Registry name is malformed")
-    if live_name.casefold() != validated_name.casefold():
+    if live_name.casefold() != expected_registry_name.casefold():
         raise PreflightError(
-            "Configured container registry does not match the approved live registry"
+            "Approved live container registry does not match the repository-derived "
+            "registry identity"
         )
     expected_scope = _canonical_arm_scope(
         f"{resource_group_scope}/providers/Microsoft.ContainerRegistry/"
-        f"registries/{validated_name}"
+        f"registries/{expected_registry_name}"
     )
     if not expected_scope.startswith(f"{resource_group_scope}/"):
         raise PreflightError("Approved Azure Container Registry scope is malformed")
@@ -1777,6 +1934,9 @@ def _check_deployment_role_allowlist(
     *,
     phase: str,
     principal_id: str,
+    repository_root: Path,
+    classified_evidence: Path | None,
+    expected_commit_sha: str | None,
 ) -> None:
     _check_graph_application_permissions(azure, principal_id=principal_id)
     _reject_transitive_group_roles(
@@ -1829,12 +1989,22 @@ def _check_deployment_role_allowlist(
             }
     elif phase in {"production-foundation", "publish", "artifacts", "rollout"}:
         # production-foundation and the runtime-composition phases require the
-        # exact three-role deployer contract, binding AcrPush to the approved
-        # ACR that live inventory verifies -- never the configured name alone.
+        # exact three-role deployer contract. AcrPush binds to the registry
+        # identity that the fail-closed classifier derived from a fresh,
+        # ARM-evaluated foundation what-if, cross-agreed with configuration,
+        # live inventory, and the AcrPush scope -- never the configured name,
+        # inventory, or role assignment alone.
+        expected_registry_name = _resolve_repository_registry_identity(
+            configuration,
+            classified_evidence=classified_evidence,
+            expected_commit_sha=expected_commit_sha,
+            repository_root=repository_root,
+        )
         registry_scope = _resolve_approved_registry_scope(
             configuration,
             azure,
             resource_group_scope=resource_group_scope,
+            expected_registry_name=expected_registry_name,
         )
         expected = {
             EffectiveRoleAssignment(READER_ROLE_ID, subscription_scope),
@@ -1883,6 +2053,9 @@ def _check_oidc_federation(
     *,
     phase: str,
     session_principal_id: str,
+    repository_root: Path,
+    classified_evidence: Path | None,
+    expected_commit_sha: str | None,
 ) -> None:
     resource_group, identity_name, configured_identity_id = _identity_parts(
         configuration.deployment_identity_resource_id,
@@ -1946,6 +2119,9 @@ def _check_oidc_federation(
         azure,
         phase=phase,
         principal_id=identity_principal_id,
+        repository_root=repository_root,
+        classified_evidence=classified_evidence,
+        expected_commit_sha=expected_commit_sha,
     )
 
 
@@ -3033,6 +3209,8 @@ def run_preflight(
     repository_root: Path,
     api_digest: str | None = None,
     ui_digest: str | None = None,
+    classified_evidence: Path | None = None,
+    expected_commit_sha: str | None = None,
 ) -> dict[str, Any]:
     """Run a read-only preflight phase and return secret-free evidence."""
     if phase not in PREFLIGHT_PHASES:
@@ -3048,6 +3226,9 @@ def run_preflight(
         azure,
         phase=phase,
         session_principal_id=session_principal_id,
+        repository_root=repository_root,
+        classified_evidence=classified_evidence,
+        expected_commit_sha=expected_commit_sha,
     )
     redis_evidence: dict[str, Any] | None = None
     if configuration.semantic_cache_enabled:
@@ -3176,6 +3357,8 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repository-root", type=Path, default=Path.cwd())
     parser.add_argument("--api-digest")
     parser.add_argument("--ui-digest")
+    parser.add_argument("--classified-evidence", type=Path)
+    parser.add_argument("--expected-commit-sha")
     parser.add_argument("--output", type=Path)
     return parser
 
@@ -3192,6 +3375,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             repository_root=arguments.repository_root.resolve(),
             api_digest=arguments.api_digest,
             ui_digest=arguments.ui_digest,
+            classified_evidence=arguments.classified_evidence,
+            expected_commit_sha=arguments.expected_commit_sha,
         )
         serialized = json.dumps(evidence, indent=2, sort_keys=True) + "\n"
         if arguments.output is not None:

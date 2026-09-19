@@ -277,6 +277,7 @@ jobs:
       AZURE_TENANT_ID: "${{ vars.AZURE_TENANT_ID }}"
       OPTIMA_COST_REVIEWED_ON: "${{ vars.OPTIMA_COST_REVIEWED_ON }}"
       OPTIMA_EXPECTED_FIXED_MONTHLY_COST_INR: "${{ vars.OPTIMA_EXPECTED_FIXED_MONTHLY_COST_INR }}"
+      OPTIMA_FOUNDATION_EXTERNAL_OBSERVATION_POLICY: "${{ vars.OPTIMA_FOUNDATION_EXTERNAL_OBSERVATION_POLICY }}"
       OPTIMA_FOUNDRY_BASE_URL: "${{ vars.OPTIMA_FOUNDRY_BASE_URL }}"
       OPTIMA_FOUNDRY_SMALL_DEPLOYMENT: "${{ vars.OPTIMA_FOUNDRY_SMALL_DEPLOYMENT }}"
       OPTIMA_FOUNDRY_SMALL_MODEL: "${{ vars.OPTIMA_FOUNDRY_SMALL_MODEL }}"
@@ -372,13 +373,6 @@ jobs:
           tenant-id: "${{ vars.AZURE_TENANT_ID }}"
           subscription-id: "${{ vars.AZURE_SUBSCRIPTION_ID }}"
 
-      - name: Run foundation preflight before Azure mutation
-        shell: bash
-        run: |
-          set -euo pipefail
-          python scripts/azure_preflight.py --phase production-foundation \
-            --output "$RUNNER_TEMP/foundation-preflight.json"
-
       - name: Reject interrupted foundation deployments before mutation
         shell: bash
         run: |
@@ -405,6 +399,60 @@ jobs:
             echo "An interrupted foundation deployment is still active" >&2
             exit 1
           fi
+
+      - name: Authoritatively what-if and classify the foundation
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          if ! az group show --name "$AZURE_RESOURCE_GROUP" >/dev/null 2>&1; then
+            echo "Production deployment requires an applied foundation resource group" >&2
+            exit 1
+          fi
+          {
+            printf 'location=%s\n' "$AZURE_LOCATION"
+            printf 'environmentName=%s\n' "hackathon"
+            printf 'resourceGroup=%s\n' "$AZURE_RESOURCE_GROUP"
+            printf 'templateFile=%s\n' "infra/resource-group.bicep"
+            printf 'parameterFile=%s\n' "infra/environments/hackathon.foundation.bicepparam"
+            printf 'deployContainerApps=%s\n' "false"
+            printf 'exposePublicUi=%s\n' "false"
+            printf 'deployRuntimeAccess=%s\n' "false"
+            printf 'semanticCacheEnabled=%s\n' "false"
+          } > "$RUNNER_TEMP/foundation-parameters.txt"
+          trap 'rm -f -- "$RUNNER_TEMP/foundation-whatif.json"' EXIT
+          test ! -e "$RUNNER_TEMP/foundation-whatif.json"
+          test ! -L "$RUNNER_TEMP/foundation-whatif.json"
+          az deployment group what-if --name optima-production-foundation-whatif \
+            --mode Incremental \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --template-file infra/resource-group.bicep \
+            --parameters infra/environments/hackathon.foundation.bicepparam \
+            --parameters \
+              "deploymentCommitSha=$GITHUB_SHA" \
+              "deploymentWorkflowRunId=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --validation-level ProviderNoRbac \
+            --result-format FullResourcePayloads \
+            --no-pretty-print --only-show-errors \
+            > "$RUNNER_TEMP/foundation-whatif.json"
+          python scripts/whatif_classification.py classify \
+            --deployment-mode Incremental \
+            --external-policy-env OPTIMA_FOUNDATION_EXTERNAL_OBSERVATION_POLICY \
+            --whatif "$RUNNER_TEMP/foundation-whatif.json" \
+            --subscription-id "$AZURE_SUBSCRIPTION_ID" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --commit-sha "$GITHUB_SHA" \
+            --parameters-file "$RUNNER_TEMP/foundation-parameters.txt" \
+            --output "$RUNNER_TEMP/foundation-plan-evidence.json"
+
+      - name: Run foundation preflight before Azure mutation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/azure_preflight.py --phase production-foundation \
+            --classified-evidence "$RUNNER_TEMP/foundation-plan-evidence.json" \
+            --expected-commit-sha "$GITHUB_SHA" \
+            --output "$RUNNER_TEMP/foundation-preflight.json"
 
       - name: What-if and converge the Azure foundation
         shell: bash
@@ -507,6 +555,8 @@ jobs:
           test "$OPTIMA_UI_AUTH_REDIRECT_URI" = "$expected_callback"
           test "$OPTIMA_RUNTIME_ACCESS_BOOTSTRAPPED" = "true"
           python scripts/azure_preflight.py --phase publish \
+            --classified-evidence "$RUNNER_TEMP/foundation-plan-evidence.json" \
+            --expected-commit-sha "$GITHUB_SHA" \
             --output "$RUNNER_TEMP/publish-preflight.json"
 
       - name: Push the exact verified images with immutable commit tags
@@ -545,6 +595,8 @@ jobs:
           set -euo pipefail
           python scripts/azure_preflight.py --phase artifacts \
             --api-digest "$API_DIGEST" --ui-digest "$UI_DIGEST" \
+            --classified-evidence "$RUNNER_TEMP/foundation-plan-evidence.json" \
+            --expected-commit-sha "$GITHUB_SHA" \
             --output "$RUNNER_TEMP/artifact-preflight.json"
 
       - name: Verify all runtime access before rollout
@@ -556,6 +608,8 @@ jobs:
           set -euo pipefail
           python scripts/azure_preflight.py --phase rollout \
             --api-digest "$API_DIGEST" --ui-digest "$UI_DIGEST" \
+            --classified-evidence "$RUNNER_TEMP/foundation-plan-evidence.json" \
+            --expected-commit-sha "$GITHUB_SHA" \
             --output "$RUNNER_TEMP/rollout-preflight.json"
 
       - name: Capture the active revision pair for automatic rollback
