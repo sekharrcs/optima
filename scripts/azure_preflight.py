@@ -3162,6 +3162,41 @@ def _check_resource_group(
     return typed_resources
 
 
+def _scoped_assignment_role_ids(
+    assignments: object,
+    *,
+    subscription_id: str,
+    expected_scope: str,
+    label: str,
+) -> list[str]:
+    """Parse a scoped role-assignment collection into exact role IDs.
+
+    Every entry must be a well-formed, unconditional assignment at exactly the
+    expected canonical scope. A malformed entry, a conditional grant, or a
+    wrong-scope entry fails closed rather than being filtered away, so the caller
+    can require the complete collection equal the exact approved grant.
+    """
+    if not isinstance(assignments, list):
+        raise PreflightError(f"{label} role assignment response is malformed")
+    role_ids: list[str] = []
+    for assignment in assignments:
+        if not isinstance(assignment, dict):
+            raise PreflightError(f"{label} role assignment response is malformed")
+        if assignment.get("condition") not in (None, ""):
+            raise PreflightError(f"{label} identity has a conditional role assignment")
+        if _canonical_arm_scope(assignment.get("scope")) != expected_scope:
+            raise PreflightError(
+                f"{label} identity has a role assignment at an unexpected scope"
+            )
+        role_ids.append(
+            _role_definition_guid(
+                assignment.get("roleDefinitionId"),
+                subscription_id=subscription_id,
+            )
+        )
+    return role_ids
+
+
 def _check_acr_push(configuration: DeploymentConfiguration, azure: AzureQuery) -> None:
     if configuration.registry_name is None:
         raise PreflightError(
@@ -3198,34 +3233,28 @@ def _check_acr_push(configuration: DeploymentConfiguration, azure: AzureQuery) -
     registry_id = registry.get("id")
     if not isinstance(registry_id, str) or not registry_id:
         raise PreflightError("Azure Container Registry resource ID is unavailable")
-    assignments = azure.json(
-        "role",
-        "assignment",
-        "list",
-        "--assignee-object-id",
-        str(identity["principalId"]),
-        "--scope",
-        registry_id,
-        "--all",
-    )
-    if not isinstance(assignments, list):
-        raise PreflightError("ACR role assignment response is malformed")
     registry_scope = _canonical_arm_scope(registry_id)
-    has_acr_push = False
-    for assignment in assignments:
-        if not isinstance(assignment, dict):
-            raise PreflightError("ACR role assignment response is malformed")
-        has_acr_push = has_acr_push or (
-            _role_definition_guid(
-                assignment.get("roleDefinitionId"),
-                subscription_id=configuration.subscription_id,
-            )
-            == ACR_PUSH_ROLE_ID
-            and _canonical_arm_scope(assignment.get("scope")) == registry_scope
-        )
-    if not has_acr_push:
+    # The deployer's complete registry-scoped grant collection must be exactly
+    # AcrPush: a broader role, a duplicate, a conditional grant, or a wrong-scope
+    # entry fails closed rather than being ignored.
+    role_ids = _scoped_assignment_role_ids(
+        azure.json(
+            "role",
+            "assignment",
+            "list",
+            "--assignee-object-id",
+            str(identity["principalId"]),
+            "--scope",
+            registry_id,
+            "--all",
+        ),
+        subscription_id=configuration.subscription_id,
+        expected_scope=registry_scope,
+        label="ACR",
+    )
+    if sorted(role_ids) != [ACR_PUSH_ROLE_ID]:
         raise PreflightError(
-            "OIDC deployment identity lacks AcrPush on the OPTIMA registry"
+            "OIDC deployment identity must have exactly AcrPush on the OPTIMA registry"
         )
 
 
@@ -3247,35 +3276,29 @@ def _check_foundry_runtime_access(
     )
     if not isinstance(identity, dict) or not identity.get("principalId"):
         raise PreflightError("OPTIMA API managed identity is unavailable")
-    assignments = azure.json(
-        "role",
-        "assignment",
-        "list",
-        "--assignee-object-id",
-        str(identity["principalId"]),
-        "--scope",
-        openai_resource_id,
-        "--all",
-    )
-    if not isinstance(assignments, list):
-        raise PreflightError("Foundry role assignment response is malformed")
     openai_scope = _canonical_arm_scope(openai_resource_id)
-    has_openai_user = False
-    for assignment in assignments:
-        if not isinstance(assignment, dict):
-            raise PreflightError("Foundry role assignment response is malformed")
-        has_openai_user = has_openai_user or (
-            _role_definition_guid(
-                assignment.get("roleDefinitionId"),
-                subscription_id=configuration.subscription_id,
-            )
-            == OPENAI_USER_ROLE_ID
-            and _canonical_arm_scope(assignment.get("scope")) == openai_scope
-        )
-    if not has_openai_user:
+    # The API identity's complete AOAI-scoped grant collection must be exactly
+    # Cognitive Services OpenAI User; a broader, duplicate, conditional, or
+    # wrong-scope grant fails closed.
+    role_ids = _scoped_assignment_role_ids(
+        azure.json(
+            "role",
+            "assignment",
+            "list",
+            "--assignee-object-id",
+            str(identity["principalId"]),
+            "--scope",
+            openai_resource_id,
+            "--all",
+        ),
+        subscription_id=configuration.subscription_id,
+        expected_scope=openai_scope,
+        label="Foundry",
+    )
+    if sorted(role_ids) != [OPENAI_USER_ROLE_ID]:
         raise PreflightError(
-            "OPTIMA API identity lacks Cognitive Services OpenAI User on the "
-            "selected account"
+            "OPTIMA API identity must have exactly Cognitive Services OpenAI User "
+            "on the selected account"
         )
 
 
@@ -3324,6 +3347,7 @@ def _check_runtime_access(
                 f"OPTIMA {component.upper()} managed identity is unavailable"
             )
         principals[component] = str(identity["principalId"])
+    registry_scope = _canonical_arm_scope(str(registry["id"]))
     registry_assignments = azure.json(
         "role",
         "assignment",
@@ -3334,22 +3358,33 @@ def _check_runtime_access(
     )
     if not isinstance(registry_assignments, list):
         raise PreflightError("ACR role assignment response is malformed")
-    for component, principal_id in principals.items():
-        has_acr_pull = False
-        for assignment in registry_assignments:
-            if not isinstance(assignment, dict):
-                raise PreflightError("ACR role assignment response is malformed")
-            has_acr_pull = has_acr_pull or (
-                assignment.get("principalId") == principal_id
-                and _role_definition_guid(
-                    assignment.get("roleDefinitionId"),
-                    subscription_id=configuration.subscription_id,
-                )
-                == ACR_PULL_ROLE_ID
-            )
-        if not has_acr_pull:
+    # Each runtime identity's complete registry-scoped grant collection must be
+    # exactly AcrPull: a broader role, a duplicate, a conditional grant, or a
+    # wrong-scope entry fails closed rather than being ignored.
+    registry_grants: dict[str, list[str]] = {}
+    for assignment in registry_assignments:
+        if not isinstance(assignment, dict):
+            raise PreflightError("ACR role assignment response is malformed")
+        principal = assignment.get("principalId")
+        if not isinstance(principal, str) or not principal:
+            raise PreflightError("ACR role assignment response is malformed")
+        if assignment.get("condition") not in (None, ""):
+            raise PreflightError("ACR identity has a conditional role assignment")
+        if _canonical_arm_scope(assignment.get("scope")) != registry_scope:
             raise PreflightError(
-                f"OPTIMA {component.upper()} identity lacks AcrPull on the registry"
+                "ACR identity has a role assignment at an unexpected scope"
+            )
+        registry_grants.setdefault(principal, []).append(
+            _role_definition_guid(
+                assignment.get("roleDefinitionId"),
+                subscription_id=configuration.subscription_id,
+            )
+        )
+    for component, principal_id in principals.items():
+        if sorted(registry_grants.get(principal_id, [])) != [ACR_PULL_ROLE_ID]:
+            raise PreflightError(
+                f"OPTIMA {component.upper()} identity must have exactly AcrPull "
+                "on the registry"
             )
     cosmos_assignments = azure.json(
         "rest",
@@ -3363,21 +3398,42 @@ def _check_runtime_access(
         if isinstance(cosmos_assignments, dict)
         else None
     )
+    if not isinstance(cosmos_values, list):
+        raise PreflightError("Cosmos data-plane role assignment response is malformed")
     expected_cosmos_scope = f"{cosmos['id']}/dbs/optima/colls/runs".casefold()
     expected_cosmos_role = (
         f"{cosmos['id']}/sqlRoleDefinitions/00000000-0000-0000-0000-000000000002"
     ).casefold()
-    if not isinstance(cosmos_values, list) or not any(
-        isinstance(assignment, dict)
-        and assignment.get("properties", {}).get("principalId") == principals["api"]
-        and str(assignment.get("properties", {}).get("roleDefinitionId", "")).casefold()
-        == expected_cosmos_role
-        and str(assignment.get("properties", {}).get("scope", "")).casefold()
-        == expected_cosmos_scope
-        for assignment in cosmos_values
-    ):
+    # The API identity must hold exactly the approved container-scoped Cosmos
+    # data grant. A broader account or database scope, a wrong role, a duplicate,
+    # or a malformed entry fails closed.
+    api_cosmos_grants: list[tuple[str, str]] = []
+    for assignment in cosmos_values:
+        if not isinstance(assignment, dict):
+            raise PreflightError(
+                "Cosmos data-plane role assignment response is malformed"
+            )
+        properties = assignment.get("properties")
+        if not isinstance(properties, dict):
+            raise PreflightError(
+                "Cosmos data-plane role assignment response is malformed"
+            )
+        principal = properties.get("principalId")
+        if not isinstance(principal, str) or not principal:
+            raise PreflightError(
+                "Cosmos data-plane role assignment response is malformed"
+            )
+        if principal == principals["api"]:
+            api_cosmos_grants.append(
+                (
+                    str(properties.get("roleDefinitionId", "")).casefold(),
+                    str(properties.get("scope", "")).casefold(),
+                )
+            )
+    if api_cosmos_grants != [(expected_cosmos_role, expected_cosmos_scope)]:
         raise PreflightError(
-            "OPTIMA API identity lacks container-scoped Cosmos data contribution"
+            "OPTIMA API identity must have exactly the container-scoped Cosmos "
+            "data contributor grant"
         )
     if redis is not None:
         redis_assignments = azure.json(
@@ -3395,15 +3451,32 @@ def _check_runtime_access(
             if isinstance(redis_assignments, dict)
             else None
         )
-        if not isinstance(redis_values, list) or not any(
-            isinstance(assignment, dict)
-            and assignment.get("properties", {}).get("accessPolicyName") == "default"
-            and assignment.get("properties", {}).get("user", {}).get("objectId")
-            == principals["api"]
-            for assignment in redis_values
-        ):
+        if not isinstance(redis_values, list):
+            raise PreflightError("Redis access policy assignment response is malformed")
+        api_redis_policies: list[str] = []
+        for assignment in redis_values:
+            if not isinstance(assignment, dict):
+                raise PreflightError(
+                    "Redis access policy assignment response is malformed"
+                )
+            properties = assignment.get("properties")
+            if not isinstance(properties, dict):
+                raise PreflightError(
+                    "Redis access policy assignment response is malformed"
+                )
+            user = properties.get("user")
+            object_id = user.get("objectId") if isinstance(user, dict) else None
+            if object_id == principals["api"]:
+                policy = properties.get("accessPolicyName")
+                if not isinstance(policy, str):
+                    raise PreflightError(
+                        "Redis access policy assignment response is malformed"
+                    )
+                api_redis_policies.append(policy)
+        if api_redis_policies != ["default"]:
             raise PreflightError(
-                "OPTIMA API identity lacks the reviewed Redis default access policy"
+                "OPTIMA API identity must have exactly the reviewed Redis default "
+                "access policy"
             )
 
 

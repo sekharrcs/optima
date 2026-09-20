@@ -472,11 +472,17 @@ jobs:
             | sha256sum --check --strict
           test ! -e "$raw"
           test ! -e "$evidence"
-          az deployment group what-if --name optima-production-foundation-whatif \
+          # F6: the what-if consumes the digest-verified artifact through a pinned
+          # descriptor so a pathname replacement cannot change the judged bytes.
+          python scripts/pinned_parameter_exec.py \
+            --parameter-file "$parameters" \
+            --expected-sha256 "${{ steps.effective_parameters.outputs.sha256 }}" \
+            --placeholder @@PINNED_PARAMETERS@@ \
+            -- az deployment group what-if --name optima-production-foundation-whatif \
             --mode Incremental \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --template-file infra/resource-group.bicep \
-            --parameters "@$RUNNER_TEMP/production-foundation.parameters.json" \
+            --parameters @@PINNED_PARAMETERS@@ \
             --validation-level ProviderNoRbac \
             --result-format FullResourcePayloads \
             --no-pretty-print --only-show-errors \
@@ -555,18 +561,36 @@ jobs:
 
       - name: Deploy the exactly authorized runtime foundation
         shell: bash
+        env:
+          CONFIRMED_SHA: "${{ inputs.confirm_commit_sha }}"
         run: |
           set -euo pipefail
-          printf '%s  %s\n' \
-            "${{ steps.effective_parameters.outputs.sha256 }}" \
-            "$RUNNER_TEMP/production-foundation.parameters.json" \
-            | sha256sum --check --strict
-          az deployment group create \
+          # F2: the final origin/main and workflow-blob equality check runs in the
+          # same step immediately before the mutation, after all preparatory and
+          # networked validation. Only the local assignment required to invoke the
+          # create follows it.
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$CONFIRMED_SHA" = "$GITHUB_SHA"
+          test "$GITHUB_SHA" = "$(git rev-parse HEAD)"
+          git fetch --no-tags --prune --depth=1 origin \
+            +refs/heads/main:refs/remotes/origin/main
+          test "$GITHUB_SHA" = "$(git rev-parse origin/main)"
+          workflow=.github/workflows/deploy-production.yml
+          test "$(git hash-object "$workflow")" = \
+            "$(git rev-parse "$GITHUB_SHA:$workflow")"
+          # F6: consume the digest-verified artifact through a pinned descriptor so
+          # a pathname replacement after verification cannot change created bytes.
+          parameters="$RUNNER_TEMP/production-foundation.parameters.json"
+          python scripts/pinned_parameter_exec.py \
+            --parameter-file "$parameters" \
+            --expected-sha256 "${{ steps.effective_parameters.outputs.sha256 }}" \
+            --placeholder @@PINNED_PARAMETERS@@ \
+            -- az deployment group create \
             --mode Incremental \
             --name "optima-foundation-$GITHUB_RUN_ID" \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --template-file infra/resource-group.bicep \
-            --parameters "@$RUNNER_TEMP/production-foundation.parameters.json" \
+            --parameters @@PINNED_PARAMETERS@@ \
             --only-show-errors >/dev/null
 
       - name: Require foundation resources and ACR publication access
@@ -600,24 +624,31 @@ jobs:
           CONFIRMED_SHA: "${{ inputs.confirm_commit_sha }}"
         run: |
           set -euo pipefail
-          # F3: reverify protected main is still the authorized commit immediately
-          # before publishing images. A superseded main stops before any push.
-          test "$GITHUB_REF" = "refs/heads/main"
-          test "$CONFIRMED_SHA" = "$GITHUB_SHA"
-          test "$GITHUB_SHA" = "$(git rev-parse HEAD)"
-          git fetch --no-tags --prune --depth=1 origin \
-            +refs/heads/main:refs/remotes/origin/main
-          test "$GITHUB_SHA" = "$(git rev-parse origin/main)"
-          workflow=.github/workflows/deploy-production.yml
-          test "$(git hash-object "$workflow")" = \
-            "$(git rev-parse "$GITHUB_SHA:$workflow")"
+          # Preparatory (networked) publication setup happens before the final
+          # freshness checks so only the push mutation follows each check.
           az acr login --name "$AZURE_CONTAINER_REGISTRY_NAME"
           registry="$(az acr show --name "$AZURE_CONTAINER_REGISTRY_NAME" --query loginServer --output tsv)"
           api_image="$registry/optima-api:$GITHUB_SHA"
           ui_image="$registry/optima-ui:$GITHUB_SHA"
           docker tag optima-api:production-check "$api_image"
           docker tag optima-ui:production-check "$ui_image"
+          # F2: a separate final origin/main and workflow-blob equality check runs
+          # immediately before each publication push. A superseded main stops
+          # before any image is published.
+          reverify_protected_main() {
+            test "$GITHUB_REF" = "refs/heads/main"
+            test "$CONFIRMED_SHA" = "$GITHUB_SHA"
+            test "$GITHUB_SHA" = "$(git rev-parse HEAD)"
+            git fetch --no-tags --prune --depth=1 origin \
+              +refs/heads/main:refs/remotes/origin/main
+            test "$GITHUB_SHA" = "$(git rev-parse origin/main)"
+            workflow=.github/workflows/deploy-production.yml
+            test "$(git hash-object "$workflow")" = \
+              "$(git rev-parse "$GITHUB_SHA:$workflow")"
+          }
+          reverify_protected_main
           docker push "$api_image"
+          reverify_protected_main
           docker push "$ui_image"
           api_digest="$(az acr manifest show-metadata --registry "$AZURE_CONTAINER_REGISTRY_NAME" \
             --name "optima-api:$GITHUB_SHA" --query digest --output tsv)"
@@ -761,15 +792,20 @@ jobs:
             --ui-image-digest "$UI_DIGEST" \
             --output "$internal_parameters")"
           [[ "$internal_sha256" =~ ^[0-9a-f]{64}$ ]]
-          # F3: reverify protected main immediately before the internal create.
+          # F2: reverify protected main before the internal what-if.
           reverify_protected_main
           internal_whatif="$RUNNER_TEMP/production-internal-rollout-whatif.json"
           test ! -e "$internal_whatif"
-          az deployment group what-if --name optima-internal-rollout-what-if \
+          # F6: pin the immutable artifact to a verified descriptor for the what-if.
+          python scripts/pinned_parameter_exec.py \
+            --parameter-file "$internal_parameters" \
+            --expected-sha256 "$internal_sha256" \
+            --placeholder @@PINNED_PARAMETERS@@ \
+            -- az deployment group what-if --name optima-internal-rollout-what-if \
             --mode Incremental \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --template-file infra/resource-group.bicep \
-            --parameters "@$internal_parameters" \
+            --parameters @@PINNED_PARAMETERS@@ \
             --parameters "${rollout_secret_parameters[@]}" \
             --validation-level ProviderNoRbac \
             --result-format FullResourcePayloads \
@@ -795,11 +831,19 @@ jobs:
           # The create consumes the exact artifact the what-if classified.
           printf '%s  %s\n' "$internal_sha256" "$internal_parameters" \
             | sha256sum --check --strict
+          # F2: final freshness check immediately before the internal create.
+          reverify_protected_main
           deployment_name="optima-internal-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          az deployment group create --name "$deployment_name" \
+          # F6: pin the immutable artifact to a verified descriptor for the create.
+          python scripts/pinned_parameter_exec.py \
+            --parameter-file "$internal_parameters" \
+            --expected-sha256 "$internal_sha256" \
+            --placeholder @@PINNED_PARAMETERS@@ \
+            -- az deployment group create --name "$deployment_name" \
+            --mode Incremental \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --template-file infra/resource-group.bicep \
-            --parameters "@$internal_parameters" \
+            --parameters @@PINNED_PARAMETERS@@ \
             --parameters "${rollout_secret_parameters[@]}" \
             --only-show-errors >/dev/null
           api_name="$(az deployment group show --name "$deployment_name" \
@@ -849,6 +893,9 @@ jobs:
           smoke_job="$(az deployment group show --name "$deployment_name" \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --query properties.outputs.smokeJobName.value --output tsv)"
+          # F2: the pre-exposure smoke job start is a mutation boundary; reverify
+          # protected main immediately before starting it.
+          reverify_protected_main
           smoke_execution="$(az containerapp job start --name "$smoke_job" \
             --resource-group "$AZURE_RESOURCE_GROUP" --query name --output tsv)"
           smoke_status=Running
@@ -884,15 +931,20 @@ jobs:
             --output "$public_parameters")"
           [[ "$public_sha256" =~ ^[0-9a-f]{64}$ ]]
           rm -f -- "$compiled"
-          # F3: reverify protected main immediately before the public create.
+          # F2: reverify protected main before the public what-if.
           reverify_protected_main
           public_whatif="$RUNNER_TEMP/production-public-rollout-whatif.json"
           test ! -e "$public_whatif"
-          az deployment group what-if --name optima-public-ui-what-if \
+          # F6: pin the immutable artifact to a verified descriptor for the what-if.
+          python scripts/pinned_parameter_exec.py \
+            --parameter-file "$public_parameters" \
+            --expected-sha256 "$public_sha256" \
+            --placeholder @@PINNED_PARAMETERS@@ \
+            -- az deployment group what-if --name optima-public-ui-what-if \
             --mode Incremental \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --template-file infra/resource-group.bicep \
-            --parameters "@$public_parameters" \
+            --parameters @@PINNED_PARAMETERS@@ \
             --parameters "${rollout_secret_parameters[@]}" \
             --validation-level ProviderNoRbac \
             --result-format FullResourcePayloads \
@@ -918,11 +970,19 @@ jobs:
           # The create consumes the exact artifact the what-if classified.
           printf '%s  %s\n' "$public_sha256" "$public_parameters" \
             | sha256sum --check --strict
+          # F2: final freshness check immediately before the public create.
+          reverify_protected_main
           deployment_name="optima-rollout-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          az deployment group create --name "$deployment_name" \
+          # F6: pin the immutable artifact to a verified descriptor for the create.
+          python scripts/pinned_parameter_exec.py \
+            --parameter-file "$public_parameters" \
+            --expected-sha256 "$public_sha256" \
+            --placeholder @@PINNED_PARAMETERS@@ \
+            -- az deployment group create --name "$deployment_name" \
+            --mode Incremental \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --template-file infra/resource-group.bicep \
-            --parameters "@$public_parameters" \
+            --parameters @@PINNED_PARAMETERS@@ \
             --parameters "${rollout_secret_parameters[@]}" \
             --only-show-errors >/dev/null
           printf 'deployment_name=%s\napi_name=%s\nui_name=%s\napi_url=%s\nui_url=%s\n' \
@@ -989,16 +1049,73 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if ! az containerapp show --name ca-optima-ui-hackathon \
-            --resource-group "$AZURE_RESOURCE_GROUP" >/dev/null 2>&1; then
-            echo "UI container app is absent; a failure before its creation exposed nothing" >&2
-            exit 0
+          ui_name=ca-optima-ui-hackathon
+          err="$RUNNER_TEMP/contain-error.txt"
+          # F5: only an authoritative ResourceNotFound is treated as absence.
+          is_resource_not_found() {
+            grep -qiE '\(ResourceNotFound\)|ResourceGroupNotFound|DeploymentNotFound|was not found|could not be found' "$1"
+          }
+          # Reconcile every outstanding rollout deployment before containment so an
+          # in-flight public create can never re-expose the UI afterwards: read its
+          # state, cancel it if still active, and wait for a terminal state.
+          for deployment_name in \
+              "optima-internal-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+              "optima-rollout-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"; do
+            if ! state="$(az deployment group show --name "$deployment_name" \
+                --resource-group "$AZURE_RESOURCE_GROUP" \
+                --query properties.provisioningState --output tsv 2>"$err")"; then
+              if is_resource_not_found "$err"; then
+                continue
+              fi
+              echo "Rollout deployment $deployment_name state is indeterminate" >&2
+              cat "$err" >&2
+              exit 1
+            fi
+            case "$state" in
+              Running | Accepted | Creating | Updating)
+                az deployment group cancel --name "$deployment_name" \
+                  --resource-group "$AZURE_RESOURCE_GROUP" >/dev/null 2>&1 || true
+                ;;
+            esac
+            reconciled=false
+            for _attempt in $(seq 1 60); do
+              case "$state" in
+                Succeeded | Failed | Canceled)
+                  reconciled=true
+                  break
+                  ;;
+              esac
+              sleep 5
+              if ! state="$(az deployment group show --name "$deployment_name" \
+                  --resource-group "$AZURE_RESOURCE_GROUP" \
+                  --query properties.provisioningState --output tsv 2>"$err")"; then
+                if is_resource_not_found "$err"; then
+                  reconciled=true
+                  break
+                fi
+                echo "Rollout deployment $deployment_name became indeterminate" >&2
+                exit 1
+              fi
+            done
+            test "$reconciled" = "true"
+          done
+          # Determine UI presence authoritatively: only ResourceNotFound is absence.
+          if ! az containerapp show --name "$ui_name" \
+              --resource-group "$AZURE_RESOURCE_GROUP" >/dev/null 2>"$err"; then
+            if is_resource_not_found "$err"; then
+              echo "recovery=absent" >> "$GITHUB_STEP_SUMMARY"
+              echo "UI container app is absent; a failure before its creation exposed nothing" >&2
+              exit 0
+            fi
+            echo "UI container app existence is indeterminate; containment fails closed" >&2
+            cat "$err" >&2
+            exit 1
           fi
           contained=false
           for _attempt in 1 2 3; do
-            if az containerapp ingress update --name ca-optima-ui-hackathon \
+            if az containerapp ingress update --name "$ui_name" \
                 --resource-group "$AZURE_RESOURCE_GROUP" --type internal && \
-              test "$(az containerapp show --name ca-optima-ui-hackathon \
+              test "$(az containerapp show --name "$ui_name" \
                 --resource-group "$AZURE_RESOURCE_GROUP" \
                 --query properties.configuration.ingress.external --output tsv)" = "false"; then
               contained=true
@@ -1006,6 +1123,7 @@ jobs:
             fi
           done
           test "$contained" = "true"
+          echo "recovery=contained" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Restore the previous ready revision pair
         if: ${{ always() && (failure() || cancelled()) && steps.rollout.outcome != 'skipped' && steps.previous.outputs.had_pair == 'true' }}

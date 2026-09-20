@@ -1,13 +1,19 @@
 """Fail-closed classification tests for the Container Apps rollout what-if.
 
-Every adversarial fixture here fails closed against the exact rollout state
-transition contract. These regressions did not exist at PR head 9705e4c, where
-the internal and public rollouts ran ``az deployment group what-if`` and then
-``create`` with no classification at all.
+Every adversarial fixture here fails closed against the complete closed
+desired-state projection of each rollout resource. The reviewed baseline payloads
+(``_api_after``/``_ui_after``/``_auth_after``/``_smoke_after``) are the only fully
+valid projections; each regression tampers with exactly one projected field and
+proves the classifier rejects it. These projection regressions did not exist at
+PR head e6ed1c0, where the rollout classifier materially checked only
+``containers[0].image`` and ``ingress.external`` and therefore accepted sidecars,
+mutated target ports, disabled authentication, mutable smoke-job images, wrong
+payload types, and a destructive delta that retained the transition fingerprint.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -30,6 +36,20 @@ API_DIGEST = "sha256:" + ("a" * 64)
 UI_DIGEST = "sha256:" + ("b" * 64)
 REGISTRY = f"acroptima{SUFFIX}.azurecr.io"
 COMMIT_SHA = "c" * 40
+CLIENT_ID = "22222222-3333-4444-5555-666666666666"
+TENANT_ID = "d04cc813-b8d5-4eba-aca4-391c3278fd1a"
+ISSUER = f"https://login.microsoftonline.com/{TENANT_ID}/v2.0"
+API_IDENTITY = f"{SCOPE}/Microsoft.ManagedIdentity/userAssignedIdentities/id-optima-api"
+UI_IDENTITY = f"{SCOPE}/Microsoft.ManagedIdentity/userAssignedIdentities/id-optima-ui"
+# The deployment-source fingerprint binds the reviewed template and every module,
+# including container-apps.bicep. It is computed once from the real repository
+# source that the projection constants mirror, never from the what-if under test.
+SOURCE_FINGERPRINT, SOURCE_FILE_COUNT = classifier.deployment_source_fingerprint(
+    {
+        "templateFile": "infra/resource-group.bicep",
+        "parameterFile": "infra/environments/hackathon.runtime.bicepparam",
+    }
+)
 
 FOUNDATION_IDS = (
     f"{SCOPE}/Microsoft.ManagedIdentity/userAssignedIdentities/id-optima-api-hackathon",
@@ -68,12 +88,129 @@ def _nochange(resource_id: str, payload: Any | None = None) -> dict[str, Any]:
     }
 
 
-def _app_payload(image: str, external: bool) -> dict[str, Any]:
+def _api_after(
+    *, external: bool = False, cache_mode: str = "false", digest: str = API_DIGEST
+) -> dict[str, Any]:
+    """The complete reviewed API container-app desired state projection input."""
+    return {
+        "identity": {
+            "type": "UserAssigned",
+            "userAssignedIdentities": {API_IDENTITY: {}},
+        },
+        "properties": {
+            "configuration": {
+                "activeRevisionsMode": "Single",
+                "ingress": {
+                    "external": external,
+                    "targetPort": 8000,
+                    "transport": "auto",
+                    "allowInsecure": False,
+                    "traffic": [{"latestRevision": True, "weight": 100}],
+                },
+                "secrets": [{"name": "application-insights-connection-string"}],
+                "registries": [{"identity": API_IDENTITY, "server": REGISTRY}],
+            },
+            "template": {
+                "containers": [
+                    {
+                        "name": "api",
+                        "image": f"{REGISTRY}/optima-api@{digest}",
+                        "env": [
+                            {
+                                "name": "OPTIMA_SEMANTIC_CACHE_ENABLED",
+                                "value": cache_mode,
+                            }
+                        ],
+                        "resources": {"cpu": 0.5, "memory": "1.0Gi"},
+                    }
+                ],
+                "scale": {"minReplicas": 0, "maxReplicas": 3},
+            },
+        },
+    }
+
+
+def _ui_after(*, external: bool, digest: str = UI_DIGEST) -> dict[str, Any]:
+    """The complete reviewed UI container-app desired state projection input."""
+    return {
+        "identity": {
+            "type": "UserAssigned",
+            "userAssignedIdentities": {UI_IDENTITY: {}},
+        },
+        "properties": {
+            "configuration": {
+                "activeRevisionsMode": "Single",
+                "ingress": {
+                    "external": external,
+                    "targetPort": 8501,
+                    "transport": "auto",
+                    "allowInsecure": False,
+                    "traffic": [{"latestRevision": True, "weight": 100}],
+                },
+                "secrets": [{"name": "ui-auth-client-secret"}],
+                "registries": [{"identity": UI_IDENTITY, "server": REGISTRY}],
+            },
+            "template": {
+                "containers": [
+                    {
+                        "name": "ui",
+                        "image": f"{REGISTRY}/optima-ui@{digest}",
+                        "resources": {"cpu": 0.5, "memory": "1.0Gi"},
+                    }
+                ],
+                "scale": {"minReplicas": 0, "maxReplicas": 2},
+            },
+        },
+    }
+
+
+def _auth_after() -> dict[str, Any]:
+    """The complete reviewed UI authentication config projection input."""
     return {
         "properties": {
-            "configuration": {"ingress": {"external": external, "targetPort": 8000}},
-            "template": {"containers": [{"name": "c", "image": image}]},
+            "platform": {"enabled": True},
+            "globalValidation": {
+                "unauthenticatedClientAction": "RedirectToLoginPage",
+                "redirectToProvider": "azureActiveDirectory",
+            },
+            "identityProviders": {
+                "azureActiveDirectory": {
+                    "enabled": True,
+                    "registration": {
+                        "clientId": CLIENT_ID,
+                        "clientSecretSettingName": "ui-auth-client-secret",
+                        "openIdIssuer": ISSUER,
+                    },
+                    "validation": {
+                        "allowedAudiences": [CLIENT_ID, f"api://{CLIENT_ID}"]
+                    },
+                }
+            },
+            "login": {"tokenStore": {"enabled": False}},
+            "httpSettings": {"requireHttps": True},
         }
+    }
+
+
+def _smoke_after(*, digest: str = UI_DIGEST) -> dict[str, Any]:
+    """The complete reviewed pre-exposure smoke-job projection input."""
+    return {
+        "identity": {
+            "type": "UserAssigned",
+            "userAssignedIdentities": {UI_IDENTITY: {}},
+        },
+        "properties": {
+            "configuration": {
+                "triggerType": "Manual",
+                "replicaRetryLimit": 0,
+                "registries": [{"identity": UI_IDENTITY, "server": REGISTRY}],
+            },
+            "template": {
+                "containers": [
+                    {"name": "smoke", "image": f"{REGISTRY}/optima-ui@{digest}"}
+                ]
+            },
+        },
     }
 
 
@@ -81,56 +218,43 @@ def _foundation_nochanges() -> list[dict[str, Any]]:
     return [_nochange(resource_id) for resource_id in FOUNDATION_IDS]
 
 
+def _create(resource_id: str, after: dict[str, Any]) -> dict[str, Any]:
+    return {"resourceId": resource_id, "changeType": "Create", "after": after}
+
+
 def _internal_apps() -> list[dict[str, Any]]:
     return [
+        _create(API_ID, _api_after(external=False)),
+        _create(UI_ID, _ui_after(external=False)),
+        _create(UI_AUTH_ID, _auth_after()),
+        _create(JOB_ID, _smoke_after()),
+    ]
+
+
+def _ui_exposure_delta() -> list[dict[str, Any]]:
+    return [
         {
-            "resourceId": API_ID,
-            "changeType": "Create",
-            "after": _app_payload(f"{REGISTRY}/optima-api@{API_DIGEST}", False),
-        },
-        {
-            "resourceId": UI_ID,
-            "changeType": "Create",
-            "after": _app_payload(f"{REGISTRY}/optima-ui@{UI_DIGEST}", False),
-        },
-        {
-            "resourceId": UI_AUTH_ID,
-            "changeType": "Create",
-            "after": {"properties": {"platform": {"enabled": True}}},
-        },
-        {
-            "resourceId": JOB_ID,
-            "changeType": "Create",
-            "after": {"properties": {"template": {"containers": []}}},
-        },
+            "path": "properties.configuration.ingress.external",
+            "propertyChangeType": "Modify",
+            "before": False,
+            "after": True,
+            "children": None,
+        }
     ]
 
 
 def _public_apps() -> list[dict[str, Any]]:
-    api_payload = _app_payload(f"{REGISTRY}/optima-api@{API_DIGEST}", False)
-    ui_internal = _app_payload(f"{REGISTRY}/optima-ui@{UI_DIGEST}", False)
-    ui_external = _app_payload(f"{REGISTRY}/optima-ui@{UI_DIGEST}", True)
-    auth = {"properties": {"platform": {"enabled": True}}}
-    job: dict[str, Any] = {"properties": {"template": {"containers": []}}}
     return [
-        _nochange(API_ID, api_payload),
+        _nochange(API_ID, _api_after(external=False)),
         {
             "resourceId": UI_ID,
             "changeType": "Modify",
-            "before": ui_internal,
-            "after": ui_external,
-            "delta": [
-                {
-                    "path": "properties.configuration.ingress.external",
-                    "propertyChangeType": "Modify",
-                    "before": False,
-                    "after": True,
-                    "children": None,
-                }
-            ],
+            "before": _ui_after(external=False),
+            "after": _ui_after(external=True),
+            "delta": _ui_exposure_delta(),
         },
-        _nochange(UI_AUTH_ID, auth),
-        _nochange(JOB_ID, job),
+        _nochange(UI_AUTH_ID, _auth_after()),
+        _nochange(JOB_ID, _smoke_after()),
     ]
 
 
@@ -147,6 +271,10 @@ def _classify(stage: str, changes: list[dict[str, Any]]) -> Any:
         environment_name="hackathon",
         api_image_digest=API_DIGEST,
         ui_image_digest=UI_DIGEST,
+        ui_auth_client_id=CLIENT_ID,
+        ui_auth_tenant_id=TENANT_ID,
+        deployment_source_fingerprint=SOURCE_FINGERPRINT,
+        deployment_source_file_count=SOURCE_FILE_COUNT,
     )
 
 
@@ -204,7 +332,7 @@ def test_unexpected_extra_application_fails_closed() -> None:
         {
             "resourceId": extra_id,
             "changeType": "Create",
-            "after": _app_payload(f"{REGISTRY}/optima-api@{API_DIGEST}", False),
+            "after": _api_after(external=False),
         }
     )
     _assert_code(
@@ -234,7 +362,7 @@ def test_duplicate_application_fails_closed() -> None:
 def test_internal_ui_exposed_fails_closed() -> None:
     """Internal rollout with an externally exposed UI fails closed."""
     changes = _foundation_nochanges() + _internal_apps()
-    changes[11]["after"] = _app_payload(f"{REGISTRY}/optima-ui@{UI_DIGEST}", True)
+    changes[11]["after"] = _ui_after(external=True)
     _assert_code(
         "internal", changes, WhatIfClassificationCode.ROLLOUT_INGRESS_TRANSITION
     )
@@ -243,7 +371,7 @@ def test_internal_ui_exposed_fails_closed() -> None:
 def test_internal_api_exposed_fails_closed() -> None:
     """The API must never be externally exposed, in either stage."""
     changes = _foundation_nochanges() + _internal_apps()
-    changes[10]["after"] = _app_payload(f"{REGISTRY}/optima-api@{API_DIGEST}", True)
+    changes[10]["after"] = _api_after(external=True)
     _assert_code(
         "internal", changes, WhatIfClassificationCode.ROLLOUT_INGRESS_TRANSITION
     )
@@ -252,7 +380,7 @@ def test_internal_api_exposed_fails_closed() -> None:
 def test_public_ui_without_transition_fails_closed() -> None:
     """A public exposure that is not an internal-to-external Modify fails closed."""
     changes = _foundation_nochanges() + _public_apps()
-    exposed = _app_payload(f"{REGISTRY}/optima-ui@{UI_DIGEST}", True)
+    exposed = _ui_after(external=True)
     changes[11] = _nochange(UI_ID, exposed)
     _assert_code(
         "public-ui", changes, WhatIfClassificationCode.ROLLOUT_INGRESS_TRANSITION
@@ -262,7 +390,7 @@ def test_public_ui_without_transition_fails_closed() -> None:
 def test_public_ui_already_external_before_fails_closed() -> None:
     """A UI Modify whose before is already external is not the reviewed transition."""
     changes = _foundation_nochanges() + _public_apps()
-    exposed = _app_payload(f"{REGISTRY}/optima-ui@{UI_DIGEST}", True)
+    exposed = _ui_after(external=True)
     changes[11]["before"] = exposed
     _assert_code(
         "public-ui", changes, WhatIfClassificationCode.ROLLOUT_INGRESS_TRANSITION
@@ -276,7 +404,7 @@ def test_public_api_change_fails_closed() -> None:
         "resourceId": API_ID,
         "changeType": "Modify",
         "before": {"properties": {}},
-        "after": _app_payload(f"{REGISTRY}/optima-api@{API_DIGEST}", False),
+        "after": _api_after(external=False),
         "delta": [
             {
                 "path": "properties.template.containers",
@@ -322,26 +450,345 @@ def test_public_smoke_job_change_fails_closed() -> None:
 def test_wrong_api_image_digest_fails_closed() -> None:
     """The API container must reference the exact pushed manifest digest."""
     changes = _foundation_nochanges() + _internal_apps()
-    changes[10]["after"] = _app_payload(
-        f"{REGISTRY}/optima-api@sha256:{'d' * 64}", False
-    )
+    changes[10]["after"] = _api_after(external=False, digest="sha256:" + "d" * 64)
     _assert_code("internal", changes, WhatIfClassificationCode.ROLLOUT_IMAGE_BINDING)
 
 
 def test_wrong_ui_image_digest_fails_closed() -> None:
     """The UI container must reference the exact pushed manifest digest."""
     changes = _foundation_nochanges() + _internal_apps()
-    changes[11]["after"] = _app_payload(
-        f"{REGISTRY}/optima-ui@sha256:{'d' * 64}", False
-    )
+    changes[11]["after"] = _ui_after(external=False, digest="sha256:" + "d" * 64)
     _assert_code("internal", changes, WhatIfClassificationCode.ROLLOUT_IMAGE_BINDING)
 
 
 def test_swapped_repository_image_fails_closed() -> None:
-    """Binding the UI digest to the API repository fails closed."""
+    """Binding the UI repository to the API resource fails closed."""
     changes = _foundation_nochanges() + _internal_apps()
-    changes[10]["after"] = _app_payload(f"{REGISTRY}/optima-ui@{API_DIGEST}", False)
+    swapped = _api_after(external=False)
+    swapped["properties"]["template"]["containers"][0]["image"] = (
+        f"{REGISTRY}/optima-ui@{API_DIGEST}"
+    )
+    changes[10]["after"] = swapped
     _assert_code("internal", changes, WhatIfClassificationCode.ROLLOUT_IMAGE_BINDING)
+
+
+# --- F1 (BLOCKING) regressions: each reproduces one Astra bypass that the
+# partial-field classifier at e6ed1c0 accepted while retaining the legitimate
+# image/transition fingerprint.
+
+
+def test_api_sidecar_container_fails_closed() -> None:
+    """An injected sidecar next to the reviewed API container fails closed."""
+    changes = _foundation_nochanges() + _internal_apps()
+    payload = _api_after(external=False)
+    payload["properties"]["template"]["containers"].append(
+        {"name": "sidecar", "image": f"{REGISTRY}/optima-api@{API_DIGEST}"}
+    )
+    changes[10]["after"] = payload
+    _assert_code("internal", changes, WhatIfClassificationCode.ROLLOUT_IMAGE_BINDING)
+
+
+def test_ui_sidecar_container_fails_closed() -> None:
+    """An injected sidecar next to the reviewed UI container fails closed."""
+    changes = _foundation_nochanges() + _internal_apps()
+    payload = _ui_after(external=False)
+    payload["properties"]["template"]["containers"].append(
+        {"name": "sidecar", "image": f"{REGISTRY}/optima-ui@{UI_DIGEST}"}
+    )
+    changes[11]["after"] = payload
+    _assert_code("internal", changes, WhatIfClassificationCode.ROLLOUT_IMAGE_BINDING)
+
+
+def test_api_target_port_change_fails_closed() -> None:
+    """A mutated API ingress target port fails closed."""
+    changes = _foundation_nochanges() + _internal_apps()
+    payload = _api_after(external=False)
+    payload["properties"]["configuration"]["ingress"]["targetPort"] = 9000
+    changes[10]["after"] = payload
+    _assert_code(
+        "internal", changes, WhatIfClassificationCode.ROLLOUT_INGRESS_TRANSITION
+    )
+
+
+def test_api_transport_change_fails_closed() -> None:
+    """A mutated API ingress transport fails closed."""
+    changes = _foundation_nochanges() + _internal_apps()
+    payload = _api_after(external=False)
+    payload["properties"]["configuration"]["ingress"]["transport"] = "tcp"
+    changes[10]["after"] = payload
+    _assert_code(
+        "internal", changes, WhatIfClassificationCode.ROLLOUT_INGRESS_TRANSITION
+    )
+
+
+def test_api_allow_insecure_change_fails_closed() -> None:
+    """An API ingress that allows insecure traffic fails closed."""
+    changes = _foundation_nochanges() + _internal_apps()
+    payload = _api_after(external=False)
+    payload["properties"]["configuration"]["ingress"]["allowInsecure"] = True
+    changes[10]["after"] = payload
+    _assert_code(
+        "internal", changes, WhatIfClassificationCode.ROLLOUT_INGRESS_TRANSITION
+    )
+
+
+def test_disabled_authentication_platform_fails_closed() -> None:
+    """A rollout that disables the UI authentication platform fails closed."""
+    changes = _foundation_nochanges() + _internal_apps()
+    auth = _auth_after()
+    auth["properties"]["platform"]["enabled"] = False
+    changes[12]["after"] = auth
+    _assert_code("internal", changes, WhatIfClassificationCode.ROLLOUT_AUTHENTICATION)
+
+
+def test_anonymous_unauthenticated_action_fails_closed() -> None:
+    """A rollout that allows anonymous UI clients fails closed."""
+    changes = _foundation_nochanges() + _internal_apps()
+    auth = _auth_after()
+    auth["properties"]["globalValidation"]["unauthenticatedClientAction"] = (
+        "AllowAnonymous"
+    )
+    changes[12]["after"] = auth
+    _assert_code("internal", changes, WhatIfClassificationCode.ROLLOUT_AUTHENTICATION)
+
+
+def test_enabled_token_store_fails_closed() -> None:
+    """A rollout that enables the UI token store fails closed."""
+    changes = _foundation_nochanges() + _internal_apps()
+    auth = _auth_after()
+    auth["properties"]["login"]["tokenStore"]["enabled"] = True
+    changes[12]["after"] = auth
+    _assert_code("internal", changes, WhatIfClassificationCode.ROLLOUT_AUTHENTICATION)
+
+
+def test_wrong_authentication_client_fails_closed() -> None:
+    """A rollout that binds a different Entra application fails closed."""
+    changes = _foundation_nochanges() + _internal_apps()
+    auth = _auth_after()
+    other = "99999999-8888-7777-6666-555555555555"
+    auth["properties"]["identityProviders"]["azureActiveDirectory"]["registration"][
+        "clientId"
+    ] = other
+    changes[12]["after"] = auth
+    _assert_code("internal", changes, WhatIfClassificationCode.ROLLOUT_AUTHENTICATION)
+
+
+def test_smoke_job_mutable_image_fails_closed() -> None:
+    """A smoke job bound to any image other than the pushed UI digest fails."""
+    changes = _foundation_nochanges() + _internal_apps()
+    job = _smoke_after(digest="sha256:" + "d" * 64)
+    changes[13]["after"] = job
+    _assert_code("internal", changes, WhatIfClassificationCode.ROLLOUT_IMAGE_BINDING)
+
+
+def test_smoke_job_api_image_fails_closed() -> None:
+    """A smoke job that runs the API image instead of the reviewed UI image fails."""
+    changes = _foundation_nochanges() + _internal_apps()
+    job = _smoke_after()
+    job["properties"]["template"]["containers"][0]["image"] = (
+        f"{REGISTRY}/optima-api@{API_DIGEST}"
+    )
+    changes[13]["after"] = job
+    _assert_code("internal", changes, WhatIfClassificationCode.ROLLOUT_IMAGE_BINDING)
+
+
+def test_smoke_job_retry_change_fails_closed() -> None:
+    """A smoke job that allows replica retries fails closed."""
+    changes = _foundation_nochanges() + _internal_apps()
+    job = _smoke_after()
+    job["properties"]["configuration"]["replicaRetryLimit"] = 3
+    changes[13]["after"] = job
+    _assert_code(
+        "internal", changes, WhatIfClassificationCode.ROLLOUT_APPLICATION_PROJECTION
+    )
+
+
+def test_missing_identity_fails_closed() -> None:
+    """A rollout resource without the reviewed managed identity fails closed."""
+    changes = _foundation_nochanges() + _internal_apps()
+    payload = _api_after(external=False)
+    del payload["identity"]
+    changes[10]["after"] = payload
+    _assert_code(
+        "internal", changes, WhatIfClassificationCode.ROLLOUT_APPLICATION_PROJECTION
+    )
+
+
+def test_extra_secret_reference_fails_closed() -> None:
+    """An undeclared secret reference fails closed."""
+    changes = _foundation_nochanges() + _internal_apps()
+    payload = _api_after(external=False)
+    payload["properties"]["configuration"]["secrets"].append({"name": "injected"})
+    changes[10]["after"] = payload
+    _assert_code(
+        "internal", changes, WhatIfClassificationCode.ROLLOUT_APPLICATION_PROJECTION
+    )
+
+
+def test_scale_bound_change_fails_closed() -> None:
+    """A mutated replica ceiling fails closed."""
+    changes = _foundation_nochanges() + _internal_apps()
+    payload = _api_after(external=False)
+    payload["properties"]["template"]["scale"]["maxReplicas"] = 50
+    changes[10]["after"] = payload
+    _assert_code(
+        "internal", changes, WhatIfClassificationCode.ROLLOUT_APPLICATION_PROJECTION
+    )
+
+
+def test_disabled_cache_redis_env_fails_closed() -> None:
+    """A disabled-cache API that still injects Redis environment fails closed."""
+    changes = _foundation_nochanges() + _internal_apps()
+    payload = _api_after(external=False)
+    payload["properties"]["template"]["containers"][0]["env"].append(
+        {"name": "OPTIMA_REDIS_HOST", "value": "redis.example.net"}
+    )
+    changes[10]["after"] = payload
+    _assert_code(
+        "internal", changes, WhatIfClassificationCode.ROLLOUT_APPLICATION_PROJECTION
+    )
+
+
+def test_wrong_payload_type_fails_closed() -> None:
+    """A wrong-typed ingress payload fails closed instead of being ignored."""
+    changes = _foundation_nochanges() + _internal_apps()
+    payload = _api_after(external=False)
+    payload["properties"]["configuration"]["ingress"] = ["external"]
+    changes[10]["after"] = payload
+    _assert_code(
+        "internal", changes, WhatIfClassificationCode.ROLLOUT_INGRESS_TRANSITION
+    )
+
+
+def test_public_destructive_delta_with_retained_transition_fails_closed() -> None:
+    """A public what-if that mutates more than the UI ingress fails closed.
+
+    The after-state retains the legitimate external=false->true transition and the
+    reviewed image digest, but also silently mutates the target port. The partial
+    classifier at e6ed1c0 accepted this; the closed projection rejects it because
+    the before/after projections differ in more than the ingress external flag.
+    """
+    changes = _foundation_nochanges() + _public_apps()
+    tampered = _ui_after(external=True)
+    tampered["properties"]["configuration"]["ingress"]["targetPort"] = 9000
+    changes[11]["after"] = tampered
+    _assert_code(
+        "public-ui", changes, WhatIfClassificationCode.ROLLOUT_INGRESS_TRANSITION
+    )
+
+
+def test_public_extra_delta_leaf_fails_closed() -> None:
+    """A public exposure delta that claims more than the ingress transition fails."""
+    changes = _foundation_nochanges() + _public_apps()
+    changes[11]["delta"] = _ui_exposure_delta() + [
+        {
+            "path": "properties.template.scale.maxReplicas",
+            "propertyChangeType": "Modify",
+            "before": 2,
+            "after": 9,
+            "children": None,
+        }
+    ]
+    _assert_code(
+        "public-ui", changes, WhatIfClassificationCode.ROLLOUT_INGRESS_TRANSITION
+    )
+
+
+def test_public_missing_exposure_delta_fails_closed() -> None:
+    """A public UI Modify whose delta omits the ingress transition fails closed."""
+    changes = _foundation_nochanges() + _public_apps()
+    changes[11]["delta"] = []
+    _assert_code(
+        "public-ui", changes, WhatIfClassificationCode.ROLLOUT_INGRESS_TRANSITION
+    )
+
+
+def test_rollout_requires_authentication_identity() -> None:
+    """A rollout without the reviewed UI authentication identity fails closed."""
+    with pytest.raises(WhatIfClassificationError) as error:
+        classify_rollout_whatif(
+            _document(_foundation_nochanges() + _internal_apps()),
+            rollout_stage="internal",
+            subscription_id=SUBSCRIPTION,
+            resource_group=GROUP,
+            api_image_digest=API_DIGEST,
+            ui_image_digest=UI_DIGEST,
+            ui_auth_client_id="",
+            ui_auth_tenant_id=TENANT_ID,
+            deployment_source_fingerprint=SOURCE_FINGERPRINT,
+            deployment_source_file_count=SOURCE_FILE_COUNT,
+        )
+    assert error.value.code == WhatIfClassificationCode.ROLLOUT_PARAMETER_MISMATCH
+
+
+def test_rollout_requires_deployment_source_fingerprint() -> None:
+    """A rollout without a bound deployment-source fingerprint fails closed."""
+    with pytest.raises(WhatIfClassificationError) as error:
+        classify_rollout_whatif(
+            _document(_foundation_nochanges() + _internal_apps()),
+            rollout_stage="internal",
+            subscription_id=SUBSCRIPTION,
+            resource_group=GROUP,
+            api_image_digest=API_DIGEST,
+            ui_image_digest=UI_DIGEST,
+            ui_auth_client_id=CLIENT_ID,
+            ui_auth_tenant_id=TENANT_ID,
+            deployment_source_fingerprint="not-a-fingerprint",
+            deployment_source_file_count=SOURCE_FILE_COUNT,
+        )
+    assert error.value.code == WhatIfClassificationCode.INVALID_DEPLOYMENT_SOURCE
+
+
+def test_rollout_evidence_binds_projection_and_source() -> None:
+    """Approved evidence commits to the projection and deployment-source bytes."""
+    result = _classify("internal", _foundation_nochanges() + _internal_apps())
+    assert result.deployment_source_fingerprint == SOURCE_FINGERPRINT
+    assert result.deployment_source_file_count == SOURCE_FILE_COUNT
+    for application in result.application_changes:
+        assert len(application.projection_fingerprint) == 64
+    evidence = classifier.build_rollout_evidence(
+        result, commit_sha=COMMIT_SHA, parameter_fingerprint_value="0" * 64
+    )
+    assert evidence["deployment_source"]["fingerprint"] == SOURCE_FINGERPRINT
+    assert evidence["deployment_source"]["file_count"] == SOURCE_FILE_COUNT
+    fingerprints = {
+        resource["role"]: resource["projection_fingerprint"]
+        for resource in evidence["applications"]["resources"]
+    }
+    assert set(fingerprints) == {
+        "api_container_app",
+        "smoke_job",
+        "ui_auth_config",
+        "ui_container_app",
+    }
+
+
+def test_rollout_projection_tracks_bicep_source() -> None:
+    """The reviewed projection constants must match the compiled Bicep source.
+
+    This binds the classifier's expected desired state to the exact reviewed
+    deployment source rather than deriving it from the observed what-if.
+    """
+    bicep = Path("infra/modules/container-apps.bicep").read_text(encoding="utf-8")
+    assert "targetPort: 8000" in bicep
+    assert "targetPort: 8501" in bicep
+    assert "transport: 'auto'" in bicep
+    assert "allowInsecure: false" in bicep
+    assert "name: 'api'" in bicep
+    assert "name: 'ui'" in bicep
+    assert "name: 'smoke'" in bicep
+    assert "clientSecretSettingName: 'ui-auth-client-secret'" in bicep
+    assert "unauthenticatedClientAction: 'RedirectToLoginPage'" in bicep
+    assert "triggerType: 'Manual'" in bicep
+    assert "replicaRetryLimit: 0" in bicep
+    assert classifier._ROLLOUT_API_TARGET_PORT == 8000
+    assert classifier._ROLLOUT_UI_TARGET_PORT == 8501
+    assert classifier._ROLLOUT_INGRESS_TRANSPORT == "auto"
+    assert classifier._ROLLOUT_CLIENT_SECRET_SETTING_NAME == "ui-auth-client-secret"
+    assert classifier._ROLLOUT_SMOKE_TRIGGER_TYPE == "Manual"
+    assert classifier._ROLLOUT_SMOKE_REPLICA_RETRY_LIMIT == 0
+    assert classifier._ROLLOUT_API_SCALE == (0, 3)
+    assert classifier._ROLLOUT_UI_SCALE == (0, 2)
 
 
 def test_foundation_create_in_rollout_fails_closed() -> None:
@@ -397,6 +844,10 @@ def test_placeholder_or_malformed_digest_fails_closed(digest: str) -> None:
             resource_group=GROUP,
             api_image_digest=digest,
             ui_image_digest=UI_DIGEST,
+            ui_auth_client_id=CLIENT_ID,
+            ui_auth_tenant_id=TENANT_ID,
+            deployment_source_fingerprint=SOURCE_FINGERPRINT,
+            deployment_source_file_count=SOURCE_FILE_COUNT,
         )
     assert error.value.code == WhatIfClassificationCode.ROLLOUT_IMAGE_BINDING
 
@@ -455,6 +906,10 @@ def test_internal_rollout_binds_the_reviewed_external_observation() -> None:
         external_policy=policy,
         api_image_digest=API_DIGEST,
         ui_image_digest=UI_DIGEST,
+        ui_auth_client_id=CLIENT_ID,
+        ui_auth_tenant_id=TENANT_ID,
+        deployment_source_fingerprint=SOURCE_FINGERPRINT,
+        deployment_source_file_count=SOURCE_FILE_COUNT,
     )
     assert len(result.external_observations) == 1
 
@@ -477,6 +932,10 @@ def test_rollout_rejects_a_second_external_observation() -> None:
             external_policy=policy,
             api_image_digest=API_DIGEST,
             ui_image_digest=UI_DIGEST,
+            ui_auth_client_id=CLIENT_ID,
+            ui_auth_tenant_id=TENANT_ID,
+            deployment_source_fingerprint=SOURCE_FINGERPRINT,
+            deployment_source_file_count=SOURCE_FILE_COUNT,
         )
     assert error.value.code == WhatIfClassificationCode.EXTERNAL_OBSERVATION_MISMATCH
 
@@ -493,13 +952,13 @@ def _rollout_parameters(*, expose_public_ui: bool) -> dict[str, Any]:
             "apiImageDigest": {"value": API_DIGEST},
             "uiImageDigest": {"value": UI_DIGEST},
             "environmentName": {"value": "hackathon"},
+            "uiAuthClientId": {"value": CLIENT_ID},
+            "uiAuthTenantId": {"value": TENANT_ID},
         },
     }
 
 
 def _write(path: Path, document: dict[str, Any]) -> tuple[Path, str]:
-    import hashlib
-
     content = (json.dumps(document, sort_keys=True) + "\n").encode("utf-8")
     path.write_bytes(content)
     return path, hashlib.sha256(content).hexdigest()

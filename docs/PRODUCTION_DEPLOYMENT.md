@@ -646,6 +646,37 @@ opened descriptor with `lstat` and `fstat` evidence. POSIX hosts additionally us
 before/open/after identity checks are the enforced fallback. Tests cover
 pathname substitution without claiming kernel-level no-follow guarantees.
 
+Every `az deployment group what-if` and `create` that consumes the immutable
+production parameter artifact is invoked through `scripts/pinned_parameter_exec.py`.
+On Linux the helper opens the artifact once with `O_RDONLY | O_NOFOLLOW`, verifies
+that it is a regular, owner-held, non-group/world-writable, single-link, bounded
+file whose SHA-256 matches the reviewed digest, keeps that descriptor inheritable,
+and execs Azure CLI with `@/proc/self/fd/<fd>` in place of a re-openable pathname.
+A pathname replacement performed after verification therefore cannot change the
+bytes Azure CLI consumes; the local `test_pinned_parameters` race regression proves
+this against the descriptor directly. Azure CLI's acceptance of the
+`@/proc/self/fd/<fd>` form is a Linux-only assumption exercised authoritatively in
+the hosted deploy job and is not proven by pull-request CI, which does not run that
+job. The confidential UI client secret is never part of the pinned artifact.
+
+Each irreversible production mutation is guarded by a final `origin/main` fetch,
+commit-equality, and workflow-blob check performed in the same shell step
+immediately before the mutation, with only the local assignments required to
+invoke it in between. The guarded mutations are the foundation create, the API
+image push, the UI image push, the internal rollout create, the pre-exposure
+smoke-job start, and the public-exposure rollout create. A `test_deployment_pipeline`
+command-double regression proves that an advanced `origin/main` refuses the
+following mutation.
+
+On rollout failure or cancellation the containment step first reconciles every
+outstanding rollout deployment: it reads each deployment's provisioning state,
+requests cancellation while it is still active, and waits for a terminal state so
+an in-flight public create cannot re-expose the UI after containment. It then
+treats only an authoritative `ResourceNotFound` result as UI absence; an access
+denial, timeout, throttle, malformed output, or any other error fails containment
+closed rather than reporting absence. Recovery reporting distinguishes `absent`,
+`contained`, and indeterminate outcomes.
+
 Preflight rebuilds canonical evidence from the raw Azure CLI result, current
 protected source, effective parameter artifact, external-observation policy, and
 convergence policy. The supplied evidence must match that reconstruction byte
@@ -663,6 +694,9 @@ The phases prove these progressively stronger conditions:
    foundation inventory, Graph permission, four-way ACR agreement, and the exact
    bootstrapped runtime access (API and UI `AcrPull`, container-scoped Cosmos
    data contribution, and the Redis `default` policy when the cache is enabled).
+   Each runtime grant is validated as an exact collection: the identity must hold
+   exactly the approved role at the exact scope with no condition, and any broader
+   role, duplicate, conditional grant, or wrong-scope entry fails closed.
    This phase runs before the first foundation create, so no Azure mutation
    precedes the runtime-access gate
 * `foundation-plan`: dedicated read-only identity, providers, checked-in IaC,
@@ -683,7 +717,14 @@ The phases prove these progressively stronger conditions:
 * `rollout`: artifacts plus API/UI `AcrPull`, container-scoped Cosmos data
   contribution, and Foundry inference access. Cache-enabled mode also requires
   the Redis `default` policy. This is the third defense-in-depth runtime-access
-  re-verification, immediately before the Container Apps mutation
+  re-verification, immediately before the Container Apps mutation. Both rollout
+  what-ifs are additionally classified against a complete closed desired-state
+  projection of every application resource (exact container cardinality and
+  names, immutable image digests including the smoke-job image, the full ingress
+  surface, authentication configuration, identities, registries, secrets,
+  scaling, and job configuration) derived from the reviewed deployment source and
+  immutable parameters; the public stage admits only the reviewed UI
+  external `false`->`true` transition with every other projected field unchanged
 
 Application and runtime phases remain strict once enabled: they do not accept
 missing UI, Entra, registry, Foundry, model, pricing, image, runtime-access, or

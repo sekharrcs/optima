@@ -881,12 +881,14 @@ class FakeAzure:
                     )
                 return assignments
             if "--assignee-object-id" not in arguments:
+                registry_scope = arguments[arguments.index("--scope") + 1]
                 return [
                     {
                         "principalId": principal_id,
                         "roleDefinitionId": role_definition_resource_id(
                             "7f951dda-4ed3-4680-a7ca-43fe172d538d"
                         ),
+                        "scope": registry_scope,
                     }
                     for principal_id in ("api-principal-id", "ui-principal-id")
                 ]
@@ -1404,7 +1406,7 @@ def test_production_foundation_rejects_missing_ui_acr_pull() -> None:
     configuration = load_configuration(valid_environment())
     azure = MissingUiAcrPull(configuration, foundation_exists=True)
 
-    with pytest.raises(PreflightError, match="UI identity lacks AcrPull"):
+    with pytest.raises(PreflightError, match="UI identity must have exactly AcrPull"):
         run_preflight(
             configuration,
             azure,
@@ -1440,6 +1442,225 @@ def test_production_foundation_rejects_wrong_scope_cosmos_data_role() -> None:
             phase="production-foundation",
             repository_root=ROOT,
         )
+
+
+_OWNER_ROLE_ID = "8e3af657-a8ff-443c-a75c-2fe8c4bcb635"
+
+
+def _reject_production_foundation(azure: FakeAzure, match: str) -> None:
+    with pytest.raises(PreflightError, match=match):
+        run_preflight(
+            azure.configuration,
+            azure,
+            phase="production-foundation",
+            repository_root=ROOT,
+        )
+
+
+def _is_registry_pull_query(arguments: tuple[str, ...]) -> bool:
+    return (
+        arguments[:3] == ("role", "assignment", "list")
+        and "--all" in arguments
+        and "--assignee-object-id" not in arguments
+    )
+
+
+def test_runtime_access_rejects_broader_api_registry_grant() -> None:
+    """An API identity with a broader registry role than AcrPull fails closed."""
+
+    class BroaderApiRegistryGrant(FakeAzure):
+        def json(self, *arguments: str, allow_missing: bool = False) -> Any:
+            result = super().json(*arguments, allow_missing=allow_missing)
+            if _is_registry_pull_query(arguments) and isinstance(result, list):
+                scope = arguments[arguments.index("--scope") + 1]
+                return [
+                    *result,
+                    {
+                        "principalId": "api-principal-id",
+                        "roleDefinitionId": role_definition_resource_id(_OWNER_ROLE_ID),
+                        "scope": scope,
+                    },
+                ]
+            return result
+
+    configuration = load_configuration(valid_environment())
+    _reject_production_foundation(
+        BroaderApiRegistryGrant(configuration, foundation_exists=True),
+        "API identity must have exactly AcrPull",
+    )
+
+
+def test_runtime_access_rejects_duplicate_api_registry_grant() -> None:
+    """A duplicated AcrPull grant for a runtime identity fails closed."""
+
+    class DuplicateApiRegistryGrant(FakeAzure):
+        def json(self, *arguments: str, allow_missing: bool = False) -> Any:
+            result = super().json(*arguments, allow_missing=allow_missing)
+            if _is_registry_pull_query(arguments) and isinstance(result, list):
+                duplicate = next(
+                    dict(entry)
+                    for entry in result
+                    if entry.get("principalId") == "api-principal-id"
+                )
+                return [*result, duplicate]
+            return result
+
+    configuration = load_configuration(valid_environment())
+    _reject_production_foundation(
+        DuplicateApiRegistryGrant(configuration, foundation_exists=True),
+        "API identity must have exactly AcrPull",
+    )
+
+
+def test_runtime_access_rejects_conditional_registry_grant() -> None:
+    """A conditional registry grant for a runtime identity fails closed."""
+
+    class ConditionalRegistryGrant(FakeAzure):
+        def json(self, *arguments: str, allow_missing: bool = False) -> Any:
+            result = super().json(*arguments, allow_missing=allow_missing)
+            if _is_registry_pull_query(arguments) and isinstance(result, list):
+                conditioned = []
+                for entry in result:
+                    updated = dict(entry)
+                    if updated.get("principalId") == "api-principal-id":
+                        updated["condition"] = "@Resource[x] StringEquals 'y'"
+                    conditioned.append(updated)
+                return conditioned
+            return result
+
+    configuration = load_configuration(valid_environment())
+    _reject_production_foundation(
+        ConditionalRegistryGrant(configuration, foundation_exists=True),
+        "conditional role assignment",
+    )
+
+
+def test_runtime_access_rejects_wrong_scope_registry_grant() -> None:
+    """A registry grant reported at an unexpected scope fails closed."""
+
+    class WrongScopeRegistryGrant(FakeAzure):
+        def json(self, *arguments: str, allow_missing: bool = False) -> Any:
+            result = super().json(*arguments, allow_missing=allow_missing)
+            if _is_registry_pull_query(arguments) and isinstance(result, list):
+                rewritten = []
+                for entry in result:
+                    updated = dict(entry)
+                    if updated.get("principalId") == "api-principal-id":
+                        updated["scope"] = f"/subscriptions/{SUBSCRIPTION_ID}"
+                    rewritten.append(updated)
+                return rewritten
+            return result
+
+    configuration = load_configuration(valid_environment())
+    _reject_production_foundation(
+        WrongScopeRegistryGrant(configuration, foundation_exists=True),
+        "unexpected scope",
+    )
+
+
+def test_runtime_access_rejects_broader_deployer_acr_push() -> None:
+    """A deployer with a broader registry role than AcrPush fails closed."""
+
+    class BroaderDeployerAcrPush(FakeAzure):
+        def json(self, *arguments: str, allow_missing: bool = False) -> Any:
+            result = super().json(*arguments, allow_missing=allow_missing)
+            if (
+                arguments[:3] == ("role", "assignment", "list")
+                and "--assignee-object-id" in arguments
+                and "--scope" in arguments
+                and "ContainerRegistry/registries"
+                in arguments[arguments.index("--scope") + 1]
+                and isinstance(result, list)
+            ):
+                scope = arguments[arguments.index("--scope") + 1]
+                return [
+                    *result,
+                    {
+                        "roleDefinitionId": role_definition_resource_id(_OWNER_ROLE_ID),
+                        "scope": scope,
+                    },
+                ]
+            return result
+
+    configuration = load_configuration(valid_environment())
+    _reject_production_foundation(
+        BroaderDeployerAcrPush(configuration, foundation_exists=True),
+        "must have exactly AcrPush",
+    )
+
+
+def test_runtime_access_rejects_broader_foundry_grant() -> None:
+    """An API identity with a broader AOAI role than OpenAI User fails closed."""
+
+    class BroaderFoundryGrant(FakeAzure):
+        def json(self, *arguments: str, allow_missing: bool = False) -> Any:
+            result = super().json(*arguments, allow_missing=allow_missing)
+            if (
+                "--scope" in arguments
+                and arguments[arguments.index("--scope") + 1] == OPENAI_RESOURCE_ID
+                and isinstance(result, list)
+            ):
+                return [
+                    *result,
+                    {
+                        "roleDefinitionId": role_definition_resource_id(_OWNER_ROLE_ID),
+                        "scope": OPENAI_RESOURCE_ID,
+                    },
+                ]
+            return result
+
+    configuration = load_configuration(valid_environment())
+    _reject_production_foundation(
+        BroaderFoundryGrant(configuration, foundation_exists=True),
+        "must have exactly Cognitive Services OpenAI User",
+    )
+
+
+def test_runtime_access_rejects_duplicate_cosmos_data_grant() -> None:
+    """A duplicated container-scoped Cosmos grant for the API fails closed."""
+
+    class DuplicateCosmosGrant(FakeAzure):
+        def json(self, *arguments: str, allow_missing: bool = False) -> Any:
+            result = super().json(*arguments, allow_missing=allow_missing)
+            if (
+                arguments[:3] == ("rest", "--method", "get")
+                and "/sqlRoleAssignments?" in arguments[-1]
+                and isinstance(result, dict)
+            ):
+                values = result.get("value", [])
+                result["value"] = [*values, dict(values[0])]
+            return result
+
+    configuration = load_configuration(valid_environment())
+    _reject_production_foundation(
+        DuplicateCosmosGrant(configuration, foundation_exists=True),
+        "container-scoped Cosmos data",
+    )
+
+
+def test_runtime_access_rejects_broader_cosmos_account_grant() -> None:
+    """An API Cosmos grant at the broader account scope fails closed."""
+
+    class AccountScopedCosmosGrant(FakeAzure):
+        def json(self, *arguments: str, allow_missing: bool = False) -> Any:
+            result = super().json(*arguments, allow_missing=allow_missing)
+            if (
+                arguments[:3] == ("rest", "--method", "get")
+                and "/sqlRoleAssignments?" in arguments[-1]
+                and isinstance(result, dict)
+            ):
+                for assignment in result.get("value", []):
+                    properties = assignment["properties"]
+                    properties["scope"] = properties["scope"].split(
+                        "/dbs/", maxsplit=1
+                    )[0]
+            return result
+
+    configuration = load_configuration(valid_environment())
+    _reject_production_foundation(
+        AccountScopedCosmosGrant(configuration, foundation_exists=True),
+        "container-scoped Cosmos data",
+    )
 
 
 def test_artifact_preflight_rejects_image_id_or_shared_digest() -> None:

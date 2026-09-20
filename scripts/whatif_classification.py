@@ -47,8 +47,9 @@ RESOURCE_ID_FINGERPRINT_VERSION = "optima-foundation-resource-id-v1"
 EXTERNAL_PAYLOAD_FINGERPRINT_VERSION = "optima-foundation-external-payload-v1"
 CONVERGENCE_POLICY_FINGERPRINT_VERSION = "optima-foundation-convergence-policy-v1"
 NORMALIZED_DELTA_FINGERPRINT_VERSION = "optima-foundation-normalized-delta-v1"
-ROLLOUT_EVIDENCE_SCHEMA_VERSION = "optima-rollout-whatif-evidence-v1"
-ROLLOUT_CHANGE_FINGERPRINT_VERSION = "optima-rollout-application-changes-v1"
+ROLLOUT_EVIDENCE_SCHEMA_VERSION = "optima-rollout-whatif-evidence-v2"
+ROLLOUT_CHANGE_FINGERPRINT_VERSION = "optima-rollout-application-changes-v2"
+ROLLOUT_PROJECTION_FINGERPRINT_VERSION = "optima-rollout-application-projection-v1"
 # The two exposure stages of the Container Apps rollout. Each stage has its own
 # closed state-transition contract; they are never interchangeable.
 ROLLOUT_STAGE_INTERNAL = "internal"
@@ -69,6 +70,42 @@ _ROLLOUT_UI_AUTH_ROLE = "ui_auth_config"
 _ROLLOUT_SMOKE_JOB_ROLE = "smoke_job"
 _IMAGE_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _PLACEHOLDER_IMAGE_DIGEST = "sha256:" + ("0" * 64)
+# The reviewed desired-state projection of every rollout application resource,
+# transcribed from infra/modules/container-apps.bicep. A structural test
+# (test_rollout_projection_tracks_bicep_source) binds these constants to the
+# compiled source so they can never silently drift from what the deployment
+# actually renders. They are the closed contract the rollout what-if after-state
+# must satisfy; expectations are derived from these constants plus the immutable
+# rollout parameters, never from the observed what-if being judged.
+_ROLLOUT_API_REPOSITORY = "optima-api"
+_ROLLOUT_UI_REPOSITORY = "optima-ui"
+_ROLLOUT_API_CONTAINER_NAME = "api"
+_ROLLOUT_UI_CONTAINER_NAME = "ui"
+_ROLLOUT_SMOKE_CONTAINER_NAME = "smoke"
+_ROLLOUT_API_TARGET_PORT = 8000
+_ROLLOUT_UI_TARGET_PORT = 8501
+_ROLLOUT_INGRESS_TRANSPORT = "auto"
+_ROLLOUT_ACTIVE_REVISIONS_MODE = "Single"
+_ROLLOUT_IDENTITY_TYPE = "UserAssigned"
+_ROLLOUT_API_SECRET_NAMES = ("application-insights-connection-string",)
+_ROLLOUT_UI_SECRET_NAMES = ("ui-auth-client-secret",)
+_ROLLOUT_CLIENT_SECRET_SETTING_NAME = "ui-auth-client-secret"
+_ROLLOUT_API_SCALE = (0, 3)
+_ROLLOUT_UI_SCALE = (0, 2)
+_ROLLOUT_CONTAINER_CPU = "0.5"
+_ROLLOUT_CONTAINER_MEMORY = "1.0Gi"
+_ROLLOUT_UNAUTHENTICATED_CLIENT_ACTION = "RedirectToLoginPage"
+_ROLLOUT_REDIRECT_PROVIDER = "azureActiveDirectory"
+_ROLLOUT_OPENID_ISSUER_SUFFIX = "/v2.0"
+_ROLLOUT_SMOKE_TRIGGER_TYPE = "Manual"
+_ROLLOUT_SMOKE_REPLICA_RETRY_LIMIT = 0
+# Container env names that only ever appear in the enabled semantic-cache
+# profile. When the cache is disabled the API container must carry none of them.
+_ROLLOUT_CACHE_ENV_PREFIX = "OPTIMA_REDIS_"
+_ROLLOUT_CACHE_ENV_EXACT = frozenset(
+    {"OPTIMA_PRICING_EMBEDDING_INPUT_RATE_PER_MILLION_TOKENS"}
+)
+_ROLLOUT_CACHE_MODE_ENV = "OPTIMA_SEMANTIC_CACHE_ENABLED"
 _EXTERNAL_POLICY_FIELDS = frozenset(
     {
         "schema_version",
@@ -215,6 +252,8 @@ class WhatIfClassificationCode(StrEnum):
     )
     ROLLOUT_INGRESS_TRANSITION = "WHATIF_ROLLOUT_INGRESS_TRANSITION"
     ROLLOUT_IMAGE_BINDING = "WHATIF_ROLLOUT_IMAGE_BINDING"
+    ROLLOUT_AUTHENTICATION = "WHATIF_ROLLOUT_AUTHENTICATION"
+    ROLLOUT_APPLICATION_PROJECTION = "WHATIF_ROLLOUT_APPLICATION_PROJECTION"
     ROLLOUT_PARAMETER_MISMATCH = "WHATIF_ROLLOUT_PARAMETER_MISMATCH"
     ROLLOUT_FOUNDATION_NOT_CONVERGED = "WHATIF_ROLLOUT_FOUNDATION_NOT_CONVERGED"
 
@@ -1157,6 +1196,78 @@ def _extract_provider_echo_leaves(delta: Any) -> list[tuple[str, str, Any, Any]]
     return _flatten_delta(delta, "")
 
 
+_DIFFERENCE_ABSENT = object()
+
+
+def _collect_semantic_differences(
+    before: Any, after: Any, prefix: str, out: dict[str, tuple[Any, Any]]
+) -> None:
+    """Collect every fully qualified leaf that differs between two payloads."""
+    before_absent = before is _DIFFERENCE_ABSENT
+    after_absent = after is _DIFFERENCE_ABSENT
+    if (
+        not before_absent
+        and not after_absent
+        and _canonical_json_text(before) == _canonical_json_text(after)
+    ):
+        return
+    if (
+        not before_absent
+        and not after_absent
+        and isinstance(before, dict)
+        and isinstance(after, dict)
+    ):
+        for key in set(before) | set(after):
+            if (
+                not isinstance(key, str)
+                or "." in key
+                or "/" in key
+                or _has_control_character(key)
+            ):
+                raise WhatIfClassificationError(
+                    WhatIfClassificationCode.NORMALIZATION_REJECTED,
+                    "Managed modification has an ambiguous property path",
+                )
+            child_prefix = f"{prefix}.{key}" if prefix else key
+            _collect_semantic_differences(
+                before.get(key, _DIFFERENCE_ABSENT),
+                after.get(key, _DIFFERENCE_ABSENT),
+                child_prefix,
+                out,
+            )
+        return
+    if not prefix:
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.NORMALIZATION_REJECTED,
+            "Managed modification changes the whole resource payload",
+        )
+    if prefix in out:
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.NORMALIZATION_REJECTED,
+            "Managed modification has a duplicate difference path",
+        )
+    out[prefix] = (
+        None if before_absent else before,
+        None if after_absent else after,
+    )
+
+
+def _semantic_difference_map(
+    before: Mapping[str, Any], after: Mapping[str, Any]
+) -> dict[str, tuple[Any, Any]]:
+    """Return every fully qualified leaf that actually differs between two payloads.
+
+    Absent keys are canonicalized to ``None`` so a delta ``Delete`` (after null) or
+    ``Create`` (before null) reconciles against a real property appearing or
+    disappearing. Lists, scalars, and type or presence mismatches are atomic
+    leaves, so an array change can never be silently hidden inside a parent.
+    Property names carrying path separators are rejected as ambiguous.
+    """
+    differences: dict[str, tuple[Any, Any]] = {}
+    _collect_semantic_differences(before, after, "", differences)
+    return differences
+
+
 def _normalize_managed_change(
     change: Mapping[str, Any],
     *,
@@ -1164,33 +1275,51 @@ def _normalize_managed_change(
     resource_type: str,
     resource_name: str,
 ) -> list[NormalizedObservation]:
-    """Normalize a managed Modify only if every delta is an approved echo."""
-    leaves = _extract_provider_echo_leaves(change.get("delta"))
-    if not leaves:
+    """Normalize a managed Modify only if the delta exactly reconciles the actual
+    before/after difference and every leaf is an approved provider echo.
+
+    The supplied delta leaves are never trusted as a complete description of the
+    change. The full canonical before/after difference is computed independently;
+    every material difference must be accounted for by exactly one approved echo,
+    and every approved echo must correspond to a real difference with the exact
+    before/after values. A hidden mutation (a real before/after difference the
+    delta omits) and a phantom delta (a delta path the payload does not reflect)
+    both fail closed.
+    """
+    before = change.get("before")
+    after = change.get("after")
+    if not isinstance(before, dict) or not isinstance(after, dict):
         raise WhatIfClassificationError(
             WhatIfClassificationCode.NORMALIZATION_REJECTED,
-            "Managed modification has no reviewable property delta",
+            "Managed modification lacks a complete before and after payload",
         )
     if change.get("extension") is not None:
         raise WhatIfClassificationError(
             WhatIfClassificationCode.NORMALIZATION_REJECTED,
             "Managed modification carries an unreviewed extension payload",
         )
+    leaves = _extract_provider_echo_leaves(change.get("delta"))
+    if not leaves:
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.NORMALIZATION_REJECTED,
+            "Managed modification has no reviewable property delta",
+        )
+    actual_differences = _semantic_difference_map(before, after)
     observations: list[NormalizedObservation] = []
-    seen_paths: set[tuple[str, str]] = set()
-    for path, operation, before, after in leaves:
-        if (path, operation) in seen_paths:
+    delta_paths: dict[str, tuple[Any, Any]] = {}
+    for path, operation, delta_before, delta_after in leaves:
+        if path in delta_paths:
             raise WhatIfClassificationError(
                 WhatIfClassificationCode.NORMALIZATION_REJECTED,
-                "Managed modification repeats a delta path",
+                "Managed modification repeats or conflicts on a delta path",
             )
-        seen_paths.add((path, operation))
+        delta_paths[path] = (delta_before, delta_after)
         rule = _PROVIDER_ECHO_INDEX.get((resource_role, resource_type, path, operation))
         if (
             rule is None
             or not _echo_profile_satisfied(rule, change)
-            or not _echo_before_matches(rule, before, resource_name=resource_name)
-            or not _echo_after_matches(rule, after)
+            or not _echo_before_matches(rule, delta_before, resource_name=resource_name)
+            or not _echo_after_matches(rule, delta_after)
         ):
             raise WhatIfClassificationError(
                 WhatIfClassificationCode.NORMALIZATION_REJECTED,
@@ -1203,13 +1332,27 @@ def _normalize_managed_change(
                 json_path=path,
                 operation=operation,
                 before_fingerprint=_versioned_fingerprint(
-                    NORMALIZED_DELTA_FINGERPRINT_VERSION, before
+                    NORMALIZED_DELTA_FINGERPRINT_VERSION, delta_before
                 ),
                 after_fingerprint=_versioned_fingerprint(
-                    NORMALIZED_DELTA_FINGERPRINT_VERSION, after
+                    NORMALIZED_DELTA_FINGERPRINT_VERSION, delta_after
                 ),
             )
         )
+    if set(delta_paths) != set(actual_differences):
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.NORMALIZATION_REJECTED,
+            "Managed modification delta does not reconcile the before/after difference",
+        )
+    for path, (delta_before, delta_after) in delta_paths.items():
+        actual_before, actual_after = actual_differences[path]
+        if _canonical_json_text(delta_before) != _canonical_json_text(
+            actual_before
+        ) or _canonical_json_text(delta_after) != _canonical_json_text(actual_after):
+            raise WhatIfClassificationError(
+                WhatIfClassificationCode.NORMALIZATION_REJECTED,
+                "Managed modification delta misstates the before/after difference",
+            )
     return observations
 
 
@@ -1527,12 +1670,20 @@ _ROLLOUT_ABSENT = object()
 
 @dataclass(frozen=True)
 class RolloutContainerApp:
-    """Sanitized result state of one runtime application resource in a rollout."""
+    """Sanitized result state of one runtime application resource in a rollout.
+
+    ``projection`` is the complete closed semantic projection of the resource's
+    reviewed desired state (container cardinality, image digests, every ingress
+    property, authentication, identity, registries, secrets, scaling, resources
+    and job configuration). ``projection_fingerprint`` binds it so the rollout
+    evidence commits to the entire managed change, not a partial field subset.
+    """
 
     role: str
     change_type: str
     ingress_external: bool | None
     image_digest: str | None
+    projection_fingerprint: str
 
     def to_document(self) -> dict[str, Any]:
         """Project only reviewed, non-sensitive rollout facts."""
@@ -1541,6 +1692,7 @@ class RolloutContainerApp:
             "change_type": self.change_type,
             "ingress_external": self.ingress_external,
             "image_digest": self.image_digest,
+            "projection_fingerprint": self.projection_fingerprint,
         }
 
 
@@ -1553,6 +1705,8 @@ class RolloutWhatIfClassification:
     environment_name: str
     scope_fingerprint: str
     change_fingerprint: str
+    deployment_source_fingerprint: str
+    deployment_source_file_count: int
     deployment_mode: str
     api_image_digest: str
     ui_image_digest: str
@@ -1610,40 +1764,540 @@ def _expected_container_app_graph(
     return graph
 
 
-def _rollout_ingress_external(payload: Any) -> Any:
-    """Return the ingress external flag from a resource payload, or an absent marker."""
-    if not isinstance(payload, dict):
-        return _ROLLOUT_ABSENT
-    properties = payload.get("properties")
-    if not isinstance(properties, dict):
-        return _ROLLOUT_ABSENT
-    configuration = properties.get("configuration")
-    if not isinstance(configuration, dict):
-        return _ROLLOUT_ABSENT
-    ingress = configuration.get("ingress")
-    if not isinstance(ingress, dict):
-        return _ROLLOUT_ABSENT
-    return ingress.get("external", _ROLLOUT_ABSENT)
+def _rollout_child_object(
+    payload: Any,
+    keys: tuple[str, ...],
+    *,
+    code: WhatIfClassificationCode,
+    message: str,
+) -> dict[str, Any]:
+    """Navigate a required nested object, failing closed on any missing level."""
+    current: Any = payload
+    for key in keys:
+        if not isinstance(current, dict):
+            raise WhatIfClassificationError(code, message)
+        current = current.get(key)
+    if not isinstance(current, dict):
+        raise WhatIfClassificationError(code, message)
+    return current
 
 
-def _rollout_container_image(payload: Any) -> str | None:
-    """Return the first container image reference from a resource payload."""
-    if not isinstance(payload, dict):
-        return None
-    properties = payload.get("properties")
-    if not isinstance(properties, dict):
-        return None
-    template = properties.get("template")
-    if not isinstance(template, dict):
-        return None
+def _rollout_require_image(image: Any, *, repository: str, digest: str) -> str:
+    """Require an image bound to the exact repository and immutable digest."""
+    if not isinstance(image, str):
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_IMAGE_BINDING,
+            "Rollout container image reference is malformed",
+        )
+    reference, separator, image_digest = image.rpartition("@")
+    suffix = f"/{repository}"
+    registry = reference[: -len(suffix)] if reference.endswith(suffix) else ""
+    if (
+        separator != "@"
+        or image_digest != digest
+        or not reference.endswith(suffix)
+        or not registry
+        or re.fullmatch(r"[A-Za-z0-9.\-:]+", registry) is None
+    ):
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_IMAGE_BINDING,
+            "Rollout container image is not bound to the pushed manifest digest",
+        )
+    return image
+
+
+def _rollout_single_container(
+    payload: dict[str, Any], *, expected_name: str, repository: str, digest: str
+) -> dict[str, Any]:
+    """Require exactly one reviewed container bound to the immutable image."""
+    template = _rollout_child_object(
+        payload,
+        ("properties", "template"),
+        code=WhatIfClassificationCode.ROLLOUT_IMAGE_BINDING,
+        message="Rollout resource template is malformed",
+    )
     containers = template.get("containers")
-    if not isinstance(containers, list) or not containers:
-        return None
-    first = containers[0]
-    if not isinstance(first, dict):
-        return None
-    image = first.get("image")
-    return image if isinstance(image, str) else None
+    if (
+        not isinstance(containers, list)
+        or len(containers) != 1
+        or not isinstance(containers[0], dict)
+    ):
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_IMAGE_BINDING,
+            "Rollout must declare exactly one reviewed container (no sidecars)",
+        )
+    container = containers[0]
+    if container.get("name") != expected_name:
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_IMAGE_BINDING,
+            "Rollout container name does not match the reviewed desired state",
+        )
+    _rollout_require_image(container.get("image"), repository=repository, digest=digest)
+    return container
+
+
+def _rollout_ingress_facts(
+    payload: dict[str, Any], *, target_port: int
+) -> dict[str, Any]:
+    """Project the complete reviewed ingress surface, failing closed on drift."""
+    ingress = _rollout_child_object(
+        payload,
+        ("properties", "configuration", "ingress"),
+        code=WhatIfClassificationCode.ROLLOUT_INGRESS_TRANSITION,
+        message="Rollout ingress configuration is malformed",
+    )
+    external = ingress.get("external")
+    port = ingress.get("targetPort")
+    if not isinstance(external, bool):
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_INGRESS_TRANSITION,
+            "Rollout ingress external flag is malformed",
+        )
+    if isinstance(port, bool) or port != target_port:
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_INGRESS_TRANSITION,
+            "Rollout ingress target port does not match the reviewed desired state",
+        )
+    if ingress.get("transport") != _ROLLOUT_INGRESS_TRANSPORT:
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_INGRESS_TRANSITION,
+            "Rollout ingress transport does not match the reviewed desired state",
+        )
+    if ingress.get("allowInsecure") is not False:
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_INGRESS_TRANSITION,
+            "Rollout ingress must reject insecure traffic",
+        )
+    return {
+        "external": external,
+        "target_port": target_port,
+        "transport": _ROLLOUT_INGRESS_TRANSPORT,
+        "allow_insecure": False,
+    }
+
+
+def _rollout_identity_type(payload: dict[str, Any]) -> str:
+    """Require the reviewed single user-assigned identity binding."""
+    identity = payload.get("identity")
+    if not isinstance(identity, dict) or identity.get("type") != _ROLLOUT_IDENTITY_TYPE:
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_APPLICATION_PROJECTION,
+            "Rollout resource identity is not the reviewed user-assigned identity",
+        )
+    assigned = identity.get("userAssignedIdentities")
+    if not isinstance(assigned, dict) or len(assigned) != 1:
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_APPLICATION_PROJECTION,
+            "Rollout resource must bind exactly one user-assigned identity",
+        )
+    return _ROLLOUT_IDENTITY_TYPE
+
+
+def _rollout_secret_names(
+    configuration: dict[str, Any], *, expected: tuple[str, ...]
+) -> list[str]:
+    """Require exactly the reviewed secret reference names."""
+    secrets = configuration.get("secrets")
+    if not isinstance(secrets, list):
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_APPLICATION_PROJECTION,
+            "Rollout secret references are malformed",
+        )
+    names: list[str] = []
+    for secret in secrets:
+        if not isinstance(secret, dict) or not isinstance(secret.get("name"), str):
+            raise WhatIfClassificationError(
+                WhatIfClassificationCode.ROLLOUT_APPLICATION_PROJECTION,
+                "Rollout secret reference is malformed",
+            )
+        names.append(secret["name"])
+    if sorted(names) != sorted(expected) or len(names) != len(set(names)):
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_APPLICATION_PROJECTION,
+            "Rollout secret references do not match the reviewed desired state",
+        )
+    return sorted(names)
+
+
+def _rollout_registry_servers(configuration: dict[str, Any]) -> list[str]:
+    """Require exactly one identity-bound registry reference."""
+    registries = configuration.get("registries")
+    if (
+        not isinstance(registries, list)
+        or len(registries) != 1
+        or not isinstance(registries[0], dict)
+    ):
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_APPLICATION_PROJECTION,
+            "Rollout registry references are malformed",
+        )
+    entry = registries[0]
+    server = entry.get("server")
+    identity = entry.get("identity")
+    if (
+        not isinstance(server, str)
+        or not server
+        or not isinstance(identity, str)
+        or not identity
+    ):
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_APPLICATION_PROJECTION,
+            "Rollout registry reference is not identity-bound",
+        )
+    return [server]
+
+
+def _rollout_scale_facts(
+    template: dict[str, Any], *, expected: tuple[int, int]
+) -> dict[str, int]:
+    """Require the reviewed replica scaling bounds."""
+    scale = template.get("scale")
+    if not isinstance(scale, dict):
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_APPLICATION_PROJECTION,
+            "Rollout scale configuration is malformed",
+        )
+    minimum = scale.get("minReplicas")
+    maximum = scale.get("maxReplicas")
+    if (
+        isinstance(minimum, bool)
+        or isinstance(maximum, bool)
+        or minimum != expected[0]
+        or maximum != expected[1]
+    ):
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_APPLICATION_PROJECTION,
+            "Rollout scaling bounds do not match the reviewed desired state",
+        )
+    return {"min_replicas": expected[0], "max_replicas": expected[1]}
+
+
+def _rollout_container_resources(container: dict[str, Any]) -> dict[str, str]:
+    """Require the reviewed CPU and memory resource limits."""
+    resources = container.get("resources")
+    if not isinstance(resources, dict):
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_APPLICATION_PROJECTION,
+            "Rollout container resources are malformed",
+        )
+    cpu = resources.get("cpu")
+    memory = resources.get("memory")
+    if (
+        not isinstance(cpu, (int, float, Decimal))
+        or isinstance(cpu, bool)
+        or _canonical_json_text(cpu) != _ROLLOUT_CONTAINER_CPU
+        or memory != _ROLLOUT_CONTAINER_MEMORY
+    ):
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_APPLICATION_PROJECTION,
+            "Rollout container resources do not match the reviewed desired state",
+        )
+    return {"cpu": _ROLLOUT_CONTAINER_CPU, "memory": _ROLLOUT_CONTAINER_MEMORY}
+
+
+def _rollout_assert_cache_env(
+    container: dict[str, Any], *, semantic_cache_enabled: bool
+) -> None:
+    """Require the API cache-mode env to match, and no cache env when disabled."""
+    env = container.get("env")
+    if not isinstance(env, list):
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_APPLICATION_PROJECTION,
+            "Rollout container environment is malformed",
+        )
+    mode_value: Any = _ROLLOUT_ABSENT
+    cache_env_count = 0
+    for entry in env:
+        if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
+            raise WhatIfClassificationError(
+                WhatIfClassificationCode.ROLLOUT_APPLICATION_PROJECTION,
+                "Rollout container environment entry is malformed",
+            )
+        name = entry["name"]
+        if name == _ROLLOUT_CACHE_MODE_ENV:
+            mode_value = entry.get("value")
+        if (
+            name.startswith(_ROLLOUT_CACHE_ENV_PREFIX)
+            or name in _ROLLOUT_CACHE_ENV_EXACT
+        ):
+            cache_env_count += 1
+    expected_mode = "true" if semantic_cache_enabled else "false"
+    if mode_value != expected_mode:
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_APPLICATION_PROJECTION,
+            "Rollout API cache-mode environment does not match the classified mode",
+        )
+    if not semantic_cache_enabled and cache_env_count != 0:
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_APPLICATION_PROJECTION,
+            "Disabled semantic cache must not inject Redis or embedding environment",
+        )
+
+
+def _project_container_app(
+    payload: Any,
+    *,
+    role: str,
+    repository: str,
+    container_name: str,
+    digest: str,
+    target_port: int,
+    secret_names: tuple[str, ...],
+    scale: tuple[int, int],
+    semantic_cache_enabled: bool,
+    check_cache_env: bool,
+) -> dict[str, Any]:
+    """Return the closed reviewed desired-state projection of one container app."""
+    if not isinstance(payload, dict):
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_APPLICATION_PROJECTION,
+            "Rollout resource payload is missing or malformed",
+        )
+    configuration = _rollout_child_object(
+        payload,
+        ("properties", "configuration"),
+        code=WhatIfClassificationCode.ROLLOUT_APPLICATION_PROJECTION,
+        message="Rollout resource configuration is malformed",
+    )
+    if configuration.get("activeRevisionsMode") != _ROLLOUT_ACTIVE_REVISIONS_MODE:
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_APPLICATION_PROJECTION,
+            "Rollout active revisions mode is not the reviewed desired state",
+        )
+    template = _rollout_child_object(
+        payload,
+        ("properties", "template"),
+        code=WhatIfClassificationCode.ROLLOUT_APPLICATION_PROJECTION,
+        message="Rollout resource template is malformed",
+    )
+    container = _rollout_single_container(
+        payload, expected_name=container_name, repository=repository, digest=digest
+    )
+    ingress = _rollout_ingress_facts(payload, target_port=target_port)
+    projection = {
+        "role": role,
+        "identity_type": _rollout_identity_type(payload),
+        "active_revisions_mode": _ROLLOUT_ACTIVE_REVISIONS_MODE,
+        "ingress": ingress,
+        "container": {
+            "name": container_name,
+            "image_repository": repository,
+            "image_digest": digest,
+        },
+        "secret_names": _rollout_secret_names(configuration, expected=secret_names),
+        "registry_servers": _rollout_registry_servers(configuration),
+        "scale": _rollout_scale_facts(template, expected=scale),
+        "resources": _rollout_container_resources(container),
+    }
+    if check_cache_env:
+        _rollout_assert_cache_env(
+            container, semantic_cache_enabled=semantic_cache_enabled
+        )
+    return projection
+
+
+def _project_ui_auth(payload: Any, *, client_id: str, tenant_id: str) -> dict[str, Any]:
+    """Return the closed reviewed projection of the UI authentication config."""
+    properties = _rollout_child_object(
+        payload,
+        ("properties",),
+        code=WhatIfClassificationCode.ROLLOUT_AUTHENTICATION,
+        message="Rollout authentication payload is malformed",
+    )
+    platform = properties.get("platform")
+    if not isinstance(platform, dict) or platform.get("enabled") is not True:
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_AUTHENTICATION,
+            "Rollout must keep the UI authentication platform enabled",
+        )
+    global_validation = properties.get("globalValidation")
+    if (
+        not isinstance(global_validation, dict)
+        or global_validation.get("unauthenticatedClientAction")
+        != _ROLLOUT_UNAUTHENTICATED_CLIENT_ACTION
+        or global_validation.get("redirectToProvider") != _ROLLOUT_REDIRECT_PROVIDER
+    ):
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_AUTHENTICATION,
+            "Rollout must redirect unauthenticated UI clients to sign in",
+        )
+    aad = _rollout_child_object(
+        payload,
+        ("properties", "identityProviders", "azureActiveDirectory"),
+        code=WhatIfClassificationCode.ROLLOUT_AUTHENTICATION,
+        message="Rollout Entra provider configuration is malformed",
+    )
+    registration = aad.get("registration")
+    if aad.get("enabled") is not True or not isinstance(registration, dict):
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_AUTHENTICATION,
+            "Rollout must keep the Entra identity provider enabled",
+        )
+    issuer = registration.get("openIdIssuer")
+    if (
+        registration.get("clientId") != client_id
+        or registration.get("clientSecretSettingName")
+        != _ROLLOUT_CLIENT_SECRET_SETTING_NAME
+        or not isinstance(issuer, str)
+        or not issuer.startswith("https://")
+        or not issuer.endswith(f"/{tenant_id}{_ROLLOUT_OPENID_ISSUER_SUFFIX}")
+    ):
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_AUTHENTICATION,
+            "Rollout Entra registration is not bound to the reviewed application",
+        )
+    validation = aad.get("validation")
+    expected_audiences = [client_id, f"api://{client_id}"]
+    if (
+        not isinstance(validation, dict)
+        or validation.get("allowedAudiences") != expected_audiences
+    ):
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_AUTHENTICATION,
+            "Rollout Entra allowed audiences are not the reviewed desired state",
+        )
+    login = properties.get("login")
+    token_store = login.get("tokenStore") if isinstance(login, dict) else None
+    if not isinstance(token_store, dict) or token_store.get("enabled") is not False:
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_AUTHENTICATION,
+            "Rollout must keep the UI token store disabled",
+        )
+    http_settings = properties.get("httpSettings")
+    if (
+        not isinstance(http_settings, dict)
+        or http_settings.get("requireHttps") is not True
+    ):
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_AUTHENTICATION,
+            "Rollout must require HTTPS for the UI authentication endpoint",
+        )
+    return {
+        "role": _ROLLOUT_UI_AUTH_ROLE,
+        "platform_enabled": True,
+        "unauthenticated_client_action": _ROLLOUT_UNAUTHENTICATED_CLIENT_ACTION,
+        "redirect_to_provider": _ROLLOUT_REDIRECT_PROVIDER,
+        "provider_enabled": True,
+        "client_id": client_id,
+        "client_secret_setting_name": _ROLLOUT_CLIENT_SECRET_SETTING_NAME,
+        "openid_issuer_tenant": tenant_id,
+        "allowed_audiences": expected_audiences,
+        "token_store_enabled": False,
+        "require_https": True,
+    }
+
+
+def _project_smoke_job(payload: Any, *, ui_digest: str) -> dict[str, Any]:
+    """Return the closed reviewed projection of the pre-exposure smoke job."""
+    if not isinstance(payload, dict):
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_APPLICATION_PROJECTION,
+            "Rollout smoke-job payload is missing or malformed",
+        )
+    configuration = _rollout_child_object(
+        payload,
+        ("properties", "configuration"),
+        code=WhatIfClassificationCode.ROLLOUT_APPLICATION_PROJECTION,
+        message="Rollout smoke-job configuration is malformed",
+    )
+    if configuration.get("triggerType") != _ROLLOUT_SMOKE_TRIGGER_TYPE:
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_APPLICATION_PROJECTION,
+            "Rollout smoke job must use the reviewed manual trigger",
+        )
+    retry = configuration.get("replicaRetryLimit")
+    if isinstance(retry, bool) or retry != _ROLLOUT_SMOKE_REPLICA_RETRY_LIMIT:
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_APPLICATION_PROJECTION,
+            "Rollout smoke job retry limit is not the reviewed desired state",
+        )
+    container = _rollout_single_container(
+        payload,
+        expected_name=_ROLLOUT_SMOKE_CONTAINER_NAME,
+        repository=_ROLLOUT_UI_REPOSITORY,
+        digest=ui_digest,
+    )
+    return {
+        "role": _ROLLOUT_SMOKE_JOB_ROLE,
+        "identity_type": _rollout_identity_type(payload),
+        "trigger_type": _ROLLOUT_SMOKE_TRIGGER_TYPE,
+        "replica_retry_limit": _ROLLOUT_SMOKE_REPLICA_RETRY_LIMIT,
+        "container": {
+            "name": container["name"],
+            "image_repository": _ROLLOUT_UI_REPOSITORY,
+            "image_digest": ui_digest,
+        },
+        "registry_servers": _rollout_registry_servers(configuration),
+    }
+
+
+def _rollout_require_exposure_delta(delta: Any) -> None:
+    """Require the UI Modify delta to be exactly the ingress exposure transition."""
+    try:
+        leaves = _extract_provider_echo_leaves(delta)
+    except WhatIfClassificationError as error:
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_INGRESS_TRANSITION,
+            "Public-UI exposure delta is malformed",
+        ) from error
+    if leaves != [("properties.configuration.ingress.external", "Modify", False, True)]:
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_INGRESS_TRANSITION,
+            "Public-UI exposure delta must be exactly the UI ingress transition",
+        )
+
+
+def _rollout_public_ui_transition(
+    change: Mapping[str, Any], *, ui_digest: str, semantic_cache_enabled: bool
+) -> dict[str, Any]:
+    """Require the reviewed internal->external UI transition with all else fixed."""
+    before_projection = _project_container_app(
+        change.get("before"),
+        role=_ROLLOUT_UI_ROLE,
+        repository=_ROLLOUT_UI_REPOSITORY,
+        container_name=_ROLLOUT_UI_CONTAINER_NAME,
+        digest=ui_digest,
+        target_port=_ROLLOUT_UI_TARGET_PORT,
+        secret_names=_ROLLOUT_UI_SECRET_NAMES,
+        scale=_ROLLOUT_UI_SCALE,
+        semantic_cache_enabled=semantic_cache_enabled,
+        check_cache_env=False,
+    )
+    after_projection = _project_container_app(
+        change.get("after"),
+        role=_ROLLOUT_UI_ROLE,
+        repository=_ROLLOUT_UI_REPOSITORY,
+        container_name=_ROLLOUT_UI_CONTAINER_NAME,
+        digest=ui_digest,
+        target_port=_ROLLOUT_UI_TARGET_PORT,
+        secret_names=_ROLLOUT_UI_SECRET_NAMES,
+        scale=_ROLLOUT_UI_SCALE,
+        semantic_cache_enabled=semantic_cache_enabled,
+        check_cache_env=False,
+    )
+    if (
+        before_projection["ingress"]["external"] is not False
+        or after_projection["ingress"]["external"] is not True
+    ):
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_INGRESS_TRANSITION,
+            "Public-UI exposure requires an internal-to-external UI transition",
+        )
+    before_other = {
+        **before_projection,
+        "ingress": {**before_projection["ingress"], "external": None},
+    }
+    after_other = {
+        **after_projection,
+        "ingress": {**after_projection["ingress"], "external": None},
+    }
+    if _canonical_json_text(before_other) != _canonical_json_text(after_other):
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_INGRESS_TRANSITION,
+            "Public-UI exposure changed more than the reviewed UI ingress state",
+        )
+    _rollout_require_exposure_delta(change.get("delta"))
+    return after_projection
 
 
 def _classify_rollout_application(
@@ -1654,65 +2308,105 @@ def _classify_rollout_application(
     rollout_stage: str,
     api_digest: str,
     ui_digest: str,
+    ui_auth_client_id: str,
+    ui_auth_tenant_id: str,
+    semantic_cache_enabled: bool,
 ) -> RolloutContainerApp:
-    """Bind one application change to its exact role/stage state contract."""
+    """Bind one application change to its complete closed desired-state projection.
+
+    Every projection is derived from the reviewed desired-state constants plus the
+    immutable rollout parameters, never from the observed what-if being judged.
+    The projection fingerprint binds the complete managed change so a partial
+    field match, a sidecar, a mutated port, disabled authentication, a mutable
+    smoke-job image, or a destructive delta can never masquerade as safe.
+    """
     after = change.get("after")
-    before = change.get("before")
     if role == _ROLLOUT_API_ROLE:
-        # The API stays internal in every stage; only the resulting after-state
-        # ingress and the exact pushed image digest are accepted.
-        if _rollout_ingress_external(after) is not False:
-            raise WhatIfClassificationError(
-                WhatIfClassificationCode.ROLLOUT_INGRESS_TRANSITION,
-                "Rollout must keep the API ingress internal",
-            )
-        image = _rollout_container_image(after)
-        if image is None or not image.endswith(f"/optima-api@{api_digest}"):
-            raise WhatIfClassificationError(
-                WhatIfClassificationCode.ROLLOUT_IMAGE_BINDING,
-                "API image is not bound to the pushed manifest digest",
-            )
         if rollout_stage == ROLLOUT_STAGE_PUBLIC_UI and change_type != "NoChange":
             raise WhatIfClassificationError(
                 WhatIfClassificationCode.ROLLOUT_UNEXPECTED_APPLICATION_CHANGE,
                 "Public-UI exposure must not change the API application",
             )
-        return RolloutContainerApp(role, change_type, False, api_digest)
-    if role == _ROLLOUT_UI_ROLE:
-        image = _rollout_container_image(after)
-        if image is None or not image.endswith(f"/optima-ui@{ui_digest}"):
+        projection = _project_container_app(
+            after,
+            role=role,
+            repository=_ROLLOUT_API_REPOSITORY,
+            container_name=_ROLLOUT_API_CONTAINER_NAME,
+            digest=api_digest,
+            target_port=_ROLLOUT_API_TARGET_PORT,
+            secret_names=_ROLLOUT_API_SECRET_NAMES,
+            scale=_ROLLOUT_API_SCALE,
+            semantic_cache_enabled=semantic_cache_enabled,
+            check_cache_env=True,
+        )
+        if projection["ingress"]["external"] is not False:
             raise WhatIfClassificationError(
-                WhatIfClassificationCode.ROLLOUT_IMAGE_BINDING,
-                "UI image is not bound to the pushed manifest digest",
+                WhatIfClassificationCode.ROLLOUT_INGRESS_TRANSITION,
+                "Rollout must keep the API ingress internal",
             )
-        after_external = _rollout_ingress_external(after)
+        fingerprint = _versioned_fingerprint(
+            ROLLOUT_PROJECTION_FINGERPRINT_VERSION, projection
+        )
+        return RolloutContainerApp(role, change_type, False, api_digest, fingerprint)
+    if role == _ROLLOUT_UI_ROLE:
         if rollout_stage == ROLLOUT_STAGE_INTERNAL:
-            if after_external is not False:
+            projection = _project_container_app(
+                after,
+                role=role,
+                repository=_ROLLOUT_UI_REPOSITORY,
+                container_name=_ROLLOUT_UI_CONTAINER_NAME,
+                digest=ui_digest,
+                target_port=_ROLLOUT_UI_TARGET_PORT,
+                secret_names=_ROLLOUT_UI_SECRET_NAMES,
+                scale=_ROLLOUT_UI_SCALE,
+                semantic_cache_enabled=semantic_cache_enabled,
+                check_cache_env=False,
+            )
+            if projection["ingress"]["external"] is not False:
                 raise WhatIfClassificationError(
                     WhatIfClassificationCode.ROLLOUT_INGRESS_TRANSITION,
                     "Internal rollout must keep the UI ingress internal",
                 )
-            return RolloutContainerApp(role, change_type, False, ui_digest)
-        # Public-UI exposure is exactly a Modify that flips internal to external.
+            fingerprint = _versioned_fingerprint(
+                ROLLOUT_PROJECTION_FINGERPRINT_VERSION, projection
+            )
+            return RolloutContainerApp(role, change_type, False, ui_digest, fingerprint)
         if change_type != "Modify":
             raise WhatIfClassificationError(
                 WhatIfClassificationCode.ROLLOUT_INGRESS_TRANSITION,
                 "Public-UI exposure requires a UI ingress modification",
             )
-        if _rollout_ingress_external(before) is not False or after_external is not True:
+        projection = _rollout_public_ui_transition(
+            change, ui_digest=ui_digest, semantic_cache_enabled=semantic_cache_enabled
+        )
+        fingerprint = _versioned_fingerprint(
+            ROLLOUT_PROJECTION_FINGERPRINT_VERSION, projection
+        )
+        return RolloutContainerApp(role, change_type, True, ui_digest, fingerprint)
+    if role == _ROLLOUT_UI_AUTH_ROLE:
+        if rollout_stage == ROLLOUT_STAGE_PUBLIC_UI and change_type != "NoChange":
             raise WhatIfClassificationError(
-                WhatIfClassificationCode.ROLLOUT_INGRESS_TRANSITION,
-                "Public-UI exposure requires an internal-to-external UI transition",
+                WhatIfClassificationCode.ROLLOUT_UNEXPECTED_APPLICATION_CHANGE,
+                "Public-UI exposure must only transition the UI ingress",
             )
-        return RolloutContainerApp(role, change_type, True, ui_digest)
-    # The authConfig and smoke job carry no ingress or pushed image; the
-    # public-UI stage additionally forbids any change beyond the UI ingress.
+        projection = _project_ui_auth(
+            after, client_id=ui_auth_client_id, tenant_id=ui_auth_tenant_id
+        )
+        fingerprint = _versioned_fingerprint(
+            ROLLOUT_PROJECTION_FINGERPRINT_VERSION, projection
+        )
+        return RolloutContainerApp(role, change_type, None, None, fingerprint)
+    # The pre-exposure smoke job.
     if rollout_stage == ROLLOUT_STAGE_PUBLIC_UI and change_type != "NoChange":
         raise WhatIfClassificationError(
             WhatIfClassificationCode.ROLLOUT_UNEXPECTED_APPLICATION_CHANGE,
             "Public-UI exposure must only transition the UI ingress",
         )
-    return RolloutContainerApp(role, change_type, None, None)
+    projection = _project_smoke_job(after, ui_digest=ui_digest)
+    fingerprint = _versioned_fingerprint(
+        ROLLOUT_PROJECTION_FINGERPRINT_VERSION, projection
+    )
+    return RolloutContainerApp(role, change_type, None, None, fingerprint)
 
 
 def classify_rollout_whatif(
@@ -1723,6 +2417,10 @@ def classify_rollout_whatif(
     resource_group: str,
     api_image_digest: str,
     ui_image_digest: str,
+    ui_auth_client_id: str,
+    ui_auth_tenant_id: str,
+    deployment_source_fingerprint: str,
+    deployment_source_file_count: int,
     environment_name: str = "hackathon",
     deployment_mode: str = "Incremental",
     semantic_cache_enabled: bool = False,
@@ -1731,16 +2429,35 @@ def classify_rollout_whatif(
     """Classify a Container Apps rollout what-if, raising on any unsafe evidence.
 
     The converged foundation subset reuses the exact fail-closed foundation
-    contract (Delete, replacement, duplicate, external, and graph checks). The
-    runtime application resources are then bound to the stage's closed
-    state-transition contract: the internal stage keeps every ingress internal,
-    and the public-UI stage is exactly one UI ingress Modify from internal to
-    external with no other application change.
+    contract (Delete, replacement, duplicate, external, and graph checks). Each
+    runtime application resource is then bound to the complete closed reviewed
+    desired-state projection for its role and stage. Evidence commits to both the
+    complete managed-change projection and the deployment-source bytes, so no
+    partial-field approval and no destructive delta can be authorized.
     """
     if rollout_stage not in _ROLLOUT_STAGES:
         raise WhatIfClassificationError(
             WhatIfClassificationCode.ROLLOUT_STAGE_MISMATCH,
             "Unsupported rollout stage",
+        )
+    if (
+        not isinstance(ui_auth_client_id, str)
+        or not ui_auth_client_id
+        or not isinstance(ui_auth_tenant_id, str)
+        or not ui_auth_tenant_id
+    ):
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_PARAMETER_MISMATCH,
+            "Rollout requires the reviewed UI authentication identity",
+        )
+    if not _validate_fingerprint(deployment_source_fingerprint) or (
+        not isinstance(deployment_source_file_count, int)
+        or isinstance(deployment_source_file_count, bool)
+        or deployment_source_file_count < 1
+    ):
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.INVALID_DEPLOYMENT_SOURCE,
+            "Rollout requires a bound deployment-source fingerprint",
         )
     api_digest = _validated_rollout_digest(api_image_digest, "API")
     ui_digest = _validated_rollout_digest(ui_image_digest, "UI")
@@ -1832,6 +2549,9 @@ def classify_rollout_whatif(
                 rollout_stage=rollout_stage,
                 api_digest=api_digest,
                 ui_digest=ui_digest,
+                ui_auth_client_id=ui_auth_client_id,
+                ui_auth_tenant_id=ui_auth_tenant_id,
+                semantic_cache_enabled=semantic_cache_enabled,
             )
         )
     application_facts.sort(key=lambda item: item.role)
@@ -1845,6 +2565,8 @@ def classify_rollout_whatif(
         environment_name=environment_name.casefold(),
         scope_fingerprint=_scope_fingerprint(subscription_id, resource_group),
         change_fingerprint=change_fingerprint,
+        deployment_source_fingerprint=deployment_source_fingerprint,
+        deployment_source_file_count=deployment_source_file_count,
         deployment_mode=deployment_mode,
         api_image_digest=api_digest,
         ui_image_digest=ui_digest,
@@ -2764,6 +3486,10 @@ def build_rollout_evidence(
             "scope_fingerprint": classification.scope_fingerprint,
         },
         "parameters": {"fingerprint": parameter_fingerprint_value},
+        "deployment_source": {
+            "fingerprint": classification.deployment_source_fingerprint,
+            "file_count": classification.deployment_source_file_count,
+        },
         "images": {
             "api": classification.api_image_digest,
             "ui": classification.ui_image_digest,
@@ -3469,6 +4195,21 @@ def _classify_rollout_document(arguments: argparse.Namespace, document: Any) -> 
             WhatIfClassificationCode.ROLLOUT_PARAMETER_MISMATCH,
             "Rollout parameters are missing the environment name",
         )
+    ui_auth_client_id = parameters.get("uiAuthClientId")
+    ui_auth_tenant_id = parameters.get("uiAuthTenantId")
+    if (
+        not isinstance(ui_auth_client_id, str)
+        or not ui_auth_client_id
+        or not isinstance(ui_auth_tenant_id, str)
+        or not ui_auth_tenant_id
+    ):
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_PARAMETER_MISMATCH,
+            "Rollout parameters are missing the UI authentication identity",
+        )
+    source_fingerprint, source_file_count = deployment_source_fingerprint(
+        parameters, source_root=arguments.source_root
+    )
     classification = classify_rollout_whatif(
         document,
         rollout_stage=arguments.stage,
@@ -3480,6 +4221,10 @@ def _classify_rollout_document(arguments: argparse.Namespace, document: Any) -> 
         external_policy=external_policy,
         api_image_digest=arguments.api_image_digest,
         ui_image_digest=arguments.ui_image_digest,
+        ui_auth_client_id=ui_auth_client_id,
+        ui_auth_tenant_id=ui_auth_tenant_id,
+        deployment_source_fingerprint=source_fingerprint,
+        deployment_source_file_count=source_file_count,
     )
     evidence = build_rollout_evidence(
         classification,
@@ -3578,6 +4323,11 @@ def create_parser() -> argparse.ArgumentParser:
     rollout.add_argument("--parameters-sha256")
     rollout.add_argument("--template-file")
     rollout.add_argument("--parameter-source-file")
+    rollout.add_argument(
+        "--source-root",
+        type=Path,
+        help="Deterministic root containing the template and parameter source files.",
+    )
     rollout.add_argument("--api-image-digest", required=True)
     rollout.add_argument("--ui-image-digest", required=True)
     rollout.add_argument("--output", type=Path)

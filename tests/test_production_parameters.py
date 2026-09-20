@@ -55,27 +55,82 @@ def environment(*, cache_enabled: bool = False) -> dict[str, str]:
     return values
 
 
+# The approved compiled-base parameter names, pinned independently of the module
+# dictionaries under test so a drift in production_parameters is caught (F7).
+_APPROVED_ENV_PARAMETER_NAMES = frozenset(
+    {
+        "foundryBaseUrl",
+        "foundrySmallDeployment",
+        "foundrySmallModel",
+        "foundrySmallModelVersion",
+        "foundryStrongDeployment",
+        "foundryStrongModel",
+        "foundryStrongModelVersion",
+        "judgeDeployment",
+        "judgeModel",
+        "judgeModelVersion",
+        "location",
+        "pricingCatalogVersion",
+        "pricingCurrency",
+        "pricingJudgeInputRatePerMillionTokens",
+        "pricingJudgeOutputRatePerMillionTokens",
+        "pricingSmallInputRatePerMillionTokens",
+        "pricingSmallOutputRatePerMillionTokens",
+        "pricingStrongInputRatePerMillionTokens",
+        "pricingStrongOutputRatePerMillionTokens",
+        "uiAuthClientId",
+        "uiAuthTenantId",
+    }
+)
+_APPROVED_OPTIONAL_PARAMETER_NAMES = frozenset(
+    {
+        "pricingJudgeCachedInputRatePerMillionTokens",
+        "pricingSmallCachedInputRatePerMillionTokens",
+        "pricingStrongCachedInputRatePerMillionTokens",
+    }
+)
+_APPROVED_OVERRIDE_NAMES = frozenset(
+    {
+        "deploymentCommitSha",
+        "deploymentWorkflowRunId",
+        "deployContainerApps",
+        "deployRuntimeAccess",
+        "environmentName",
+        "exposePublicUi",
+        "productionEvaluatorMode",
+        "semanticCacheEnabled",
+    }
+)
+
+
 def compiled_document() -> dict[str, object]:
-    """Return a closed compiled runtime parameter skeleton."""
+    """Return a closed compiled runtime parameter skeleton.
+
+    The parameter names come from the independently pinned approved contract, not
+    from the module dictionaries under test.
+    """
     names = (
-        set(production_parameters._REQUIRED_ENVIRONMENT_PARAMETERS)
-        | set(production_parameters._OPTIONAL_ENVIRONMENT_PARAMETERS)
-        | {
-            "deploymentCommitSha",
-            "deploymentWorkflowRunId",
-            "deployContainerApps",
-            "deployRuntimeAccess",
-            "environmentName",
-            "exposePublicUi",
-            "productionEvaluatorMode",
-            "semanticCacheEnabled",
-        }
+        _APPROVED_ENV_PARAMETER_NAMES
+        | _APPROVED_OPTIONAL_PARAMETER_NAMES
+        | _APPROVED_OVERRIDE_NAMES
     )
     return {
         "$schema": production_parameters.DEPLOYMENT_PARAMETERS_SCHEMA,
         "contentVersion": "1.0.0.0",
         "parameters": {name: {"value": None} for name in names},
     }
+
+
+def test_module_parameter_contract_matches_independent_pin() -> None:
+    """The module dictionaries must equal the independently pinned contract."""
+    assert (
+        set(production_parameters._REQUIRED_ENVIRONMENT_PARAMETERS)
+        == _APPROVED_ENV_PARAMETER_NAMES
+    )
+    assert (
+        set(production_parameters._OPTIONAL_ENVIRONMENT_PARAMETERS)
+        == _APPROVED_OPTIONAL_PARAMETER_NAMES
+    )
 
 
 def values(document: dict[str, object]) -> dict[str, object]:

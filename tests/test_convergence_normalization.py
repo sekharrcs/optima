@@ -176,27 +176,60 @@ def _appi_flat_echo_delta() -> list[dict[str, Any]]:
     ]
 
 
+def _cosmos_echoed_properties() -> dict[str, Any]:
+    """The three provider-populated properties the cosmos echoes remove."""
+    return {
+        "analyticalStorageConfiguration": {"schemaType": "WellDefined"},
+        "enablePerRegionPerPartitionAutoscale": False,
+        "sqlEndpoint": COSMOS_ENDPOINT,
+    }
+
+
 def _cosmos_change(
     *,
     delta: list[dict[str, Any]] | None = None,
     payload: dict[str, Any] | None = None,
+    before: dict[str, Any] | None = None,
+    after: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    resolved = _cosmos_profile() if payload is None else payload
+    # The before/after payloads reconcile with the echo delta: the three
+    # provider-populated properties are present before and removed after.
+    base = _cosmos_profile() if payload is None else payload
+    resolved_after = copy.deepcopy(base) if after is None else after
+    if before is None:
+        resolved_before = copy.deepcopy(base)
+        resolved_before.setdefault("properties", {})
+        resolved_before["properties"].update(_cosmos_echoed_properties())
+    else:
+        resolved_before = before
     return {
         "resourceId": COSMOS_ACCOUNT_ID,
         "changeType": "Modify",
-        "before": resolved,
-        "after": resolved,
+        "before": resolved_before,
+        "after": resolved_after,
         "delta": _cosmos_echo_delta() if delta is None else delta,
     }
 
 
-def _appi_change(*, delta: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+def _appi_change(
+    *,
+    delta: list[dict[str, Any]] | None = None,
+    before: dict[str, Any] | None = None,
+    after: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    # The after payload adds exactly the two provider-populated properties the
+    # Create echoes describe, so the delta reconciles the real difference.
+    resolved_before = {"properties": {}} if before is None else before
+    resolved_after = (
+        {"properties": {"Flow_Type": "Bluefield", "Request_Source": "rest"}}
+        if after is None
+        else after
+    )
     return {
         "resourceId": APPI_ID,
         "changeType": "Modify",
-        "before": {"properties": {}},
-        "after": {"properties": {}},
+        "before": resolved_before,
+        "after": resolved_after,
         "delta": _appi_echo_delta() if delta is None else delta,
     }
 
@@ -1414,3 +1447,90 @@ def test_flat_vs_nested_raw_encoding_breaks_promotion_equality() -> None:
     with pytest.raises(WhatIfClassificationError) as error:
         classifier.compare_promotion_evidence(nested, flat)
     assert error.value.code is WhatIfClassificationCode.PROMOTION_MISMATCH
+
+
+# --- F4: full before/after reconciliation of normalized provider echoes ------
+
+
+def test_hidden_disable_local_auth_change_fails_closed() -> None:
+    """Astra reproduction: a hidden DisableLocalAuth true->false alongside only the
+    approved App Insights echoes fails closed.
+
+    At e6ed1c0 the normalizer trusted the delta leaves alone, so the two approved
+    Flow_Type/Request_Source echoes normalized the resource while the real
+    before/after payload silently flipped DisableLocalAuth true->false.
+    """
+    appi = _appi_change(
+        before={"properties": {"DisableLocalAuth": True}},
+        after={
+            "properties": {
+                "DisableLocalAuth": False,
+                "Flow_Type": "Bluefield",
+                "Request_Source": "rest",
+            }
+        },
+    )
+    _assert_code(
+        deployed_document(appi=appi), WhatIfClassificationCode.NORMALIZATION_REJECTED
+    )
+
+
+def test_phantom_cosmos_delta_fails_closed() -> None:
+    """A delta that claims echoes the payload does not reflect fails closed."""
+    cosmos = _cosmos_change(before=_cosmos_profile(), after=_cosmos_profile())
+    _assert_code(
+        deployed_document(cosmos=cosmos),
+        WhatIfClassificationCode.NORMALIZATION_REJECTED,
+    )
+
+
+def test_cosmos_delta_before_value_mismatch_fails_closed() -> None:
+    """A delta whose stated before value differs from the real payload fails."""
+    before = _cosmos_profile()
+    before["properties"].update(_cosmos_echoed_properties())
+    before["properties"]["sqlEndpoint"] = "https://foreign.documents.azure.com:443/"
+    cosmos = _cosmos_change(before=before)
+    _assert_code(
+        deployed_document(cosmos=cosmos),
+        WhatIfClassificationCode.NORMALIZATION_REJECTED,
+    )
+
+
+def test_hidden_array_change_fails_closed() -> None:
+    """A hidden array change not described by the delta fails closed."""
+    before = _cosmos_profile()
+    before["properties"].update(_cosmos_echoed_properties())
+    after = _cosmos_profile()
+    after["properties"]["capabilities"] = [
+        {"name": "EnableServerless"},
+        {"name": "EnableCassandra"},
+    ]
+    cosmos = _cosmos_change(before=before, after=after)
+    _assert_code(
+        deployed_document(cosmos=cosmos),
+        WhatIfClassificationCode.NORMALIZATION_REJECTED,
+    )
+
+
+def test_modify_without_after_payload_fails_closed() -> None:
+    """A managed Modify without a complete after payload fails closed."""
+    cosmos = _cosmos_change()
+    cosmos["after"] = None
+    _assert_code(
+        deployed_document(cosmos=cosmos),
+        WhatIfClassificationCode.NORMALIZATION_REJECTED,
+    )
+
+
+def test_ambiguous_property_path_fails_closed() -> None:
+    """A provider payload with a dotted property key is rejected as ambiguous."""
+    before = _cosmos_profile()
+    before["properties"].update(_cosmos_echoed_properties())
+    before["properties"]["a.b"] = 1
+    after = _cosmos_profile()
+    after["properties"]["a.b"] = 2
+    cosmos = _cosmos_change(before=before, after=after)
+    _assert_code(
+        deployed_document(cosmos=cosmos),
+        WhatIfClassificationCode.NORMALIZATION_REJECTED,
+    )
