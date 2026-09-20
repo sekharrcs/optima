@@ -1344,6 +1344,104 @@ def test_disabled_rollout_omits_redis_resource_and_access_queries() -> None:
     )
 
 
+def test_production_foundation_verifies_runtime_access_before_mutation() -> None:
+    """F8: the exact runtime-access check runs before the first foundation create."""
+    configuration = load_configuration(valid_environment())
+    azure = FakeAzure(configuration, foundation_exists=True)
+
+    evidence = run_preflight(
+        configuration,
+        azure,
+        phase="production-foundation",
+        repository_root=ROOT,
+    )
+
+    assert "runtime_access" in evidence["checks"]
+    assert any(
+        call[:3] == ("rest", "--method", "get") and "/sqlRoleAssignments?" in call[-1]
+        for call in azure.calls
+    )
+
+
+def test_publish_verifies_runtime_access_before_image_push() -> None:
+    """F8: the exact runtime-access check runs before image publication."""
+    configuration = load_configuration(valid_environment())
+    azure = FakeAzure(configuration, foundation_exists=True)
+
+    evidence = run_preflight(
+        configuration,
+        azure,
+        phase="publish",
+        repository_root=ROOT,
+    )
+
+    assert "runtime_access" in evidence["checks"]
+    assert any(
+        call[:3] == ("rest", "--method", "get") and "/sqlRoleAssignments?" in call[-1]
+        for call in azure.calls
+    )
+
+
+def test_production_foundation_rejects_missing_ui_acr_pull() -> None:
+    """F8: a UI identity without AcrPull fails the early runtime-access gate."""
+
+    class MissingUiAcrPull(FakeAzure):
+        def json(self, *arguments: str, allow_missing: bool = False) -> Any:
+            result = super().json(*arguments, allow_missing=allow_missing)
+            if (
+                arguments[:3] == ("role", "assignment", "list")
+                and "--all" in arguments
+                and "--assignee-object-id" not in arguments
+                and isinstance(result, list)
+            ):
+                return [
+                    assignment
+                    for assignment in result
+                    if assignment.get("principalId") != "ui-principal-id"
+                ]
+            return result
+
+    configuration = load_configuration(valid_environment())
+    azure = MissingUiAcrPull(configuration, foundation_exists=True)
+
+    with pytest.raises(PreflightError, match="UI identity lacks AcrPull"):
+        run_preflight(
+            configuration,
+            azure,
+            phase="production-foundation",
+            repository_root=ROOT,
+        )
+
+
+def test_production_foundation_rejects_wrong_scope_cosmos_data_role() -> None:
+    """F8: a Cosmos data role at the wrong scope fails the early runtime-access gate."""
+
+    class WrongCosmosScope(FakeAzure):
+        def json(self, *arguments: str, allow_missing: bool = False) -> Any:
+            result = super().json(*arguments, allow_missing=allow_missing)
+            if (
+                arguments[:3] == ("rest", "--method", "get")
+                and "/sqlRoleAssignments?" in arguments[-1]
+                and isinstance(result, dict)
+            ):
+                for assignment in result.get("value", []):
+                    assignment["properties"]["scope"] = assignment["properties"][
+                        "scope"
+                    ].replace("/colls/runs", "/colls/other")
+            return result
+
+    configuration = load_configuration(valid_environment())
+    azure = WrongCosmosScope(configuration, foundation_exists=True)
+
+    with pytest.raises(PreflightError, match="container-scoped Cosmos data"):
+        run_preflight(
+            configuration,
+            azure,
+            phase="production-foundation",
+            repository_root=ROOT,
+        )
+
+
 def test_artifact_preflight_rejects_image_id_or_shared_digest() -> None:
     """Reject mutable, local, placeholder, and cross-component identifiers."""
     configuration = load_configuration(valid_environment())

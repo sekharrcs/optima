@@ -135,6 +135,114 @@ def test_disabled_profile_rejects_cache_only_value() -> None:
         production_parameters.build_effective_document(compiled_document(), configured)
 
 
+API_DIGEST = "sha256:" + ("a" * 64)
+UI_DIGEST = "sha256:" + ("b" * 64)
+
+
+def rollout_compiled_document() -> dict[str, object]:
+    """Return a compiled base that also declares the image-digest passthroughs."""
+    document = compiled_document()
+    parameters = document["parameters"]
+    assert isinstance(parameters, dict)
+    parameters["apiImageDigest"] = {
+        "value": production_parameters._PLACEHOLDER_IMAGE_DIGEST
+    }
+    parameters["uiImageDigest"] = {
+        "value": production_parameters._PLACEHOLDER_IMAGE_DIGEST
+    }
+    return document
+
+
+def test_internal_rollout_builds_deployable_container_apps_document() -> None:
+    """The internal rollout artifact deploys Container Apps with an internal UI."""
+    document = production_parameters.build_effective_document(
+        rollout_compiled_document(),
+        environment(),
+        mode=production_parameters.MODE_INTERNAL_ROLLOUT,
+        api_image_digest=API_DIGEST,
+        ui_image_digest=UI_DIGEST,
+    )
+    bindings = values(document)
+
+    assert bindings["deployContainerApps"] is True
+    assert bindings["exposePublicUi"] is False
+    assert bindings["deployRuntimeAccess"] is False
+    assert bindings["apiImageDigest"] == API_DIGEST
+    assert bindings["uiImageDigest"] == UI_DIGEST
+    assert "uiAuthClientSecret" not in bindings
+
+
+def test_public_rollout_exposes_the_ui() -> None:
+    """The public rollout artifact differs only by exposing the UI ingress."""
+    document = production_parameters.build_effective_document(
+        rollout_compiled_document(),
+        environment(),
+        mode=production_parameters.MODE_PUBLIC_ROLLOUT,
+        api_image_digest=API_DIGEST,
+        ui_image_digest=UI_DIGEST,
+    )
+    bindings = values(document)
+
+    assert bindings["deployContainerApps"] is True
+    assert bindings["exposePublicUi"] is True
+
+
+def test_rollout_requires_both_image_digests() -> None:
+    """A rollout artifact cannot be built without both immutable digests."""
+    with pytest.raises(
+        production_parameters.ProductionParameterError, match="image digest"
+    ):
+        production_parameters.build_effective_document(
+            rollout_compiled_document(),
+            environment(),
+            mode=production_parameters.MODE_INTERNAL_ROLLOUT,
+            api_image_digest=API_DIGEST,
+            ui_image_digest=None,
+        )
+
+
+def test_rollout_rejects_placeholder_image_digest() -> None:
+    """A placeholder digest is never a deployable rollout binding."""
+    with pytest.raises(
+        production_parameters.ProductionParameterError, match="image digest"
+    ):
+        production_parameters.build_effective_document(
+            rollout_compiled_document(),
+            environment(),
+            mode=production_parameters.MODE_PUBLIC_ROLLOUT,
+            api_image_digest=production_parameters._PLACEHOLDER_IMAGE_DIGEST,
+            ui_image_digest=UI_DIGEST,
+        )
+
+
+def test_rollout_rejects_identical_image_digests() -> None:
+    """The API and UI must resolve to distinct manifests."""
+    with pytest.raises(
+        production_parameters.ProductionParameterError, match="must be distinct"
+    ):
+        production_parameters.build_effective_document(
+            rollout_compiled_document(),
+            environment(),
+            mode=production_parameters.MODE_INTERNAL_ROLLOUT,
+            api_image_digest=API_DIGEST,
+            ui_image_digest=API_DIGEST,
+        )
+
+
+def test_foundation_mode_rejects_image_digests() -> None:
+    """The foundation artifact must never bind runtime image digests."""
+    with pytest.raises(
+        production_parameters.ProductionParameterError, match="must not bind image"
+    ):
+        production_parameters.build_effective_document(
+            compiled_document(),
+            environment(),
+            mode=production_parameters.MODE_FOUNDATION,
+            api_image_digest=API_DIGEST,
+            ui_image_digest=UI_DIGEST,
+        )
+
+
 def test_unexpected_compiled_parameter_is_rejected() -> None:
     """An unknown compiled binding must not survive generation."""
     compiled = compiled_document()

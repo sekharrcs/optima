@@ -47,6 +47,28 @@ RESOURCE_ID_FINGERPRINT_VERSION = "optima-foundation-resource-id-v1"
 EXTERNAL_PAYLOAD_FINGERPRINT_VERSION = "optima-foundation-external-payload-v1"
 CONVERGENCE_POLICY_FINGERPRINT_VERSION = "optima-foundation-convergence-policy-v1"
 NORMALIZED_DELTA_FINGERPRINT_VERSION = "optima-foundation-normalized-delta-v1"
+ROLLOUT_EVIDENCE_SCHEMA_VERSION = "optima-rollout-whatif-evidence-v1"
+ROLLOUT_CHANGE_FINGERPRINT_VERSION = "optima-rollout-application-changes-v1"
+# The two exposure stages of the Container Apps rollout. Each stage has its own
+# closed state-transition contract; they are never interchangeable.
+ROLLOUT_STAGE_INTERNAL = "internal"
+ROLLOUT_STAGE_PUBLIC_UI = "public-ui"
+_ROLLOUT_STAGES = frozenset({ROLLOUT_STAGE_INTERNAL, ROLLOUT_STAGE_PUBLIC_UI})
+# Casefolded ARM types for the exact runtime application resources the rollout
+# deploys on top of the converged foundation.
+_CONTAINER_APP_TYPE = "microsoft.app/containerapps"
+_CONTAINER_APP_AUTH_TYPE = "microsoft.app/containerapps/authconfigs"
+_CONTAINER_JOB_TYPE = "microsoft.app/jobs"
+_ROLLOUT_APPLICATION_TYPES = frozenset(
+    {_CONTAINER_APP_TYPE, _CONTAINER_APP_AUTH_TYPE, _CONTAINER_JOB_TYPE}
+)
+# The exact application roles present in every rollout what-if.
+_ROLLOUT_API_ROLE = "api_container_app"
+_ROLLOUT_UI_ROLE = "ui_container_app"
+_ROLLOUT_UI_AUTH_ROLE = "ui_auth_config"
+_ROLLOUT_SMOKE_JOB_ROLE = "smoke_job"
+_IMAGE_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+_PLACEHOLDER_IMAGE_DIGEST = "sha256:" + ("0" * 64)
 _EXTERNAL_POLICY_FIELDS = frozenset(
     {
         "schema_version",
@@ -186,6 +208,15 @@ class WhatIfClassificationCode(StrEnum):
     PROMOTION_MISMATCH = "WHATIF_PROMOTION_MISMATCH"
     NORMALIZATION_REJECTED = "WHATIF_NORMALIZATION_REJECTED"
     RESIDUAL_UNAPPROVED_CHANGE = "WHATIF_RESIDUAL_UNAPPROVED_CHANGE"
+    ROLLOUT_STAGE_MISMATCH = "WHATIF_ROLLOUT_STAGE_MISMATCH"
+    ROLLOUT_APPLICATION_GRAPH_MISMATCH = "WHATIF_ROLLOUT_APPLICATION_GRAPH_MISMATCH"
+    ROLLOUT_UNEXPECTED_APPLICATION_CHANGE = (
+        "WHATIF_ROLLOUT_UNEXPECTED_APPLICATION_CHANGE"
+    )
+    ROLLOUT_INGRESS_TRANSITION = "WHATIF_ROLLOUT_INGRESS_TRANSITION"
+    ROLLOUT_IMAGE_BINDING = "WHATIF_ROLLOUT_IMAGE_BINDING"
+    ROLLOUT_PARAMETER_MISMATCH = "WHATIF_ROLLOUT_PARAMETER_MISMATCH"
+    ROLLOUT_FOUNDATION_NOT_CONVERGED = "WHATIF_ROLLOUT_FOUNDATION_NOT_CONVERGED"
 
 
 class WhatIfClassificationError(RuntimeError):
@@ -1491,6 +1522,342 @@ def classify_foundation_whatif(
     )
 
 
+_ROLLOUT_ABSENT = object()
+
+
+@dataclass(frozen=True)
+class RolloutContainerApp:
+    """Sanitized result state of one runtime application resource in a rollout."""
+
+    role: str
+    change_type: str
+    ingress_external: bool | None
+    image_digest: str | None
+
+    def to_document(self) -> dict[str, Any]:
+        """Project only reviewed, non-sensitive rollout facts."""
+        return {
+            "role": self.role,
+            "change_type": self.change_type,
+            "ingress_external": self.ingress_external,
+            "image_digest": self.image_digest,
+        }
+
+
+@dataclass(frozen=True)
+class RolloutWhatIfClassification:
+    """Result of classifying one Container Apps rollout stage as safe to apply."""
+
+    rollout_stage: str
+    resource_group: str
+    environment_name: str
+    scope_fingerprint: str
+    change_fingerprint: str
+    deployment_mode: str
+    api_image_digest: str
+    ui_image_digest: str
+    semantic_cache_enabled: bool
+    application_changes: tuple[RolloutContainerApp, ...]
+    foundation_change_counts: Mapping[str, int]
+    foundation_convergence_policy_fingerprint: str
+    external_observations: tuple[ExternalObservation, ...]
+
+
+def _validated_rollout_digest(value: Any, label: str) -> str:
+    """Require an immutable, non-placeholder sha256 image digest binding."""
+    if not isinstance(value, str) or _IMAGE_DIGEST.fullmatch(value) is None:
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_IMAGE_BINDING,
+            f"{label} image digest is not an immutable sha256",
+        )
+    if value == _PLACEHOLDER_IMAGE_DIGEST:
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_IMAGE_BINDING,
+            f"{label} image digest is still a placeholder",
+        )
+    return value
+
+
+def _expected_container_app_graph(
+    *, subscription_id: str, resource_group: str, environment_name: str
+) -> dict[str, tuple[str, str]]:
+    """Return canonical IDs mapped to the exact rollout application role and type."""
+    scope = (
+        f"/subscriptions/{subscription_id}/resourcegroups/{resource_group}/providers"
+    ).casefold()
+    entries = {
+        _ROLLOUT_API_ROLE: (
+            _CONTAINER_APP_TYPE,
+            f"containerapps/ca-optima-api-{environment_name}",
+        ),
+        _ROLLOUT_UI_ROLE: (
+            _CONTAINER_APP_TYPE,
+            f"containerapps/ca-optima-ui-{environment_name}",
+        ),
+        _ROLLOUT_UI_AUTH_ROLE: (
+            _CONTAINER_APP_AUTH_TYPE,
+            f"containerapps/ca-optima-ui-{environment_name}/authconfigs/current",
+        ),
+        _ROLLOUT_SMOKE_JOB_ROLE: (
+            _CONTAINER_JOB_TYPE,
+            f"jobs/caj-optima-smoke-{environment_name}",
+        ),
+    }
+    graph: dict[str, tuple[str, str]] = {}
+    for role, (resource_type, tail) in entries.items():
+        namespace = resource_type.split("/")[0]
+        graph[f"{scope}/{namespace}/{tail}".casefold()] = (role, resource_type)
+    return graph
+
+
+def _rollout_ingress_external(payload: Any) -> Any:
+    """Return the ingress external flag from a resource payload, or an absent marker."""
+    if not isinstance(payload, dict):
+        return _ROLLOUT_ABSENT
+    properties = payload.get("properties")
+    if not isinstance(properties, dict):
+        return _ROLLOUT_ABSENT
+    configuration = properties.get("configuration")
+    if not isinstance(configuration, dict):
+        return _ROLLOUT_ABSENT
+    ingress = configuration.get("ingress")
+    if not isinstance(ingress, dict):
+        return _ROLLOUT_ABSENT
+    return ingress.get("external", _ROLLOUT_ABSENT)
+
+
+def _rollout_container_image(payload: Any) -> str | None:
+    """Return the first container image reference from a resource payload."""
+    if not isinstance(payload, dict):
+        return None
+    properties = payload.get("properties")
+    if not isinstance(properties, dict):
+        return None
+    template = properties.get("template")
+    if not isinstance(template, dict):
+        return None
+    containers = template.get("containers")
+    if not isinstance(containers, list) or not containers:
+        return None
+    first = containers[0]
+    if not isinstance(first, dict):
+        return None
+    image = first.get("image")
+    return image if isinstance(image, str) else None
+
+
+def _classify_rollout_application(
+    *,
+    role: str,
+    change: Mapping[str, Any],
+    change_type: str,
+    rollout_stage: str,
+    api_digest: str,
+    ui_digest: str,
+) -> RolloutContainerApp:
+    """Bind one application change to its exact role/stage state contract."""
+    after = change.get("after")
+    before = change.get("before")
+    if role == _ROLLOUT_API_ROLE:
+        # The API stays internal in every stage; only the resulting after-state
+        # ingress and the exact pushed image digest are accepted.
+        if _rollout_ingress_external(after) is not False:
+            raise WhatIfClassificationError(
+                WhatIfClassificationCode.ROLLOUT_INGRESS_TRANSITION,
+                "Rollout must keep the API ingress internal",
+            )
+        image = _rollout_container_image(after)
+        if image is None or not image.endswith(f"/optima-api@{api_digest}"):
+            raise WhatIfClassificationError(
+                WhatIfClassificationCode.ROLLOUT_IMAGE_BINDING,
+                "API image is not bound to the pushed manifest digest",
+            )
+        if rollout_stage == ROLLOUT_STAGE_PUBLIC_UI and change_type != "NoChange":
+            raise WhatIfClassificationError(
+                WhatIfClassificationCode.ROLLOUT_UNEXPECTED_APPLICATION_CHANGE,
+                "Public-UI exposure must not change the API application",
+            )
+        return RolloutContainerApp(role, change_type, False, api_digest)
+    if role == _ROLLOUT_UI_ROLE:
+        image = _rollout_container_image(after)
+        if image is None or not image.endswith(f"/optima-ui@{ui_digest}"):
+            raise WhatIfClassificationError(
+                WhatIfClassificationCode.ROLLOUT_IMAGE_BINDING,
+                "UI image is not bound to the pushed manifest digest",
+            )
+        after_external = _rollout_ingress_external(after)
+        if rollout_stage == ROLLOUT_STAGE_INTERNAL:
+            if after_external is not False:
+                raise WhatIfClassificationError(
+                    WhatIfClassificationCode.ROLLOUT_INGRESS_TRANSITION,
+                    "Internal rollout must keep the UI ingress internal",
+                )
+            return RolloutContainerApp(role, change_type, False, ui_digest)
+        # Public-UI exposure is exactly a Modify that flips internal to external.
+        if change_type != "Modify":
+            raise WhatIfClassificationError(
+                WhatIfClassificationCode.ROLLOUT_INGRESS_TRANSITION,
+                "Public-UI exposure requires a UI ingress modification",
+            )
+        if _rollout_ingress_external(before) is not False or after_external is not True:
+            raise WhatIfClassificationError(
+                WhatIfClassificationCode.ROLLOUT_INGRESS_TRANSITION,
+                "Public-UI exposure requires an internal-to-external UI transition",
+            )
+        return RolloutContainerApp(role, change_type, True, ui_digest)
+    # The authConfig and smoke job carry no ingress or pushed image; the
+    # public-UI stage additionally forbids any change beyond the UI ingress.
+    if rollout_stage == ROLLOUT_STAGE_PUBLIC_UI and change_type != "NoChange":
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_UNEXPECTED_APPLICATION_CHANGE,
+            "Public-UI exposure must only transition the UI ingress",
+        )
+    return RolloutContainerApp(role, change_type, None, None)
+
+
+def classify_rollout_whatif(
+    document: Any,
+    *,
+    rollout_stage: str,
+    subscription_id: str,
+    resource_group: str,
+    api_image_digest: str,
+    ui_image_digest: str,
+    environment_name: str = "hackathon",
+    deployment_mode: str = "Incremental",
+    semantic_cache_enabled: bool = False,
+    external_policy: ExternalObservationPolicy | None = None,
+) -> RolloutWhatIfClassification:
+    """Classify a Container Apps rollout what-if, raising on any unsafe evidence.
+
+    The converged foundation subset reuses the exact fail-closed foundation
+    contract (Delete, replacement, duplicate, external, and graph checks). The
+    runtime application resources are then bound to the stage's closed
+    state-transition contract: the internal stage keeps every ingress internal,
+    and the public-UI stage is exactly one UI ingress Modify from internal to
+    external with no other application change.
+    """
+    if rollout_stage not in _ROLLOUT_STAGES:
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_STAGE_MISMATCH,
+            "Unsupported rollout stage",
+        )
+    api_digest = _validated_rollout_digest(api_image_digest, "API")
+    ui_digest = _validated_rollout_digest(ui_image_digest, "UI")
+    if api_digest == ui_digest:
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_IMAGE_BINDING,
+            "API and UI image digests must be distinct",
+        )
+    if not isinstance(document, dict):
+        _raise_malformed("What-if output is not a JSON object")
+    changes = document.get("changes")
+    if not isinstance(changes, list) or not changes:
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.NO_STRUCTURED_CHANGES,
+            "What-if output has no complete structured changes array",
+        )
+
+    foundation_changes: list[Any] = []
+    application_entries: list[tuple[dict[str, Any], ParsedResourceId]] = []
+    for raw_change in changes:
+        change = _validate_change_shape(raw_change)
+        resource_id = _parse_resource_id(
+            change["resourceId"],
+            subscription_id=subscription_id,
+            resource_group=resource_group,
+        )
+        if resource_id.resource_type in _ROLLOUT_APPLICATION_TYPES:
+            application_entries.append((change, resource_id))
+        else:
+            foundation_changes.append(raw_change)
+
+    # The foundation subset must be an already-converged foundation: reuse the
+    # exact proven foundation contract, then require zero net Create so a rollout
+    # can never quietly re-provision or replace a foundation resource.
+    foundation_document = {
+        key: value for key, value in document.items() if key != "changes"
+    }
+    foundation_document["changes"] = foundation_changes
+    foundation = classify_foundation_whatif(
+        foundation_document,
+        subscription_id=subscription_id,
+        resource_group=resource_group,
+        environment_name=environment_name,
+        deployment_mode=deployment_mode,
+        semantic_cache_enabled=semantic_cache_enabled,
+        external_policy=external_policy,
+    )
+    if foundation.change_counts.get("Create", 0) != 0:
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_FOUNDATION_NOT_CONVERGED,
+            "Rollout requires an already-converged foundation with no new resource",
+        )
+
+    expected_apps = _expected_container_app_graph(
+        subscription_id=subscription_id,
+        resource_group=resource_group,
+        environment_name=environment_name.casefold(),
+    )
+    entries_by_role: dict[str, dict[str, Any]] = {}
+    seen_ids: set[str] = set()
+    for change, resource_id in application_entries:
+        if resource_id.canonical_id in seen_ids:
+            raise WhatIfClassificationError(
+                WhatIfClassificationCode.DUPLICATE_RESOURCE,
+                "Rollout what-if contains a duplicate application resource",
+            )
+        seen_ids.add(resource_id.canonical_id)
+        role_type = expected_apps.get(resource_id.canonical_id)
+        if role_type is None or resource_id.resource_type != role_type[1]:
+            raise WhatIfClassificationError(
+                WhatIfClassificationCode.ROLLOUT_APPLICATION_GRAPH_MISMATCH,
+                "Rollout what-if contains an unexpected application resource",
+            )
+        entries_by_role[role_type[0]] = change
+    if set(entries_by_role) != {role for role, _ in expected_apps.values()}:
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_APPLICATION_GRAPH_MISMATCH,
+            "Rollout what-if does not contain the exact application graph",
+        )
+
+    application_facts: list[RolloutContainerApp] = []
+    for role, change in entries_by_role.items():
+        change_type = _validate_change_semantics(change, allow_external_ignore=False)
+        application_facts.append(
+            _classify_rollout_application(
+                role=role,
+                change=change,
+                change_type=change_type,
+                rollout_stage=rollout_stage,
+                api_digest=api_digest,
+                ui_digest=ui_digest,
+            )
+        )
+    application_facts.sort(key=lambda item: item.role)
+    change_fingerprint = _versioned_fingerprint(
+        ROLLOUT_CHANGE_FINGERPRINT_VERSION,
+        [fact.to_document() for fact in application_facts],
+    )
+    return RolloutWhatIfClassification(
+        rollout_stage=rollout_stage,
+        resource_group=resource_group.casefold(),
+        environment_name=environment_name.casefold(),
+        scope_fingerprint=_scope_fingerprint(subscription_id, resource_group),
+        change_fingerprint=change_fingerprint,
+        deployment_mode=deployment_mode,
+        api_image_digest=api_digest,
+        ui_image_digest=ui_digest,
+        semantic_cache_enabled=semantic_cache_enabled,
+        application_changes=tuple(application_facts),
+        foundation_change_counts=dict(foundation.change_counts),
+        foundation_convergence_policy_fingerprint=(
+            foundation.convergence_policy_fingerprint
+        ),
+        external_observations=foundation.external_observations,
+    )
+
+
 def external_policy_fingerprint(policy: ExternalObservationPolicy | None) -> str:
     """Bind the full configured policy, including the explicit disabled state."""
     return _versioned_fingerprint(
@@ -2368,6 +2735,128 @@ def compare_convergence_evidence(plan: Any, converged: Any) -> None:
         )
 
 
+def build_rollout_evidence(
+    classification: RolloutWhatIfClassification,
+    *,
+    commit_sha: str,
+    parameter_fingerprint_value: str,
+) -> dict[str, Any]:
+    """Build a sanitized, deterministic rollout classification evidence document."""
+    if _COMMIT_SHA.fullmatch(commit_sha) is None:
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_STAGE_MISMATCH,
+            "Rollout evidence requires a full lowercase commit SHA",
+        )
+    if not _validate_fingerprint(parameter_fingerprint_value):
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_PARAMETER_MISMATCH,
+            "Rollout evidence requires a valid parameter fingerprint",
+        )
+    return {
+        "schema_version": ROLLOUT_EVIDENCE_SCHEMA_VERSION,
+        "classification": "APPROVED",
+        "rollout_stage": classification.rollout_stage,
+        "commit_sha": commit_sha.casefold(),
+        "deployment_mode": classification.deployment_mode,
+        "target": {
+            "resource_group": classification.resource_group,
+            "environment_name": classification.environment_name,
+            "scope_fingerprint": classification.scope_fingerprint,
+        },
+        "parameters": {"fingerprint": parameter_fingerprint_value},
+        "images": {
+            "api": classification.api_image_digest,
+            "ui": classification.ui_image_digest,
+        },
+        "semantic_cache_enabled": classification.semantic_cache_enabled,
+        "applications": {
+            "fingerprint": classification.change_fingerprint,
+            "resources": [
+                fact.to_document() for fact in classification.application_changes
+            ],
+        },
+        "foundation": {
+            "change_counts": dict(classification.foundation_change_counts),
+            "convergence_policy_fingerprint": (
+                classification.foundation_convergence_policy_fingerprint
+            ),
+        },
+        "external_observations": [
+            observation.to_document()
+            for observation in classification.external_observations
+        ],
+    }
+
+
+def _validate_rollout_parameters(
+    parameters: Mapping[str, Any],
+    *,
+    rollout_stage: str,
+    api_image_digest: str,
+    ui_image_digest: str,
+) -> bool:
+    """Bind the immutable rollout parameter artifact to the classified stage."""
+    if parameters.get("deployContainerApps") is not True:
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_PARAMETER_MISMATCH,
+            "Rollout parameters must deploy Container Apps",
+        )
+    if parameters.get("deployRuntimeAccess") is not False:
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_PARAMETER_MISMATCH,
+            "Rollout parameters must not provision runtime access",
+        )
+    expected_public = rollout_stage == ROLLOUT_STAGE_PUBLIC_UI
+    if parameters.get("exposePublicUi") is not expected_public:
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_PARAMETER_MISMATCH,
+            "Rollout parameters expose flag does not match the classified stage",
+        )
+    if (
+        parameters.get("apiImageDigest") != api_image_digest
+        or parameters.get("uiImageDigest") != ui_image_digest
+    ):
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_PARAMETER_MISMATCH,
+            "Rollout parameters image digests do not match the pushed manifests",
+        )
+    cache = parameters.get("semanticCacheEnabled")
+    if not isinstance(cache, bool):
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_PARAMETER_MISMATCH,
+            "Rollout parameters semantic cache flag is malformed",
+        )
+    return cache
+
+
+def _summarize_rollout(evidence: Mapping[str, Any]) -> str:
+    """Render a readable rollout summary with no subscription or full resource ID."""
+    target = evidence["target"]
+    applications = evidence["applications"]
+    lines = [
+        f"Rollout what-if classification: APPROVED ({evidence['rollout_stage']})",
+        f"  schema: {evidence['schema_version']}",
+        f"  commit: {evidence['commit_sha']}",
+        f"  deployment mode: {evidence['deployment_mode']}",
+        f"  resource group: {target['resource_group']}",
+        f"  environment: {target['environment_name']}",
+        f"  scope fingerprint: {target['scope_fingerprint']}",
+        f"  parameter fingerprint: {evidence['parameters']['fingerprint']}",
+        f"  api image: {evidence['images']['api']}",
+        f"  ui image: {evidence['images']['ui']}",
+        f"  semantic cache enabled: {evidence['semantic_cache_enabled']}",
+        f"  application fingerprint: {applications['fingerprint']}",
+        f"  foundation change counts: {evidence['foundation']['change_counts']}",
+        f"  external observations: {len(evidence['external_observations'])}",
+    ]
+    for change in applications["resources"]:
+        lines.append(
+            f"  {change['change_type']}: {change['role']} "
+            f"(external={change['ingress_external']})"
+        )
+    return "\n".join(lines) + "\n"
+
+
 def _summarize(evidence: Mapping[str, Any]) -> str:
     """Render a readable summary containing no subscription or full resource ID."""
     target = evidence["target"]
@@ -2958,6 +3447,69 @@ def _classify_document(arguments: argparse.Namespace, document: Any) -> None:
     print(_summarize(evidence), end="")
 
 
+def _classify_rollout_document(arguments: argparse.Namespace, document: Any) -> None:
+    """Classify a rollout what-if result and write sanitized evidence."""
+    external_policy = _external_policy_from_environment(arguments.external_policy_env)
+    parameters = read_foundation_parameters(
+        arguments.parameters_file,
+        template_file=arguments.template_file,
+        parameter_source_file=arguments.parameter_source_file,
+        resource_group=arguments.resource_group,
+        expected_sha256=arguments.parameters_sha256,
+    )
+    semantic_cache_enabled = _validate_rollout_parameters(
+        parameters,
+        rollout_stage=arguments.stage,
+        api_image_digest=arguments.api_image_digest,
+        ui_image_digest=arguments.ui_image_digest,
+    )
+    environment_name = parameters.get("environmentName")
+    if not isinstance(environment_name, str) or not environment_name:
+        raise WhatIfClassificationError(
+            WhatIfClassificationCode.ROLLOUT_PARAMETER_MISMATCH,
+            "Rollout parameters are missing the environment name",
+        )
+    classification = classify_rollout_whatif(
+        document,
+        rollout_stage=arguments.stage,
+        subscription_id=arguments.subscription_id,
+        resource_group=arguments.resource_group,
+        environment_name=environment_name,
+        deployment_mode=arguments.deployment_mode,
+        semantic_cache_enabled=semantic_cache_enabled,
+        external_policy=external_policy,
+        api_image_digest=arguments.api_image_digest,
+        ui_image_digest=arguments.ui_image_digest,
+    )
+    evidence = build_rollout_evidence(
+        classification,
+        commit_sha=arguments.commit_sha,
+        parameter_fingerprint_value=parameter_fingerprint(parameters),
+    )
+    serialized = serialize_evidence(evidence)
+    if arguments.output is not None:
+        arguments.output.parent.mkdir(parents=True, exist_ok=True)
+        arguments.output.write_bytes(serialized)
+    print(_summarize_rollout(evidence), end="")
+
+
+def _run_classify_rollout(arguments: argparse.Namespace) -> None:
+    """Load and classify a rollout what-if, failing closed on unsafe evidence."""
+    paths = [arguments.whatif, arguments.parameters_file]
+    if arguments.output is not None:
+        paths.append(arguments.output)
+    if len({path.resolve() for path in paths}) != len(paths):
+        _raise_malformed("Classification input and output paths must be distinct")
+    if arguments.output is not None:
+        arguments.output.unlink(missing_ok=True)
+    document = _load_json(
+        arguments.whatif,
+        WhatIfClassificationCode.MALFORMED_DOCUMENT,
+        expected_sha256=arguments.whatif_sha256,
+    )
+    _classify_rollout_document(arguments, document)
+
+
 def _run_promote_check(arguments: argparse.Namespace) -> None:
     """Fail closed unless apply evidence matches the approved plan evidence."""
     plan = _load_json(arguments.plan, WhatIfClassificationCode.PROMOTION_MISMATCH)
@@ -3009,6 +3561,27 @@ def create_parser() -> argparse.ArgumentParser:
         help="Write nonpromotable field-shape diagnostics on classification failure.",
     )
     classify.set_defaults(handler=_run_classify)
+
+    rollout = subparsers.add_parser(
+        "classify-rollout",
+        help="Classify a Container Apps rollout what-if for one exposure stage.",
+    )
+    rollout.add_argument("--stage", required=True, choices=sorted(_ROLLOUT_STAGES))
+    rollout.add_argument("--whatif", type=Path, required=True)
+    rollout.add_argument("--whatif-sha256")
+    rollout.add_argument("--subscription-id", required=True)
+    rollout.add_argument("--resource-group", required=True)
+    rollout.add_argument("--commit-sha", required=True)
+    rollout.add_argument("--deployment-mode", default="Incremental")
+    rollout.add_argument("--external-policy-env")
+    rollout.add_argument("--parameters-file", type=Path, required=True)
+    rollout.add_argument("--parameters-sha256")
+    rollout.add_argument("--template-file")
+    rollout.add_argument("--parameter-source-file")
+    rollout.add_argument("--api-image-digest", required=True)
+    rollout.add_argument("--ui-image-digest", required=True)
+    rollout.add_argument("--output", type=Path)
+    rollout.set_defaults(handler=_run_classify_rollout)
 
     promote = subparsers.add_parser(
         "promote-check",

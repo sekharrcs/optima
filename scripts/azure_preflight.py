@@ -46,6 +46,13 @@ RUNTIME_COMPOSITION_PHASES = frozenset(
 ACR_ROLE_IDENTITY_PHASES = frozenset(
     {"production-foundation", "publish", "artifacts", "rollout"}
 )
+# Phases that must re-verify the exact bootstrapped runtime access (AcrPull for
+# both identities, container-scoped Cosmos data contribution, and the reviewed
+# Redis policy when the cache is enabled) before the mutation they authorize.
+# production-foundation runs before the first foundation create and publish runs
+# before the image push, so both gate their mutation on live runtime access;
+# rollout re-verifies it a third time as defense in depth before Container Apps.
+RUNTIME_ACCESS_PHASES = frozenset({"production-foundation", "publish", "rollout"})
 EXPECTED_LOCATION = "eastus2"
 EXPECTED_ENVIRONMENT = "hackathon"
 EXPECTED_REPOSITORY = "sekharrcs/optima"
@@ -3521,7 +3528,7 @@ def run_preflight(
         _check_ui_authentication(configuration, azure)
         _check_acr_push(configuration, azure)
         _check_foundry_runtime_access(configuration, azure)
-    if phase == "rollout":
+    if phase in RUNTIME_ACCESS_PHASES:
         _check_runtime_access(configuration, azure, resources)
     artifact_evidence: dict[str, str] = {}
     if phase in {"artifacts", "rollout"}:
@@ -3588,8 +3595,8 @@ def run_preflight(
                 if require_foundation
                 else ()
             ),
-            *(("runtime_access", "immutable_artifacts") if phase == "rollout" else ()),
-            *(("immutable_artifacts",) if phase == "artifacts" else ()),
+            *(("runtime_access",) if phase in RUNTIME_ACCESS_PHASES else ()),
+            *(("immutable_artifacts",) if phase in {"artifacts", "rollout"} else ()),
         ],
         "cost": cost_evidence,
         "environment": EXPECTED_ENVIRONMENT,

@@ -103,10 +103,32 @@ _ALLOWED_PASSTHROUGH_PARAMETERS = frozenset(
         "uiImageDigest",
     }
 )
+# The three artifact modes. ``foundation`` converges the runtime foundation with
+# Container Apps disabled; the two rollout modes deploy Container Apps and differ
+# only in the UI ingress exposure that each authorizes.
+MODE_FOUNDATION = "foundation"
+MODE_INTERNAL_ROLLOUT = "internal-rollout"
+MODE_PUBLIC_ROLLOUT = "public-rollout"
+ARTIFACT_MODES = (MODE_FOUNDATION, MODE_INTERNAL_ROLLOUT, MODE_PUBLIC_ROLLOUT)
+_IMAGE_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+_PLACEHOLDER_IMAGE_DIGEST = "sha256:" + ("0" * 64)
 
 
 class ProductionParameterError(RuntimeError):
     """The effective production parameter artifact cannot be trusted."""
+
+
+def _validated_image_digest(value: str | None, label: str) -> str:
+    """Require an immutable, non-placeholder sha256 manifest digest."""
+    if (
+        not isinstance(value, str)
+        or _IMAGE_DIGEST.fullmatch(value) is None
+        or value == _PLACEHOLDER_IMAGE_DIGEST
+    ):
+        raise ProductionParameterError(
+            f"{label} image digest must be an immutable non-placeholder sha256"
+        )
+    return value
 
 
 def _reject_duplicate_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -170,9 +192,25 @@ def _load_compiled_document(path: Path) -> dict[str, Any]:
 
 
 def build_effective_document(
-    compiled: Mapping[str, Any], environment: Mapping[str, str]
+    compiled: Mapping[str, Any],
+    environment: Mapping[str, str],
+    *,
+    mode: str = MODE_FOUNDATION,
+    api_image_digest: str | None = None,
+    ui_image_digest: str | None = None,
 ) -> dict[str, Any]:
-    """Return the canonical runtime parameter document for foundation mutation."""
+    """Return the canonical runtime parameter document for the requested mode.
+
+    ``foundation`` keeps Container Apps disabled. The two rollout modes enable
+    Container Apps, bind the exact pushed image digests, and differ only in the
+    UI ingress exposure: ``internal-rollout`` keeps the UI internal while
+    ``public-rollout`` authorizes external UI ingress. All three modes exclude
+    the confidential UI client secret, which is supplied inline at mutation time.
+    """
+    if mode not in ARTIFACT_MODES:
+        raise ProductionParameterError(f"Unsupported parameter artifact mode {mode}")
+    deploy_container_apps = mode != MODE_FOUNDATION
+    expose_public_ui = mode == MODE_PUBLIC_ROLLOUT
     parameters = compiled.get("parameters")
     if not isinstance(parameters, dict):
         raise ProductionParameterError("Compiled runtime parameters are malformed")
@@ -204,13 +242,24 @@ def build_effective_document(
     overrides: dict[str, Any] = {
         "deploymentCommitSha": commit_sha,
         "deploymentWorkflowRunId": f"{run_id}-{run_attempt}",
-        "deployContainerApps": False,
+        "deployContainerApps": deploy_container_apps,
         "deployRuntimeAccess": False,
         "environmentName": "hackathon",
-        "exposePublicUi": False,
+        "exposePublicUi": expose_public_ui,
         "productionEvaluatorMode": "LLM_JUDGE",
         "semanticCacheEnabled": cache_enabled,
     }
+    if deploy_container_apps:
+        api_digest = _validated_image_digest(api_image_digest, "API")
+        ui_digest = _validated_image_digest(ui_image_digest, "UI")
+        if api_digest == ui_digest:
+            raise ProductionParameterError("API and UI image digests must be distinct")
+        overrides["apiImageDigest"] = api_digest
+        overrides["uiImageDigest"] = ui_digest
+    elif api_image_digest is not None or ui_image_digest is not None:
+        raise ProductionParameterError(
+            "The foundation parameter artifact must not bind image digests"
+        )
     overrides.update(
         {
             parameter: _required(environment, variable)
@@ -350,10 +399,13 @@ def _write_new_file(path: Path, content: bytes) -> None:
 def create_parser() -> argparse.ArgumentParser:
     """Create the effective production parameter CLI parser."""
     parser = argparse.ArgumentParser(
-        description="Build one canonical production foundation parameter artifact."
+        description="Build one canonical production deployment parameter artifact."
     )
     parser.add_argument("--compiled-base", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--mode", choices=ARTIFACT_MODES, default=MODE_FOUNDATION)
+    parser.add_argument("--api-image-digest")
+    parser.add_argument("--ui-image-digest")
     return parser
 
 
@@ -362,7 +414,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = create_parser().parse_args(argv)
     try:
         compiled = _load_compiled_document(arguments.compiled_base)
-        document = build_effective_document(compiled, os.environ)
+        document = build_effective_document(
+            compiled,
+            os.environ,
+            mode=arguments.mode,
+            api_image_digest=arguments.api_image_digest,
+            ui_image_digest=arguments.ui_image_digest,
+        )
         content = canonical_parameter_bytes(document)
         _write_new_file(arguments.output, content)
         verified = read_regular_file(

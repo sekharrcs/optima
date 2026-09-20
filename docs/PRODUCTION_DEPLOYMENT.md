@@ -660,7 +660,11 @@ The phases prove these progressively stronger conditions:
    mutation capability
 * `production-foundation`: deterministic evidence reconstruction from the raw
    runtime what-if and exact parameter artifact, full runtime configuration,
-   foundation inventory, Graph permission, and four-way ACR agreement
+   foundation inventory, Graph permission, four-way ACR agreement, and the exact
+   bootstrapped runtime access (API and UI `AcrPull`, container-scoped Cosmos
+   data contribution, and the Redis `default` policy when the cache is enabled).
+   This phase runs before the first foundation create, so no Azure mutation
+   precedes the runtime-access gate
 * `foundation-plan`: dedicated read-only identity, providers, checked-in IaC,
    semantically valid fixed-cost governance, explicit disabled cache, and absent
    Redis and embedding configuration
@@ -672,12 +676,14 @@ The phases prove these progressively stronger conditions:
    B0 advertisement, applicable restrictions, quota exposure, and
    allocation-unknown evidence before Redis mutation
 * `publish`: foundation resources, active model deployments and pricing binding,
-   exact UI callback and assignment policy, `AcrPush`, and external Foundry access
-   for the API identity
+   exact UI callback and assignment policy, `AcrPush`, external Foundry access
+   for the API identity, and the same exact bootstrapped runtime access re-read
+   immediately before image publication
 * `artifacts`: separate API and UI registry manifest digests
 * `rollout`: artifacts plus API/UI `AcrPull`, container-scoped Cosmos data
   contribution, and Foundry inference access. Cache-enabled mode also requires
-  the Redis `default` policy
+  the Redis `default` policy. This is the third defense-in-depth runtime-access
+  re-verification, immediately before the Container Apps mutation
 
 Application and runtime phases remain strict once enabled: they do not accept
 missing UI, Entra, registry, Foundry, model, pricing, image, runtime-access, or
@@ -780,6 +786,51 @@ Third-party GitHub Actions are pinned to full commit SHAs. The comments beside
 each pin record the release tag. Resolve a proposed update with
 `git ls-remote --refs <upstream-repository> refs/tags/<tag>`, review the upstream
 release and commit, then update the pin and comment together.
+
+## Mutation boundaries and rollout classification
+
+The deploy job performs exactly four irreversible Azure mutations, in order:
+
+1. The runtime foundation create (`optima-foundation-<run>`).
+2. The image push to ACR.
+3. The internal Container Apps create (`optima-internal-<run>`), UI internal.
+4. The public UI exposure create (`optima-rollout-<run>`), UI external.
+
+Every mutation is fail-closed by its own gates:
+
+* Before mutation 1, the deploy job verifies the bootstrapped runtime-access
+  flag and re-reads the exact runtime access through the `production-foundation`
+  phase. No mutation precedes this gate.
+* Immediately before mutations 2, 3, and 4, the job re-fetches `origin/main`,
+  requires it to still equal the authorized `GITHUB_SHA`, and pins the
+  checked-out `deploy-production.yml` blob to that commit. A superseded protected
+  main therefore stops before publication and before either rollout create.
+* Each rollout builds one immutable, secret-free parameter artifact through
+  `scripts/production_parameters.py --mode internal-rollout|public-rollout`. The
+  artifact bakes `deployContainerApps=true`, the stage-specific `exposePublicUi`
+  flag, and the exact pushed image digests. The confidential UI secret and the
+  per-run smoke markers are supplied inline, identically, to the what-if and the
+  create.
+* Each rollout runs an authoritative Incremental `ProviderNoRbac`
+  `FullResourcePayloads` what-if, captures it to a file, and classifies it with
+  `scripts/whatif_classification.py classify-rollout --stage internal|public-ui`.
+  The create runs only after the classifier approves and after the same artifact
+  digest the classifier bound is re-verified.
+
+The rollout classifier reuses the converged-foundation contract for the
+foundation subset (no new foundation resource is permitted) and then binds the
+runtime application resources to a closed, stage-specific state transition:
+
+* The internal stage requires the exact API, UI, UI auth config, and smoke job
+  graph, both container ingresses internal, and the exact pushed image digests.
+* The public stage requires exactly one UI ingress `Modify` from internal to
+  external, the API internal and unchanged, and no other application change.
+
+Both stages fail closed on a `Delete`, a replacement, an unexpected or missing
+resource, a duplicate identity, an unmanaged observation, a malformed field, a
+wrong UI ingress transition, or any parameter, source, or image-binding
+mismatch. A structural parser never approves a change independently of the
+semantic role, type, path, and value contract.
 
 ## Runtime verification
 

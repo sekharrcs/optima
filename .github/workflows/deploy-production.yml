@@ -501,10 +501,15 @@ jobs:
           printf 'raw_sha256=%s\nevidence_sha256=%s\n' \
             "$raw_sha256" "$evidence_sha256" >> "$GITHUB_OUTPUT"
 
-      - name: Run foundation preflight before Azure mutation
+      - name: Verify bootstrapped runtime access and foundation preflight before mutation
         shell: bash
         run: |
           set -euo pipefail
+          # F8: the runtime-access bootstrap flag and the exact runtime-access
+          # verification must both succeed before the first Azure mutation. The
+          # production-foundation phase re-reads every AcrPull, Cosmos data, and
+          # Redis grant, so no foundation create or image push can precede it.
+          test "$OPTIMA_RUNTIME_ACCESS_BOOTSTRAPPED" = "true"
           python scripts/azure_preflight.py --phase production-foundation \
             --raw-whatif "$RUNNER_TEMP/production-foundation-whatif.json" \
             --raw-whatif-sha256 "${{ steps.foundation_authorization.outputs.raw_sha256 }}" \
@@ -591,8 +596,21 @@ jobs:
       - name: Push the exact verified images with immutable commit tags
         id: images
         shell: bash
+        env:
+          CONFIRMED_SHA: "${{ inputs.confirm_commit_sha }}"
         run: |
           set -euo pipefail
+          # F3: reverify protected main is still the authorized commit immediately
+          # before publishing images. A superseded main stops before any push.
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$CONFIRMED_SHA" = "$GITHUB_SHA"
+          test "$GITHUB_SHA" = "$(git rev-parse HEAD)"
+          git fetch --no-tags --prune --depth=1 origin \
+            +refs/heads/main:refs/remotes/origin/main
+          test "$GITHUB_SHA" = "$(git rev-parse origin/main)"
+          workflow=.github/workflows/deploy-production.yml
+          test "$(git hash-object "$workflow")" = \
+            "$(git rev-parse "$GITHUB_SHA:$workflow")"
           az acr login --name "$AZURE_CONTAINER_REGISTRY_NAME"
           registry="$(az acr show --name "$AZURE_CONTAINER_REGISTRY_NAME" --query loginServer --output tsv)"
           api_image="$registry/optima-api:$GITHUB_SHA"
@@ -695,77 +713,95 @@ jobs:
             "$api_semantic_cache_enabled" "$public_ui" \
             >> "$GITHUB_OUTPUT"
 
-      - name: What-if and deploy digest-qualified Container Apps
+      - name: Classify and deploy the digest-qualified Container Apps rollout
         id: rollout
         shell: bash
         env:
           API_DIGEST: "${{ steps.images.outputs.api_digest }}"
           UI_DIGEST: "${{ steps.images.outputs.ui_digest }}"
+          CONFIRMED_SHA: "${{ inputs.confirm_commit_sha }}"
         run: |
           set -euo pipefail
+          umask 077
           trace_id="$(printf '%s' "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" | sha256sum | cut -c1-32)"
           parent_id="$(printf '%s' "$GITHUB_SHA" | sha256sum | cut -c1-16)"
-          parameters=(
-            "deployRuntimeAccess=false"
-            "deployContainerApps=true"
-            "semanticCacheEnabled=$OPTIMA_SEMANTIC_CACHE_ENABLED"
-            "deploymentCommitSha=$GITHUB_SHA"
-            "deploymentWorkflowRunId=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          az bicep install --version "v$BICEP_VERSION"
+          test "$(az bicep version | sed -n 's/.*Bicep CLI version \([^ ]*\).*/\1/p')" = "$BICEP_VERSION"
+          compiled="$RUNNER_TEMP/rollout-base.parameters.json"
+          test ! -e "$compiled"
+          AZURE_BICEP_CHECK_VERSION=false az bicep build-params \
+            --file infra/environments/hackathon.runtime.bicepparam \
+            --outfile "$compiled"
+          # The confidential UI secret and per-run smoke markers are supplied
+          # inline, identically, to every rollout what-if and create; the exposure
+          # flag and image digests live only in the immutable parameter artifact.
+          rollout_secret_parameters=(
+            "uiAuthClientSecret=$OPTIMA_UI_AUTH_CLIENT_SECRET"
             "smokeTraceparent=00-$trace_id-$parent_id-01"
             "smokeRunMarker=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-            "apiImageDigest=$API_DIGEST"
-            "uiImageDigest=$UI_DIGEST"
-            "uiAuthClientId=$OPTIMA_UI_AUTH_CLIENT_ID"
-            "uiAuthTenantId=$OPTIMA_UI_AUTH_TENANT_ID"
-            "uiAuthClientSecret=$OPTIMA_UI_AUTH_CLIENT_SECRET"
-            "foundryBaseUrl=$OPTIMA_FOUNDRY_BASE_URL"
-            "foundrySmallDeployment=$OPTIMA_FOUNDRY_SMALL_DEPLOYMENT"
-            "foundrySmallModel=$OPTIMA_FOUNDRY_SMALL_MODEL"
-            "foundrySmallModelVersion=$OPTIMA_FOUNDRY_SMALL_MODEL_VERSION"
-            "foundryStrongDeployment=$OPTIMA_FOUNDRY_STRONG_DEPLOYMENT"
-            "foundryStrongModel=$OPTIMA_FOUNDRY_STRONG_MODEL"
-            "foundryStrongModelVersion=$OPTIMA_FOUNDRY_STRONG_MODEL_VERSION"
-            "productionEvaluatorMode=LLM_JUDGE"
-            "judgeDeployment=$OPTIMA_JUDGE_DEPLOYMENT"
-            "judgeModel=$OPTIMA_JUDGE_MODEL"
-            "judgeModelVersion=$OPTIMA_JUDGE_MODEL_VERSION"
-            "pricingCatalogVersion=$OPTIMA_PRICING_CATALOG_VERSION"
-            "pricingCurrency=$OPTIMA_PRICING_CURRENCY"
-            "pricingSmallInputRatePerMillionTokens=$OPTIMA_PRICING_SMALL_INPUT_RATE_PER_MILLION_TOKENS"
-            "pricingSmallOutputRatePerMillionTokens=$OPTIMA_PRICING_SMALL_OUTPUT_RATE_PER_MILLION_TOKENS"
-            "pricingStrongInputRatePerMillionTokens=$OPTIMA_PRICING_STRONG_INPUT_RATE_PER_MILLION_TOKENS"
-            "pricingStrongOutputRatePerMillionTokens=$OPTIMA_PRICING_STRONG_OUTPUT_RATE_PER_MILLION_TOKENS"
-            "pricingJudgeInputRatePerMillionTokens=$OPTIMA_PRICING_JUDGE_INPUT_RATE_PER_MILLION_TOKENS"
-            "pricingJudgeOutputRatePerMillionTokens=$OPTIMA_PRICING_JUDGE_OUTPUT_RATE_PER_MILLION_TOKENS"
           )
-          if test "$OPTIMA_SEMANTIC_CACHE_ENABLED" = "true"; then
-            parameters+=(
-              "redisEmbeddingDeployment=$OPTIMA_REDIS_EMBEDDING_DEPLOYMENT"
-              "redisEmbeddingModel=$OPTIMA_REDIS_EMBEDDING_MODEL"
-              "redisEmbeddingDimension=$OPTIMA_REDIS_EMBEDDING_DIMENSION"
-              "pricingEmbeddingInputRatePerMillionTokens=$OPTIMA_PRICING_EMBEDDING_INPUT_RATE_PER_MILLION_TOKENS"
-            )
-          fi
-          if test -n "$OPTIMA_PRICING_SMALL_CACHED_INPUT_RATE_PER_MILLION_TOKENS"; then
-            parameters+=("pricingSmallCachedInputRatePerMillionTokens=$OPTIMA_PRICING_SMALL_CACHED_INPUT_RATE_PER_MILLION_TOKENS")
-          fi
-          if test -n "$OPTIMA_PRICING_STRONG_CACHED_INPUT_RATE_PER_MILLION_TOKENS"; then
-            parameters+=("pricingStrongCachedInputRatePerMillionTokens=$OPTIMA_PRICING_STRONG_CACHED_INPUT_RATE_PER_MILLION_TOKENS")
-          fi
-          if test -n "$OPTIMA_PRICING_JUDGE_CACHED_INPUT_RATE_PER_MILLION_TOKENS"; then
-            parameters+=("pricingJudgeCachedInputRatePerMillionTokens=$OPTIMA_PRICING_JUDGE_CACHED_INPUT_RATE_PER_MILLION_TOKENS")
-          fi
-          az deployment group what-if --name optima-rollout-what-if \
+          reverify_protected_main() {
+            test "$GITHUB_REF" = "refs/heads/main"
+            test "$CONFIRMED_SHA" = "$GITHUB_SHA"
+            test "$GITHUB_SHA" = "$(git rev-parse HEAD)"
+            git fetch --no-tags --prune --depth=1 origin \
+              +refs/heads/main:refs/remotes/origin/main
+            test "$GITHUB_SHA" = "$(git rev-parse origin/main)"
+            workflow=.github/workflows/deploy-production.yml
+            test "$(git hash-object "$workflow")" = \
+              "$(git rev-parse "$GITHUB_SHA:$workflow")"
+          }
+          # --- Internal rollout: deploy Container Apps with the UI kept internal.
+          internal_parameters="$RUNNER_TEMP/production-internal-rollout.parameters.json"
+          test ! -e "$internal_parameters"
+          internal_sha256="$(AZURE_BICEP_CHECK_VERSION=false python \
+            scripts/production_parameters.py --mode internal-rollout \
+            --compiled-base "$compiled" \
+            --api-image-digest "$API_DIGEST" \
+            --ui-image-digest "$UI_DIGEST" \
+            --output "$internal_parameters")"
+          [[ "$internal_sha256" =~ ^[0-9a-f]{64}$ ]]
+          # F3: reverify protected main immediately before the internal create.
+          reverify_protected_main
+          internal_whatif="$RUNNER_TEMP/production-internal-rollout-whatif.json"
+          test ! -e "$internal_whatif"
+          az deployment group what-if --name optima-internal-rollout-what-if \
+            --mode Incremental \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --template-file infra/resource-group.bicep \
-            --parameters infra/environments/hackathon.runtime.bicepparam \
-            --parameters "${parameters[@]}" exposePublicUi=false
+            --parameters "@$internal_parameters" \
+            --parameters "${rollout_secret_parameters[@]}" \
+            --validation-level ProviderNoRbac \
+            --result-format FullResourcePayloads \
+            --no-pretty-print --only-show-errors \
+            > "$internal_whatif"
+          internal_whatif_sha256="$(sha256sum "$internal_whatif" | cut -d ' ' -f 1)"
+          # F1: fail closed on any unapproved internal rollout what-if operation.
+          python scripts/whatif_classification.py classify-rollout \
+            --stage internal \
+            --whatif "$internal_whatif" \
+            --whatif-sha256 "$internal_whatif_sha256" \
+            --subscription-id "$AZURE_SUBSCRIPTION_ID" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --commit-sha "$GITHUB_SHA" \
+            --external-policy-env OPTIMA_FOUNDATION_EXTERNAL_OBSERVATION_POLICY \
+            --parameters-file "$internal_parameters" \
+            --parameters-sha256 "$internal_sha256" \
+            --template-file infra/resource-group.bicep \
+            --parameter-source-file infra/environments/hackathon.runtime.bicepparam \
+            --api-image-digest "$API_DIGEST" \
+            --ui-image-digest "$UI_DIGEST" \
+            --output "$RUNNER_TEMP/internal-rollout-evidence.json"
+          # The create consumes the exact artifact the what-if classified.
+          printf '%s  %s\n' "$internal_sha256" "$internal_parameters" \
+            | sha256sum --check --strict
           deployment_name="optima-internal-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           az deployment group create --name "$deployment_name" \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --template-file infra/resource-group.bicep \
-            --parameters infra/environments/hackathon.runtime.bicepparam \
-            --parameters "${parameters[@]}" exposePublicUi=false >/dev/null
+            --parameters "@$internal_parameters" \
+            --parameters "${rollout_secret_parameters[@]}" \
+            --only-show-errors >/dev/null
           api_name="$(az deployment group show --name "$deployment_name" \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --query properties.outputs.apiContainerAppName.value --output tsv)"
@@ -837,17 +873,58 @@ jobs:
             sleep 10
           done
           test "$telemetry_seen" = "true"
+          # --- Public UI exposure: transition the UI ingress internal -> external.
+          public_parameters="$RUNNER_TEMP/production-public-rollout.parameters.json"
+          test ! -e "$public_parameters"
+          public_sha256="$(AZURE_BICEP_CHECK_VERSION=false python \
+            scripts/production_parameters.py --mode public-rollout \
+            --compiled-base "$compiled" \
+            --api-image-digest "$API_DIGEST" \
+            --ui-image-digest "$UI_DIGEST" \
+            --output "$public_parameters")"
+          [[ "$public_sha256" =~ ^[0-9a-f]{64}$ ]]
+          rm -f -- "$compiled"
+          # F3: reverify protected main immediately before the public create.
+          reverify_protected_main
+          public_whatif="$RUNNER_TEMP/production-public-rollout-whatif.json"
+          test ! -e "$public_whatif"
           az deployment group what-if --name optima-public-ui-what-if \
+            --mode Incremental \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --template-file infra/resource-group.bicep \
-            --parameters infra/environments/hackathon.runtime.bicepparam \
-            --parameters "${parameters[@]}" exposePublicUi=true
+            --parameters "@$public_parameters" \
+            --parameters "${rollout_secret_parameters[@]}" \
+            --validation-level ProviderNoRbac \
+            --result-format FullResourcePayloads \
+            --no-pretty-print --only-show-errors \
+            > "$public_whatif"
+          public_whatif_sha256="$(sha256sum "$public_whatif" | cut -d ' ' -f 1)"
+          # F2: fail closed unless the public what-if is exactly the UI exposure.
+          python scripts/whatif_classification.py classify-rollout \
+            --stage public-ui \
+            --whatif "$public_whatif" \
+            --whatif-sha256 "$public_whatif_sha256" \
+            --subscription-id "$AZURE_SUBSCRIPTION_ID" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --commit-sha "$GITHUB_SHA" \
+            --external-policy-env OPTIMA_FOUNDATION_EXTERNAL_OBSERVATION_POLICY \
+            --parameters-file "$public_parameters" \
+            --parameters-sha256 "$public_sha256" \
+            --template-file infra/resource-group.bicep \
+            --parameter-source-file infra/environments/hackathon.runtime.bicepparam \
+            --api-image-digest "$API_DIGEST" \
+            --ui-image-digest "$UI_DIGEST" \
+            --output "$RUNNER_TEMP/public-rollout-evidence.json"
+          # The create consumes the exact artifact the what-if classified.
+          printf '%s  %s\n' "$public_sha256" "$public_parameters" \
+            | sha256sum --check --strict
           deployment_name="optima-rollout-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           az deployment group create --name "$deployment_name" \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --template-file infra/resource-group.bicep \
-            --parameters infra/environments/hackathon.runtime.bicepparam \
-            --parameters "${parameters[@]}" exposePublicUi=true >/dev/null
+            --parameters "@$public_parameters" \
+            --parameters "${rollout_secret_parameters[@]}" \
+            --only-show-errors >/dev/null
           printf 'deployment_name=%s\napi_name=%s\nui_name=%s\napi_url=%s\nui_url=%s\n' \
             "$deployment_name" "$api_name" "$ui_name" "$api_url" "$ui_url" \
             >> "$GITHUB_OUTPUT"
