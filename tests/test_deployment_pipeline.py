@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import os
 import re
 import shlex
+import shutil
+import subprocess
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "deploy-production.yml"
+BASH = shutil.which("bash")
 
 
 def workflow() -> str:
@@ -48,7 +54,9 @@ def test_azure_oidc_permission_exists_only_after_validation() -> None:
     assert "uv run pytest" not in content
     assert "PYTHONPATH" not in content
     assert content.index("id-token: write") < content.index("azure/login@")
-    assert content.index("azure/login@") < content.index("--phase foundation")
+    assert content.index("azure/login@") < content.index(
+        "--phase production-foundation"
+    )
     assert "client-secret:" not in content
     assert "persist-credentials: false" in content
 
@@ -71,19 +79,179 @@ def test_all_actions_are_pinned_to_full_commit_shas() -> None:
 def test_preflight_and_mutation_order_is_fail_closed() -> None:
     """Run each read-only gate before the mutation it authorizes."""
     content = workflow()
-    foundation = content.index("--phase foundation")
+    session = content.index("--phase production-session")
+    parameters = content.index(
+        "Generate one canonical effective runtime parameter artifact"
+    )
+    whatif = content.index(
+        "az deployment group what-if --name optima-production-foundation-whatif"
+    )
+    classification = content.index("scripts/whatif_classification.py classify")
+    foundation = content.index("--phase production-foundation")
     foundation_create = content.index("az deployment group create", foundation)
     publish = content.index("--phase publish", foundation_create)
     image_push = content.index('docker push "$api_image"', publish)
     artifacts = content.index("--phase artifacts", image_push)
     rollout = content.index("--phase rollout", artifacts)
-    applications = content.index('"deployContainerApps=true"', rollout)
+    applications = content.index("classify-rollout", rollout)
 
+    assert session < parameters < whatif < classification < foundation
     assert foundation < foundation_create < publish < image_push
     assert image_push < artifacts < rollout < applications
     assert "deployRuntimeAccess=true" not in content
-    assert "az deployment group what-if" in content
-    assert "az deployment sub what-if" in content
+    assert "az deployment sub what-if" not in content
+    assert "az deployment sub create" not in content
+
+
+def test_classified_whatif_runs_before_preflight_and_all_mutation() -> None:
+    """The authoritative foundation what-if and classifier precede every mutation."""
+    content = workflow()
+    login = content.index("azure/login@")
+    whatif = content.index(
+        "az deployment group what-if --name optima-production-foundation-whatif"
+    )
+    classify = content.index("scripts/whatif_classification.py classify", whatif)
+    evidence = content.index("production-foundation-evidence.json", classify)
+    preflight = content.index("--phase production-foundation", evidence)
+    consume = content.index(
+        '--classified-evidence "$RUNNER_TEMP/production-foundation-evidence.json"',
+        preflight,
+    )
+    create = content.index("az deployment group create", consume)
+    image_push = content.index('docker push "$api_image"', create)
+
+    # login -> authoritative what-if -> classify -> preflight consumes evidence
+    assert login < whatif < classify < evidence < preflight < consume
+    # no foundation deployment or image push before classification and preflight
+    assert consume < create < image_push
+    assert content.index("--expected-commit-sha", preflight) < create
+    assert "- uses:" not in content[classify:consume]
+
+
+def test_exactly_one_foundation_whatif_and_create_share_parameters() -> None:
+    """One exact parameter artifact authorizes one foundation create."""
+    content = workflow()
+
+    assert (
+        content.count(
+            "az deployment group what-if --name optima-production-foundation-whatif"
+        )
+        == 1
+    )
+    assert content.count("Deploy the exactly authorized runtime foundation") == 1
+    # F6: both the foundation what-if and create consume the same immutable
+    # artifact through the descriptor-pinning helper, never a re-openable path.
+    assert content.count('--parameter-file "$parameters"') == 2
+    assert content.count('--parameters "@$RUNNER_TEMP/production-foundation') == 0
+    assert content.count("python scripts/production_parameters.py") == 1
+    assert content.count("parameter_sha256=") == 1
+    assert content.count("infra/environments/hackathon.foundation.bicepparam") == 0
+    authorization = content[
+        content.index(
+            "Generate one canonical effective runtime parameter artifact"
+        ) : content.index("Require foundation resources and ACR publication access")
+    ]
+    assert authorization.count("infra/environments/hackathon.runtime.bicepparam") == 2
+    assert "--validation-level ProviderNoRbac" in content
+    assert "--result-format FullResourcePayloads" in content
+
+
+def test_every_three_role_preflight_consumes_classified_evidence() -> None:
+    """Each ACR-consuming preflight binds the same-job classified evidence."""
+    content = workflow()
+    for phase in ("production-foundation", "publish", "artifacts", "rollout"):
+        phase_index = content.index(f"--phase {phase}")
+        window = content[phase_index : phase_index + 1100]
+        assert "production-foundation-evidence.json" in window
+        assert "production-foundation-whatif.json" in window
+        assert "production-foundation.parameters.json" in window
+        assert "--classified-evidence-sha256" in window
+        assert "--raw-whatif-sha256" in window
+        assert "--effective-parameters-sha256" in window
+        assert "--expected-commit-sha" in window
+    # The evidence is generated exactly once before it is consumed.
+    assert content.count('--output "$evidence"') == 1
+
+
+def test_production_reverifies_main_and_workflow_before_mutation() -> None:
+    """Environment delay or workflow-file drift invalidates authorization."""
+    content = workflow()
+    deploy = content[content.index("  deploy:") :]
+    first = content.index("Reverify current protected main and workflow")
+    final = content.index(
+        "Reverify authorization immediately before foundation mutation"
+    )
+    create = content.index("Deploy the exactly authorized runtime foundation")
+
+    assert first < content.index("actions/download-artifact@")
+    assert final < create
+    # F2: five distinct freshness checkpoints (three inline steps plus the two
+    # reverify_protected_main function bodies used before the publication and
+    # rollout mutations) each fetch current main and pin the workflow blob.
+    assert deploy.count("refs/heads/main:refs/remotes/origin/main") == 5
+    assert deploy.count('test "$GITHUB_SHA" = "$(git rev-parse origin/main)"') == 5
+    assert deploy.count('git hash-object "$workflow"') == 5
+    assert deploy.count('test "$CONFIRMED_SHA" = "$GITHUB_SHA"') == 5
+    assert deploy.count("--phase production-foundation") == 2
+    freshness = deploy.index("foundation-freshness-preflight.json")
+    mutation = deploy.index("Deploy the exactly authorized runtime foundation")
+    assert freshness < mutation
+
+
+def test_post_approval_main_advancement_fails_before_mutation() -> None:
+    """The final gate compares fetched current main with the authorized SHA."""
+    content = workflow()
+    final = content.index(
+        "Reverify authorization immediately before foundation mutation"
+    )
+    create = content.index("Deploy the exactly authorized runtime foundation", final)
+    commands = content[final:create]
+
+    assert "+refs/heads/main:refs/remotes/origin/main" in commands
+    assert 'test "$GITHUB_SHA" = "$(git rev-parse origin/main)"' in commands
+    assert 'test "$CONFIRMED_SHA" = "$GITHUB_SHA"' in commands
+
+
+def test_wrong_workflow_blob_fails_at_both_freshness_gates() -> None:
+    """The checked-out workflow must equal the authorized commit's blob."""
+    content = workflow()
+    deploy = content[content.index("  deploy:") :]
+
+    assert deploy.count('expected_workflow_blob="$(git rev-parse') == 1
+    assert deploy.count('git hash-object "$workflow"') == 5
+    assert deploy.count('git rev-parse "$GITHUB_SHA:$workflow"') == 5
+
+
+def test_production_requires_existing_successful_foundation() -> None:
+    """Subscription bootstrap belongs only to the dedicated foundation workflow."""
+    content = workflow()
+
+    assert "Production requires a successfully deployed foundation" in content
+    assert "properties.provisioningState=='Succeeded'" in content
+    assert "az deployment sub create" not in content
+    assert "--template-file infra/main.bicep" not in content
+
+
+def test_runbook_requires_foundation_and_complete_evidence_arguments() -> None:
+    """Keep operator examples aligned with the production trust boundary."""
+    runbook = (ROOT / "docs" / "PRODUCTION_DEPLOYMENT.md").read_text(encoding="utf-8")
+
+    assert "successful foundation apply and convergence is a production" in runbook
+    assert "Production has no subscription deployment branch" in runbook
+    assert "--phase production-session" in runbook
+    assert "--phase production-foundation" in runbook
+    for argument in (
+        "--raw-whatif",
+        "--raw-whatif-sha256",
+        "--effective-parameters",
+        "--effective-parameters-sha256",
+        "--classified-evidence",
+        "--classified-evidence-sha256",
+        "--expected-commit-sha",
+    ):
+        assert runbook.count(argument) >= 1
+    assert "does not cryptographically attest" in runbook
+    assert "Windows lacks equivalent `O_NOFOLLOW`" in runbook
 
 
 def test_cache_mode_is_configuration_controlled_and_propagated() -> None:
@@ -96,32 +264,37 @@ def test_cache_mode_is_configuration_controlled_and_propagated() -> None:
     )
     assert 'OPTIMA_SEMANTIC_CACHE_ENABLED: "false"' not in content
     assert 'OPTIMA_SEMANTIC_CACHE_ENABLED: "true"' not in content
-    assert content.count('"semanticCacheEnabled=$OPTIMA_SEMANTIC_CACHE_ENABLED"') == 2
-    assert content.count('if test "$OPTIMA_SEMANTIC_CACHE_ENABLED" = "true"; then') == 3
+    parameter_builder = (ROOT / "scripts" / "production_parameters.py").read_text(
+        encoding="utf-8"
+    )
+    # The canonical cache Boolean is resolved into every immutable parameter
+    # artifact by the shared builder, never by a workflow-owned literal, so the
+    # foundation and both rollout artifacts stay in exact agreement.
+    assert "OPTIMA_SEMANTIC_CACHE_ENABLED" in parameter_builder
+    assert '"semanticCacheEnabled=' not in content
+    # The cache-only Bicep bindings live only in the builder's enabled branch;
+    # the workflow never hardcodes a Redis or embedding parameter.
     for parameter in (
         "redisEmbeddingDeployment",
         "redisEmbeddingModel",
         "redisEmbeddingDimension",
         "pricingEmbeddingInputRatePerMillionTokens",
     ):
-        assert content.count(f'"{parameter}=$OPTIMA_') == 2
-    foundation_parameters = content.index("parameters=(", content.index("What-if"))
-    foundation_cache_branch = content.index(
-        'if test "$OPTIMA_SEMANTIC_CACHE_ENABLED" = "true"; then',
-        foundation_parameters,
-    )
-    assert (
-        content.index(
-            '"semanticCacheEnabled=$OPTIMA_SEMANTIC_CACHE_ENABLED"',
-            foundation_parameters,
-        )
-        < foundation_cache_branch
-    )
+        assert f'"{parameter}=$OPTIMA_' not in content
+        assert parameter in parameter_builder
+    # The deployed API revision is inspected for the exact mode and the exact
+    # cache-environment count before exposure.
+    assert content.count('if test "$OPTIMA_SEMANTIC_CACHE_ENABLED" = "true"; then') == 1
+    assert 'test "$cache_environment_count" -eq 9' in content
+    assert 'test "$cache_environment_count" -eq 0' in content
 
 
 def test_reviewed_model_versions_reach_both_bicep_deployment_phases() -> None:
     """Pass each protected role version through foundation and rollout unchanged."""
     content = workflow()
+    parameter_builder = (ROOT / "scripts" / "production_parameters.py").read_text(
+        encoding="utf-8"
+    )
     expected = {
         "foundrySmallModelVersion": "OPTIMA_FOUNDRY_SMALL_MODEL_VERSION",
         "foundryStrongModelVersion": "OPTIMA_FOUNDRY_STRONG_MODEL_VERSION",
@@ -130,7 +303,9 @@ def test_reviewed_model_versions_reach_both_bicep_deployment_phases() -> None:
 
     for parameter, variable in expected.items():
         assert f'{variable}: "${{{{ vars.{variable} }}}}"' in content
-        assert content.count(f'"{parameter}=${variable}"') == 2
+        assert f'"{parameter}=$' not in content
+        assert parameter in parameter_builder
+        assert variable in parameter_builder
 
     assert "EXPECTED_RESPONSE_MODEL" not in content
 
@@ -171,13 +346,15 @@ def test_cache_mode_is_strictly_canonically_validated_before_azure_login() -> No
     )
     assert canonical_gate < error_message
     assert canonical_gate < content.index("azure/login@")
-    assert canonical_gate < content.index("--phase foundation")
+    assert canonical_gate < content.index("--phase production-foundation")
 
 
 def test_disabled_cache_is_verified_before_pre_exposure_smoke() -> None:
     """Inspect the deployed revision for exact mode and absent cache environment."""
     content = workflow()
-    rollout = content.index("What-if and deploy digest-qualified Container Apps")
+    rollout = content.index(
+        "Classify and deploy the digest-qualified Container Apps rollout"
+    )
     cache_mode = content.index('configured_cache_mode="$(az containerapp', rollout)
     cache_environment = content.index(
         'cache_environment_count="$(az containerapp', cache_mode
@@ -186,7 +363,7 @@ def test_disabled_cache_is_verified_before_pre_exposure_smoke() -> None:
         'test "$cache_environment_count" -eq 0', cache_environment
     )
     smoke = content.index("az containerapp job start", absent_gate)
-    public = content.index("exposePublicUi=true", smoke)
+    public = content.index("--stage public-ui", smoke)
 
     assert cache_mode < cache_environment < absent_gate < smoke < public
     assert (
@@ -216,8 +393,8 @@ def test_images_are_built_for_amd64_and_deployed_by_registry_digest() -> None:
     assert (
         "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c" in content
     )
-    assert '"apiImageDigest=$API_DIGEST"' in content
-    assert '"uiImageDigest=$UI_DIGEST"' in content
+    assert '--api-image-digest "$API_DIGEST"' in content
+    assert '--ui-image-digest "$UI_DIGEST"' in content
     assert 'test "$api_image" = "$REGISTRY/optima-api@$API_DIGEST"' in content
     assert 'test "$ui_image" = "$REGISTRY/optima-ui@$UI_DIGEST"' in content
 
@@ -226,9 +403,13 @@ def test_rollout_records_source_and_verifies_runtime_contracts() -> None:
     """Trace revisions to source and verify readiness, routing, and telemetry."""
     content = workflow()
     smoke = (ROOT / "src" / "ui" / "deployment_smoke.py").read_text(encoding="utf-8")
+    parameter_builder = (ROOT / "scripts" / "production_parameters.py").read_text(
+        encoding="utf-8"
+    )
 
-    assert '"deploymentCommitSha=$GITHUB_SHA"' in content
-    assert '"deploymentWorkflowRunId=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"' in content
+    assert "deploymentCommitSha" in parameter_builder
+    assert "deploymentWorkflowRunId" in parameter_builder
+    assert '"smokeRunMarker=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"' in content
     assert "properties.latestRevisionName" in content
     assert 'test "$api_health" = "Healthy"' in content
     assert 'test "$ui_health" = "Healthy"' in content
@@ -256,11 +437,11 @@ def test_rollout_records_source_and_verifies_runtime_contracts() -> None:
 def test_ui_is_internal_until_easy_auth_is_verified() -> None:
     """Prevent a partial ARM failure from exposing unauthenticated Streamlit."""
     content = workflow()
-    internal = content.index("exposePublicUi=false", content.index("--phase rollout"))
+    internal = content.index("--stage internal", content.index("--phase rollout"))
     auth = content.index("authConfigs/current", internal)
     live_execution = content.index("az containerapp job start", auth)
     telemetry = content.index("operation_Id == '$trace_id'", live_execution)
-    public = content.index("exposePublicUi=true", auth)
+    public = content.index("--stage public-ui", auth)
 
     assert internal < auth < live_execution < telemetry < public
     assert 'clientSecretSettingName == "ui-auth-client-secret"' in content
@@ -286,7 +467,7 @@ def test_pre_exposure_smoke_uses_a_container_apps_job() -> None:
     status = content.index("properties.status", start)
     gate = content.index('test "$smoke_status" = "Succeeded"', status)
     telemetry = content.index("operation_Id == '$trace_id'", gate)
-    public = content.index("exposePublicUi=true", gate)
+    public = content.index("--stage public-ui", gate)
     assert start < status < gate < telemetry < public
 
 
@@ -420,3 +601,355 @@ def test_image_load_step_passes_valid_go_template_without_backslash() -> None:
 
     # no mutable tag is accepted in place of the immutable checked identity
     assert body.count("optima-$component:production-check") == 3
+
+
+def _deploy_job() -> str:
+    """Return the deploy-job region of the production workflow."""
+    content = workflow()
+    return content[content.index("  deploy:") :]
+
+
+def test_internal_rollout_classifies_its_whatif_before_the_create() -> None:
+    """F1: the internal what-if is captured and classified before its create."""
+    deploy = _deploy_job()
+    whatif = deploy.index("optima-internal-rollout-what-if")
+    capture = deploy.index('> "$internal_whatif"', whatif)
+    classify = deploy.index("classify-rollout", capture)
+    stage = deploy.index("--stage internal", classify)
+    create = deploy.index('deployment_name="optima-internal-', stage)
+    azure_create = deploy.index("az deployment group create", create)
+
+    assert whatif < capture < classify < stage < create < azure_create
+    # The classifier consumes the exact captured what-if and its digest.
+    window = deploy[classify:create]
+    assert '--whatif "$internal_whatif"' in window
+    assert '--whatif-sha256 "$internal_whatif_sha256"' in window
+
+
+def test_public_rollout_classifies_its_whatif_before_the_create() -> None:
+    """F2: the public what-if is captured and classified before its create."""
+    deploy = _deploy_job()
+    whatif = deploy.index("optima-public-ui-what-if")
+    capture = deploy.index('> "$public_whatif"', whatif)
+    classify = deploy.index("classify-rollout", capture)
+    stage = deploy.index("--stage public-ui", classify)
+    create = deploy.index('deployment_name="optima-rollout-', stage)
+    azure_create = deploy.index("az deployment group create", create)
+
+    assert whatif < capture < classify < stage < create < azure_create
+    window = deploy[classify:create]
+    assert '--whatif "$public_whatif"' in window
+    assert '--whatif-sha256 "$public_whatif_sha256"' in window
+
+
+def test_every_irreversible_mutation_reverifies_protected_main() -> None:
+    """F3: image push and both rollout creates reverify current origin/main."""
+    deploy = _deploy_job()
+    fresh = 'test "$GITHUB_SHA" = "$(git rev-parse origin/main)"'
+
+    # The image push step reverifies protected main immediately before pushing.
+    push_step = deploy.index("Push the exact verified images")
+    push = deploy.index('docker push "$api_image"', push_step)
+    assert fresh in deploy[push_step:push]
+
+    # Both rollout creates are guarded by a reverify_protected_main call.
+    internal_create = deploy.index('deployment_name="optima-internal-')
+    public_create = deploy.index('deployment_name="optima-rollout-')
+    assert "reverify_protected_main()" in deploy
+    assert deploy[:internal_create].rstrip().endswith("reverify_protected_main") or (
+        "reverify_protected_main"
+        in deploy[deploy.index("internal_whatif") - 400 : internal_create]
+    )
+    assert (
+        "reverify_protected_main"
+        in deploy[deploy.index("public_whatif") - 400 : public_create]
+    )
+    # The reverify body still fetches current main and pins the workflow blob.
+    fn = deploy[
+        deploy.index("reverify_protected_main() {") : deploy.index(
+            "# --- Internal rollout"
+        )
+    ]
+    assert "+refs/heads/main:refs/remotes/origin/main" in fn
+    assert 'git hash-object "$workflow"' in fn
+
+
+def test_bootstrap_and_runtime_access_precede_the_first_mutation() -> None:
+    """F8: the bootstrap flag and runtime-access gate precede any mutation."""
+    deploy = _deploy_job()
+    bootstrap = deploy.index('test "$OPTIMA_RUNTIME_ACCESS_BOOTSTRAPPED" = "true"')
+    runtime_phase = deploy.index("--phase production-foundation", bootstrap - 2000)
+    foundation_create = deploy.index("Deploy the exactly authorized runtime foundation")
+    image_push = deploy.index('docker push "$api_image"')
+
+    assert bootstrap < foundation_create
+    assert runtime_phase < foundation_create
+    # No Azure mutation may precede the first bootstrap+runtime-access gate.
+    before_gate = deploy[:bootstrap]
+    assert "az deployment group create" not in before_gate
+    assert 'docker push "$api_image"' not in before_gate
+    assert bootstrap < image_push
+
+
+def test_rollout_creates_consume_the_classified_parameter_artifact() -> None:
+    """Point 5: the create uses the exact artifact digest the what-if classified."""
+    deploy = _deploy_job()
+    for parameters, sha in (
+        ("internal_parameters", "internal_sha256"),
+        ("public_parameters", "public_sha256"),
+    ):
+        classify = deploy.index(f'--parameters-file "${parameters}"')
+        # The classifier binds the exact artifact digest the create will consume.
+        assert f'--parameters-sha256 "${sha}"' in deploy[classify : classify + 400]
+        # The create rechecks that digest and then deploys the same file through
+        # the descriptor-pinning helper (F6), never a re-openable pathname.
+        strict = deploy.index("sha256sum --check --strict", classify)
+        pinned = deploy.index(f'--parameter-file "${parameters}"', strict)
+        create = deploy.index("az deployment group create", pinned)
+        assert classify < strict < pinned < create
+
+
+def test_rollout_whatif_is_incremental_full_resource_payload_json() -> None:
+    """The rollout what-ifs feed the classifier the exact FullResourcePayloads JSON."""
+    deploy = _deploy_job()
+    for name in ("optima-internal-rollout-what-if", "optima-public-ui-what-if"):
+        whatif = deploy.index(name)
+        window = deploy[whatif : whatif + 600]
+        assert "--mode Incremental" in window
+        assert "--validation-level ProviderNoRbac" in window
+        assert "--result-format FullResourcePayloads" in window
+        assert "--no-pretty-print" in window
+    # The unclassified single what-if of the pre-classification head must not return.
+    assert "optima-rollout-what-if " not in workflow()
+
+
+# --- F2: a final freshness check immediately precedes every mutation ----------
+
+
+def _final_check_precedes(
+    deploy: str, mutation_marker: str, *, search_from: int
+) -> bool:
+    """Return whether a freshness check immediately precedes a mutation marker.
+
+    Only local assignments (no networked command) may appear between the final
+    origin/main equality check or reverify call and the mutation.
+    """
+    mutation = deploy.index(mutation_marker, search_from)
+    window = deploy[:mutation]
+    inline = window.rfind('test "$GITHUB_SHA" = "$(git rev-parse origin/main)"')
+    call = window.rfind("\n          reverify_protected_main\n")
+    anchor = max(inline, call)
+    assert anchor != -1, f"no freshness check precedes {mutation_marker!r}"
+    between = deploy[anchor:mutation]
+    # No networked az/docker/git-fetch command may sit between the check and the
+    # mutation; only local variable assignments and the pinned-exec invocation.
+    for forbidden in (
+        "az deployment group what-if",
+        "az acr ",
+        "az containerapp show",
+        "git fetch",
+    ):
+        assert forbidden not in between, (
+            f"{forbidden!r} runs between the final check and {mutation_marker!r}"
+        )
+    return True
+
+
+def test_final_freshness_check_precedes_every_mutation() -> None:
+    """F2: foundation create, both pushes, both rollout creates, and the smoke
+    job start are each immediately preceded by a final freshness check."""
+    deploy = _deploy_job()
+    # Foundation create (inline freshness check in the same step).
+    assert _final_check_precedes(
+        deploy,
+        "python scripts/pinned_parameter_exec.py",
+        search_from=deploy.index("Deploy the exactly authorized runtime foundation"),
+    )
+    # API and UI pushes.
+    assert _final_check_precedes(
+        deploy, 'docker push "$api_image"', search_from=deploy.index("Push the exact")
+    )
+    assert _final_check_precedes(
+        deploy, 'docker push "$ui_image"', search_from=deploy.index("Push the exact")
+    )
+    # Internal rollout create.
+    assert _final_check_precedes(
+        deploy,
+        "az deployment group create --name",
+        search_from=deploy.index('deployment_name="optima-internal-'),
+    )
+    # Smoke job start.
+    assert _final_check_precedes(
+        deploy,
+        "az containerapp job start",
+        search_from=deploy.index("smoke_job="),
+    )
+    # Public rollout create.
+    assert _final_check_precedes(
+        deploy,
+        "az deployment group create --name",
+        search_from=deploy.index('deployment_name="optima-rollout-'),
+    )
+
+
+def _reverify_function_body() -> str:
+    """Extract the reverify_protected_main function body from the deploy job."""
+    deploy = _deploy_job()
+    start = deploy.index("reverify_protected_main() {")
+    end = deploy.index("\n          }\n", start) + len("\n          }\n")
+    return deploy[start:end]
+
+
+@pytest.mark.skipif(BASH is None, reason="bash is required for the command-double test")
+def test_advancing_main_refuses_mutation(tmp_path: Path) -> None:
+    """F2 command double: when origin/main advances the mutation is refused.
+
+    The exact reverify_protected_main body from the workflow runs under bash with
+    a fake git whose ``rev-parse origin/main`` reports an advanced commit; the
+    following mutation marker is never reached. The fake is a bash function so it
+    reliably shadows the real git on every platform.
+    """
+    body = _reverify_function_body()
+    sha = "a" * 40
+    marker = tmp_path / "mutated"
+    fake_git = (
+        "git() {\n"
+        '  case "$*" in\n'
+        '    "rev-parse HEAD") echo "$GITHUB_SHA" ;;\n'
+        '    "rev-parse origin/main") echo "$ORIGIN_MAIN" ;;\n'
+        "    fetch*) return 0 ;;\n"
+        "    hash-object*) echo BLOB ;;\n"
+        "    rev-parse*) echo BLOB ;;\n"
+        "    *) echo UNEXPECTED >&2; return 3 ;;\n"
+        "  esac\n"
+        "}\n"
+    )
+    script = (
+        f"set -euo pipefail\n{fake_git}{body}\nreverify_protected_main\n"
+        f"touch '{marker}'\n"
+    )
+    base_env = {
+        **os.environ,
+        "GITHUB_REF": "refs/heads/main",
+        "CONFIRMED_SHA": sha,
+        "GITHUB_SHA": sha,
+    }
+    # Advanced main: the mutation is refused and the marker is never created.
+    advanced = subprocess.run(
+        [str(BASH), "-c", script],
+        env={**base_env, "ORIGIN_MAIN": "b" * 40},
+        capture_output=True,
+        cwd=str(ROOT),
+    )
+    assert advanced.returncode != 0
+    assert not marker.exists()
+    # Control: a matching main permits the mutation exactly once.
+    ok = subprocess.run(
+        [str(BASH), "-c", script],
+        env={**base_env, "ORIGIN_MAIN": sha},
+        capture_output=True,
+        cwd=str(ROOT),
+    )
+    assert ok.returncode == 0, ok.stderr.decode()
+    assert marker.exists()
+
+
+# --- F5: containment authoritative absence and deployment reconciliation ------
+
+
+def _containment_body() -> str:
+    """Return the shell body of the containment step."""
+    content = workflow()
+    start = content.index("- name: Contain a failed rollout")
+    after_run = content[start:].split("run: |\n", 1)[1]
+    body: list[str] = []
+    for line in after_run.splitlines():
+        if line.strip() and not line.startswith(" " * 10):
+            break
+        body.append(line)
+    return "\n".join(body)
+
+
+def test_containment_only_treats_resource_not_found_as_absence() -> None:
+    """F5: only an authoritative ResourceNotFound is treated as UI absence."""
+    body = _containment_body()
+    assert "is_resource_not_found" in body
+    assert "ResourceNotFound" in body
+    assert "existence is indeterminate; containment fails closed" in body
+    # The step reconciles outstanding rollout deployments (cancel + wait) first.
+    assert "az deployment group cancel" in body
+    assert "optima-internal-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" in body
+    assert "optima-rollout-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" in body
+    # Truthful recovery reporting distinguishes absent from contained.
+    assert "recovery=absent" in body
+    assert "recovery=contained" in body
+
+
+@pytest.mark.skipif(BASH is None, reason="bash is required for the containment test")
+def test_containment_fails_closed_on_access_denied(tmp_path: Path) -> None:
+    """F5 executable: an access-denied UI lookup fails containment, never absent."""
+    body = _containment_body()
+    fake = (
+        "sleep() { return 0; }\n"
+        "az() {\n"
+        '  case "$*" in\n'
+        # Outstanding rollout deployments are absent (authoritative not found).
+        '    "deployment group show"*)\n'
+        '      echo "ERROR: (ResourceNotFound) was not found" >&2; return 3 ;;\n'
+        # The UI lookup is denied, not a not-found result.
+        '    "containerapp show"*)\n'
+        '      echo "ERROR: (AuthorizationFailed) access denied" >&2; return 1 ;;\n'
+        "    *) return 0 ;;\n"
+        "  esac\n"
+        "}\n"
+    )
+    script = (
+        f"export AZURE_RESOURCE_GROUP=rg GITHUB_RUN_ID=1 GITHUB_RUN_ATTEMPT=1 "
+        f"RUNNER_TEMP='{tmp_path}' GITHUB_STEP_SUMMARY='{tmp_path / 'summary'}'\n"
+        f"{fake}{body}\n"
+    )
+    result = subprocess.run(
+        [str(BASH), "-c", script],
+        env={**os.environ},
+        capture_output=True,
+        cwd=str(ROOT),
+    )
+    assert result.returncode != 0
+    assert "indeterminate" in result.stderr.decode()
+
+
+@pytest.mark.skipif(BASH is None, reason="bash is required for the containment test")
+def test_containment_cancels_outstanding_public_deployment(tmp_path: Path) -> None:
+    """F5 executable: an in-flight rollout deployment is cancelled before contain."""
+    body = _containment_body()
+    cancel_log = tmp_path / "cancelled"
+    state_file = tmp_path / "state"
+    fake = (
+        "sleep() { return 0; }\n"
+        "az() {\n"
+        f'  local state_file="{state_file}"\n'
+        '  case "$*" in\n'
+        '    "deployment group show"*)\n'
+        '      if [ -f "$state_file" ]; then echo Canceled; else echo Running; fi ;;\n'
+        '    "deployment group cancel"*)\n'
+        f'      touch "{cancel_log}"; touch "$state_file"; return 0 ;;\n'
+        '    "containerapp show"*ingress.external*) echo false ;;\n'
+        '    "containerapp show"*) return 0 ;;\n'
+        '    "containerapp ingress update"*) return 0 ;;\n'
+        "    *) return 0 ;;\n"
+        "  esac\n"
+        "}\n"
+    )
+    script = (
+        f"export AZURE_RESOURCE_GROUP=rg GITHUB_RUN_ID=1 GITHUB_RUN_ATTEMPT=1 "
+        f"RUNNER_TEMP='{tmp_path}' GITHUB_STEP_SUMMARY='{tmp_path / 'summary'}'\n"
+        f"{fake}{body}\n"
+    )
+    result = subprocess.run(
+        [str(BASH), "-c", script],
+        env={**os.environ},
+        capture_output=True,
+        cwd=str(ROOT),
+    )
+    assert result.returncode == 0, result.stderr.decode()
+    assert cancel_log.exists()

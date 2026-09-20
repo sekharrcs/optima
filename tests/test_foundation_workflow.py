@@ -1324,37 +1324,40 @@ def test_production_rejects_active_foundation_deployments_at_both_scopes() -> No
         index
         for index, step in enumerate(steps)
         if step.get("name")
-        == "Reject interrupted foundation deployments before mutation"
+        == "Require a deployed foundation and reject interrupted deployments"
     )
-    foundation_index = next(
+    freshness_index = next(
         index
         for index, step in enumerate(steps)
-        if step.get("name") == "What-if and converge the Azure foundation"
+        if step.get("name")
+        == "Reverify authorization immediately before foundation mutation"
+    )
+    mutation_index = next(
+        index
+        for index, step in enumerate(steps)
+        if step.get("name") == "Deploy the exactly authorized runtime foundation"
     )
     guard = steps[guard_index]["run"]
 
-    assert guard_index < foundation_index
+    assert guard_index < freshness_index < mutation_index
     assert "az deployment sub list" in guard
     assert "az deployment group list" in guard
     assert "az group exists" in guard
     assert 'case "$group_exists" in' in guard
     assert "true)" in guard
-    assert "false) ;;" in guard
+    assert "Production requires a successfully deployed foundation" in guard
     assert "Resource-group existence returned invalid evidence" in guard
-    assert "az group show" not in guard
+    assert "properties.provisioningState=='Succeeded'" in guard
     for terminal_state in ("Succeeded", "Failed", "Canceled", "Deleted"):
         assert f"properties.provisioningState!='{terminal_state}'" in guard
     assert 'test -n "$subscription_active" || test -n "$group_active"' in guard
 
-    foundation = steps[foundation_index]["run"]
-    assert foundation.count("az group exists") == 1
-    assert foundation.count("az deployment sub list") == 1
-    assert foundation.count("az deployment group list") == 1
-    assert 'case "$group_exists" in' in foundation
-    assert 'test -z "$subscription_active"' in foundation
-    assert 'test -z "$group_active"' in foundation
-    assert 'if test "$group_exists" = "true"; then' in foundation
-    assert "az group show" not in foundation
+    freshness = steps[freshness_index]["run"]
+    assert freshness.count("az deployment sub list") == 1
+    assert freshness.count("az deployment group list") == 1
+    assert 'test -z "$subscription_active"' in freshness
+    assert 'test -z "$group_active"' in freshness
+    assert "az deployment sub create" not in freshness
 
 
 def test_no_run_block_interpolates_untrusted_inputs_or_secrets() -> None:

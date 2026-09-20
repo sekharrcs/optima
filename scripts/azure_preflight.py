@@ -21,9 +21,10 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 from urllib.parse import parse_qs, urljoin, urlparse
 
 if TYPE_CHECKING or __package__:
-    from scripts import oidc_federation
+    from scripts import oidc_federation, whatif_classification
 else:
     import oidc_federation
+    import whatif_classification
 
 EXIT_SUCCESS = 0
 EXIT_FAILURE = 1
@@ -31,11 +32,27 @@ PREFLIGHT_PHASES = (
     "foundation-plan",
     "foundation-apply",
     "foundation",
+    "production-session",
+    "production-foundation",
     "publish",
     "artifacts",
     "rollout",
 )
-RUNTIME_COMPOSITION_PHASES = frozenset({"publish", "artifacts", "rollout"})
+RUNTIME_COMPOSITION_PHASES = frozenset(
+    {"production-foundation", "publish", "artifacts", "rollout"}
+)
+# Phases whose exact deployer role contract binds AcrPush to the approved ACR;
+# these must load the registry identity even without runtime composition.
+ACR_ROLE_IDENTITY_PHASES = frozenset(
+    {"production-foundation", "publish", "artifacts", "rollout"}
+)
+# Phases that must re-verify the exact bootstrapped runtime access (AcrPull for
+# both identities, container-scoped Cosmos data contribution, and the reviewed
+# Redis policy when the cache is enabled) before the mutation they authorize.
+# production-foundation runs before the first foundation create and publish runs
+# before the image push, so both gate their mutation on live runtime access;
+# rollout re-verifies it a third time as defense in depth before Container Apps.
+RUNTIME_ACCESS_PHASES = frozenset({"production-foundation", "publish", "rollout"})
 EXPECTED_LOCATION = "eastus2"
 EXPECTED_ENVIRONMENT = "hackathon"
 EXPECTED_REPOSITORY = "sekharrcs/optima"
@@ -49,6 +66,27 @@ REDIS_MAX_RESPONSE_PAGES = 32
 REDIS_ARM_HOST = "management.azure.com"
 MICROSOFT_GRAPH_HOST = "graph.microsoft.com"
 MAX_TRANSITIVE_GROUPS = 999
+MAX_GRAPH_APP_ROLE_ASSIGNMENTS = 999
+# Microsoft Graph first-party application (appId) and the exact application
+# permission the deployment identities require to read directory evidence.
+MICROSOFT_GRAPH_APP_ID = "00000003-0000-0000-c000-000000000000"
+GRAPH_APPLICATION_READ_ALL_ROLE_ID = "9a5d68dd-52b0-4cc2-bd40-abcf44ac3a30"
+# Casefolded ARM resource type of an Azure Container Registry, used to bind the
+# approved registry from live inventory instead of trusting configuration alone.
+ACR_REGISTRY_RESOURCE_TYPE = "microsoft.containerregistry/registries"
+# An Azure Container Registry name is exactly 5-50 ASCII alphanumeric characters.
+ACR_NAME_PATTERN = re.compile(r"[A-Za-z0-9]{5,50}")
+# Exact, case-insensitive placeholder registry names that satisfy the ACR
+# grammar but must never bind a live registry.
+ACR_PLACEHOLDER_NAMES = frozenset(
+    {"example", "placeholder", "changeme", "replace_me", "todo"}
+)
+# The closed foundation deployment profile whose ARM-evaluated what-if the
+# fail-closed classifier approves. The production-foundation registry identity
+# is derived from that classified evidence, never from configuration alone.
+FOUNDATION_TEMPLATE_FILE = "infra/resource-group.bicep"
+FOUNDATION_PARAMETER_FILE = "infra/environments/hackathon.runtime.bicepparam"
+CONTAINER_REGISTRY_RESOURCE_ROLE = "container_registry"
 ACR_PUSH_ROLE_ID = "8311e382-0749-4cb8-b61a-304f252e45ec"
 ACR_PULL_ROLE_ID = "7f951dda-4ed3-4680-a7ca-43fe172d538d"
 CONTRIBUTOR_ROLE_ID = "b24988ac-6180-42a0-ab88-20f7382dd24c"
@@ -508,6 +546,43 @@ def _load_pricing(
     )
 
 
+def _validated_registry_name(value: str) -> str:
+    """Return ``value`` when it is a syntactically valid ACR name.
+
+    Azure Container Registry names are exactly 5-50 ASCII alphanumeric
+    characters. Malformed names such as ``bad_name`` must fail configuration
+    load rather than reaching generic ARM-segment validation deeper in the
+    preflight. The original value is returned unchanged so the canonical
+    inventory binding, not this validator, performs case-insensitive matching.
+    """
+    if ACR_NAME_PATTERN.fullmatch(value) is None:
+        raise PreflightError(
+            "AZURE_CONTAINER_REGISTRY_NAME must be 5-50 ASCII alphanumeric characters"
+        )
+    return value
+
+
+def _required_raw_registry_name(environment: Mapping[str, str], name: str) -> str:
+    """Validate the raw registry name before any trimming or normalization.
+
+    The generic ``_required`` helper strips surrounding whitespace, which would
+    silently accept a padded value. The Azure Container Registry name must be
+    exactly 5-50 ASCII alphanumeric characters with no surrounding or internal
+    whitespace, and it must not be a recognized placeholder. A narrowly scoped
+    loader keeps the strict raw contract off the global configuration helper.
+    """
+    raw = environment.get(name)
+    if raw is None or raw == "":
+        raise PreflightError(f"Required deployment setting {name} is missing")
+    if raw != raw.strip() or any(character.isspace() for character in raw):
+        raise PreflightError(f"Deployment setting {name} contains whitespace")
+    if ACR_NAME_PATTERN.fullmatch(raw) is None:
+        raise PreflightError(f"{name} must be 5-50 ASCII alphanumeric characters")
+    if raw.casefold() in ACR_PLACEHOLDER_NAMES:
+        raise PreflightError(f"Deployment setting {name} is a placeholder")
+    return raw
+
+
 def load_configuration(
     environment: Mapping[str, str], *, phase: str = "rollout"
 ) -> DeploymentConfiguration:
@@ -526,21 +601,26 @@ def load_configuration(
     )
     foundation_plan = phase == "foundation-plan"
     separated_foundation_apply = phase == "foundation-apply"
+    session_only = phase == "production-session"
     if foundation_plan and semantic_cache_enabled:
         raise PreflightError("foundation-plan does not support enabled semantic cache")
-    runtime_composition = phase in RUNTIME_COMPOSITION_PHASES or semantic_cache_enabled
+    runtime_composition = not session_only and (
+        phase in RUNTIME_COMPOSITION_PHASES or semantic_cache_enabled
+    )
+    # ACR identity loads for its exact role contract without runtime composition.
+    requires_registry_identity = phase in ACR_ROLE_IDENTITY_PHASES
     supplied_cache_settings = sorted(
         name
         for name in PREFLIGHT_CACHE_ONLY_SETTINGS
         if environment.get(name, "").strip()
     )
-    if not semantic_cache_enabled and supplied_cache_settings:
+    if not session_only and not semantic_cache_enabled and supplied_cache_settings:
         raise PreflightError(
             "Disabled semantic cache cannot configure cache-only deployment "
             f"settings: {', '.join(supplied_cache_settings)}"
         )
     embedding_dimension: int | None = None
-    if semantic_cache_enabled:
+    if semantic_cache_enabled and not session_only:
         try:
             embedding_dimension = int(
                 _required(environment, "OPTIMA_REDIS_EMBEDDING_DIMENSION")
@@ -619,8 +699,8 @@ def load_configuration(
         resource_group=_required(environment, "AZURE_RESOURCE_GROUP"),
         location=_required(environment, "AZURE_LOCATION"),
         registry_name=(
-            _required(environment, "AZURE_CONTAINER_REGISTRY_NAME")
-            if runtime_composition
+            _required_raw_registry_name(environment, "AZURE_CONTAINER_REGISTRY_NAME")
+            if runtime_composition or requires_registry_identity
             else None
         ),
         openai_resource_id=(
@@ -923,6 +1003,29 @@ def _canonical_guid(value: object, *, label: str) -> str:
     ):
         raise PreflightError(f"{label} is not a canonical GUID")
     return normalized
+
+
+def _canonical_graph_assignment_id(value: object) -> str:
+    """Return one canonical bounded Microsoft Graph assignment identifier."""
+    if (
+        not isinstance(value, str)
+        or re.fullmatch(r"[A-Za-z0-9_-]{20,128}", value) is None
+    ):
+        raise PreflightError("Microsoft Graph app role assignment ID is malformed")
+    try:
+        decoded = base64.b64decode(
+            value + ("=" * (-len(value) % 4)),
+            altchars=b"-_",
+            validate=True,
+        )
+    except binascii.Error as error:
+        raise PreflightError(
+            "Microsoft Graph app role assignment ID is malformed"
+        ) from error
+    canonical = base64.urlsafe_b64encode(decoded).decode("ascii").rstrip("=")
+    if not 16 <= len(decoded) <= 64 or canonical != value:
+        raise PreflightError("Microsoft Graph app role assignment ID is malformed")
+    return value
 
 
 def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -1508,13 +1611,556 @@ def _check_foundation_plan_role_definition(
         )
 
 
+def _resolve_graph_service_principal(azure: AzureQuery) -> tuple[str, frozenset[str]]:
+    """Return the Microsoft Graph service-principal ID and enabled app roles.
+
+    The resource identity for every Graph application permission must be the
+    Microsoft Graph first-party service principal. The returned app-role set is
+    limited to enabled application-membership roles so a granted permission can
+    be proven to be a real, enabled application permission.
+    """
+    document = azure.json(
+        "rest",
+        "--method",
+        "get",
+        "--url",
+        (
+            f"https://{MICROSOFT_GRAPH_HOST}/v1.0/servicePrincipals(appId="
+            f"'{MICROSOFT_GRAPH_APP_ID}')?$select=id,appId,appRoles"
+        ),
+        "--resource",
+        "https://graph.microsoft.com/",
+    )
+    if not isinstance(document, dict) or set(document) - {
+        "@odata.context",
+        "id",
+        "appId",
+        "appRoles",
+    }:
+        raise PreflightError("Microsoft Graph service principal is malformed")
+    if document.get("appId") != MICROSOFT_GRAPH_APP_ID:
+        raise PreflightError("Resolved Microsoft Graph service principal is unexpected")
+    graph_principal_id = _canonical_guid(
+        document.get("id"),
+        label="Microsoft Graph service principal ID",
+    )
+    app_roles = document.get("appRoles")
+    if not isinstance(app_roles, list):
+        raise PreflightError("Microsoft Graph application roles are malformed")
+    enabled_application_roles: set[str] = set()
+    for app_role in app_roles:
+        if not isinstance(app_role, dict):
+            raise PreflightError("Microsoft Graph application roles are malformed")
+        member_types = app_role.get("allowedMemberTypes")
+        if not isinstance(member_types, list) or any(
+            not isinstance(member_type, str) for member_type in member_types
+        ):
+            raise PreflightError("Microsoft Graph application roles are malformed")
+        if app_role.get("isEnabled") is True and "Application" in member_types:
+            enabled_application_roles.add(
+                _canonical_guid(
+                    app_role.get("id"),
+                    label="Microsoft Graph application role ID",
+                )
+            )
+    return graph_principal_id, frozenset(enabled_application_roles)
+
+
+def _check_graph_application_permissions(
+    azure: AzureQuery, *, principal_id: str
+) -> None:
+    """Verify the identity holds exactly Application.Read.All on Microsoft Graph.
+
+    Proving Graph access indirectly is insufficient: the executing deployment
+    identity must carry exactly one Microsoft Graph application permission and
+    it must be the approved Application.Read.All app role, granted on the real
+    Graph service principal. Additional Graph application permissions such as
+    Directory.Read.All or Application.ReadWrite.All are rejected. Non-Graph
+    enterprise-application assignments are outside this check.
+    """
+    graph_principal_id, enabled_application_roles = _resolve_graph_service_principal(
+        azure
+    )
+    document = azure.json(
+        "rest",
+        "--method",
+        "get",
+        "--url",
+        (
+            f"https://{MICROSOFT_GRAPH_HOST}/v1.0/servicePrincipals/"
+            f"{principal_id}/appRoleAssignments"
+            "?$select=id,appRoleId,principalId,resourceId&$top=999&$count=true"
+        ),
+        "--headers",
+        "ConsistencyLevel=eventual",
+        "Accept=application/json;odata.metadata=full",
+        "--resource",
+        "https://graph.microsoft.com/",
+    )
+    if not isinstance(document, dict) or set(document) - {
+        "@odata.count",
+        "@odata.context",
+        "@odata.nextLink",
+        "value",
+    }:
+        raise PreflightError("Microsoft Graph app role assignments are malformed")
+    if document.get("@odata.nextLink") not in (None, ""):
+        raise PreflightError("Microsoft Graph app role assignments exceed the limit")
+    values = document.get("value")
+    count = document.get("@odata.count")
+    if (
+        not isinstance(values, list)
+        or len(values) > MAX_GRAPH_APP_ROLE_ASSIGNMENTS
+        or not isinstance(count, int)
+        or isinstance(count, bool)
+        or count != len(values)
+    ):
+        raise PreflightError("Microsoft Graph app role assignments are malformed")
+    graph_role_ids: list[str] = []
+    assignment_ids: set[str] = set()
+    for value in values:
+        required_fields = {
+            "@odata.type",
+            "id",
+            "appRoleId",
+            "principalId",
+            "resourceId",
+        }
+        allowed_fields = required_fields | {
+            "@odata.editLink",
+            "@odata.id",
+            "appRoleId@odata.type",
+            "principalId@odata.type",
+            "resourceId@odata.type",
+        }
+        if (
+            not isinstance(value, dict)
+            or not required_fields <= set(value) <= allowed_fields
+            or value.get("@odata.type") != "#microsoft.graph.appRoleAssignment"
+        ):
+            raise PreflightError("Microsoft Graph app role assignment is malformed")
+        # Validate every structural field before deciding whether the assignment
+        # targets Microsoft Graph. A malformed unrelated assignment must fail
+        # closed rather than be silently filtered out of the equality check.
+        resource_id = _canonical_guid(
+            value.get("resourceId"),
+            label="Microsoft Graph app role assignment resource",
+        )
+        assigned_principal_id = _canonical_guid(
+            value.get("principalId"),
+            label="Microsoft Graph app role assignment principal",
+        )
+        assigned_role_id = _canonical_guid(
+            value.get("appRoleId"),
+            label="Microsoft Graph app role ID",
+        )
+        assignment_id = _canonical_graph_assignment_id(value.get("id"))
+        if assignment_id in assignment_ids:
+            raise PreflightError(
+                "Microsoft Graph app role assignments contain duplicate IDs"
+            )
+        assignment_ids.add(assignment_id)
+        for annotation in (
+            "appRoleId@odata.type",
+            "principalId@odata.type",
+            "resourceId@odata.type",
+        ):
+            if annotation in value and value[annotation] != "#Guid":
+                raise PreflightError("Microsoft Graph app role assignment is malformed")
+        for link in ("@odata.id", "@odata.editLink"):
+            if link in value and (not isinstance(value[link], str) or not value[link]):
+                raise PreflightError("Microsoft Graph app role assignment is malformed")
+        if assigned_principal_id != principal_id:
+            raise PreflightError(
+                "Microsoft Graph app role assignment targets another principal"
+            )
+        if resource_id != graph_principal_id:
+            # A structurally valid enterprise-application permission on another
+            # resource is outside the Microsoft Graph application-permission
+            # contract and is ignored only after full validation.
+            continue
+        graph_role_ids.append(assigned_role_id)
+    if len(graph_role_ids) != 1:
+        raise PreflightError(
+            "OIDC deployment identity must have exactly the Application.Read.All "
+            "Microsoft Graph permission"
+        )
+    if graph_role_ids[0] != GRAPH_APPLICATION_READ_ALL_ROLE_ID:
+        raise PreflightError(
+            "OIDC deployment identity Microsoft Graph permission is not "
+            "Application.Read.All"
+        )
+    if GRAPH_APPLICATION_READ_ALL_ROLE_ID not in enabled_application_roles:
+        raise PreflightError(
+            "Application.Read.All is not an enabled Microsoft Graph application "
+            "permission"
+        )
+
+
+def _validate_effective_production_parameters(
+    configuration: DeploymentConfiguration,
+    parameters: Mapping[str, Any],
+    *,
+    expected_commit_sha: str,
+) -> None:
+    """Bind the effective ARM parameters to the protected runtime configuration."""
+    models = {binding.role: binding for binding in configuration.models}
+    pricing = configuration.pricing
+    if (
+        configuration.ui_auth_client_id is None
+        or configuration.ui_auth_tenant_id is None
+        or configuration.foundry_base_url is None
+        or pricing is None
+        or set(models) < {"SMALL", "STRONG", "JUDGE"}
+    ):
+        raise PreflightError(
+            "Production-foundation runtime configuration is incomplete"
+        )
+    expected: dict[str, Any] = {
+        "deploymentCommitSha": expected_commit_sha,
+        "deployContainerApps": False,
+        "deployRuntimeAccess": False,
+        "environmentName": EXPECTED_ENVIRONMENT,
+        "exposePublicUi": False,
+        "foundryBaseUrl": configuration.foundry_base_url,
+        "foundrySmallDeployment": models["SMALL"].deployment,
+        "foundrySmallModel": models["SMALL"].model,
+        "foundrySmallModelVersion": models["SMALL"].version,
+        "foundryStrongDeployment": models["STRONG"].deployment,
+        "foundryStrongModel": models["STRONG"].model,
+        "foundryStrongModelVersion": models["STRONG"].version,
+        "judgeDeployment": models["JUDGE"].deployment,
+        "judgeModel": models["JUDGE"].model,
+        "judgeModelVersion": models["JUDGE"].version,
+        "location": configuration.location,
+        "pricingCatalogVersion": pricing.catalog_version,
+        "pricingCurrency": pricing.currency,
+        "pricingJudgeCachedInputRatePerMillionTokens": (
+            str(pricing.judge_cached_input)
+            if pricing.judge_cached_input is not None
+            else None
+        ),
+        "pricingJudgeInputRatePerMillionTokens": str(pricing.judge_input),
+        "pricingJudgeOutputRatePerMillionTokens": str(pricing.judge_output),
+        "pricingSmallCachedInputRatePerMillionTokens": (
+            str(pricing.small_cached_input)
+            if pricing.small_cached_input is not None
+            else None
+        ),
+        "pricingSmallInputRatePerMillionTokens": str(pricing.small_input),
+        "pricingSmallOutputRatePerMillionTokens": str(pricing.small_output),
+        "pricingStrongCachedInputRatePerMillionTokens": (
+            str(pricing.strong_cached_input)
+            if pricing.strong_cached_input is not None
+            else None
+        ),
+        "pricingStrongInputRatePerMillionTokens": str(pricing.strong_input),
+        "pricingStrongOutputRatePerMillionTokens": str(pricing.strong_output),
+        "productionEvaluatorMode": "LLM_JUDGE",
+        "semanticCacheEnabled": configuration.semantic_cache_enabled,
+        "uiAuthClientId": configuration.ui_auth_client_id,
+        "uiAuthTenantId": configuration.ui_auth_tenant_id,
+    }
+    if configuration.semantic_cache_enabled:
+        embedding = models.get("EMBEDDING")
+        if (
+            embedding is None
+            or configuration.embedding_dimension is None
+            or pricing.embedding_input is None
+        ):
+            raise PreflightError(
+                "Enabled semantic cache runtime parameters are incomplete"
+            )
+        expected.update(
+            {
+                "pricingEmbeddingInputRatePerMillionTokens": str(
+                    pricing.embedding_input
+                ),
+                "redisEmbeddingDeployment": embedding.deployment,
+                "redisEmbeddingDimension": configuration.embedding_dimension,
+                "redisEmbeddingModel": embedding.model,
+            }
+        )
+    if any(parameters.get(name) != value for name, value in expected.items()):
+        raise PreflightError(
+            "Effective runtime parameters do not match protected configuration"
+        )
+    workflow_run_id = parameters.get("deploymentWorkflowRunId")
+    if (
+        not isinstance(workflow_run_id, str)
+        or re.fullmatch(r"[1-9][0-9]{0,19}-[1-9][0-9]{0,19}", workflow_run_id) is None
+    ):
+        raise PreflightError("Effective runtime workflow identity is malformed")
+
+
+def _require_converged_foundation(
+    evidence: Mapping[str, Any], *, semantic_cache_enabled: bool
+) -> None:
+    """Fail closed unless classified evidence proves an applied, converged foundation.
+
+    Production requires an already applied foundation. An ARM deployment that
+    merely reports ``Succeeded`` is never sufficient on its own: the fresh,
+    source-bound what-if reconstruction must show zero effective Creates and the
+    exact managed resource count as NoChange, with no unapproved residual
+    change. Evidence describing resource creation -- an unapplied foundation --
+    is rejected here so a bare Succeeded deployment name cannot authorize
+    production mutation. Delete, replacement, unapproved Modify, unexpected
+    resource types, the exact provider-echo normalizations, the LAW NoEffect
+    exception, and the policy-bound external observation count are all already
+    enforced by the fail-closed classifier that produced this evidence.
+    """
+    expected_nochange = (
+        whatif_classification._CACHE_MANAGED_FOUNDATION_RESOURCE_COUNT
+        if semantic_cache_enabled
+        else whatif_classification._BASE_MANAGED_FOUNDATION_RESOURCE_COUNT
+    )
+    counts = evidence["changes"]["counts"]
+    if counts.get("Create", 0) != 0:
+        raise PreflightError(
+            "Production requires a converged foundation; classified evidence still "
+            "reports resource creation"
+        )
+    if counts.get("NoChange", 0) != expected_nochange:
+        raise PreflightError(
+            "Classified foundation evidence does not report the exact converged "
+            "managed resource count"
+        )
+    residual = evidence["normalizations"]["residual_unapproved_change_count"]
+    if not isinstance(residual, int) or isinstance(residual, bool) or residual != 0:
+        raise PreflightError(
+            "Classified foundation evidence reports unapproved residual changes"
+        )
+
+
+def _resolve_repository_registry_identity(
+    configuration: DeploymentConfiguration,
+    *,
+    classified_evidence: Path | None,
+    classified_evidence_sha256: str | None,
+    raw_whatif: Path | None,
+    raw_whatif_sha256: str | None,
+    effective_parameters: Path | None,
+    effective_parameters_sha256: str | None,
+    expected_commit_sha: str | None,
+    repository_root: Path,
+) -> str:
+    """Recompute evidence and return its ARM-evaluated registry identity.
+
+    The repository/Bicep-derived registry identity is the single
+    ``container_registry`` fact emitted by the fail-closed classifier over a
+    fresh, source-bound foundation what-if. ARM evaluates the exact reviewed
+    ``uniqueString(subscription, environment)`` expression, so this identity is
+    independent of the mutable configured name, live inventory, and the AcrPush
+    scope. Every binding field -- schema, classification, commit SHA,
+    deployment mode, target scope, source fingerprint, parameter fingerprint,
+    convergence-policy fingerprint, external-policy fingerprint, residual
+    change count, and resource cardinality -- is re-derived here and compared
+    before the ACR fact is trusted. A plain command-line registry name is never
+    accepted as proof.
+    """
+    if (
+        classified_evidence is None
+        or classified_evidence_sha256 is None
+        or raw_whatif is None
+        or raw_whatif_sha256 is None
+        or effective_parameters is None
+        or effective_parameters_sha256 is None
+        or expected_commit_sha is None
+    ):
+        raise PreflightError(
+            "Production-foundation preflight requires complete foundation evidence"
+        )
+    try:
+        evidence_bytes = whatif_classification.read_regular_file(
+            classified_evidence,
+            maximum_bytes=whatif_classification.MAX_EFFECTIVE_PARAMETER_FILE_BYTES,
+            expected_sha256=classified_evidence_sha256,
+        )
+        evidence_document = whatif_classification._validate_evidence(
+            whatif_classification.parse_strict_json(
+                evidence_bytes,
+                code=whatif_classification.WhatIfClassificationCode.PROMOTION_MISMATCH,
+                label=classified_evidence.name,
+            )
+        )
+        raw_bytes = whatif_classification.read_regular_file(
+            raw_whatif,
+            expected_sha256=raw_whatif_sha256,
+        )
+        raw_document = whatif_classification.parse_strict_json(
+            raw_bytes,
+            code=whatif_classification.WhatIfClassificationCode.MALFORMED_DOCUMENT,
+            label=raw_whatif.name,
+        )
+        parameter_bytes = whatif_classification.read_regular_file(
+            effective_parameters,
+            maximum_bytes=whatif_classification.MAX_EFFECTIVE_PARAMETER_FILE_BYTES,
+            expected_sha256=effective_parameters_sha256,
+        )
+        parameters = whatif_classification.parse_foundation_parameters(
+            parameter_bytes,
+            label=effective_parameters.name,
+            template_file=FOUNDATION_TEMPLATE_FILE,
+            parameter_source_file=FOUNDATION_PARAMETER_FILE,
+            resource_group=configuration.resource_group,
+        )
+        _validate_effective_production_parameters(
+            configuration,
+            parameters,
+            expected_commit_sha=expected_commit_sha,
+        )
+        external_policy = whatif_classification._external_policy_from_environment(
+            whatif_classification.EXTERNAL_POLICY_ENV
+        )
+        recomputed = whatif_classification.build_evidence_from_whatif(
+            raw_document,
+            parameters=parameters,
+            source_root=repository_root,
+            subscription_id=configuration.subscription_id,
+            resource_group=configuration.resource_group,
+            commit_sha=expected_commit_sha,
+            deployment_mode="Incremental",
+            external_policy=external_policy,
+        )
+    except (
+        OSError,
+        ValueError,
+        whatif_classification.WhatIfClassificationError,
+    ) as error:
+        raise PreflightError(
+            "Foundation authorization artifacts are missing, changed, or malformed"
+        ) from error
+    canonical_recomputed = whatif_classification.serialize_evidence(recomputed)
+    if evidence_document != recomputed or evidence_bytes != canonical_recomputed:
+        raise PreflightError(
+            "Classified foundation evidence differs from raw what-if reconstruction"
+        )
+    _require_converged_foundation(
+        recomputed, semantic_cache_enabled=configuration.semantic_cache_enabled
+    )
+    registry_facts = [
+        fact
+        for fact in recomputed["changes"]["resources"]
+        if fact["resource_role"] == CONTAINER_REGISTRY_RESOURCE_ROLE
+    ]
+    if len(registry_facts) != 1:
+        raise PreflightError(
+            "Classified foundation evidence must contain exactly one container "
+            "registry fact"
+        )
+    registry_fact = registry_facts[0]
+    if registry_fact["resource_type"] != ACR_REGISTRY_RESOURCE_TYPE:
+        raise PreflightError(
+            "Classified foundation registry fact has an unexpected resource type"
+        )
+    registry_name = registry_fact["resource_name"]
+    if (
+        not isinstance(registry_name, str)
+        or ACR_NAME_PATTERN.fullmatch(registry_name) is None
+    ):
+        raise PreflightError("Classified foundation registry name is malformed")
+    return registry_name
+
+
+def _resolve_approved_registry_scope(
+    configuration: DeploymentConfiguration,
+    azure: AzureQuery,
+    *,
+    resource_group_scope: str,
+    expected_registry_name: str,
+) -> str:
+    """Return the canonical AcrPush scope agreed by all four trusted sources.
+
+    ``expected_registry_name`` is the repository/Bicep-derived identity from the
+    fail-closed classifier over a fresh ARM-evaluated foundation what-if. The
+    configured name, the single live Container Registry in the approved resource
+    group, and the returned AcrPush scope must all agree canonically with that
+    identity. Because the trusted name is never derived from configuration, live
+    inventory, or the role assignment, a self-consistent alternate registry
+    across those three sources still fails closed.
+    """
+    if configuration.registry_name is None:
+        raise PreflightError("Container registry name is unavailable")
+    validated_name = _validated_registry_name(configuration.registry_name)
+    if validated_name.casefold() != expected_registry_name.casefold():
+        raise PreflightError(
+            "Configured container registry does not match the repository-derived "
+            "registry identity"
+        )
+    registries = azure.json(
+        "acr",
+        "list",
+        "--resource-group",
+        configuration.resource_group,
+    )
+    if not isinstance(registries, list):
+        raise PreflightError("Azure Container Registry inventory response is malformed")
+    typed_registries = [
+        registry for registry in registries if isinstance(registry, dict)
+    ]
+    if len(typed_registries) != len(registries):
+        raise PreflightError("Azure Container Registry inventory response is malformed")
+    container_registries = [
+        registry
+        for registry in typed_registries
+        if str(registry.get("type", "")).casefold() == ACR_REGISTRY_RESOURCE_TYPE
+    ]
+    if len(container_registries) != len(typed_registries):
+        raise PreflightError(
+            "Azure Container Registry inventory contains a non-registry resource"
+        )
+    if len(container_registries) != 1:
+        raise PreflightError(
+            "OPTIMA resource group must contain exactly one Azure Container Registry"
+        )
+    registry = container_registries[0]
+    provisioning_state = registry.get("provisioningState")
+    if (
+        not isinstance(provisioning_state, str)
+        or provisioning_state.casefold() != "succeeded"
+    ):
+        raise PreflightError(
+            "Approved Azure Container Registry is not fully provisioned"
+        )
+    live_name = registry.get("name")
+    if not isinstance(live_name, str) or ACR_NAME_PATTERN.fullmatch(live_name) is None:
+        raise PreflightError("Approved Azure Container Registry name is malformed")
+    if live_name.casefold() != expected_registry_name.casefold():
+        raise PreflightError(
+            "Approved live container registry does not match the repository-derived "
+            "registry identity"
+        )
+    expected_scope = _canonical_arm_scope(
+        f"{resource_group_scope}/providers/Microsoft.ContainerRegistry/"
+        f"registries/{expected_registry_name}"
+    )
+    if not expected_scope.startswith(f"{resource_group_scope}/"):
+        raise PreflightError("Approved Azure Container Registry scope is malformed")
+    live_scope = _canonical_arm_scope(registry.get("id"))
+    if live_scope != expected_scope:
+        raise PreflightError(
+            "Approved Azure Container Registry resource ID does not match the "
+            "managed identity"
+        )
+    return live_scope
+
+
 def _check_deployment_role_allowlist(
     configuration: DeploymentConfiguration,
     azure: AzureQuery,
     *,
     phase: str,
     principal_id: str,
+    repository_root: Path,
+    classified_evidence: Path | None,
+    classified_evidence_sha256: str | None,
+    raw_whatif: Path | None,
+    raw_whatif_sha256: str | None,
+    effective_parameters: Path | None,
+    effective_parameters_sha256: str | None,
+    expected_commit_sha: str | None,
 ) -> None:
+    _check_graph_application_permissions(azure, principal_id=principal_id)
     _reject_transitive_group_roles(
         configuration,
         azure,
@@ -1563,12 +2209,29 @@ def _check_deployment_role_allowlist(
                 EffectiveRoleAssignment(READER_ROLE_ID, subscription_scope),
                 EffectiveRoleAssignment(CONTRIBUTOR_ROLE_ID, resource_group_scope),
             }
-    else:
-        if configuration.registry_name is None:
-            raise PreflightError("Container registry name is unavailable")
-        registry_scope = _canonical_arm_scope(
-            f"{resource_group_scope}/providers/Microsoft.ContainerRegistry/"
-            f"registries/{configuration.registry_name}"
+    elif phase in {"production-foundation", "publish", "artifacts", "rollout"}:
+        # production-foundation and the runtime-composition phases require the
+        # exact three-role deployer contract. AcrPush binds to the registry
+        # identity that the fail-closed classifier derived from a fresh,
+        # ARM-evaluated foundation what-if, cross-agreed with configuration,
+        # live inventory, and the AcrPush scope -- never the configured name,
+        # inventory, or role assignment alone.
+        expected_registry_name = _resolve_repository_registry_identity(
+            configuration,
+            classified_evidence=classified_evidence,
+            classified_evidence_sha256=classified_evidence_sha256,
+            raw_whatif=raw_whatif,
+            raw_whatif_sha256=raw_whatif_sha256,
+            effective_parameters=effective_parameters,
+            effective_parameters_sha256=effective_parameters_sha256,
+            expected_commit_sha=expected_commit_sha,
+            repository_root=repository_root,
+        )
+        registry_scope = _resolve_approved_registry_scope(
+            configuration,
+            azure,
+            resource_group_scope=resource_group_scope,
+            expected_registry_name=expected_registry_name,
         )
         expected = {
             EffectiveRoleAssignment(READER_ROLE_ID, subscription_scope),
@@ -1579,6 +2242,8 @@ def _check_deployment_role_allowlist(
             raise PreflightError(
                 "OIDC deployment identity lacks AcrPush on the OPTIMA registry"
             )
+    else:
+        raise PreflightError(f"Unsupported preflight role phase {phase}")
     if assignments != expected:
         if any(
             assignment.role_definition_id in FORBIDDEN_DEPLOYMENT_ROLE_IDS
@@ -1615,6 +2280,15 @@ def _check_oidc_federation(
     *,
     phase: str,
     session_principal_id: str,
+    repository_root: Path,
+    classified_evidence: Path | None,
+    classified_evidence_sha256: str | None,
+    raw_whatif: Path | None,
+    raw_whatif_sha256: str | None,
+    effective_parameters: Path | None,
+    effective_parameters_sha256: str | None,
+    expected_commit_sha: str | None,
+    verify_roles: bool = True,
 ) -> None:
     resource_group, identity_name, configured_identity_id = _identity_parts(
         configuration.deployment_identity_resource_id,
@@ -1673,11 +2347,21 @@ def _check_oidc_federation(
         raise PreflightError(
             "GitHub environment federated credential is missing or mismatched"
         ) from error
+    if not verify_roles:
+        return
     _check_deployment_role_allowlist(
         configuration,
         azure,
         phase=phase,
         principal_id=identity_principal_id,
+        repository_root=repository_root,
+        classified_evidence=classified_evidence,
+        classified_evidence_sha256=classified_evidence_sha256,
+        raw_whatif=raw_whatif,
+        raw_whatif_sha256=raw_whatif_sha256,
+        effective_parameters=effective_parameters,
+        effective_parameters_sha256=effective_parameters_sha256,
+        expected_commit_sha=expected_commit_sha,
     )
 
 
@@ -2478,6 +3162,41 @@ def _check_resource_group(
     return typed_resources
 
 
+def _scoped_assignment_role_ids(
+    assignments: object,
+    *,
+    subscription_id: str,
+    expected_scope: str,
+    label: str,
+) -> list[str]:
+    """Parse a scoped role-assignment collection into exact role IDs.
+
+    Every entry must be a well-formed, unconditional assignment at exactly the
+    expected canonical scope. A malformed entry, a conditional grant, or a
+    wrong-scope entry fails closed rather than being filtered away, so the caller
+    can require the complete collection equal the exact approved grant.
+    """
+    if not isinstance(assignments, list):
+        raise PreflightError(f"{label} role assignment response is malformed")
+    role_ids: list[str] = []
+    for assignment in assignments:
+        if not isinstance(assignment, dict):
+            raise PreflightError(f"{label} role assignment response is malformed")
+        if assignment.get("condition") not in (None, ""):
+            raise PreflightError(f"{label} identity has a conditional role assignment")
+        if _canonical_arm_scope(assignment.get("scope")) != expected_scope:
+            raise PreflightError(
+                f"{label} identity has a role assignment at an unexpected scope"
+            )
+        role_ids.append(
+            _role_definition_guid(
+                assignment.get("roleDefinitionId"),
+                subscription_id=subscription_id,
+            )
+        )
+    return role_ids
+
+
 def _check_acr_push(configuration: DeploymentConfiguration, azure: AzureQuery) -> None:
     if configuration.registry_name is None:
         raise PreflightError(
@@ -2514,34 +3233,28 @@ def _check_acr_push(configuration: DeploymentConfiguration, azure: AzureQuery) -
     registry_id = registry.get("id")
     if not isinstance(registry_id, str) or not registry_id:
         raise PreflightError("Azure Container Registry resource ID is unavailable")
-    assignments = azure.json(
-        "role",
-        "assignment",
-        "list",
-        "--assignee-object-id",
-        str(identity["principalId"]),
-        "--scope",
-        registry_id,
-        "--all",
-    )
-    if not isinstance(assignments, list):
-        raise PreflightError("ACR role assignment response is malformed")
     registry_scope = _canonical_arm_scope(registry_id)
-    has_acr_push = False
-    for assignment in assignments:
-        if not isinstance(assignment, dict):
-            raise PreflightError("ACR role assignment response is malformed")
-        has_acr_push = has_acr_push or (
-            _role_definition_guid(
-                assignment.get("roleDefinitionId"),
-                subscription_id=configuration.subscription_id,
-            )
-            == ACR_PUSH_ROLE_ID
-            and _canonical_arm_scope(assignment.get("scope")) == registry_scope
-        )
-    if not has_acr_push:
+    # The deployer's complete registry-scoped grant collection must be exactly
+    # AcrPush: a broader role, a duplicate, a conditional grant, or a wrong-scope
+    # entry fails closed rather than being ignored.
+    role_ids = _scoped_assignment_role_ids(
+        azure.json(
+            "role",
+            "assignment",
+            "list",
+            "--assignee-object-id",
+            str(identity["principalId"]),
+            "--scope",
+            registry_id,
+            "--all",
+        ),
+        subscription_id=configuration.subscription_id,
+        expected_scope=registry_scope,
+        label="ACR",
+    )
+    if sorted(role_ids) != [ACR_PUSH_ROLE_ID]:
         raise PreflightError(
-            "OIDC deployment identity lacks AcrPush on the OPTIMA registry"
+            "OIDC deployment identity must have exactly AcrPush on the OPTIMA registry"
         )
 
 
@@ -2563,35 +3276,29 @@ def _check_foundry_runtime_access(
     )
     if not isinstance(identity, dict) or not identity.get("principalId"):
         raise PreflightError("OPTIMA API managed identity is unavailable")
-    assignments = azure.json(
-        "role",
-        "assignment",
-        "list",
-        "--assignee-object-id",
-        str(identity["principalId"]),
-        "--scope",
-        openai_resource_id,
-        "--all",
-    )
-    if not isinstance(assignments, list):
-        raise PreflightError("Foundry role assignment response is malformed")
     openai_scope = _canonical_arm_scope(openai_resource_id)
-    has_openai_user = False
-    for assignment in assignments:
-        if not isinstance(assignment, dict):
-            raise PreflightError("Foundry role assignment response is malformed")
-        has_openai_user = has_openai_user or (
-            _role_definition_guid(
-                assignment.get("roleDefinitionId"),
-                subscription_id=configuration.subscription_id,
-            )
-            == OPENAI_USER_ROLE_ID
-            and _canonical_arm_scope(assignment.get("scope")) == openai_scope
-        )
-    if not has_openai_user:
+    # The API identity's complete AOAI-scoped grant collection must be exactly
+    # Cognitive Services OpenAI User; a broader, duplicate, conditional, or
+    # wrong-scope grant fails closed.
+    role_ids = _scoped_assignment_role_ids(
+        azure.json(
+            "role",
+            "assignment",
+            "list",
+            "--assignee-object-id",
+            str(identity["principalId"]),
+            "--scope",
+            openai_resource_id,
+            "--all",
+        ),
+        subscription_id=configuration.subscription_id,
+        expected_scope=openai_scope,
+        label="Foundry",
+    )
+    if sorted(role_ids) != [OPENAI_USER_ROLE_ID]:
         raise PreflightError(
-            "OPTIMA API identity lacks Cognitive Services OpenAI User on the "
-            "selected account"
+            "OPTIMA API identity must have exactly Cognitive Services OpenAI User "
+            "on the selected account"
         )
 
 
@@ -2640,6 +3347,7 @@ def _check_runtime_access(
                 f"OPTIMA {component.upper()} managed identity is unavailable"
             )
         principals[component] = str(identity["principalId"])
+    registry_scope = _canonical_arm_scope(str(registry["id"]))
     registry_assignments = azure.json(
         "role",
         "assignment",
@@ -2650,22 +3358,33 @@ def _check_runtime_access(
     )
     if not isinstance(registry_assignments, list):
         raise PreflightError("ACR role assignment response is malformed")
-    for component, principal_id in principals.items():
-        has_acr_pull = False
-        for assignment in registry_assignments:
-            if not isinstance(assignment, dict):
-                raise PreflightError("ACR role assignment response is malformed")
-            has_acr_pull = has_acr_pull or (
-                assignment.get("principalId") == principal_id
-                and _role_definition_guid(
-                    assignment.get("roleDefinitionId"),
-                    subscription_id=configuration.subscription_id,
-                )
-                == ACR_PULL_ROLE_ID
-            )
-        if not has_acr_pull:
+    # Each runtime identity's complete registry-scoped grant collection must be
+    # exactly AcrPull: a broader role, a duplicate, a conditional grant, or a
+    # wrong-scope entry fails closed rather than being ignored.
+    registry_grants: dict[str, list[str]] = {}
+    for assignment in registry_assignments:
+        if not isinstance(assignment, dict):
+            raise PreflightError("ACR role assignment response is malformed")
+        principal = assignment.get("principalId")
+        if not isinstance(principal, str) or not principal:
+            raise PreflightError("ACR role assignment response is malformed")
+        if assignment.get("condition") not in (None, ""):
+            raise PreflightError("ACR identity has a conditional role assignment")
+        if _canonical_arm_scope(assignment.get("scope")) != registry_scope:
             raise PreflightError(
-                f"OPTIMA {component.upper()} identity lacks AcrPull on the registry"
+                "ACR identity has a role assignment at an unexpected scope"
+            )
+        registry_grants.setdefault(principal, []).append(
+            _role_definition_guid(
+                assignment.get("roleDefinitionId"),
+                subscription_id=configuration.subscription_id,
+            )
+        )
+    for component, principal_id in principals.items():
+        if sorted(registry_grants.get(principal_id, [])) != [ACR_PULL_ROLE_ID]:
+            raise PreflightError(
+                f"OPTIMA {component.upper()} identity must have exactly AcrPull "
+                "on the registry"
             )
     cosmos_assignments = azure.json(
         "rest",
@@ -2679,21 +3398,42 @@ def _check_runtime_access(
         if isinstance(cosmos_assignments, dict)
         else None
     )
+    if not isinstance(cosmos_values, list):
+        raise PreflightError("Cosmos data-plane role assignment response is malformed")
     expected_cosmos_scope = f"{cosmos['id']}/dbs/optima/colls/runs".casefold()
     expected_cosmos_role = (
         f"{cosmos['id']}/sqlRoleDefinitions/00000000-0000-0000-0000-000000000002"
     ).casefold()
-    if not isinstance(cosmos_values, list) or not any(
-        isinstance(assignment, dict)
-        and assignment.get("properties", {}).get("principalId") == principals["api"]
-        and str(assignment.get("properties", {}).get("roleDefinitionId", "")).casefold()
-        == expected_cosmos_role
-        and str(assignment.get("properties", {}).get("scope", "")).casefold()
-        == expected_cosmos_scope
-        for assignment in cosmos_values
-    ):
+    # The API identity must hold exactly the approved container-scoped Cosmos
+    # data grant. A broader account or database scope, a wrong role, a duplicate,
+    # or a malformed entry fails closed.
+    api_cosmos_grants: list[tuple[str, str]] = []
+    for assignment in cosmos_values:
+        if not isinstance(assignment, dict):
+            raise PreflightError(
+                "Cosmos data-plane role assignment response is malformed"
+            )
+        properties = assignment.get("properties")
+        if not isinstance(properties, dict):
+            raise PreflightError(
+                "Cosmos data-plane role assignment response is malformed"
+            )
+        principal = properties.get("principalId")
+        if not isinstance(principal, str) or not principal:
+            raise PreflightError(
+                "Cosmos data-plane role assignment response is malformed"
+            )
+        if principal == principals["api"]:
+            api_cosmos_grants.append(
+                (
+                    str(properties.get("roleDefinitionId", "")).casefold(),
+                    str(properties.get("scope", "")).casefold(),
+                )
+            )
+    if api_cosmos_grants != [(expected_cosmos_role, expected_cosmos_scope)]:
         raise PreflightError(
-            "OPTIMA API identity lacks container-scoped Cosmos data contribution"
+            "OPTIMA API identity must have exactly the container-scoped Cosmos "
+            "data contributor grant"
         )
     if redis is not None:
         redis_assignments = azure.json(
@@ -2711,15 +3451,32 @@ def _check_runtime_access(
             if isinstance(redis_assignments, dict)
             else None
         )
-        if not isinstance(redis_values, list) or not any(
-            isinstance(assignment, dict)
-            and assignment.get("properties", {}).get("accessPolicyName") == "default"
-            and assignment.get("properties", {}).get("user", {}).get("objectId")
-            == principals["api"]
-            for assignment in redis_values
-        ):
+        if not isinstance(redis_values, list):
+            raise PreflightError("Redis access policy assignment response is malformed")
+        api_redis_policies: list[str] = []
+        for assignment in redis_values:
+            if not isinstance(assignment, dict):
+                raise PreflightError(
+                    "Redis access policy assignment response is malformed"
+                )
+            properties = assignment.get("properties")
+            if not isinstance(properties, dict):
+                raise PreflightError(
+                    "Redis access policy assignment response is malformed"
+                )
+            user = properties.get("user")
+            object_id = user.get("objectId") if isinstance(user, dict) else None
+            if object_id == principals["api"]:
+                policy = properties.get("accessPolicyName")
+                if not isinstance(policy, str):
+                    raise PreflightError(
+                        "Redis access policy assignment response is malformed"
+                    )
+                api_redis_policies.append(policy)
+        if api_redis_policies != ["default"]:
             raise PreflightError(
-                "OPTIMA API identity lacks the reviewed Redis default access policy"
+                "OPTIMA API identity must have exactly the reviewed Redis default "
+                "access policy"
             )
 
 
@@ -2765,12 +3522,44 @@ def run_preflight(
     repository_root: Path,
     api_digest: str | None = None,
     ui_digest: str | None = None,
+    classified_evidence: Path | None = None,
+    classified_evidence_sha256: str | None = None,
+    raw_whatif: Path | None = None,
+    raw_whatif_sha256: str | None = None,
+    effective_parameters: Path | None = None,
+    effective_parameters_sha256: str | None = None,
+    expected_commit_sha: str | None = None,
 ) -> dict[str, Any]:
     """Run a read-only preflight phase and return secret-free evidence."""
     if phase not in PREFLIGHT_PHASES:
         raise PreflightError(f"Unsupported preflight phase {phase}")
     _check_iac_representation(repository_root)
     session_principal_id = _check_account(configuration, azure)
+    if phase == "production-session":
+        _check_oidc_federation(
+            configuration,
+            azure,
+            phase=phase,
+            session_principal_id=session_principal_id,
+            repository_root=repository_root,
+            classified_evidence=None,
+            classified_evidence_sha256=None,
+            raw_whatif=None,
+            raw_whatif_sha256=None,
+            effective_parameters=None,
+            effective_parameters_sha256=None,
+            expected_commit_sha=None,
+            verify_roles=False,
+        )
+        return {
+            "checks": ["account", "github_oidc_federation"],
+            "environment": EXPECTED_ENVIRONMENT,
+            "location": configuration.location,
+            "phase": phase,
+            "resource_group": configuration.resource_group,
+            "subscription_id": _redact_identifier(configuration.subscription_id),
+            "tenant_id": _redact_identifier(configuration.tenant_id),
+        }
     cache_provider = _check_providers(
         azure,
         semantic_cache_enabled=configuration.semantic_cache_enabled,
@@ -2780,6 +3569,14 @@ def run_preflight(
         azure,
         phase=phase,
         session_principal_id=session_principal_id,
+        repository_root=repository_root,
+        classified_evidence=classified_evidence,
+        classified_evidence_sha256=classified_evidence_sha256,
+        raw_whatif=raw_whatif,
+        raw_whatif_sha256=raw_whatif_sha256,
+        effective_parameters=effective_parameters,
+        effective_parameters_sha256=effective_parameters_sha256,
+        expected_commit_sha=expected_commit_sha,
     )
     redis_evidence: dict[str, Any] | None = None
     if configuration.semantic_cache_enabled:
@@ -2789,7 +3586,12 @@ def run_preflight(
     model_evidence: dict[str, dict[str, str]] = {}
     if configuration.models:
         model_evidence = _check_model_deployments(configuration, azure)
-    require_foundation = phase in {"publish", "artifacts", "rollout"}
+    require_foundation = phase in {
+        "production-foundation",
+        "publish",
+        "artifacts",
+        "rollout",
+    }
     resources = _check_resource_group(
         configuration,
         azure,
@@ -2799,7 +3601,7 @@ def run_preflight(
         _check_ui_authentication(configuration, azure)
         _check_acr_push(configuration, azure)
         _check_foundry_runtime_access(configuration, azure)
-    if phase == "rollout":
+    if phase in RUNTIME_ACCESS_PHASES:
         _check_runtime_access(configuration, azure, resources)
     artifact_evidence: dict[str, str] = {}
     if phase in {"artifacts", "rollout"}:
@@ -2866,8 +3668,8 @@ def run_preflight(
                 if require_foundation
                 else ()
             ),
-            *(("runtime_access", "immutable_artifacts") if phase == "rollout" else ()),
-            *(("immutable_artifacts",) if phase == "artifacts" else ()),
+            *(("runtime_access",) if phase in RUNTIME_ACCESS_PHASES else ()),
+            *(("immutable_artifacts",) if phase in {"artifacts", "rollout"} else ()),
         ],
         "cost": cost_evidence,
         "environment": EXPECTED_ENVIRONMENT,
@@ -2908,6 +3710,13 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repository-root", type=Path, default=Path.cwd())
     parser.add_argument("--api-digest")
     parser.add_argument("--ui-digest")
+    parser.add_argument("--classified-evidence", type=Path)
+    parser.add_argument("--classified-evidence-sha256")
+    parser.add_argument("--raw-whatif", type=Path)
+    parser.add_argument("--raw-whatif-sha256")
+    parser.add_argument("--effective-parameters", type=Path)
+    parser.add_argument("--effective-parameters-sha256")
+    parser.add_argument("--expected-commit-sha")
     parser.add_argument("--output", type=Path)
     return parser
 
@@ -2924,6 +3733,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             repository_root=arguments.repository_root.resolve(),
             api_digest=arguments.api_digest,
             ui_digest=arguments.ui_digest,
+            classified_evidence=arguments.classified_evidence,
+            classified_evidence_sha256=arguments.classified_evidence_sha256,
+            raw_whatif=arguments.raw_whatif,
+            raw_whatif_sha256=arguments.raw_whatif_sha256,
+            effective_parameters=arguments.effective_parameters,
+            effective_parameters_sha256=arguments.effective_parameters_sha256,
+            expected_commit_sha=arguments.expected_commit_sha,
         )
         serialized = json.dumps(evidence, indent=2, sort_keys=True) + "\n"
         if arguments.output is not None:

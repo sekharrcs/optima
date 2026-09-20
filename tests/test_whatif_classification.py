@@ -49,6 +49,13 @@ FOUNDATION_IDS = (
     f"{SCOPE}/Microsoft.App/managedEnvironments/cae-optima-hackathon",
     f"{SCOPE}/Microsoft.Insights/actionGroups/Application Insights Smart Detection",
 )
+REDIS_IDS = (
+    f"{SCOPE}/Microsoft.Cache/redisEnterprise/redis-optima-{UNIQUE_SUFFIX}",
+    (
+        f"{SCOPE}/Microsoft.Cache/redisEnterprise/redis-optima-{UNIQUE_SUFFIX}"
+        "/databases/default"
+    ),
+)
 
 FOUNDATION_PARAMETERS = (
     "location=eastus2\n"
@@ -185,6 +192,45 @@ def test_expected_foundation_creates_are_approved() -> None:
         "smart_detection_action_group",
         "ui_identity",
     }
+
+
+def test_cache_enabled_foundation_requires_exact_redis_graph() -> None:
+    """Approve only the complete two-resource Managed Redis extension."""
+    document = _document(
+        *(_change_id(resource_id) for resource_id in (*FOUNDATION_IDS, *REDIS_IDS))
+    )
+
+    classification = classify_foundation_whatif(
+        document,
+        subscription_id=SUBSCRIPTION_ID,
+        resource_group=RESOURCE_GROUP,
+        environment_name=ENVIRONMENT_NAME,
+        semantic_cache_enabled=True,
+    )
+
+    assert classification.change_counts == {"Create": 12, "NoChange": 0}
+    assert {change.resource_role for change in classification.allowed_changes} >= {
+        "managed_redis",
+        "managed_redis_database",
+    }
+
+
+def test_cache_enabled_foundation_rejects_partial_redis_graph() -> None:
+    """One Redis resource cannot satisfy the cache-enabled graph."""
+    document = _document(
+        *(_change_id(resource_id) for resource_id in (*FOUNDATION_IDS, REDIS_IDS[0]))
+    )
+
+    with pytest.raises(WhatIfClassificationError) as error:
+        classify_foundation_whatif(
+            document,
+            subscription_id=SUBSCRIPTION_ID,
+            resource_group=RESOURCE_GROUP,
+            environment_name=ENVIRONMENT_NAME,
+            semantic_cache_enabled=True,
+        )
+
+    assert error.value.code is WhatIfClassificationCode.RESOURCE_GRAPH_MISMATCH
 
 
 def test_idempotent_nochange_is_approved() -> None:
@@ -938,6 +984,36 @@ def test_cli_classify_writes_sanitized_evidence(tmp_path: Path) -> None:
     assert evidence["deployment_source"]["file_count"] == 9
     assert SUBSCRIPTION_ID not in output.read_text(encoding="utf-8")
     assert "/subscriptions/" not in output.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("digest_argument", ["--whatif-sha256", "--parameters-sha256"])
+def test_cli_classify_rejects_captured_digest_mismatch(
+    tmp_path: Path, digest_argument: str
+) -> None:
+    """Classification cannot consume raw or parameter bytes after substitution."""
+    whatif = tmp_path / "whatif.json"
+    whatif.write_text(json.dumps(_foundation_creates()), encoding="utf-8")
+    parameters = _write_parameters(tmp_path)
+
+    exit_code = main(
+        [
+            "classify",
+            "--whatif",
+            str(whatif),
+            "--subscription-id",
+            SUBSCRIPTION_ID,
+            "--resource-group",
+            RESOURCE_GROUP,
+            "--commit-sha",
+            COMMIT_SHA,
+            "--parameters-file",
+            str(parameters),
+            digest_argument,
+            "0" * 64,
+        ]
+    )
+
+    assert exit_code == 1
 
 
 def test_cli_classify_fails_closed_on_forbidden_change(tmp_path: Path) -> None:
