@@ -3337,8 +3337,14 @@ def _foundation_whatif_document(
     subscription_id: str = SUBSCRIPTION_ID,
     resource_group: str = PRODUCTION_RESOURCE_GROUP,
     environment: str = "hackathon",
+    change_type: str = "NoChange",
 ) -> dict[str, Any]:
-    """Build a canonical ten-resource foundation what-if with all-Create changes."""
+    """Build a canonical ten-resource foundation what-if.
+
+    Production requires an already applied, converged foundation, so the default
+    change type is NoChange. Passing ``change_type="Create"`` builds the
+    unapplied ten-Create form that the convergence gate must reject.
+    """
     suffix = registry_name[len("acroptima") :]
     cosmos = f"cosmos-optima-{suffix}"
     base = f"/subscriptions/{subscription_id}/resourceGroups/{resource_group}/providers"
@@ -3360,7 +3366,7 @@ def _foundation_whatif_document(
     return {
         "status": "Succeeded",
         "changes": [
-            {"changeType": "Create", "resourceId": resource_id}
+            {"changeType": change_type, "resourceId": resource_id}
             for resource_id in resource_ids
         ],
     }
@@ -4498,6 +4504,53 @@ def test_production_foundation_binds_all_four_approved_sources() -> None:
     assert evidence["phase"] == "production-foundation"
 
 
+def _write_unconverged_foundation() -> tuple[Path, Path, Path]:
+    """Persist matching evidence, raw what-if, and parameters for ten Creates."""
+    whatif = _foundation_whatif_document(change_type="Create")
+    evidence_path = _write_evidence(_classified_evidence_document(document=whatif))
+    raw_path = evidence_path.with_name("foundation-whatif.json")
+    raw_path.write_bytes(
+        json.dumps(
+            whatif, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+        ).encode("ascii")
+    )
+    parameters_path = evidence_path.with_name("production-foundation.parameters.json")
+    parameters_path.write_bytes(
+        production_parameters.canonical_parameter_bytes(_effective_parameter_document())
+    )
+    return evidence_path, raw_path, parameters_path
+
+
+@pytest.mark.real_registry_identity
+def test_production_foundation_rejects_unconverged_ten_create_foundation() -> None:
+    """Fresh evidence describing ten Creates proves an unapplied foundation."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    _authenticated_production_azure(azure)
+    evidence_path, raw_path, parameters_path = _write_unconverged_foundation()
+
+    with pytest.raises(PreflightError, match="converged foundation"):
+        _run_production_foundation(
+            configuration,
+            azure,
+            classified_evidence=evidence_path,
+            raw_whatif=raw_path,
+            effective_parameters=parameters_path,
+        )
+
+
+@pytest.mark.real_registry_identity
+def test_production_foundation_accepts_converged_foundation() -> None:
+    """The default converged evidence reports zero Creates and passes."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    _authenticated_production_azure(azure)
+
+    evidence = _run_production_foundation(configuration, azure)
+
+    assert evidence["phase"] == "production-foundation"
+
+
 @pytest.mark.real_registry_identity
 def test_self_consistent_alternate_registry_fails_against_evidence() -> None:
     """Config, inventory, and AcrPush agreeing on an alternate ACR still fails.
@@ -4841,6 +4894,36 @@ def test_production_foundation_rejects_malformed_unrelated_graph_assignment() ->
         graph_assignment(),
         {"resourceId": "dddddddd-1111-2222-3333-444444444444"},
     ]
+    _authenticated_production_azure(azure)
+
+    with pytest.raises(PreflightError, match="app role assignment is malformed"):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+def test_production_foundation_rejects_graph_assignment_missing_id() -> None:
+    """A Graph app-role assignment without an id fails closed (finding 9)."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    assignment = graph_assignment()
+    del assignment["id"]
+    azure.graph_app_role_assignments = [assignment]
+    _authenticated_production_azure(azure)
+
+    with pytest.raises(PreflightError, match="app role assignment is malformed"):
+        run_preflight(
+            configuration, azure, phase="production-foundation", repository_root=ROOT
+        )
+
+
+def test_production_foundation_rejects_graph_assignment_missing_odata_type() -> None:
+    """A Graph app-role assignment without @odata.type fails closed (finding 9)."""
+    configuration = _production_foundation_configuration()
+    azure = FakeAzure(configuration, foundation_exists=True)
+    assignment = graph_assignment()
+    del assignment["@odata.type"]
+    azure.graph_app_role_assignments = [assignment]
     _authenticated_production_azure(azure)
 
     with pytest.raises(PreflightError, match="app role assignment is malformed"):

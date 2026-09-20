@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -80,6 +81,28 @@ _CACHE_ENVIRONMENT_PARAMETERS = {
     "redisEmbeddingDeployment": "OPTIMA_REDIS_EMBEDDING_DEPLOYMENT",
     "redisEmbeddingModel": "OPTIMA_REDIS_EMBEDDING_MODEL",
 }
+# Cache Bicep bindings that only ever appear in the enabled profile. When the
+# cache is disabled their canonical representation is absence; a compiled base
+# that supplies any of them with a nonempty value is rejected.
+_CACHE_PARAMETER_NAMES = frozenset(_CACHE_ENVIRONMENT_PARAMETERS) | {
+    "redisEmbeddingDimension"
+}
+_CACHE_ENVIRONMENT_VARIABLES = frozenset(_CACHE_ENVIRONMENT_PARAMETERS.values()) | {
+    "OPTIMA_REDIS_EMBEDDING_DIMENSION"
+}
+# Compiled bindings that OPTIMA passes through unchanged: they are declared by
+# the runtime template and carried by hackathon.runtime.bicepparam but are not
+# rebound from the protected environment. The closed contract admits exactly
+# these names in addition to the rebound overrides and the cache bindings.
+_ALLOWED_PASSTHROUGH_PARAMETERS = frozenset(
+    {
+        "apiImageDigest",
+        "applicationInsightsSamplingRatio",
+        "foundryTokenScope",
+        "judgeTimeoutSeconds",
+        "uiImageDigest",
+    }
+)
 
 
 class ProductionParameterError(RuntimeError):
@@ -198,9 +221,6 @@ def build_effective_document(
         raw = environment.get(variable, "")
         overrides[parameter] = _required(environment, variable) if raw else None
 
-    cache_variables = {
-        variable for variable in _CACHE_ENVIRONMENT_PARAMETERS.values()
-    } | {"OPTIMA_REDIS_EMBEDDING_DIMENSION"}
     if cache_enabled:
         overrides.update(
             {
@@ -215,14 +235,42 @@ def build_effective_document(
             raise ProductionParameterError(
                 "OPTIMA_REDIS_EMBEDDING_DIMENSION must be an integer"
             ) from error
-    elif any(environment.get(name, "") for name in cache_variables):
+
+    # Closed name contract: the compiled base may carry only the rebound
+    # overrides, the reviewed pass-through bindings, and the cache bindings.
+    # Any other compiled parameter -- including unexpectedParameter -- fails.
+    allowed_names = (
+        set(overrides) | _ALLOWED_PASSTHROUGH_PARAMETERS | _CACHE_PARAMETER_NAMES
+    )
+    unexpected = sorted(name for name in values if name not in allowed_names)
+    if unexpected:
         raise ProductionParameterError(
-            "Disabled semantic cache cannot supply Redis or embedding parameters"
+            "Compiled runtime parameters contain unexpected bindings: "
+            + ", ".join(unexpected)
         )
 
-    cache_additions = set(_CACHE_ENVIRONMENT_PARAMETERS) | {"redisEmbeddingDimension"}
+    if not cache_enabled:
+        # A disabled artifact rejects any enabled cache value from either the
+        # protected environment or the compiled base, and never emits a cache
+        # binding. Absence or an explicit null is the canonical disabled state.
+        if any(environment.get(name, "") for name in _CACHE_ENVIRONMENT_VARIABLES):
+            raise ProductionParameterError(
+                "Disabled semantic cache cannot supply Redis or embedding parameters"
+            )
+        for name in _CACHE_PARAMETER_NAMES:
+            binding = values.get(name)
+            binding_value = binding.get("value") if isinstance(binding, dict) else None
+            if binding_value not in (None, ""):
+                raise ProductionParameterError(
+                    "Disabled semantic cache cannot supply Redis or embedding "
+                    "parameters"
+                )
+            values.pop(name, None)
+
     missing = sorted(
-        name for name in overrides if name not in values and name not in cache_additions
+        name
+        for name in overrides
+        if name not in values and name not in _CACHE_PARAMETER_NAMES
     )
     if missing:
         raise ProductionParameterError(
@@ -251,12 +299,52 @@ def canonical_parameter_bytes(document: Mapping[str, Any]) -> bytes:
     ).encode("ascii")
 
 
+def _fsync_directory(directory: Path) -> None:
+    """Apply a best-effort durability barrier to a directory entry."""
+    try:
+        descriptor = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    except OSError:
+        pass
+    finally:
+        os.close(descriptor)
+
+
 def _write_new_file(path: Path, content: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
-    descriptor = os.open(path, flags, 0o600)
-    with os.fdopen(descriptor, "wb") as stream:
-        stream.write(content)
+    """Publish content atomically and exclusively to a new destination.
+
+    The bytes are written to a unique 0600 temporary file in the destination
+    directory, flushed and fsynced, verified, then published with a no-replace
+    hard link. An interruption therefore never leaves a partial or overwritten
+    destination: only a temporary file can exist, and it is always removed. The
+    destination directory is fsynced where the platform supports it.
+    """
+    directory = path.parent
+    directory.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        raise FileExistsError(f"Refusing to overwrite existing artifact {path}")
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=directory, prefix=".optima-parameters-"
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if temporary_path.read_bytes() != content:
+            raise ProductionParameterError(
+                "Effective production parameter artifact changed before publication"
+            )
+        os.link(temporary_path, path)
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
+    temporary_path.unlink(missing_ok=True)
+    _fsync_directory(directory)
 
 
 def create_parser() -> argparse.ArgumentParser:

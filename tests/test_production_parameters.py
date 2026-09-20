@@ -135,6 +135,93 @@ def test_disabled_profile_rejects_cache_only_value() -> None:
         production_parameters.build_effective_document(compiled_document(), configured)
 
 
+def test_unexpected_compiled_parameter_is_rejected() -> None:
+    """An unknown compiled binding must not survive generation."""
+    compiled = compiled_document()
+    parameters = compiled["parameters"]
+    assert isinstance(parameters, dict)
+    parameters["unexpectedParameter"] = {"value": "smuggled"}
+
+    with pytest.raises(
+        production_parameters.ProductionParameterError,
+        match="unexpected",
+    ):
+        production_parameters.build_effective_document(compiled, environment())
+
+
+def test_disabled_profile_rejects_compiled_cache_binding() -> None:
+    """A disabled artifact cannot carry a nonempty compiled Redis model."""
+    compiled = compiled_document()
+    parameters = compiled["parameters"]
+    assert isinstance(parameters, dict)
+    parameters["redisEmbeddingModel"] = {"value": "text-embedding"}
+
+    with pytest.raises(
+        production_parameters.ProductionParameterError,
+        match="Redis or embedding",
+    ):
+        production_parameters.build_effective_document(compiled, environment())
+
+
+def test_disabled_profile_rejects_compiled_enabled_dimension() -> None:
+    """A disabled artifact cannot carry an enabled compiled embedding dimension."""
+    compiled = compiled_document()
+    parameters = compiled["parameters"]
+    assert isinstance(parameters, dict)
+    parameters["redisEmbeddingDimension"] = {"value": 1536}
+
+    with pytest.raises(
+        production_parameters.ProductionParameterError,
+        match="Redis or embedding",
+    ):
+        production_parameters.build_effective_document(compiled, environment())
+
+
+def test_disabled_profile_accepts_canonical_disabled_cache_binding() -> None:
+    """A null compiled cache binding is the canonical disabled representation."""
+    compiled = compiled_document()
+    parameters = compiled["parameters"]
+    assert isinstance(parameters, dict)
+    parameters["redisEmbeddingModel"] = {"value": None}
+    parameters["redisEmbeddingDimension"] = {"value": None}
+
+    document = production_parameters.build_effective_document(compiled, environment())
+    bindings = values(document)
+
+    assert "redisEmbeddingModel" not in bindings
+    assert "redisEmbeddingDimension" not in bindings
+
+
+def test_interrupted_publication_leaves_no_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An interrupted write must never publish a partial destination file."""
+    output = tmp_path / "effective.json"
+
+    def failing_fsync(descriptor: int) -> None:
+        raise OSError("publication interrupted before completion")
+
+    monkeypatch.setattr(os, "fsync", failing_fsync)
+
+    with pytest.raises(OSError):
+        production_parameters._write_new_file(output, b"x" * 128)
+
+    assert not output.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_publication_refuses_existing_destination(tmp_path: Path) -> None:
+    """Atomic publication preserves fail-if-destination-exists semantics."""
+    output = tmp_path / "effective.json"
+    output.write_bytes(b"existing")
+
+    with pytest.raises(OSError):
+        production_parameters._write_new_file(output, b"replacement")
+
+    assert output.read_bytes() == b"existing"
+    assert list(tmp_path.iterdir()) == [output]
+
+
 def test_cli_writes_exclusive_regular_artifact_and_reports_digest(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

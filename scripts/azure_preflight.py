@@ -1886,6 +1886,45 @@ def _validate_effective_production_parameters(
         raise PreflightError("Effective runtime workflow identity is malformed")
 
 
+def _require_converged_foundation(
+    evidence: Mapping[str, Any], *, semantic_cache_enabled: bool
+) -> None:
+    """Fail closed unless classified evidence proves an applied, converged foundation.
+
+    Production requires an already applied foundation. An ARM deployment that
+    merely reports ``Succeeded`` is never sufficient on its own: the fresh,
+    source-bound what-if reconstruction must show zero effective Creates and the
+    exact managed resource count as NoChange, with no unapproved residual
+    change. Evidence describing resource creation -- an unapplied foundation --
+    is rejected here so a bare Succeeded deployment name cannot authorize
+    production mutation. Delete, replacement, unapproved Modify, unexpected
+    resource types, the exact provider-echo normalizations, the LAW NoEffect
+    exception, and the policy-bound external observation count are all already
+    enforced by the fail-closed classifier that produced this evidence.
+    """
+    expected_nochange = (
+        whatif_classification._CACHE_MANAGED_FOUNDATION_RESOURCE_COUNT
+        if semantic_cache_enabled
+        else whatif_classification._BASE_MANAGED_FOUNDATION_RESOURCE_COUNT
+    )
+    counts = evidence["changes"]["counts"]
+    if counts.get("Create", 0) != 0:
+        raise PreflightError(
+            "Production requires a converged foundation; classified evidence still "
+            "reports resource creation"
+        )
+    if counts.get("NoChange", 0) != expected_nochange:
+        raise PreflightError(
+            "Classified foundation evidence does not report the exact converged "
+            "managed resource count"
+        )
+    residual = evidence["normalizations"]["residual_unapproved_change_count"]
+    if not isinstance(residual, int) or isinstance(residual, bool) or residual != 0:
+        raise PreflightError(
+            "Classified foundation evidence reports unapproved residual changes"
+        )
+
+
 def _resolve_repository_registry_identity(
     configuration: DeploymentConfiguration,
     *,
@@ -1989,6 +2028,9 @@ def _resolve_repository_registry_identity(
         raise PreflightError(
             "Classified foundation evidence differs from raw what-if reconstruction"
         )
+    _require_converged_foundation(
+        recomputed, semantic_cache_enabled=configuration.semantic_cache_enabled
+    )
     registry_facts = [
         fact
         for fact in recomputed["changes"]["resources"]
